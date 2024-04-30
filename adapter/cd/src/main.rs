@@ -4,6 +4,7 @@ use std::io::prelude::*;
 use std::io;
 use std::path::Path;
 use std::fs::OpenOptions;
+use std::sync::Arc;
 use daemonize::Daemonize;
 
 
@@ -11,8 +12,8 @@ pub mod cd;
 
 
 
-const LOG_DIR: &str = "/var/log/zpr";
-const PID_DIR: &str = "/var/log/zpr";
+const LOG_DIR: &str = "/var/run/zpr";
+const PID_DIR: &str = "/var/run/zpr";
 
 
 
@@ -38,8 +39,13 @@ fn main() -> io::Result<()> {
             false
         };  
 
+
+    let config = Arc::new(cd::Config {
+        socket_path: String::from("/var/run/zpr/cd.sock"),
+    });
+
     if foreground {
-        return cd::tokio_main();
+        return cd::tokio_main(config.clone());
     }    
 
     // Else we go into background.
@@ -76,7 +82,7 @@ fn main() -> io::Result<()> {
         Ok(_) => println!("cd launching in background..."),
         Err(e) => eprintln!("failed to launch CD: {}", e),
     }
-    cd::tokio_main()
+    cd::tokio_main(config.clone())
 }
 
 

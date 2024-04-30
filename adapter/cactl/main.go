@@ -5,11 +5,15 @@ import (
 	"fmt"
 	"os"
 
+	"zpr.org/cactl/ipc"
+
 	"github.com/labstack/gommon/color"
 	"github.com/urfave/cli/v2"
 )
 
 const VERSION = "0.0.1-beta"
+
+const CD_CONTROL_SOCKET = "/var/run/zpr/cd.sock"
 
 func main() {
 	app := &cli.App{
@@ -50,8 +54,19 @@ func statusCmd() *cli.Command {
 		Name:  "status",
 		Usage: "Show status of active ZPR connections",
 		Action: func(c *cli.Context) error {
-			fmt.Print(color.Green("status..."))
-			fmt.Println(color.Red(" -- not implemented"))
+			ctl, err := ipc.NewCDCtl(CD_CONTROL_SOCKET)
+			if err != nil {
+				return err
+			}
+			result, err := ctl.Status()
+			if err != nil {
+				return err
+			}
+			if result.IsError {
+				fmt.Println(color.Red(result.Message))
+			} else {
+				fmt.Println(color.Green(result.Message))
+			}
 			return nil
 		},
 	}
