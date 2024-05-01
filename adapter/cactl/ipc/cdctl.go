@@ -46,6 +46,10 @@ func (cdc *CDCtl) Status() (*CDResponse, error) {
 	return cdc.cactlToResp("status\n")
 }
 
+func (cdc *CDCtl) Connect(configPath string) (*CDResponse, error) {
+	return cdc.cactlToResp(fmt.Sprintf("connect %s\n", configPath))
+}
+
 func (cdc *CDCtl) dial() (net.Conn, error) {
 	return net.Dial("unix", cdc.socketPath)
 }
@@ -64,6 +68,7 @@ func (cdc *CDCtl) cactlToResp(cmd string) (*CDResponse, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		lineno++
+		// fmt.Printf("%d ) >> '%s'\n", lineno, line)
 		switch lineno {
 		case 1:
 			if n, err := strconv.Atoi(line); err == nil {

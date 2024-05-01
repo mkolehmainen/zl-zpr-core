@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"zpr.org/cactl/ipc"
 
@@ -42,8 +43,25 @@ func connectCmd() *cli.Command {
 			if configName == "" {
 				return errors.New("missing configuration name")
 			}
-			fmt.Printf(color.Green("connecting to %v"), configName)
-			fmt.Println(color.Red(" -- not implemented"))
+			cpath, err := filepath.Abs(configName)
+			if err != nil {
+				fmt.Print(color.Red("failed to parse configuration path"))
+				fmt.Println("  {}", err)
+			} else {
+				ctl, err := ipc.NewCDCtl(CD_CONTROL_SOCKET)
+				if err != nil {
+					return err
+				}
+				result, err := ctl.Connect(cpath)
+				if err != nil {
+					return err
+				}
+				if result.IsError {
+					fmt.Println(color.Red(result.Message()))
+				} else {
+					fmt.Println(color.Green(result.Message()))
+				}
+			}
 			return nil
 		},
 	}

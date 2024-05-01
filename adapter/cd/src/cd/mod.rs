@@ -4,6 +4,9 @@ pub use crate::cd::command_server::command_server;
 mod config;
 pub use crate::cd::config::Config;
 
+mod zpr;
+pub use crate::cd::zpr::Zpr;
+
 use std::{fs, io, sync::Arc};
 
 use tracing::{error, info};
@@ -26,6 +29,8 @@ pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
     tracing_subscriber::fmt::init();
 
     info!("cd starts");
+
+    let zpr = Zpr::new();
 
     // Watch for SIGINT and SIGTERM
     let (sig_shutdown_tx, mut sig_shutdown_rx) = oneshot::channel();
@@ -50,7 +55,7 @@ pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
     let (cs_shutdown_tx, mut cs_shutdown_rx) = oneshot::channel();
     let cs_config = config.clone();
     tokio::spawn(async move {
-        match command_server(cs_config).await {
+        match command_server(cs_config, zpr.clone()).await {
             Ok(()) => {
                 info!("command server shut down");
             }
