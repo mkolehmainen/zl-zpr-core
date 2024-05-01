@@ -63,9 +63,9 @@ func statusCmd() *cli.Command {
 				return err
 			}
 			if result.IsError {
-				fmt.Println(color.Red(result.Message))
+				fmt.Println(color.Red(result.Message()))
 			} else {
-				fmt.Println(color.Green(result.Message))
+				fmt.Println(color.Green(result.Message()))
 			}
 			return nil
 		},

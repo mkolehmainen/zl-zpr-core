@@ -121,6 +121,16 @@ async fn command_server(config: Arc<Config>) -> io::Result<()> {
 }
 
 
+// A command message is one line of text terminated with "\n".
+// A response is multi line with the first line just being the integer number of lines to follow.
+// Also, line 2 is always OK or ERR.
+// 
+// For example:
+// 
+//      2
+//      OK
+//      explanatory message here
+//
 async fn handle_command_connection(stream: tokio::net::UnixStream) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
@@ -139,16 +149,16 @@ async fn handle_command_connection(stream: tokio::net::UnixStream) -> io::Result
         let parts: Vec<&str> = line.split_whitespace().collect();
         match parts[0] {
             "status" => {
-                writer.write_all(b"OK status unknown\n").await?;
+                writer.write_all(b"2\nOK\nstatus unknown\n").await?;
             },
             "connect" => {
-                writer.write_all(b"ERR connect not implemented\n").await?;                
+                writer.write_all(b"2\nERR\nconnect not implemented\n").await?;                
             },
             "disconnect" => {
-                writer.write_all(b"ERR disconnect not implemented\n").await?;                                
+                writer.write_all(b"2\nERR\ndisconnect not implemented\n").await?;                                
             },
             _ => {
-                writer.write_all(b"ERR unknown command\n").await?;
+                writer.write_all(b"2\nERR\nunknown command\n").await?;
             }
         }
         break;
