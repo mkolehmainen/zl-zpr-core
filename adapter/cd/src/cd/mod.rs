@@ -1,31 +1,25 @@
-use std::{
-    fs, io,
-    sync::Arc,
-};
+mod command_server;
+pub use crate::cd::command_server::command_server;
+
+mod config;
+pub use crate::cd::config::Config;
+
+use std::{fs, io, sync::Arc};
 
 use tracing::{error, info};
 use tracing_subscriber;
 
-
 use tokio::{
-    net::UnixListener,
-    io::{
-        //AsyncReadExt,
-        AsyncWriteExt,
-        //BufReader,
-        AsyncBufReadExt
-    },
-    sync::oneshot,
-    signal::unix::{signal, SignalKind},
     select,
+    signal::unix::{signal, SignalKind},
+    //io::{
+    //AsyncReadExt,
+    //AsyncWriteExt,
+    //BufReader,
+    //AsyncBufReadExt
+    //},
+    sync::oneshot,
 };
-
-
-pub struct Config {
-    pub socket_path: String,
-}
-
-
 
 #[tokio::main]
 pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
@@ -50,7 +44,7 @@ pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
                 }
             }
         }
-        let _ = sig_shutdown_tx.send(());        
+        let _ = sig_shutdown_tx.send(());
     });
 
     let (cs_shutdown_tx, mut cs_shutdown_rx) = oneshot::channel();
@@ -84,84 +78,11 @@ pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
 
     // cleanup
     info!("cd preparing for exit");
-    match fs::remove_file(&config.socket_path) {        
+    match fs::remove_file(&config.socket_path) {
         Ok(()) => (),
         Err(_) => (),
     };
 
     info!("cd shuts down");
-    Ok(())
-}
-
-
-
-// TODO: How to signal when this server exits.
-// TODO: How to stop this server.
-async fn command_server(config: Arc<Config>) -> io::Result<()> {
-    info!("starting command server on {}", config.socket_path);    
-    let listener = UnixListener::bind(config.socket_path.clone())?;
-    loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                info!("accepted command connection");
-                tokio::spawn(async move {
-                    if let Err(e) = handle_command_connection(stream).await {
-                        error!("Error handling command connection: {}", e);
-                    }
-                });
-            }
-            Err(e) => {
-                //error!({error = e}, "Error accepting command connection");                
-                // error!("Error accepting command connection: {}", e);
-                // break;
-                return Err(e);
-            }
-        }
-    }
-}
-
-
-// A command message is one line of text terminated with "\n".
-// A response is multi line with the first line just being the integer number of lines to follow.
-// Also, line 2 is always OK or ERR.
-// 
-// For example:
-// 
-//      2
-//      OK
-//      explanatory message here
-//
-async fn handle_command_connection(stream: tokio::net::UnixStream) -> io::Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = tokio::io::BufReader::new(reader);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break;
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            error!("empty line received");
-            break;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        match parts[0] {
-            "status" => {
-                writer.write_all(b"2\nOK\nstatus unknown\n").await?;
-            },
-            "connect" => {
-                writer.write_all(b"2\nERR\nconnect not implemented\n").await?;                
-            },
-            "disconnect" => {
-                writer.write_all(b"2\nERR\ndisconnect not implemented\n").await?;                                
-            },
-            _ => {
-                writer.write_all(b"2\nERR\nunknown command\n").await?;
-            }
-        }
-        break;
-    }
     Ok(())
 }
