@@ -59,9 +59,9 @@ fn main() -> io::Result<()> {
         .append(true)
         .truncate(false)
         .open(format!("{}/cd.out", LOG_DIR))?;
-    write!(
+    writeln!(
         stdout,
-        "=============== cd restarts at {} ==============\n",
+        "=============== cd restarts at {} ==============",
         chrono::Local::now()
     )?;
     let mut stderr = OpenOptions::new()
@@ -69,9 +69,9 @@ fn main() -> io::Result<()> {
         .append(true)
         .truncate(false)
         .open(format!("{}/cd.err", LOG_DIR))?;
-    write!(
+    writeln!(
         stderr,
-        "=============== cd restarts at {} ==============\n",
+        "=============== cd restarts at {} ==============",
         chrono::Local::now()
     )?;
 

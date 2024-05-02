@@ -82,6 +82,14 @@ impl Configuration {
     }    
 }
 
+// TODO: Rust what is this "default" stuff?
+impl Default for Zpr {
+    fn default() -> Self {
+        Zpr::new()
+    }
+}
+
+
 impl Zpr {
     pub fn new() -> Zpr {
         Zpr {
@@ -113,7 +121,7 @@ impl Zpr {
         }
 
         // Name must be unique
-        for (conf, state) in &*state {
+        for (conf, _) in &*state {
             // XXX <------- RUST WTF IS THIS "&*" ?
             if conf.profile.name == c.profile.name {
                 return Err(Error::new(

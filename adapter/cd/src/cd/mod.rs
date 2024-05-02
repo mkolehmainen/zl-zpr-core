@@ -95,10 +95,7 @@ pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
 
     // cleanup
     info!("cd preparing for exit");
-    match fs::remove_file(&config.socket_path) {
-        Ok(()) => (),
-        Err(_) => (),
-    };
+    if let Ok(()) = fs::remove_file(&config.socket_path) { () } // don't care
 
     info!("cd shuts down");
     Ok(())

@@ -30,7 +30,7 @@ pub async fn command_server(config: Arc<Config>, zpr: Zpr, token: CancellationTo
             }
             result = listener.accept() => {
                 match result {
-                    Ok((stream, addr)) => {
+                    Ok((stream, _)) => {
                         info!("accepted command connection");
                         let zpr = zpr.clone();
                         tokio::spawn(async move {
@@ -61,7 +61,7 @@ pub async fn command_server(config: Arc<Config>, zpr: Zpr, token: CancellationTo
 //
 async fn handle_command_connection(stream: tokio::net::UnixStream, zpr: Zpr) -> io::Result<()> {
     // let (reader, mut writer) = stream.into_split();
-    let (reader, mut send) = stream.into_split();
+    let (reader, send) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
 
     let writer = tokio::io::BufWriter::new(send);
@@ -103,7 +103,7 @@ async fn handle_status(
 
     let mut writer = writer.lock().await;
 
-    if stats.len() == 0 {
+    if stats.is_empty() {
         writer.write_all(b"2\nOK\nno configurations\n").await?;
         return Ok(());
     }
@@ -135,7 +135,7 @@ async fn handle_connect(
     // Determine if it is a name of existing or a path to a new one.
     // Our approach - if the name is found in our configuration list then use it as a name, else assume a path.
 
-    let mut cname: String;
+    let cname: String;
 
     if !zpr.has_configuration(parts[1]) {
         info!("configuration not found '{}', attempting to load as file", parts[1]);
@@ -143,7 +143,7 @@ async fn handle_connect(
             Ok(c) => c,
             Err(e) => {
                 error!("Error loading configuration {}: {}", parts[1], e);
-                let emsg = e.to_string().replace("\n", " ");
+                let emsg = e.to_string().replace('\n', " ");
                 writer
                     .write_all(format!("2\nERR\n{}\n", emsg).as_bytes())
                     .await?;
@@ -157,7 +157,7 @@ async fn handle_connect(
         match zpr.add_configuration(configuration) {
             Ok(()) => (),
             Err(e) => {
-                let emsg = e.to_string().replace("\n", " ");
+                let emsg = e.to_string().replace('\n', " ");
                 writer
                     .write_all(format!("2\nERR\n{}\n", emsg).as_bytes())
                     .await?;
@@ -187,7 +187,7 @@ async fn handle_connect(
 
 
     if let Err(e) = zpr.set_status(&cname, ConfigState::Connected(Instant::now())) {
-        let emsg = e.to_string().replace("\n", " ");
+        let emsg = e.to_string().replace('\n', " ");
         writer
             .write_all(format!("3\nERR\nset status failed\n{}\n", emsg).as_bytes())
             .await?;
