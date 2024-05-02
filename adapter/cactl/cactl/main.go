@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"zpr.org/cactl/ipc"
+	"zpr.org/cactl/internal/ipc"
 
 	"github.com/labstack/gommon/color"
 	"github.com/urfave/cli/v2"
