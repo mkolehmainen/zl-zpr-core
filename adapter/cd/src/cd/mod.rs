@@ -24,12 +24,20 @@ use tokio::{
     sync::oneshot,
 };
 
+use tokio_util::{
+    sync::CancellationToken,
+    task::TaskTracker,
+};
+
+
 #[tokio::main]
 pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
     tracing_subscriber::fmt::init();
 
     info!("cd starts");
 
+    let tracker = TaskTracker::new();
+    let token = CancellationToken::new();
     let zpr = Zpr::new();
 
     // Watch for SIGINT and SIGTERM
@@ -54,8 +62,9 @@ pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
 
     let (cs_shutdown_tx, mut cs_shutdown_rx) = oneshot::channel();
     let cs_config = config.clone();
-    tokio::spawn(async move {
-        match command_server(cs_config, zpr.clone()).await {
+    let cs_token = token.clone();
+    tracker.spawn(async move {
+        match command_server(cs_config, zpr.clone(), cs_token).await {
             Ok(()) => {
                 info!("command server shut down");
             }
@@ -67,6 +76,7 @@ pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
     });
 
     // Now just waiting for an exit condition:
+    tracker.close();
     loop {
         tokio::select! {
             _ = &mut cs_shutdown_rx => {
@@ -75,11 +85,13 @@ pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
             },
             _ = &mut sig_shutdown_rx => {
                 info!("exiting due to signal");
-                // TODO: Do I need to stop the command server?
+                token.cancel();
                 break;
             }
         }
     }
+
+    tracker.wait().await;
 
     // cleanup
     info!("cd preparing for exit");
