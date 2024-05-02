@@ -68,28 +68,25 @@ async fn handle_command_connection(stream: tokio::net::UnixStream, zpr: Zpr) -> 
     let writer = Arc::new(Mutex::new(writer));
 
     let mut line = String::new();
-    'readline: loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break 'readline;
-        }
+
+    line.clear();
+    let n = reader.read_line(&mut line).await?;
+    if n > 0 {
         let line = line.trim();
         if line.is_empty() {
             error!("empty line received");
-            break 'readline;
+        } else {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            match parts[0] {
+                "status" => handle_status(Arc::clone(&writer), zpr).await?,
+                "connect" => handle_connect(&parts, Arc::clone(&writer), zpr).await?,
+                "disconnect" => handle_disconnect(&parts, Arc::clone(&writer), zpr).await?,
+                _ => {
+                    let mut ww = writer.lock().await;
+                    ww.write_all(b"2\nERR\nunknown command\n").await?;
+                }
+            }    
         }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        match parts[0] {
-            "status" => handle_status(Arc::clone(&writer), zpr).await?,
-            "connect" => handle_connect(&parts, Arc::clone(&writer), zpr).await?,
-            "disconnect" => handle_disconnect(&parts, Arc::clone(&writer), zpr).await?,
-            _ => {
-                let mut ww = writer.lock().await;
-                ww.write_all(b"2\nERR\nunknown command\n").await?;
-            }
-        }
-        break 'readline;
     }
     writer.lock().await.flush().await?;
     Ok(())
