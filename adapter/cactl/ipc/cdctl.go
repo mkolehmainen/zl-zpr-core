@@ -50,6 +50,14 @@ func (cdc *CDCtl) Connect(configPath string) (*CDResponse, error) {
 	return cdc.cactlToResp(fmt.Sprintf("connect %s\n", configPath))
 }
 
+func (cdc *CDCtl) Disconnect(configName string) (*CDResponse, error) {
+	if configName == "" {
+		return cdc.cactlToResp("disconnect\n")
+	} else {
+		return cdc.cactlToResp(fmt.Sprintf("disconnect %s\n", configName))
+	}
+}
+
 func (cdc *CDCtl) dial() (net.Conn, error) {
 	return net.Dial("unix", cdc.socketPath)
 }

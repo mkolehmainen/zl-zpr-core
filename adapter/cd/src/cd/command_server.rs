@@ -1,8 +1,10 @@
+use std::vec;
 use std::{io, sync::Arc};
-
+use std::time::Instant;
 
 use tracing::{error, info};
 
+use tokio::sync::Mutex;
 use tokio::{
     io::{
         //BufReader,
@@ -14,9 +16,7 @@ use tokio::{
 };
 
 pub use crate::cd::config::Config;
-pub use crate::cd::zpr::{Zpr, load_configuration};
-
-
+pub use crate::cd::zpr::{load_configuration, Zpr, ConfigState};
 
 // TODO: How to signal when this server exits.
 // TODO: How to stop this server.
@@ -27,7 +27,7 @@ pub async fn command_server(config: Arc<Config>, zpr: Zpr) -> io::Result<()> {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 info!("accepted command connection");
-                let zpr = zpr.clone();                                    
+                let zpr = zpr.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_command_connection(stream, zpr).await {
                         error!("Error handling command connection: {}", e);
@@ -55,8 +55,13 @@ pub async fn command_server(config: Arc<Config>, zpr: Zpr) -> io::Result<()> {
 //      explanatory message here
 //
 async fn handle_command_connection(stream: tokio::net::UnixStream, zpr: Zpr) -> io::Result<()> {
-    let (reader, mut writer) = stream.into_split();
+    // let (reader, mut writer) = stream.into_split();
+    let (reader, mut send) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
+
+    let writer = tokio::io::BufWriter::new(send);
+    let writer = Arc::new(Mutex::new(writer));
+
     let mut line = String::new();
     'readline: loop {
         line.clear();
@@ -71,71 +76,184 @@ async fn handle_command_connection(stream: tokio::net::UnixStream, zpr: Zpr) -> 
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
         match parts[0] {
-            "status" => {
-                let stats = zpr.get_status();
-                if stats.len() == 0 {
-                    writer.write_all(b"2\nOK\nno configurations\n").await?;
-                    break 'readline;
-                }
-                writer.write_all(format!("{}\nOK\n", stats.len() + 1).as_bytes()).await?;
-                for (cpath, cstat) in &stats {
-                    writer.write_all(format!("{} - {}\n", cpath, cstat).as_bytes()).await?;
-                }
-            }
-            "connect" => {
-                // Connect takes a single argument - the path to a ZPR configuration file.
-                //
-                // TODO: Need to manage some state here.  We should only allow a single connection
-                // at a time to a given ZPR endpoint/configuration.  Somewhere there is a table 
-                // of [configuration | endpoint | status] rows.
-                if parts.len() < 2 {
-                    writer
-                        .write_all(b"2\nERR\nconnect requires a path\n")
-                        .await?;
-                    break 'readline;
-                }
-
-                let configuration = match load_configuration(parts[1]) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("Error loading configuration {}: {}", parts[1], e);
-                        let emsg = e.to_string().replace("\n", " ");
-                        writer
-                            .write_all(format!("2\nERR\n{}\n", emsg).as_bytes())
-                            .await?;
-                        break 'readline;
-                    }
-                };
-
-                // install the configuration
-                match zpr.add_configuration(configuration) {
-                    Ok(()) => (),
-                    Err(e) => {
-                        let emsg = e.to_string().replace("\n", " ");                        
-                        writer
-                            .write_all(format!("2\nERR\n{}\n", emsg).as_bytes())
-                            .await?;
-                        break 'readline;
-                    }
-                }
-
-                // TODO: Kick off start me up.
-                info!("(TODO) kick off start-me-up for configuration just loaded");
-
-                writer
-                    .write_all(b"2\nOK\nconnect starting\n")
-                    .await?;
-            }
-            "disconnect" => {
-                writer
-                    .write_all(b"2\nERR\ndisconnect not implemented\n")
-                    .await?;
-            }
+            "status" => handle_status(Arc::clone(&writer), zpr).await?,
+            "connect" => handle_connect(&parts, Arc::clone(&writer), zpr).await?,
+            "disconnect" => handle_disconnect(&parts, Arc::clone(&writer), zpr).await?,
             _ => {
-                writer.write_all(b"2\nERR\nunknown command\n").await?;
+                let mut ww = writer.lock().await;
+                ww.write_all(b"2\nERR\nunknown command\n").await?;
             }
         }
         break 'readline;
     }
+    writer.lock().await.flush().await?;
+    Ok(())
+}
+
+async fn handle_status(
+    writer: Arc<Mutex<tokio::io::BufWriter<tokio::net::unix::OwnedWriteHalf>>>,
+    zpr: Zpr,
+) -> Result<(), io::Error> {
+    let stats = zpr.get_status();
+
+    let mut writer = writer.lock().await;
+
+    if stats.len() == 0 {
+        writer.write_all(b"2\nOK\nno configurations\n").await?;
+        return Ok(());
+    }
+    writer
+        .write_all(format!("{}\nOK\n", stats.len() + 1).as_bytes())
+        .await?;
+    for (cname, cpath, cstat) in &stats {
+        writer
+            .write_all(format!("{}: {} - {}\n", cname, cpath, cstat).as_bytes())
+            .await?;
+    }
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn handle_connect(
+    parts: &Vec<&str>,
+    writer: Arc<Mutex<tokio::io::BufWriter<tokio::net::unix::OwnedWriteHalf>>>,
+    zpr: Zpr,
+) -> Result<(), io::Error> {
+    let mut writer = writer.lock().await;
+    if parts.len() < 2 {
+        writer
+            .write_all(b"2\nERR\nconnect requires a configuration path or name\n")
+            .await?;
+        return Ok(());
+    }
+
+    // Determine if it is a name of existing or a path to a new one.
+    // Our approach - if the name is found in our configuration list then use it as a name, else assume a path.
+
+    let mut cname: String;
+
+    if !zpr.has_configuration(parts[1]) {
+        info!("configuration not found '{}', attempting to load as file", parts[1]);
+        let configuration = match load_configuration(parts[1]) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Error loading configuration {}: {}", parts[1], e);
+                let emsg = e.to_string().replace("\n", " ");
+                writer
+                    .write_all(format!("2\nERR\n{}\n", emsg).as_bytes())
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        cname = configuration.get_name().to_string();
+
+        // install the configuration
+        match zpr.add_configuration(configuration) {
+            Ok(()) => (),
+            Err(e) => {
+                let emsg = e.to_string().replace("\n", " ");
+                writer
+                    .write_all(format!("2\nERR\n{}\n", emsg).as_bytes())
+                    .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        // Already have the config, so this is just dummy code to update the status.
+        cname = parts[1].to_string();
+        let old_state = match zpr.get_configuration_state(parts[1]) {
+            Some(s) => s,
+            None => {
+                writer
+                    .write_all(b"2\nERR\nfailed to find configuration\n")
+                    .await?;
+                return Ok(());
+            }
+        };
+        if matches!(old_state, ConfigState::Connected(_)) {
+            // Already in connected state.
+            writer
+                .write_all(b"2\nERR\nalready connected\n")
+                .await?;
+            return Ok(());
+        }
+    }
+
+
+    if let Err(e) = zpr.set_status(&cname, ConfigState::Connected(Instant::now())) {
+        let emsg = e.to_string().replace("\n", " ");
+        writer
+            .write_all(format!("3\nERR\nset status failed\n{}\n", emsg).as_bytes())
+            .await?;
+        return Ok(());
+    }            
+
+
+    // TODO: Kick off start me up.
+    info!("(TODO) kick off start-me-up");
+
+    writer.write_all(b"2\nOK\nconnect starting\n").await?;
+
+    Ok(())
+}
+
+async fn handle_disconnect(
+    parts: &Vec<&str>,
+    writer: Arc<Mutex<tokio::io::BufWriter<tokio::net::unix::OwnedWriteHalf>>>,
+    zpr: Zpr,
+) -> Result<(), io::Error> {
+    let mut writer = writer.lock().await;
+
+    let mut all = true;
+    let mut cname = "";
+
+    if parts.len() > 1 { 
+        all = false;
+        cname = parts[1];    
+    }
+
+    let mut fails = vec![];
+    let mut successes = vec![];
+
+    let statuses = zpr.get_status();
+    for (name, _, state_str) in statuses {
+        if (all || name == cname) && (state_str != "disconnected") {
+            if let Err(e) = zpr.set_status(&name, ConfigState::Disconnected) {
+                error!("Error setting status to disconnected for {}: {}", name, e);
+                fails.push(name);
+            } else {
+                successes.push(name);
+            }
+        }
+    }
+
+    let stats_total = fails.len() + successes.len();
+    if stats_total == 0 {
+        if all {
+            writer
+                .write_all("1\nERR\nnothing connected".as_bytes())
+                .await?;
+        } else {
+            writer
+                .write_all(format!("1\nERR\n{} is not connected", cname).as_bytes())
+                .await?;
+        }
+    } else {
+        writer
+            .write_all(format!("{}\nOK\n", stats_total + 1).as_bytes())
+            .await?;
+        for name in &successes {
+            writer
+                .write_all(format!("{}: disconnect OK\n", name).as_bytes())
+                .await?;
+        }
+        for name in &fails {
+            writer
+                .write_all(format!("{}: disconnect ERROR\n", name).as_bytes())
+                .await?;
+        }
+    }
+
     Ok(())
 }

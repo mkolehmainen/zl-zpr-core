@@ -1,0 +1,20 @@
+# Example ZPR configuration file for an adapter
+
+[profile]
+# Each config must have a unique name
+name = "myconf_1"
+
+
+[dock]
+# This is the public contact address for the node wireguard start-me-up listener service.
+host_or_ip = "a.spacelaser.net"
+startup_port = 13131
+
+[adapter]
+# optional - adapter will generate new random one if not set
+# private_key = "OHlN31RzhsshftD1tF+OszPGmw8f2/Vwb/YTo+i/nF4="
+
+
+# TODO:
+# [credentials]
+# foo = fee ,etc
