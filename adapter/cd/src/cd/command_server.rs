@@ -60,7 +60,6 @@ pub async fn command_server(config: Arc<Config>, zpr: Zpr, token: CancellationTo
 //      explanatory message here
 //
 async fn handle_command_connection(stream: tokio::net::UnixStream, zpr: Zpr) -> io::Result<()> {
-    // let (reader, mut writer) = stream.into_split();
     let (reader, send) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
 
