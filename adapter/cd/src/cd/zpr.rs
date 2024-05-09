@@ -108,7 +108,6 @@ impl Zpr {
         let mut found = false;
         let mut state = self.shared.configurations.lock().unwrap();
         for (conf, state) in &*state {
-            // XXX <------- RUST WTF IS THIS "&*" ?
             if conf.path_name == c.path_name {
                 found = true;
                 if !matches!(state, ConfigState::Disconnected) {
@@ -126,7 +125,6 @@ impl Zpr {
 
         // Name must be unique
         for (conf, _) in &*state {
-            // XXX <------- RUST WTF IS THIS "&*" ?
             if conf.profile.name == c.profile.name {
                 return Err(Error::new(
                     ErrorKind::Other,

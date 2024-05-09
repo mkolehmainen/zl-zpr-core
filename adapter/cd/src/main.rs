@@ -46,13 +46,10 @@ fn main() -> io::Result<()> {
     // Else we go into background.
 
     let logpath = Path::new(LOG_DIR);
-    if !logpath.exists() {
-        std::fs::create_dir_all(logpath).expect("failed to create log directory");
-    }
+    std::fs::create_dir_all(logpath).expect("failed to create log directory");
+    
     let pidpath = Path::new(PID_DIR);
-    if !pidpath.exists() {
-        std::fs::create_dir_all(pidpath).expect("failed to create PID directory");
-    }
+    std::fs::create_dir_all(pidpath).expect("failed to create PID directory");
 
     let mut stdout = OpenOptions::new()
         .create(true)
