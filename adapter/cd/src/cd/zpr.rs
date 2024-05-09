@@ -86,7 +86,7 @@ impl Configuration {
     }    
 }
 
-// TODO: Rust what is this "default" stuff?
+
 impl Default for Zpr {
     fn default() -> Self {
         Zpr::new()
