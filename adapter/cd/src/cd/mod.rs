@@ -13,8 +13,8 @@ use tracing::{error, info};
 use tracing_subscriber;
 
 use tokio::{
-    select,
-    signal::unix::{signal, SignalKind},
+    signal,
+    // signal::unix::{signal, SignalKind},
     //io::{
     //AsyncReadExt,
     //AsyncWriteExt,
@@ -40,26 +40,6 @@ pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
     let token = CancellationToken::new();
     let zpr = Zpr::new();
 
-    // Watch for SIGINT and SIGTERM
-    let (sig_shutdown_tx, mut sig_shutdown_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
-        loop {
-            select! {
-                _ = sigterm.recv() => {
-                    info!("received SIGTERM");
-                    break;
-                },
-                _ = sigint.recv() => {
-                    info!("received SIGINT");
-                    break;
-                }
-            }
-        }
-        let _ = sig_shutdown_tx.send(());
-    });
-
     let (cs_shutdown_tx, mut cs_shutdown_rx) = oneshot::channel();
     let cs_config = config.clone();
     let cs_token = token.clone();
@@ -83,7 +63,7 @@ pub async fn tokio_main(config: Arc<Config>) -> io::Result<()> {
                 info!("exiting due to command server shutdown");
                 break;
             },
-            _ = &mut sig_shutdown_rx => {
+            _ = signal::ctrl_c() => {
                 info!("exiting due to signal");
                 token.cancel();
                 break;
