@@ -3,6 +3,7 @@ use std::{
     io::{BufReader, Error, ErrorKind, Read},
     time::Instant,
     sync::{Arc, Mutex},
+    collections::HashMap,
 };
 
 
@@ -70,6 +71,11 @@ pub fn load_configuration(path: &str) -> Result<Configuration, std::io::Error> {
 
 
 
+// Zpr is the "shared state" for the control daemon. Not quite sure yet what will be in
+// here.  For now is holding state information about configurations.
+// 
+// This pattern on an Arc and then a Mutex is copied from the tokio "best practice" as
+// illustrated in the redis example.
 #[derive(Debug, Clone)]
 pub struct Zpr {
     shared: Arc<Shared>,
@@ -77,7 +83,12 @@ pub struct Zpr {
 
 #[derive(Debug)]
 struct Shared {
-    configurations: Mutex<Vec<(Configuration, ConfigState)>>,
+    state: Mutex<State>,    
+}
+
+#[derive(Debug)]
+struct State {
+    configurations: HashMap<String, (Configuration, ConfigState)>, // indexed by configuration.profile.name.
 }
 
 impl Configuration {
@@ -98,7 +109,9 @@ impl Zpr {
     pub fn new() -> Zpr {
         Zpr {
             shared: Arc::new(Shared {
-                configurations: Mutex::new(Vec::new()),
+                state: Mutex::new(State {
+                    configurations: HashMap::new(),                    
+                }),
             }),
         }
     }
@@ -106,10 +119,12 @@ impl Zpr {
     // If a configuration exists with the same path, we overrite the existing one but only if it is disconnected.
     pub fn add_configuration(&self, c: Configuration) -> Result<(), std::io::Error> {
         let mut found = false;
-        let mut state = self.shared.configurations.lock().unwrap();
-        for (conf, state) in &*state {
+        let mut found_name: String = String::new();
+        let mut state = self.shared.state.lock().unwrap();            
+        for (conf, state) in state.configurations.values() {
             if conf.path_name == c.path_name {
                 found = true;
+                found_name = conf.get_name().to_string();
                 if !matches!(state, ConfigState::Disconnected) {
                     return Err(Error::new(
                         ErrorKind::Other,
@@ -119,13 +134,13 @@ impl Zpr {
             }
         }
         if found {
-            // Remove the existing configuration
-            state.retain(|(conf, _)| conf.path_name != c.path_name);
-        }
-
-        // Name must be unique
-        for (conf, _) in &*state {
-            if conf.profile.name == c.profile.name {
+            // If the names are the same, just writing our new config will overwrite the existing one.
+            if found_name != c.profile.name {
+                state.configurations.remove(&found_name);
+            }
+        } else {
+            // The new path is not present, but also we require a unique name.
+            if state.configurations.contains_key(c.get_name()) {
                 return Err(Error::new(
                     ErrorKind::Other,
                     format!("Configuration with name {} already exists", c.profile.name),
@@ -133,15 +148,15 @@ impl Zpr {
             }
         }
 
-        state.push((c, ConfigState::Disconnected));
+        state.configurations.insert(c.get_name().to_string(), (c, ConfigState::Disconnected));
         Ok(())
     }
 
     // Mock up status function.  This returns a vector of (CONFIG_NAME, ENDPOINT, STATUS)
     pub fn get_status(&self) -> Vec<(String, String, String)> {
         let mut status = Vec::new();
-        let state = self.shared.configurations.lock().unwrap();
-        for (conf, state) in &*state {
+        let state = self.shared.state.lock().unwrap();
+        for (cname, (conf, state)) in &state.configurations {
             let s = match state {
                 ConfigState::Connecting => String::from("connecting"),
                 ConfigState::Connected(ctime) => {
@@ -152,54 +167,42 @@ impl Zpr {
                 ConfigState::Disconnecting => String::from("disconnecting"),
                 ConfigState::Disconnected => String::from("disconnected"),
             };
-            status.push((conf.profile.name.clone(), conf.dock.host_or_ip.clone(), s));
+            status.push((cname.clone(), conf.dock.host_or_ip.clone(), s));
         }
         status
     }
 
 
     pub fn get_configuration_state(&self, name: &str) -> Option<ConfigState> {
-        let state = self.shared.configurations.lock().unwrap();
-        for (conf, s) in &*state {
-            if conf.profile.name == name {
-                return Some(s.clone());
-            }
+        let state = self.shared.state.lock().unwrap();
+        let foo = state.configurations.get(name);
+        if foo.is_none() {
+            return None;
         }
-        None
+        let (_, cs) = foo.unwrap();
+        return Some(cs.clone());
     }
+
 
     // Not sure if this will be how things work later, but for now allowing the 
     // command server to just set the status.
     pub fn set_status(&self, name: &str, status: ConfigState) -> Result<(), std::io::Error> {
         let mut found = false;
-        let mut state = self.shared.configurations.lock().unwrap();
-        for (conf, _) in &*state {
-            if conf.profile.name == name {
-                found = true;
-            }
-        }
-        if !found {
-            return Err(Error::new(
+        let mut state = self.shared.state.lock().unwrap();
+
+        let conf_state_tuple = state.configurations.get_mut(name).ok_or_else(|| {
+            Error::new(
                 ErrorKind::Other,
                 format!("Configuration with name {} not found", name),
-            ));
-        }
-        for (conf, s) in &mut *state {
-            if conf.profile.name == name {
-                *s = status.clone();
-            }
-        }
+            )
+        })?;
+        (*conf_state_tuple).1 = status;
         Ok(())
     }
 
     pub fn has_configuration(&self, name: &str) -> bool {
-        let state = self.shared.configurations.lock().unwrap();
-        for (conf, _) in &*state {
-            if conf.profile.name == name {
-                return true;
-            }
-        }
-        false
+        let state = self.shared.state.lock().unwrap();
+        return state.configurations.contains_key(name);
     }
 
 }
