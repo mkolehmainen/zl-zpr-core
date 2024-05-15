@@ -1,6 +1,5 @@
 use std::vec;
 use std::{io, sync::Arc};
-use std::time::Instant;
 
 use tracing::{error, info};
 
@@ -161,41 +160,21 @@ async fn handle_connect(
             }
         }
     } else {
-        // Already have the config, so this is just dummy code to update the status.
         cname = parts[1].to_string();
-        let old_state = match zpr.get_configuration_state(parts[1]) {
-            Some(s) => s,
-            None => {
-                writer
-                    .write_all(b"2\nERR\nfailed to find configuration\n")
-                    .await?;
-                return Ok(());
-            }
-        };
-        if matches!(old_state, ConfigState::Connected(_)) {
-            // Already in connected state.
-            writer
-                .write_all(b"2\nERR\nalready connected\n")
-                .await?;
-            return Ok(());
-        }
     }
 
-
-    if let Err(e) = zpr.set_status(&cname, ConfigState::Connected(Instant::now())) {
-        let emsg = e.to_string().replace('\n', " ");
-        writer
-            .write_all(format!("3\nERR\nset status failed\n{}\n", emsg).as_bytes())
-            .await?;
-        return Ok(());
-    }            
-
-
-    // TODO: Kick off start me up.
-    info!("(TODO) kick off start-me-up");
-
-    writer.write_all(b"2\nOK\nconnect starting\n").await?;
-
+    match zpr.start_me_up(&cname).await {
+        Ok(()) => {
+            writer.write_all(b"2\nOK\nconnect starting\n").await?;            
+        },
+        Err(e) => {
+            error!("Error starting up configuration {}: {}", cname, e);
+            let emsg = e.to_string().replace('\n', " ");
+            writer
+                .write_all(format!("3\nERR\nfailed to start configuration\n{}\n", emsg).as_bytes())
+                .await?;
+        }
+    }
     Ok(())
 }
 

@@ -1,14 +1,29 @@
 use std::{
-    fs,
-    io::{BufReader, Error, ErrorKind, Read},
-    time::Instant,
-    sync::{Arc, Mutex},
-    collections::HashMap,
+    collections::HashMap, 
+    fs, 
+    io::{
+        BufReader, Cursor, Error, ErrorKind, Read, SeekFrom, Write, Seek
+    }, 
+    sync::{Arc, Mutex}, 
+    time::{Instant, SystemTime},
+    net::Ipv6Addr,
+};
+
+use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt}; 
+use base64::prelude::*;
+
+use serde::Deserialize;
+
+use tokio::{
+    net::TcpStream,
+    io::AsyncWriteExt,
 };
 
 
+const NOISE_KEY_LEN: usize = 32;
+const START_ME_UP_MIN_MSG_LEN: usize = 32 + 32 + 32; // <core message> + <noise key> + <hmac>
 
-use serde::Deserialize;
+
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigState {
@@ -42,7 +57,8 @@ struct Dock {
 
 #[derive(Debug, Clone, Deserialize)]
 struct Adapter {
-    private_key: Option<String>,
+    private_key: Option<String>, // base64
+    public_key: Option<String>, // base64
 }
 
 pub fn load_configuration(path: &str) -> Result<Configuration, std::io::Error> {
@@ -187,9 +203,7 @@ impl Zpr {
     // Not sure if this will be how things work later, but for now allowing the 
     // command server to just set the status.
     pub fn set_status(&self, name: &str, status: ConfigState) -> Result<(), std::io::Error> {
-        let mut found = false;
         let mut state = self.shared.state.lock().unwrap();
-
         let conf_state_tuple = state.configurations.get_mut(name).ok_or_else(|| {
             Error::new(
                 ErrorKind::Other,
@@ -205,8 +219,205 @@ impl Zpr {
         return state.configurations.contains_key(name);
     }
 
+    pub async fn start_me_up(&self, name: &str) -> Result<(), std::io::Error> {
+        let cc = match self.start_me_up_prepare(name) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(e);
+            }
+        };
+
+        // Do the start-me-up protocol here.
+        match do_start_me_up(&cc).await {
+            Err(e) => {
+                // Set the state back to disconnected.
+                let _ = self.set_status(name, ConfigState::Disconnected);
+                return Err(e);
+            },
+            Ok(()) => {
+                return self.set_status(name, ConfigState::Connected(Instant::now()));                
+            },
+        }
+    }
+
+    // Prepare for start-me-up by setting the state of the config to "connecting".
+    // Returns a clone of the configuration.
+    fn start_me_up_prepare(&self, name: &str) -> Result<Configuration, std::io::Error> {
+        let mut state = self.shared.state.lock().unwrap();
+        let conf_state_tuple = state.configurations.get_mut(name).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Other,
+                format!("Configuration with name {} not found", name),
+            )
+        })?;
+        let (_, conf_state) = conf_state_tuple;
+        // In order to start the state must be in disconnected.
+        if !matches!(conf_state, ConfigState::Disconnected) {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("Configuration {} is not disconnected", name),
+            ));
+        }
+        (*conf_state_tuple).1 = ConfigState::Connecting;
+
+        // Loose the MUT reference and get a read-only one:
+        let conf_state_tuple = state.configurations.get(name).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Other,
+                format!("Configuration with name {} not found", name),
+            )
+        })?;
+        let (conf, _) = conf_state_tuple;
+        Ok(conf.clone())
+    }
 }
 
+
+// Run the start-me-up protocol against the dock. All needed details are in the
+// passed configuration.
+async fn do_start_me_up(config: &Configuration) -> Result<(), std::io::Error> {
+ 
+    let msg = create_start_me_up_msg(config)?;
+
+    println!("prepared {} byte start-me-up message:", msg.len());
+    println!("{}", hex::encode(&msg));
+    println!("");
+
+    println!("starting connect to {}: {}", config.dock.host_or_ip, config.dock.startup_port);    
+
+    let mut stream = TcpStream::connect(format!("{}:{}", config.dock.host_or_ip, config.dock.startup_port)).await?;
+    println!("");
+    stream.write_all(&msg).await?;
+
+
+    stream.shutdown().await?; // shut down write side of the connection.
+
+    // TODO: This assumes we get the entire response in a single read.
+    let mut resp_buffer = vec![0; 1024];
+    loop {
+        stream.readable().await?;
+        match stream.try_read(&mut resp_buffer) {
+            Ok(n) => {
+                resp_buffer.truncate(n);
+                break;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                continue;
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
+
+    println!("Got {} byte message from dock:", resp_buffer.len());
+    println!("{}", hex::encode(&resp_buffer));
+    println!("");
+
+    if resp_buffer.len() < START_ME_UP_MIN_MSG_LEN {
+        return Err(Error::new(
+            ErrorKind::Other,
+            "Dock response too short",
+        ))
+    }
+
+
+    let mut rdr = Cursor::new(&resp_buffer);
+
+    println!("            status: {}", resp_buffer[0]);
+    rdr.seek(SeekFrom::Start(2))?;
+    println!("           wg_port: {}", ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?);
+
+    // read IPv6
+    rdr.seek(SeekFrom::Start(4))?;    
+    let mut ip6 = [0u16; 8];
+    for i in 0..8 {
+        ip6[i] = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;
+    }
+    let ip6_addr = Ipv6Addr::new(ip6[0], ip6[1], ip6[2], ip6[3], ip6[4], ip6[5], ip6[6], ip6[7]);
+    println!("  local WG address: {}", ip6_addr);
+    println!("         IPv6 mask: /{}", resp_buffer[20]);
+    println!("    signature_type: {}", resp_buffer[21]);
+    rdr.seek(SeekFrom::Start(22))?;
+    let key_len = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;    
+    println!("           key_len: {}", key_len);
+
+    let mut nonce = [0u8; 8];
+    for i in 0..8 {
+        nonce[i] = resp_buffer[24+i];
+    }
+    println!("             nonce: {}", hex::encode(&nonce));
+
+    if key_len as usize != NOISE_KEY_LEN {
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!("Invalid key length {}", key_len),
+        ))
+    }
+
+    // We already checked the lentgh of the response above so there is no danger of 
+    // exceeding the bounds of the buffer here.
+
+    // Now we should have a 32 byte noise key.
+    let mut noise_key = [0u8; NOISE_KEY_LEN];
+    for i in 0..NOISE_KEY_LEN {
+        noise_key[i] = resp_buffer[32+i];
+    }
+    println!("         noise_key: {}", BASE64_STANDARD.encode(&noise_key));
+
+    // Now we should have a 32 byte hmac.
+    let mut hmac = [0u8; 32];
+    for i in 0..32 {
+        hmac[i] = resp_buffer[64+i];
+    }
+    println!("              hmac: {}", hex::encode(&hmac));
+
+    // TODO: Verify the HMAC.
+    // Hmac is over CONCAT( address, nonce, key ) and uses the ZPR node_key rsa key.
+
+    Ok(())
+}
+
+
+// Create the start-me-up message payload.
+fn create_start_me_up_msg(config: &Configuration) -> Result<Vec<u8>, std::io::Error> {
+
+    let kbuf: Vec<u8>;
+
+    if let Some(key) = config.adapter.public_key.as_ref() {
+        kbuf = match BASE64_STANDARD.decode(key) {
+            Ok(k) => k,
+            Err(e) => {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!("Error decoding public key: {}", e),
+                ))
+            }
+        }
+    } else {
+        kbuf = Vec::new();
+    }
+
+    if kbuf.len() > std::u16::MAX as usize {
+        return Err(Error::new(
+            ErrorKind::Other,
+            "Public key too long",
+        ))
+    }
+    let key_len:u16 = kbuf.len() as u16;
+    let mut msgbuf = Cursor::new(vec![0; 12+key_len as usize]);
+    let _ = std::io::Write::write(&mut msgbuf, &[0x01, 0x00]); // transport_type, signature_type
+    let _ = WriteBytesExt::write_u16::<BigEndian>(&mut msgbuf, key_len); // message length    
+    let timestamp = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(n) => n.as_secs(),
+        Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+    };
+    let _ = WriteBytesExt::write_u64::<BigEndian>(&mut msgbuf, timestamp);    
+    if key_len > 0 {
+        let _ = std::io::Write::write(&mut msgbuf, &kbuf);
+    }
+    Ok(msgbuf.into_inner())
+}
 
 
 #[cfg(test)]

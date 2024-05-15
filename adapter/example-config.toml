@@ -11,9 +11,9 @@ host_or_ip = "a.spacelaser.net"
 startup_port = 13131
 
 [adapter]
-# optional - adapter will generate new random one if not set
+# optional - adapter will generate new random one if not set. Should be base64 encoded.
 # private_key = "OHlN31RzhsshftD1tF+OszPGmw8f2/Vwb/YTo+i/nF4="
-
+# public_key = "..."
 
 # TODO:
 # [credentials]
