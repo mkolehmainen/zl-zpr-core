@@ -19,9 +19,24 @@ use tokio::{
     io::AsyncWriteExt,
 };
 
+use ring::signature;
+use tracing::{error, info};
+
 
 const NOISE_KEY_LEN: usize = 32;
-const START_ME_UP_MIN_MSG_LEN: usize = 32 + 32 + 32; // <core message> + <noise key> + <hmac>
+const HMAC_SHA256_LEN: usize = 256;
+const START_ME_UP_MIN_MSG_LEN: usize = 32 + NOISE_KEY_LEN + HMAC_SHA256_LEN; // <core message> + <noise key> + <hmac>
+const START_ME_UP_NONCE_LEN: usize = 8;
+const START_ME_UP_STATUS_OK: u8 = 0x0;
+const SIG_TYPE_RSA_PKCS1_SHA256: u8 = 0x1;
+
+const START_ME_UP_RESP_OFFSET_WG_PORT: usize = 2;
+const START_ME_UP_RESP_OFFSET_IP_ADDR: usize = 4;
+const START_ME_UP_RESP_OFFSET_NETMASK: usize = 20;
+const START_ME_UP_RESP_OFFSET_SIGTYPE: usize = 21;
+const START_ME_UP_RESP_OFFSET_KEYLEN: usize = 22;
+const START_ME_UP_RESP_OFFSET_NONCE: usize = 24;
+const START_ME_UP_RESP_OFFSET_DATA: usize = 32;
 
 
 
@@ -53,12 +68,13 @@ struct Profile {
 struct Dock {
     host_or_ip: String,
     startup_port: u16,
+    certificate: String, // path to node key file in DER format (TODO: ability to just use a PEM cert here!!)
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct Adapter {
-    private_key: Option<String>, // base64
-    public_key: Option<String>, // base64
+    private_key: Option<String>, // base64 noise key
+    public_key: Option<String>,  // base64 noise key (TODO: should be able to derive from private key)
 }
 
 pub fn load_configuration(path: &str) -> Result<Configuration, std::io::Error> {
@@ -83,6 +99,14 @@ pub fn load_configuration(path: &str) -> Result<Configuration, std::io::Error> {
     };
     c.path_name = path.to_string();
     Ok(c)
+}
+
+
+struct StartMyUpResponse {
+    wg_port: u16,
+    local_wg_addr: Ipv6Addr,
+    ipv6_mask: u8,
+    noise_key: [u8; NOISE_KEY_LEN],
 }
 
 
@@ -200,8 +224,10 @@ impl Zpr {
     }
 
 
-    // Not sure if this will be how things work later, but for now allowing the 
-    // command server to just set the status.
+    // This public access to the status property is temporary.  As this is developed the status
+    // value will depend on the outcome of operations or reactions to events.
+    // 
+    // For example, when `start_me_up` succeeds, the status moves to "connected".
     pub fn set_status(&self, name: &str, status: ConfigState) -> Result<(), std::io::Error> {
         let mut state = self.shared.state.lock().unwrap();
         let conf_state_tuple = state.configurations.get_mut(name).ok_or_else(|| {
@@ -219,6 +245,7 @@ impl Zpr {
         return state.configurations.contains_key(name);
     }
 
+    // Perform the start-me-up protocol using the named configuration.
     pub async fn start_me_up(&self, name: &str) -> Result<(), std::io::Error> {
         let cc = match self.start_me_up_prepare(name) {
             Ok(c) => c,
@@ -234,7 +261,9 @@ impl Zpr {
                 let _ = self.set_status(name, ConfigState::Disconnected);
                 return Err(e);
             },
-            Ok(()) => {
+            Ok(resp) => {
+                // TODO: Figure out what todo with our new information.
+                info!(config = name, dock_wg_port = resp.wg_port, local_wg_addr = format!("{:?}", resp.local_wg_addr), "start-me-up sucess");
                 return self.set_status(name, ConfigState::Connected(Instant::now()));                
             },
         }
@@ -275,21 +304,14 @@ impl Zpr {
 
 // Run the start-me-up protocol against the dock. All needed details are in the
 // passed configuration.
-async fn do_start_me_up(config: &Configuration) -> Result<(), std::io::Error> {
+async fn do_start_me_up(config: &Configuration) -> Result<StartMyUpResponse, std::io::Error> {
  
     let msg = create_start_me_up_msg(config)?;
 
-    println!("prepared {} byte start-me-up message:", msg.len());
-    println!("{}", hex::encode(&msg));
-    println!("");
-
     println!("starting connect to {}: {}", config.dock.host_or_ip, config.dock.startup_port);    
-
     let mut stream = TcpStream::connect(format!("{}:{}", config.dock.host_or_ip, config.dock.startup_port)).await?;
-    println!("");
+
     stream.write_all(&msg).await?;
-
-
     stream.shutdown().await?; // shut down write side of the connection.
 
     // TODO: This assumes we get the entire response in a single read.
@@ -310,10 +332,18 @@ async fn do_start_me_up(config: &Configuration) -> Result<(), std::io::Error> {
         }
     }
 
-    println!("Got {} byte message from dock:", resp_buffer.len());
-    println!("{}", hex::encode(&resp_buffer));
-    println!("");
-
+    if resp_buffer.len() < 1 {
+        return Err(Error::new(
+            ErrorKind::Other,
+            "start-me-up empty response",
+        ))
+    }
+    if resp_buffer[0] != START_ME_UP_STATUS_OK { // status must be 0x0 to proceed
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!("start-me-up returns non-zero status: {}", resp_buffer[0]),
+        ))
+    }
     if resp_buffer.len() < START_ME_UP_MIN_MSG_LEN {
         return Err(Error::new(
             ErrorKind::Other,
@@ -324,30 +354,28 @@ async fn do_start_me_up(config: &Configuration) -> Result<(), std::io::Error> {
 
     let mut rdr = Cursor::new(&resp_buffer);
 
-    println!("            status: {}", resp_buffer[0]);
-    rdr.seek(SeekFrom::Start(2))?;
-    println!("           wg_port: {}", ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?);
+    rdr.seek(SeekFrom::Start(START_ME_UP_RESP_OFFSET_WG_PORT as u64))?;
+    let wg_port = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;    
 
     // read IPv6
-    rdr.seek(SeekFrom::Start(4))?;    
+    rdr.seek(SeekFrom::Start(START_ME_UP_RESP_OFFSET_IP_ADDR as u64))?;    
     let mut ip6 = [0u16; 8];
     for i in 0..8 {
         ip6[i] = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;
     }
     let ip6_addr = Ipv6Addr::new(ip6[0], ip6[1], ip6[2], ip6[3], ip6[4], ip6[5], ip6[6], ip6[7]);
-    println!("  local WG address: {}", ip6_addr);
-    println!("         IPv6 mask: /{}", resp_buffer[20]);
-    println!("    signature_type: {}", resp_buffer[21]);
-    rdr.seek(SeekFrom::Start(22))?;
-    let key_len = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;    
-    println!("           key_len: {}", key_len);
+    let ipv6_mask = resp_buffer[START_ME_UP_RESP_OFFSET_NETMASK];
 
-    let mut nonce = [0u8; 8];
-    for i in 0..8 {
-        nonce[i] = resp_buffer[24+i];
+    let sig_type = resp_buffer[START_ME_UP_RESP_OFFSET_SIGTYPE];
+    if sig_type != SIG_TYPE_RSA_PKCS1_SHA256 {
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!("Unsupported signature type: {}", sig_type),
+        ));
     }
-    println!("             nonce: {}", hex::encode(&nonce));
-
+    
+    rdr.seek(SeekFrom::Start(START_ME_UP_RESP_OFFSET_KEYLEN as u64))?;
+    let key_len = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;    
     if key_len as usize != NOISE_KEY_LEN {
         return Err(Error::new(
             ErrorKind::Other,
@@ -355,29 +383,56 @@ async fn do_start_me_up(config: &Configuration) -> Result<(), std::io::Error> {
         ))
     }
 
-    // We already checked the lentgh of the response above so there is no danger of 
-    // exceeding the bounds of the buffer here.
+    let mut nonce = [0u8; START_ME_UP_NONCE_LEN];
+    for i in 0..START_ME_UP_NONCE_LEN {
+        nonce[i] = resp_buffer[START_ME_UP_RESP_OFFSET_NONCE+i];
+    }
 
-    // Now we should have a 32 byte noise key.
+    // We already checked the length of the response above so there is no danger of 
+    // exceeding the bounds of the buffer here.  From here on we assume a NOISE key,
+    // and a 256 byte HMAC.
+
     let mut noise_key = [0u8; NOISE_KEY_LEN];
     for i in 0..NOISE_KEY_LEN {
-        noise_key[i] = resp_buffer[32+i];
+        noise_key[i] = resp_buffer[START_ME_UP_RESP_OFFSET_DATA+i];
     }
-    println!("         noise_key: {}", BASE64_STANDARD.encode(&noise_key));
-
-    // Now we should have a 32 byte hmac.
-    let mut hmac = [0u8; 32];
-    for i in 0..32 {
-        hmac[i] = resp_buffer[64+i];
+    // Next we should have hmac    
+    let mut hmac = [0u8; HMAC_SHA256_LEN];
+    for i in 0..HMAC_SHA256_LEN {
+        hmac[i] = resp_buffer[START_ME_UP_RESP_OFFSET_DATA + NOISE_KEY_LEN + i];
     }
-    println!("              hmac: {}", hex::encode(&hmac));
 
-    // TODO: Verify the HMAC.
     // Hmac is over CONCAT( address, nonce, key ) and uses the ZPR node_key rsa key.
+    let mut checkbuf = Vec::new();
+    checkbuf.extend_from_slice(&ip6_addr.octets());
+    checkbuf.extend_from_slice(&nonce);
+    checkbuf.extend_from_slice(&noise_key);
 
-    Ok(())
+    // The path in the config file is relative to the config file path itself... unless it starts with /
+    // which Path::join takes care of magically.
+    let der_path = std::path::Path::new(&config.path_name).parent().unwrap().join(&config.dock.certificate);
+    let public_key = 
+        signature::UnparsedPublicKey::new(&signature::RSA_PKCS1_2048_8192_SHA256, 
+                                          read_file(der_path.as_path())?);
+    public_key.verify(&checkbuf, &hmac)
+        .map_err(|e| std::io::Error::new(ErrorKind::Other, format!("hmac verify error: {:?}", e)))?;                                      
+
+    let resp = StartMyUpResponse {
+        wg_port: wg_port,
+        local_wg_addr: ip6_addr,
+        ipv6_mask: ipv6_mask,
+        noise_key: noise_key,
+    };
+
+    Ok(resp)
 }
 
+fn read_file(path: &std::path::Path) -> Result<Vec<u8>, std::io::Error> {
+    let mut file = std::fs::File::open(path)?;
+    let mut contents: Vec<u8> = Vec::new();
+    file.read_to_end(&mut contents)?;
+    Ok(contents)
+}
 
 // Create the start-me-up message payload.
 fn create_start_me_up_msg(config: &Configuration) -> Result<Vec<u8>, std::io::Error> {
@@ -466,6 +521,7 @@ mod test {
             [dock]
             host_or_ip = "localhost"
             startup_port = 2242
+            certificate = "missing"
             [adapter]
             #blank
         "#;
@@ -491,6 +547,7 @@ mod test {
             [dock]
             host_or_ip = "localhost"
             startup_port = 2242
+            certificate = "missing"
             [adapter]
             #blank
         "#;
@@ -525,6 +582,7 @@ mod test {
             [dock]
             host_or_ip = "localhost"
             startup_port = 2242
+            certificate = "missing"
             [adapter]
             #blank
         "#;
@@ -548,6 +606,7 @@ mod test {
             [dock]
             host_or_ip = "anotherlocalhost"
             startup_port = 2243
+            certificate = "missing"
             [adapter]
             #blank
         "#;
@@ -581,6 +640,7 @@ mod test {
             [dock]
             host_or_ip = "localhost"
             startup_port = 2242
+            certificate = "missing"
             [adapter]
             #blank
         "#;
