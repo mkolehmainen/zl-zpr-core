@@ -1,43 +1,13 @@
-use std::{
-    collections::HashMap, 
-    fs, 
-    io::{
-        BufReader, Cursor, Error, ErrorKind, Read, SeekFrom, Write, Seek
-    }, 
-    sync::{Arc, Mutex}, 
-    time::{Instant, SystemTime},
-    net::Ipv6Addr,
-};
-
-use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt}; 
-use base64::prelude::*;
-
+use std::collections::HashMap;
+use std::fs;
+use std::io::{BufReader, Error, ErrorKind, Read};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use serde::Deserialize;
-
-use tokio::{
-    net::TcpStream,
-    io::AsyncWriteExt,
-};
-
-use ring::signature;
-use tracing::{error, info};
+use tracing::info;
 
 
-const NOISE_KEY_LEN: usize = 32;
-const HMAC_SHA256_LEN: usize = 256;
-const START_ME_UP_MIN_MSG_LEN: usize = 32 + NOISE_KEY_LEN + HMAC_SHA256_LEN; // <core message> + <noise key> + <hmac>
-const START_ME_UP_NONCE_LEN: usize = 8;
-const START_ME_UP_STATUS_OK: u8 = 0x0;
-const SIG_TYPE_RSA_PKCS1_SHA256: u8 = 0x1;
-
-const START_ME_UP_RESP_OFFSET_WG_PORT: usize = 2;
-const START_ME_UP_RESP_OFFSET_IP_ADDR: usize = 4;
-const START_ME_UP_RESP_OFFSET_NETMASK: usize = 20;
-const START_ME_UP_RESP_OFFSET_SIGTYPE: usize = 21;
-const START_ME_UP_RESP_OFFSET_KEYLEN: usize = 22;
-const START_ME_UP_RESP_OFFSET_NONCE: usize = 24;
-const START_ME_UP_RESP_OFFSET_DATA: usize = 32;
-
+use crate::cd::startmeup::do_start_me_up;
 
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,13 +71,34 @@ pub fn load_configuration(path: &str) -> Result<Configuration, std::io::Error> {
     Ok(c)
 }
 
+impl Configuration {
+    pub fn get_name(&self) -> &str {
+        self.profile.name.as_str()
+    }    
 
-struct StartMyUpResponse {
-    wg_port: u16,
-    local_wg_addr: Ipv6Addr,
-    ipv6_mask: u8,
-    noise_key: [u8; NOISE_KEY_LEN],
+    pub fn get_dock_host(&self) -> &str {
+        self.dock.host_or_ip.as_str()        
+    }
+
+    pub fn get_dock_startup_port(&self) -> u16 {
+        self.dock.startup_port
+    }
+
+    pub fn get_path(&self) -> &str {
+        self.path_name.as_str()                   
+    }
+
+    // Returns a filename (possibly relative to the config file path)
+    pub fn get_dock_certificate(&self) -> &str {
+        self.dock.certificate.as_str()
+    }
+
+    pub fn get_adapter_public_key(&self) -> Option<&str> {
+        self.adapter.public_key.as_deref()
+    }
 }
+
+
 
 
 
@@ -129,12 +120,6 @@ struct Shared {
 #[derive(Debug)]
 struct State {
     configurations: HashMap<String, (Configuration, ConfigState)>, // indexed by configuration.profile.name.
-}
-
-impl Configuration {
-    pub fn get_name(&self) -> &str {
-        self.profile.name.as_str()
-    }    
 }
 
 
@@ -302,177 +287,6 @@ impl Zpr {
 }
 
 
-// Run the start-me-up protocol against the dock. All needed details are in the
-// passed configuration.
-async fn do_start_me_up(config: &Configuration) -> Result<StartMyUpResponse, std::io::Error> {
- 
-    let msg = create_start_me_up_msg(config)?;
-
-    println!("starting connect to {}: {}", config.dock.host_or_ip, config.dock.startup_port);    
-    let mut stream = TcpStream::connect(format!("{}:{}", config.dock.host_or_ip, config.dock.startup_port)).await?;
-
-    stream.write_all(&msg).await?;
-    stream.shutdown().await?; // shut down write side of the connection.
-
-    // TODO: This assumes we get the entire response in a single read.
-    let mut resp_buffer = vec![0; 1024];
-    loop {
-        stream.readable().await?;
-        match stream.try_read(&mut resp_buffer) {
-            Ok(n) => {
-                resp_buffer.truncate(n);
-                break;
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                continue;
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        }
-    }
-
-    if resp_buffer.len() < 1 {
-        return Err(Error::new(
-            ErrorKind::Other,
-            "start-me-up empty response",
-        ))
-    }
-    if resp_buffer[0] != START_ME_UP_STATUS_OK { // status must be 0x0 to proceed
-        return Err(Error::new(
-            ErrorKind::Other,
-            format!("start-me-up returns non-zero status: {}", resp_buffer[0]),
-        ))
-    }
-    if resp_buffer.len() < START_ME_UP_MIN_MSG_LEN {
-        return Err(Error::new(
-            ErrorKind::Other,
-            "Dock response too short",
-        ))
-    }
-
-
-    let mut rdr = Cursor::new(&resp_buffer);
-
-    rdr.seek(SeekFrom::Start(START_ME_UP_RESP_OFFSET_WG_PORT as u64))?;
-    let wg_port = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;    
-
-    // read IPv6
-    rdr.seek(SeekFrom::Start(START_ME_UP_RESP_OFFSET_IP_ADDR as u64))?;    
-    let mut ip6 = [0u16; 8];
-    for i in 0..8 {
-        ip6[i] = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;
-    }
-    let ip6_addr = Ipv6Addr::new(ip6[0], ip6[1], ip6[2], ip6[3], ip6[4], ip6[5], ip6[6], ip6[7]);
-    let ipv6_mask = resp_buffer[START_ME_UP_RESP_OFFSET_NETMASK];
-
-    let sig_type = resp_buffer[START_ME_UP_RESP_OFFSET_SIGTYPE];
-    if sig_type != SIG_TYPE_RSA_PKCS1_SHA256 {
-        return Err(Error::new(
-            ErrorKind::Other,
-            format!("Unsupported signature type: {}", sig_type),
-        ));
-    }
-    
-    rdr.seek(SeekFrom::Start(START_ME_UP_RESP_OFFSET_KEYLEN as u64))?;
-    let key_len = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;    
-    if key_len as usize != NOISE_KEY_LEN {
-        return Err(Error::new(
-            ErrorKind::Other,
-            format!("Invalid key length {}", key_len),
-        ))
-    }
-
-    let mut nonce = [0u8; START_ME_UP_NONCE_LEN];
-    for i in 0..START_ME_UP_NONCE_LEN {
-        nonce[i] = resp_buffer[START_ME_UP_RESP_OFFSET_NONCE+i];
-    }
-
-    // We already checked the length of the response above so there is no danger of 
-    // exceeding the bounds of the buffer here.  From here on we assume a NOISE key,
-    // and a 256 byte HMAC.
-
-    let mut noise_key = [0u8; NOISE_KEY_LEN];
-    for i in 0..NOISE_KEY_LEN {
-        noise_key[i] = resp_buffer[START_ME_UP_RESP_OFFSET_DATA+i];
-    }
-    // Next we should have hmac    
-    let mut hmac = [0u8; HMAC_SHA256_LEN];
-    for i in 0..HMAC_SHA256_LEN {
-        hmac[i] = resp_buffer[START_ME_UP_RESP_OFFSET_DATA + NOISE_KEY_LEN + i];
-    }
-
-    // Hmac is over CONCAT( address, nonce, key ) and uses the ZPR node_key rsa key.
-    let mut checkbuf = Vec::new();
-    checkbuf.extend_from_slice(&ip6_addr.octets());
-    checkbuf.extend_from_slice(&nonce);
-    checkbuf.extend_from_slice(&noise_key);
-
-    // The path in the config file is relative to the config file path itself... unless it starts with /
-    // which Path::join takes care of magically.
-    let der_path = std::path::Path::new(&config.path_name).parent().unwrap().join(&config.dock.certificate);
-    let public_key = 
-        signature::UnparsedPublicKey::new(&signature::RSA_PKCS1_2048_8192_SHA256, 
-                                          read_file(der_path.as_path())?);
-    public_key.verify(&checkbuf, &hmac)
-        .map_err(|e| std::io::Error::new(ErrorKind::Other, format!("hmac verify error: {:?}", e)))?;                                      
-
-    let resp = StartMyUpResponse {
-        wg_port: wg_port,
-        local_wg_addr: ip6_addr,
-        ipv6_mask: ipv6_mask,
-        noise_key: noise_key,
-    };
-
-    Ok(resp)
-}
-
-fn read_file(path: &std::path::Path) -> Result<Vec<u8>, std::io::Error> {
-    let mut file = std::fs::File::open(path)?;
-    let mut contents: Vec<u8> = Vec::new();
-    file.read_to_end(&mut contents)?;
-    Ok(contents)
-}
-
-// Create the start-me-up message payload.
-fn create_start_me_up_msg(config: &Configuration) -> Result<Vec<u8>, std::io::Error> {
-
-    let kbuf: Vec<u8>;
-
-    if let Some(key) = config.adapter.public_key.as_ref() {
-        kbuf = match BASE64_STANDARD.decode(key) {
-            Ok(k) => k,
-            Err(e) => {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!("Error decoding public key: {}", e),
-                ))
-            }
-        }
-    } else {
-        kbuf = Vec::new();
-    }
-
-    if kbuf.len() > std::u16::MAX as usize {
-        return Err(Error::new(
-            ErrorKind::Other,
-            "Public key too long",
-        ))
-    }
-    let key_len:u16 = kbuf.len() as u16;
-    let mut msgbuf = Cursor::new(vec![0; 12+key_len as usize]);
-    let _ = std::io::Write::write(&mut msgbuf, &[0x01, 0x00]); // transport_type, signature_type
-    let _ = WriteBytesExt::write_u16::<BigEndian>(&mut msgbuf, key_len); // message length    
-    let timestamp = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(n) => n.as_secs(),
-        Err(_) => panic!("SystemTime before UNIX EPOCH!"),
-    };
-    let _ = WriteBytesExt::write_u64::<BigEndian>(&mut msgbuf, timestamp);    
-    if key_len > 0 {
-        let _ = std::io::Write::write(&mut msgbuf, &kbuf);
-    }
-    Ok(msgbuf.into_inner())
-}
 
 
 #[cfg(test)]
