@@ -1,8 +1,8 @@
 
 use std::net::Ipv6Addr;
-use std::io::{Error, ErrorKind, Cursor, SeekFrom, Read, Seek};
+use std::io::{Cursor, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::time::SystemTime;
-use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt}; 
+use byteorder::{BigEndian, WriteBytesExt}; 
 use base64::prelude::*;
 use ring::signature;
 use tracing::info;
@@ -10,10 +10,9 @@ use tracing::info;
 
 use crate::cd::zpr::Configuration;
 
-use tokio::{
-    net::TcpStream,
-    io::AsyncWriteExt,
-};
+use tokio::net::TcpStream;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
+
 
 
 const NOISE_KEY_LEN: usize = 32;
@@ -56,56 +55,35 @@ pub async fn do_start_me_up(config: &Configuration) -> Result<StartMeUpResponse,
     stream.write_all(&msg).await?;
     stream.shutdown().await?; // shut down write side of the connection.
 
-    // TODO: This assumes we get the entire response in a single read.
-    let mut resp_buffer = vec![0; 1024];
-    loop {
-        stream.readable().await?;
-        match stream.try_read(&mut resp_buffer) {
-            Ok(n) => {
-                resp_buffer.truncate(n);
-                break;
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                continue;
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        }
-    }
 
-    if resp_buffer.len() < 1 {
-        return Err(Error::new(
-            ErrorKind::Other,
-            "start-me-up empty response",
-        ))
-    }
+    // For now we expect a fixed length message back.  In the future we may want more flexibility here.
+    let mut resp_buffer = vec![0; START_ME_UP_MIN_MSG_LEN];
+    match stream.read_exact(&mut resp_buffer).await {
+        Ok(_) => (),
+        Err(e) => {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("start-me-up read error: {}", e),
+            ))
+        }
+    };
     if resp_buffer[0] != START_ME_UP_STATUS_OK { // status must be 0x0 to proceed
         return Err(Error::new(
             ErrorKind::Other,
             format!("start-me-up returns non-zero status: {}", resp_buffer[0]),
         ))
     }
-    if resp_buffer.len() < START_ME_UP_MIN_MSG_LEN {
-        return Err(Error::new(
-            ErrorKind::Other,
-            "Dock response too short",
-        ))
-    }
-
 
     let mut rdr = Cursor::new(&resp_buffer);
-
     rdr.seek(SeekFrom::Start(OFFSET_WG_PORT as u64))?;
-    let wg_port = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;    
+    let wg_port = rdr.read_u16().await?;        
 
     // read IPv6
     rdr.seek(SeekFrom::Start(OFFSET_IP_ADDR as u64))?;    
-    let mut ip6 = [0u16; 8];
-    for i in 0..8 {
-        ip6[i] = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;
-    }
-    let ip6_addr = Ipv6Addr::new(ip6[0], ip6[1], ip6[2], ip6[3], ip6[4], ip6[5], ip6[6], ip6[7]);
+    let mut ip6 = [0u8; 16];
+    AsyncReadExt::read_exact(&mut rdr, &mut ip6).await?;
+    let ip6_addr = Ipv6Addr::from(ip6);
+
     let ipv6_mask = resp_buffer[OFFSET_NETMASK];
 
     let sig_type = resp_buffer[OFFSET_SIGTYPE];
@@ -117,7 +95,7 @@ pub async fn do_start_me_up(config: &Configuration) -> Result<StartMeUpResponse,
     }
     
     rdr.seek(SeekFrom::Start(OFFSET_KEYLEN as u64))?;
-    let key_len = ReadBytesExt::read_u16::<BigEndian>(&mut rdr)?;    
+    let key_len = rdr.read_u16().await?;
     if key_len as usize != NOISE_KEY_LEN {
         return Err(Error::new(
             ErrorKind::Other,
@@ -210,7 +188,7 @@ fn create_start_me_up_msg(config: &Configuration) -> Result<Vec<u8>, std::io::Er
     };
     let _ = WriteBytesExt::write_u64::<BigEndian>(&mut msgbuf, timestamp);    
     if key_len > 0 {
-        let _ = std::io::Write::write(&mut msgbuf, &kbuf);
+        let _ = std::io::Write::write(&mut msgbuf, &kbuf);                
     }
     Ok(msgbuf.into_inner())
 }
