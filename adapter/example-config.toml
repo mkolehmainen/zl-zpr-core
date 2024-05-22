@@ -10,10 +10,14 @@ name = "myconf_1"
 host_or_ip = "a.spacelaser.net"
 startup_port = 13131
 
-[adapter]
-# optional - adapter will generate new random one if not set
-# private_key = "OHlN31RzhsshftD1tF+OszPGmw8f2/Vwb/YTo+i/nF4="
+# This is named "certificate" with the expectation that eventually we will be able to use a 
+# standard PEM encoded certificate here.  For now you must use a DER encoded public key.
+certificate = "xxx.der"
 
+[adapter]
+# optional - adapter will generate new random one if not set. Should be base64 encoded.
+# private_key = "OHlN31RzhsshftD1tF+OszPGmw8f2/Vwb/YTo+i/nF4="
+# public_key = "..."
 
 # TODO:
 # [credentials]

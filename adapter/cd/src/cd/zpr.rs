@@ -1,14 +1,14 @@
-use std::{
-    fs,
-    io::{BufReader, Error, ErrorKind, Read},
-    time::Instant,
-    sync::{Arc, Mutex},
-    collections::HashMap,
-};
-
-
-
+use std::collections::HashMap;
+use std::fs;
+use std::io::{BufReader, Error, ErrorKind, Read};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use serde::Deserialize;
+use tracing::info;
+
+
+use crate::cd::startmeup::do_start_me_up;
+
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigState {
@@ -38,11 +38,13 @@ struct Profile {
 struct Dock {
     host_or_ip: String,
     startup_port: u16,
+    certificate: String, // path to node key file in DER format (TODO: ability to just use a PEM cert here!!)
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct Adapter {
-    private_key: Option<String>,
+    private_key: Option<String>, // base64 noise key
+    public_key: Option<String>,  // base64 noise key (TODO: should be able to derive from private key)
 }
 
 pub fn load_configuration(path: &str) -> Result<Configuration, std::io::Error> {
@@ -69,6 +71,35 @@ pub fn load_configuration(path: &str) -> Result<Configuration, std::io::Error> {
     Ok(c)
 }
 
+impl Configuration {
+    pub fn get_name(&self) -> &str {
+        self.profile.name.as_str()
+    }    
+
+    pub fn get_dock_host(&self) -> &str {
+        self.dock.host_or_ip.as_str()        
+    }
+
+    pub fn get_dock_startup_port(&self) -> u16 {
+        self.dock.startup_port
+    }
+
+    pub fn get_path(&self) -> &str {
+        self.path_name.as_str()                   
+    }
+
+    // Returns a filename (possibly relative to the config file path)
+    pub fn get_dock_certificate(&self) -> &str {
+        self.dock.certificate.as_str()
+    }
+
+    pub fn get_adapter_public_key(&self) -> Option<&str> {
+        self.adapter.public_key.as_deref()
+    }
+}
+
+
+
 
 
 // Zpr is the "shared state" for the control daemon. Not quite sure yet what will be in
@@ -89,12 +120,6 @@ struct Shared {
 #[derive(Debug)]
 struct State {
     configurations: HashMap<String, (Configuration, ConfigState)>, // indexed by configuration.profile.name.
-}
-
-impl Configuration {
-    pub fn get_name(&self) -> &str {
-        self.profile.name.as_str()
-    }    
 }
 
 
@@ -175,37 +200,90 @@ impl Zpr {
 
     pub fn get_configuration_state(&self, name: &str) -> Option<ConfigState> {
         let state = self.shared.state.lock().unwrap();
-        let foo = state.configurations.get(name);
-        if foo.is_none() {
-            return None;
-        }
-        let (_, cs) = foo.unwrap();
-        return Some(cs.clone());
+        let cfg = state.configurations.get(name);
+        cfg?;
+        let (_, cs) = cfg.unwrap();
+        Some(cs.clone())
     }
 
 
-    // Not sure if this will be how things work later, but for now allowing the 
-    // command server to just set the status.
+    // This public access to the status property is temporary.  As this is developed the status
+    // value will depend on the outcome of operations or reactions to events.
+    // 
+    // For example, when `start_me_up` succeeds, the status moves to "connected".
     pub fn set_status(&self, name: &str, status: ConfigState) -> Result<(), std::io::Error> {
-        let mut found = false;
         let mut state = self.shared.state.lock().unwrap();
-
         let conf_state_tuple = state.configurations.get_mut(name).ok_or_else(|| {
             Error::new(
                 ErrorKind::Other,
                 format!("Configuration with name {} not found", name),
             )
         })?;
-        (*conf_state_tuple).1 = status;
+        conf_state_tuple.1 = status;
         Ok(())
     }
 
     pub fn has_configuration(&self, name: &str) -> bool {
         let state = self.shared.state.lock().unwrap();
-        return state.configurations.contains_key(name);
+        state.configurations.contains_key(name)
     }
 
+    // Perform the start-me-up protocol using the named configuration.
+    pub async fn start_me_up(&self, name: &str) -> Result<(), std::io::Error> {
+        let cc = match self.start_me_up_prepare(name) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(e);
+            }
+        };
+
+        // Do the start-me-up protocol here.
+        match do_start_me_up(&cc).await {
+            Err(e) => {
+                // Set the state back to disconnected.
+                let _ = self.set_status(name, ConfigState::Disconnected);
+                Err(e)
+            },
+            Ok(resp) => {
+                // TODO: Figure out what todo with our new information.
+                info!(config = name, dock_wg_port = resp.wg_port, local_wg_addr = format!("{:?}", resp.local_wg_addr), "start-me-up sucess");
+                self.set_status(name, ConfigState::Connected(Instant::now()))
+            },
+        }
+    }
+
+    // Prepare for start-me-up by setting the state of the config to "connecting".
+    // Returns a clone of the configuration.
+    fn start_me_up_prepare(&self, name: &str) -> Result<Configuration, std::io::Error> {
+        let mut state = self.shared.state.lock().unwrap();
+        let conf_state_tuple = state.configurations.get_mut(name).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Other,
+                format!("Configuration with name {} not found", name),
+            )
+        })?;
+        let (_, conf_state) = conf_state_tuple;
+        // In order to start the state must be in disconnected.
+        if !matches!(conf_state, ConfigState::Disconnected) {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("Configuration {} is not disconnected", name),
+            ));
+        }
+        conf_state_tuple.1 = ConfigState::Connecting;
+
+        // Loose the MUT reference and get a read-only one:
+        let conf_state_tuple = state.configurations.get(name).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Other,
+                format!("Configuration with name {} not found", name),
+            )
+        })?;
+        let (conf, _) = conf_state_tuple;
+        Ok(conf.clone())
+    }
 }
+
 
 
 
@@ -255,6 +333,7 @@ mod test {
             [dock]
             host_or_ip = "localhost"
             startup_port = 2242
+            certificate = "missing"
             [adapter]
             #blank
         "#;
@@ -280,6 +359,7 @@ mod test {
             [dock]
             host_or_ip = "localhost"
             startup_port = 2242
+            certificate = "missing"
             [adapter]
             #blank
         "#;
@@ -314,6 +394,7 @@ mod test {
             [dock]
             host_or_ip = "localhost"
             startup_port = 2242
+            certificate = "missing"
             [adapter]
             #blank
         "#;
@@ -337,6 +418,7 @@ mod test {
             [dock]
             host_or_ip = "anotherlocalhost"
             startup_port = 2243
+            certificate = "missing"
             [adapter]
             #blank
         "#;
@@ -370,6 +452,7 @@ mod test {
             [dock]
             host_or_ip = "localhost"
             startup_port = 2242
+            certificate = "missing"
             [adapter]
             #blank
         "#;
