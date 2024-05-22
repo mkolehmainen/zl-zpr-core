@@ -1,6 +1,6 @@
 
 use std::net::Ipv6Addr;
-use std::io::{Cursor, Error, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Error, ErrorKind, Read, Seek, SeekFrom};
 use std::time::SystemTime;
 use byteorder::{BigEndian, WriteBytesExt}; 
 use base64::prelude::*;
@@ -104,18 +104,16 @@ pub async fn do_start_me_up(config: &Configuration) -> Result<StartMeUpResponse,
     }
 
     let mut nonce = [0u8; START_ME_UP_NONCE_LEN];
-    for i in 0..START_ME_UP_NONCE_LEN {
-        nonce[i] = resp_buffer[OFFSET_NONCE+i];
-    }
+    nonce[..START_ME_UP_NONCE_LEN].copy_from_slice(&resp_buffer[OFFSET_NONCE..(START_ME_UP_NONCE_LEN + OFFSET_NONCE)]);
+
 
     // We already checked the length of the response above so there is no danger of 
     // exceeding the bounds of the buffer here.  From here on we assume a NOISE key,
     // and a 256 byte HMAC.
 
     let mut noise_key = [0u8; NOISE_KEY_LEN];
-    for i in 0..NOISE_KEY_LEN {
-        noise_key[i] = resp_buffer[OFFSET_DATA+i];
-    }
+    noise_key[..NOISE_KEY_LEN].copy_from_slice(&resp_buffer[OFFSET_DATA..(NOISE_KEY_LEN + OFFSET_DATA)]);
+
     // Next we should have hmac    
     let mut hmac = [0u8; HMAC_SHA256_LEN];
     for i in 0..HMAC_SHA256_LEN {
@@ -130,7 +128,7 @@ pub async fn do_start_me_up(config: &Configuration) -> Result<StartMeUpResponse,
 
     // The path in the config file is relative to the config file path itself... unless it starts with /
     // which Path::join takes care of magically.
-    let der_path = std::path::Path::new(&config.get_path()).parent().unwrap().join(&config.get_dock_certificate());
+    let der_path = std::path::Path::new(&config.get_path()).parent().unwrap().join(config.get_dock_certificate());
     let public_key = 
         signature::UnparsedPublicKey::new(&signature::RSA_PKCS1_2048_8192_SHA256, 
                                           read_file(der_path.as_path())?);
@@ -138,10 +136,10 @@ pub async fn do_start_me_up(config: &Configuration) -> Result<StartMeUpResponse,
         .map_err(|e| std::io::Error::new(ErrorKind::Other, format!("hmac verify error: {:?}", e)))?;                                      
 
     let resp = StartMeUpResponse {
-        wg_port: wg_port,
+        wg_port,
         local_wg_addr: ip6_addr,
-        ipv6_mask: ipv6_mask,
-        noise_key: noise_key,
+        ipv6_mask,
+        noise_key,
     };
 
     Ok(resp)

@@ -200,12 +200,10 @@ impl Zpr {
 
     pub fn get_configuration_state(&self, name: &str) -> Option<ConfigState> {
         let state = self.shared.state.lock().unwrap();
-        let foo = state.configurations.get(name);
-        if foo.is_none() {
-            return None;
-        }
-        let (_, cs) = foo.unwrap();
-        return Some(cs.clone());
+        let cfg = state.configurations.get(name);
+        cfg?;
+        let (_, cs) = cfg.unwrap();
+        Some(cs.clone())
     }
 
 
@@ -221,13 +219,13 @@ impl Zpr {
                 format!("Configuration with name {} not found", name),
             )
         })?;
-        (*conf_state_tuple).1 = status;
+        conf_state_tuple.1 = status;
         Ok(())
     }
 
     pub fn has_configuration(&self, name: &str) -> bool {
         let state = self.shared.state.lock().unwrap();
-        return state.configurations.contains_key(name);
+        state.configurations.contains_key(name)
     }
 
     // Perform the start-me-up protocol using the named configuration.
@@ -244,12 +242,12 @@ impl Zpr {
             Err(e) => {
                 // Set the state back to disconnected.
                 let _ = self.set_status(name, ConfigState::Disconnected);
-                return Err(e);
+                Err(e)
             },
             Ok(resp) => {
                 // TODO: Figure out what todo with our new information.
                 info!(config = name, dock_wg_port = resp.wg_port, local_wg_addr = format!("{:?}", resp.local_wg_addr), "start-me-up sucess");
-                return self.set_status(name, ConfigState::Connected(Instant::now()));                
+                self.set_status(name, ConfigState::Connected(Instant::now()))
             },
         }
     }
@@ -272,7 +270,7 @@ impl Zpr {
                 format!("Configuration {} is not disconnected", name),
             ));
         }
-        (*conf_state_tuple).1 = ConfigState::Connecting;
+        conf_state_tuple.1 = ConfigState::Connecting;
 
         // Loose the MUT reference and get a read-only one:
         let conf_state_tuple = state.configurations.get(name).ok_or_else(|| {
