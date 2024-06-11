@@ -4,8 +4,10 @@ use std::process::ExitCode;
 use tokio::io;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
+use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use std::fs;
 use tokio::signal::unix::{signal, SignalKind};
 use std::io::Error;
 use std::process;
@@ -18,6 +20,7 @@ mod packet;
 mod queues;
 mod assembly;
 mod inbound_recv_worker;
+mod rpc_worker;
 mod counter;
 mod inbound_processor_worker;
 mod inbound_send_worker;
@@ -58,10 +61,16 @@ fn main() -> ExitCode {
 
     let execname = args.next().unwrap();
 
-    if args.len() < 3 {
-        eprintln!("Usage: {execname} <self addr:port> <peer addr:port> <TUN fd> [<TUN fd>...]");
+    if args.len() < 4 {
+        eprintln!("Usage: {execname} <socket path> <self addr:port> <peer addr:port> <TUN fd> [<TUN fd>...]");
         return ExitCode::FAILURE;
     }
+
+    let Ok(sock_path) = args.next().unwrap().parse::<String>()
+    else {
+        eprintln!("Socket path parse failure");
+        return ExitCode::FAILURE;
+    };
 
     let Ok(self_addr) = args.next().unwrap().parse::<SocketAddr>()
     else {
@@ -144,6 +153,9 @@ fn main() -> ExitCode {
             
             let socket = Box::leak(Box::new(UdpSocket::bind(self_addr).await.expect("unable to bind to self addr")));
             socket.connect(peer_addr).await.expect("unable to connect to peer addr");
+            
+            fs::remove_file(&sock_path);
+            let unix_socket =  Box::leak(Box::new(UnixListener::bind(sock_path).unwrap())); //TODO not sure if this needs the Box leak wrapper
 
             let async_tun_fds = tun_fds.into_iter().map(|tun_fd| AsyncFd::new(tun_fd).unwrap()).collect::<Vec<_>>().leak();
 
@@ -153,6 +165,9 @@ fn main() -> ExitCode {
                     &inbound_recv_worker::Config{ batch_size: inbound_recv_batch_size },
                     &*asm, &*socket));
             
+            // Launches RPC worker program
+            js.spawn(rpc_worker::launch(
+                &*asm, &*unix_socket));
             let mut usr1_stream = Box::leak(Box::new(signal(SignalKind::user_defined1()).unwrap()));
             let mut term_stream = Box::leak(Box::new(signal(SignalKind::terminate()).unwrap()));
 
