@@ -166,8 +166,9 @@ fn main() -> ExitCode {
                     &*asm, &*socket));
             
             // Launches RPC worker program
-            js.spawn(rpc_worker::launch(
-                &*asm, &*unix_socket));
+
+            js.spawn(rpc_worker::launch(&*asm, &*unix_socket));
+          
             let mut usr1_stream = Box::leak(Box::new(signal(SignalKind::user_defined1()).unwrap()));
             let mut term_stream = Box::leak(Box::new(signal(SignalKind::terminate()).unwrap()));
 
