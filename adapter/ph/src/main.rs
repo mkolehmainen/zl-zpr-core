@@ -12,6 +12,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use std::io::Error;
 use std::process;
 
+use std::fs;
 // TODO: make these all non-pub once everything is used
 pub mod ext;
 mod config;
@@ -24,6 +25,7 @@ mod rpc_worker;
 mod counter;
 mod inbound_processor_worker;
 mod inbound_send_worker;
+mod rpc_worker;
 
 use buffer_stack::BufferStack;
 use queues::*;
@@ -190,6 +192,10 @@ fn main() -> ExitCode {
                     &inbound_send_worker::Config{ batch_size: inbound_send_batch_size },
                     &*asm, is_outq, &*async_tun_fd));
             }
+
+            js.spawn(rpc_worker::launch(
+                &rpc_worker::Config{ batch_size: inbound_recv_batch_size },
+                &*asm, &*unix_socket));
 
             while let Some(res) = js.join_next().await {
                 res.unwrap();
