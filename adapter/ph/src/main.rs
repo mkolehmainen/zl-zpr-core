@@ -174,7 +174,6 @@ fn main() -> ExitCode {
             let mut js = JoinSet::new();
 
             // Launches RPC worker program
-
             js.spawn(rpc_worker::launch(&*asm, &*unix_socket));
 
             let mut usr1_stream = Box::leak(Box::new(signal(SignalKind::user_defined1()).unwrap()));
@@ -198,6 +197,7 @@ fn main() -> ExitCode {
                     &inbound_send_worker::Config{ batch_size: inbound_send_batch_size },
                     &*asm, is_outq, &*async_tun_fd));
             }
+
 
             // TODO: initiate the DTLS connection asynchronously; for now, keep this at the end
             let socket = Box::leak(Box::new(UdpSocket::bind(self_addr).await.expect("unable to bind to self addr")));
