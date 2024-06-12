@@ -73,3 +73,4 @@ async fn counters_reset(asm: &Assembly<'_>) -> String {
         asm.counters[p].reset();
     }
     return "counters_reset\n".to_string(); // TODO change the return value of counters reset
+}

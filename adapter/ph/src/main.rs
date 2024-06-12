@@ -1,3 +1,4 @@
+use std::fs;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
@@ -9,7 +10,6 @@ use tokio::net::UdpSocket;
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use std::fs;
 use tokio::signal::unix::{signal, SignalKind};
 use std::io::Error;
 use std::process;
@@ -17,7 +17,6 @@ use std::process;
 #[macro_use]
 extern crate arrayref;
 
-use std::fs;
 // TODO: make these all non-pub once everything is used
 pub mod ext;
 mod config;
@@ -25,7 +24,6 @@ pub mod buffer_stack;
 mod packet;
 mod queues;
 mod assembly;
-mod rpc_worker;
 mod counter;
 mod udp_stream;
 mod dtls_worker;
@@ -208,9 +206,7 @@ fn main() -> ExitCode {
                     &*asm, is_outq, &*async_tun_fd));
             }
 
-            js.spawn(rpc_worker::launch(
-                &rpc_worker::Config{ batch_size: inbound_recv_batch_size },
-                &*asm, &*unix_socket));
+            js.spawn(rpc_worker::launch(&*asm, &*unix_socket));
 
             while let Some(res) = js.join_next().await {
                 res.unwrap();
