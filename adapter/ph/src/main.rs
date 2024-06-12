@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::pin::Pin;
 use std::process::ExitCode;
+use openssl::ssl;
 use tokio::io;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
@@ -12,6 +14,9 @@ use tokio::signal::unix::{signal, SignalKind};
 use std::io::Error;
 use std::process;
 
+#[macro_use]
+extern crate arrayref;
+
 use std::fs;
 // TODO: make these all non-pub once everything is used
 pub mod ext;
@@ -20,9 +25,10 @@ pub mod buffer_stack;
 mod packet;
 mod queues;
 mod assembly;
-mod inbound_recv_worker;
 mod rpc_worker;
 mod counter;
+mod udp_stream;
+mod dtls_worker;
 mod inbound_processor_worker;
 mod inbound_send_worker;
 mod rpc_worker;
@@ -109,12 +115,11 @@ fn main() -> ExitCode {
     // sizes below which are all just double the batch size.  Performance
     // testing will inform us the correct values for these, which balance
     // throughput with service time.
-    let inbound_recv_batch_size = 16;
     let inbound_processor_batch_size = 16;
     let inbound_send_batch_size = 4;
     let outbound_recv_batch_size = 4;
     let outbound_processor_batch_size = 16;
-    let outbound_send_batch_size = 16;
+    let outbound_send_queue_size = 16;
 
     let buf_storage = vec![[0u8; config::PACKET_BUFFER_SIZE]; 256];
     let buffer_stack = BufferStack::new(buf_storage.leak::<'static>());
@@ -135,7 +140,7 @@ fn main() -> ExitCode {
     let (op_inq, op_outq) = mpsc::channel(outbound_processor_batch_size * 2);
     let outbound_processor = OutboundProcessor::new(op_inq);
 
-    let (os_inq, os_outq) = mpsc::channel(outbound_send_batch_size * 2);
+    let (os_inq, os_outq) = mpsc::channel(outbound_send_queue_size);
     let outbound_send = OutboundSend::new(os_inq);
 
     let counters = [Counter::new(), Counter::new()];
@@ -144,7 +149,17 @@ fn main() -> ExitCode {
             buffer_stack, inbound_processor, inbound_send,
             outbound_processor, outbound_send, counters
         }));
-    
+
+    let mut ssl_context_builder = ssl::SslContext::builder(ssl::SslMethod::dtls()).unwrap();
+    ssl_context_builder.set_options(
+        ssl::SslOptions::NO_COMPRESSION |
+        (ssl::SslOptions::NO_SSL_MASK & !ssl::SslOptions::NO_DTLSV1_2));
+    // TODO: set CA cert, client key, & enable verification here
+    let ssl_context = Box::leak(Box::new(ssl_context_builder.build()));
+    // FIXME: "OpenSSL’s default configuration is insecure.  It is highly
+    // recommended to use SslConnector rather than Ssl directly, as it
+    // manages that configuration."
+    let ssl = ssl::Ssl::new(&ssl_context).unwrap();
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -155,6 +170,8 @@ fn main() -> ExitCode {
             
             let socket = Box::leak(Box::new(UdpSocket::bind(self_addr).await.expect("unable to bind to self addr")));
             socket.connect(peer_addr).await.expect("unable to connect to peer addr");
+            let mut ssl_stream = tokio_openssl::SslStream::new(ssl, udp_stream::UdpStream::new(socket)).unwrap();
+            Pin::new(&mut ssl_stream).connect().await.expect("unable to establish DTLS connection");
             
             fs::remove_file(&sock_path);
             let unix_socket =  Box::leak(Box::new(UnixListener::bind(sock_path).unwrap())); //TODO not sure if this needs the Box leak wrapper
@@ -163,9 +180,7 @@ fn main() -> ExitCode {
 
             let mut js = JoinSet::new();
 
-            js.spawn(inbound_recv_worker::launch(
-                    &inbound_recv_worker::Config{ batch_size: inbound_recv_batch_size },
-                    &*asm, &*socket));
+            js.spawn(dtls_worker::launch(&*asm, ssl_stream, os_outq));
             
             // Launches RPC worker program
 
