@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
@@ -11,8 +12,6 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::signal::unix::{signal, SignalKind};
-use std::io::Error;
-use std::process;
 
 #[macro_use]
 extern crate arrayref;
@@ -165,8 +164,8 @@ fn main() -> ExitCode {
         .unwrap()
         .block_on(async {
             // TODO signal handler goes here
-
-            fs::remove_file(&sock_path);
+            
+            fs::remove_file(&sock_path).or_else(|e| if e.kind() == ErrorKind::NotFound { Ok(()) } else { Err(e) }).unwrap();
             let unix_socket =  Box::leak(Box::new(UnixListener::bind(sock_path).unwrap())); //TODO not sure if this needs the Box leak wrapper
 
             let async_tun_fds = tun_fds.into_iter().map(|tun_fd| AsyncFd::new(tun_fd).unwrap()).collect::<Vec<_>>().leak();
@@ -176,14 +175,14 @@ fn main() -> ExitCode {
             // Launches RPC worker program
             js.spawn(rpc_worker::launch(&*asm, &*unix_socket));
 
-            let mut usr1_stream = Box::leak(Box::new(signal(SignalKind::user_defined1()).unwrap()));
-            let mut term_stream = Box::leak(Box::new(signal(SignalKind::terminate()).unwrap()));
+            let usr1_stream = Box::leak(Box::new(signal(SignalKind::user_defined1()).unwrap()));
+            let term_stream = Box::leak(Box::new(signal(SignalKind::terminate()).unwrap()));
 
             js.spawn(async {
                 loop {
                     tokio::select! {
-                        _ = usr1_stream.recv() => (emit_counts(&asm.counters)),
-                        _ = term_stream.recv() => (emit_counts(&asm.counters))
+                        _ = usr1_stream.recv() => emit_counts(&asm.counters),
+                        _ = term_stream.recv() => emit_counts(&asm.counters)
                     }  
                 }
             });
@@ -197,7 +196,6 @@ fn main() -> ExitCode {
                     &inbound_send_worker::Config{ batch_size: inbound_send_batch_size },
                     &*asm, is_outq, &*async_tun_fd));
             }
-
 
             // TODO: initiate the DTLS connection asynchronously; for now, keep this at the end
             let socket = Box::leak(Box::new(UdpSocket::bind(self_addr).await.expect("unable to bind to self addr")));
