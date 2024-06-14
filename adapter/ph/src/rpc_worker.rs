@@ -6,6 +6,7 @@ use tokio::io::BufReader;
 use tokio::io::BufWriter;
 use tokio::task::JoinSet;
 use tokio::io::AsyncBufReadExt;
+use crate::counters_enum::CounterType;
 
 async fn worker(
     asm: &'static Assembly<'static>, socket: &UnixListener
@@ -19,7 +20,6 @@ async fn worker(
                 match accepted {
                     Ok((mut stream, _addr)) => {
                         set.spawn(async move {
-
                             eprintln!("Connection recieved");
                             //let local = task::LocalSet::new();
                             let mut str_message = String::new();
@@ -45,7 +45,6 @@ async fn worker(
                                                         buf_writer.write_all("OK\n".as_bytes()).await},
                                     _                => buf_writer.write_all("ERR\n".as_bytes()).await,
                                 };
-                
                                 buf_writer.flush().await;
                                 buf_writer.shutdown().await;
                             }
@@ -54,7 +53,6 @@ async fn worker(
                     Err(_e) => {
                         eprintln!("Connection failed");
                     }
-
             }
         }
         
@@ -75,16 +73,16 @@ async fn echo(_asm: &Assembly<'_>) -> String {
 
 // TODO not sure if just printing is what we want this function to do
 async fn counters(asm: &Assembly<'_>) -> String {
-    for p in 0..2 { // TODO replace 2 with some global var that represents # of packets
-        let num = asm.counters[p].get_count();
-        println!("{num}");
+    for value in asm.counters.values() {
+        println!("{}", value.get_count());
     }
     return "counters\n".to_string(); // TODO change the return value of counters
 }
 
 async fn counters_reset(asm: &Assembly<'_>) -> String {
-    for p in 0..2 {
-        asm.counters[p].reset();
+    for value in asm.counters.values() {
+        value.reset();
     }
+
     return "counters_reset\n".to_string(); // TODO change the return value of counters reset
 }

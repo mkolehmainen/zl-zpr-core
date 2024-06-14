@@ -6,6 +6,7 @@ use crate::assembly::Assembly;
 use crate::config;
 use crate::packet::{self, Packet};
 use crate::udp_stream::UdpStream;
+use crate::counters_enum::CounterType;
 
 // NOTE: Packet buffers *must* be at least 16384 bytes, to match TLS maximum
 // record size.  This is because OpenSSL read functions provide no way to
@@ -34,7 +35,7 @@ impl<'pktbuf> InboundRecvState<'pktbuf> {
                 let offset = packet::PACKET_BUFFER_MIN_BODY_OFFSET;
                 match ssl_stream.read(&mut buf[offset..]).await {
                     Ok(size) => {
-                        asm.counters[0].increment();
+                        asm.counters[CounterType::InPacksRec].increment();
                         // NOTE: There is no way to detect a too-large packet.  See above.
                         *self = InboundRecvState::EnqueuePacket{ pkt: Packet::new_with_existing_data(buf, offset, size) };
                     },
