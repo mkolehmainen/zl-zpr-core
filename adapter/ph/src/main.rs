@@ -12,8 +12,6 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::signal::unix::{signal, SignalKind};
-use std::io::Error;
-use std::process;
 use enum_map::{enum_map, EnumMap};
 
 #[allow(unused_imports)]

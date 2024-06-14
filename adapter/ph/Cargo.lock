@@ -306,8 +306,8 @@ name = "ph-test"
 version = "0.1.0"
 dependencies = [
  "arrayref",
- "enum-map",
  "bytes",
+ "enum-map",
  "foreign-types",
  "libc",
  "nix",
