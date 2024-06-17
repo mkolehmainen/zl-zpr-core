@@ -54,7 +54,7 @@ impl<'pktbuf> InboundRecvState<'pktbuf> {
                 asm.buffer_stack.put_buffer(buf),
 
             InboundRecvState::EnqueuePacket{ pkt } =>
-                asm.buffer_stack.put_buffer(pkt.buf)
+                asm.buffer_stack.put_buffer(pkt.destroy())
         }
     }
 }
@@ -84,7 +84,7 @@ async fn worker<'pktbuf>(
                 // writes can only block on the L2 network queue, not the
                 // path through the node.
                 ssl_stream.write(out_pkt.body()).await.unwrap();  // TODO: error handling
-                asm.buffer_stack.put_buffer(out_pkt.buf);
+                asm.buffer_stack.put_buffer(out_pkt.destroy());
             }
         };
     }
