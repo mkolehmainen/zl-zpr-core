@@ -14,9 +14,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::signal::unix::{signal, SignalKind};
 use clap::Parser;
-use std::io::Error;
-use std::process;
-
 use enum_map::{enum_map, EnumMap};
 
 #[allow(unused_imports)]
@@ -50,19 +47,21 @@ use counters_enum::*;
 #[derive(Parser)]
 #[command(version, about)]
 struct CmdLine {
-    #[arg(short, long)]
+    #[arg(long)]
     control_path: String,
 
-    #[arg(short, long)]
+    #[arg(long)]
     self_addr: SocketAddr,
 
-    #[arg(short, long)]
+    #[arg(long)]
     dock_addr: SocketAddr,
 
-    #[arg(short, long, num_args(1..))]
+    #[arg(long)]
+    ca_file: String,
+
+    #[arg(long, num_args(1..))]
     tun_fd: Vec<RawFd>,
 }
-
 
 fn is_std_fd(rfd: RawFd) -> bool {
     rfd == std::io::stdin().as_raw_fd() ||
@@ -86,7 +85,6 @@ fn emit_counts(counts_map: &EnumMap<CounterType, Counter>) {
     for (key, &ref value) in counts_map {
         let counter_type = name_counters(key);
         println!("{counter_type}: {}", value.get_count());
-
     }
 
 }
@@ -98,6 +96,7 @@ fn main() -> ExitCode {
     let peer_addr = cmd_line.dock_addr;
     let self_addr = cmd_line.self_addr;
     let tun_parse = cmd_line.tun_fd;
+    let ca_file   = cmd_line.ca_file;
 
     let mut tun_fds = Vec::new();
     for rfd in tun_parse {
@@ -156,7 +155,12 @@ fn main() -> ExitCode {
     ssl_context_builder.set_options(
         ssl::SslOptions::NO_COMPRESSION |
         (ssl::SslOptions::NO_SSL_MASK & !ssl::SslOptions::NO_DTLSV1_2));
+
+    //eprintln!("{}", ca_file.unwrap());
+    ssl_context_builder.set_ca_file(ca_file).unwrap();
+    ssl_context_builder.set_verify(ssl::SslVerifyMode::PEER);
     // TODO: set CA cert, client key, & enable verification here
+
     let ssl_context = Box::leak(Box::new(ssl_context_builder.build()));
     // FIXME: "OpenSSL’s default configuration is insecure.  It is highly
     // recommended to use SslConnector rather than Ssl directly, as it
