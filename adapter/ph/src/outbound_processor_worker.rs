@@ -18,7 +18,8 @@ async fn worker<'pktbuf>(
     while let _count @ 1.. = queue.recv_many(&mut pkts, config.batch_size).await {
         for pkt in pkts.drain(..) {
             match pkt {
-                OutboundProcessorMessage::Packet(pkt) => { handle_packets(pkt, asm); }
+                OutboundProcessorMessage::Packet(pkt) => { handle_packets(pkt, asm).await; },
+                OutboundProcessorMessage::TestPacket(pkt) => pkt.acknowledge(queue.len()) 
             }
         }
     }

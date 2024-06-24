@@ -22,13 +22,15 @@ async fn worker<'pktbuf, Fd: AsFd + AsRawFd + Send + Sync>(
     while let _count @ 1.. = queue.recv_many(&mut messages, config.batch_size).await {
         for msg in &messages {
             match msg {
-                InboundSendMessage::Packet(msg) => async_fd_write_vectored(tun_fd, &[IoSlice::new(msg.body())]).await.unwrap(),  // TODO: error handling
+                InboundSendMessage::Packet(msg) => { async_fd_write_vectored(tun_fd, &[IoSlice::new(msg.body())]).await.unwrap(); },// TODO: error handling
+                InboundSendMessage::TestPacket(_msg) => { () }
             };
         }
         asm.buffer_stack.put_buffers(messages.drain(..).filter_map(|msg| 
             match msg {
                 InboundSendMessage::Packet(msg) => Some(msg.destroy()),
-                // testpacket => None()
+                InboundSendMessage::TestPacket(msg) => { msg.acknowledge(queue.len()); None }
+
             }
         ));
     }

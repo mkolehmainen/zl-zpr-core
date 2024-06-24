@@ -1,6 +1,7 @@
 use tokio::sync::mpsc;
 use crate::packet::Packet;
-
+use crate::test_packet::*;
+use tokio::sync::oneshot::error::RecvError;
 // Queues (i.e., frontend interface) for each stage of the system.
 
 // "Inbound" refers to the dock->adapter direction (i.e., inbound to this host).
@@ -13,7 +14,8 @@ use crate::packet::Packet;
 // CPU-intensive postprocessing (e.g. signature verification).
 // This may morph into more or fewer (i.e. zero) stages depending on future requirements.
 pub enum InboundProcessorMessage<'pktbuf> {
-    Packet(Packet<'pktbuf>)
+    Packet(Packet<'pktbuf>),
+    TestPacket(TestPacket)
 }
 
 pub struct InboundProcessor<'pktbuf> {
@@ -30,13 +32,22 @@ impl<'pktbuf> InboundProcessor<'pktbuf> {
     pub async fn enqueue_packet(&self, packet: Packet<'pktbuf>) {
         self.sender.send(InboundProcessorMessage::Packet(packet)).await.unwrap();
     }
+
+    pub async fn enqueue_test_packet(&self) -> Result<TestPacketMetrics, RecvError> {
+        let test_tuple = TestPacket::create();
+
+        self.sender.send(InboundProcessorMessage::TestPacket(test_tuple.0)).await.unwrap();
+
+        Ok(test_tuple.1.await?)
+    }
 }
 
 
 // InboundSend is responsible for emitting decapsulated agent packets on the
 // host's TUN interface.
 pub enum InboundSendMessage<'pktbuf> {
-    Packet(Packet<'pktbuf>)
+    Packet(Packet<'pktbuf>),
+    TestPacket(TestPacket)
 }
 
 pub struct InboundSend<'pktbuf> {
@@ -53,6 +64,20 @@ impl<'pktbuf> InboundSend<'pktbuf> {
     pub async fn enqueue_packet(&self, packet: Packet<'pktbuf>) {
         self.senders[packet.flowhash() as usize % self.senders.len()].send(InboundSendMessage::Packet(packet)).await.unwrap();
     }
+
+    pub async fn enqueue_test_packet(&self, queue: usize) -> Result<TestPacketMetrics, RecvError> {
+        let test_tuple = TestPacket::create();
+
+        self.senders[queue].send(InboundSendMessage::TestPacket(test_tuple.0)).await.unwrap();
+
+        Ok(test_tuple.1.await?)
+    }
+
+    // gets size of the queue array in order for the user to give a reasonable queue value in 
+    // enqueue_test_packet
+    pub fn fanout(&self) -> usize{
+        self.senders.len()
+    }
 }
 
 
@@ -61,7 +86,8 @@ impl<'pktbuf> InboundSend<'pktbuf> {
 // CPU-intensive preprocessing (e.g. signature generation).
 // This may morph into more or fewer (i.e. zero) stages depending on future requirements.
 pub enum OutboundProcessorMessage<'pktbuf> {
-    Packet(Packet<'pktbuf>)
+    Packet(Packet<'pktbuf>),
+    TestPacket(TestPacket)
 }
 
 pub struct OutboundProcessor<'pktbuf> {
@@ -78,12 +104,21 @@ impl<'pktbuf> OutboundProcessor<'pktbuf> {
     pub async fn enqueue_packet(&self, packet: Packet<'pktbuf>) {
         self.sender.send(OutboundProcessorMessage::Packet(packet)).await.unwrap();
     }
+
+    pub async fn enqueue_test_packet(&self) -> Result<TestPacketMetrics, RecvError> {
+        let test_tuple = TestPacket::create();
+
+        self.sender.send(OutboundProcessorMessage::TestPacket(test_tuple.0)).await.unwrap();
+
+        Ok(test_tuple.1.await?)
+    }
 }
 
 
 // OutboundSend is responsible for sending encapsulated agent packets to the dock.
 pub enum OutboundSendMessage<'pktbuf> {
-    Packet(Packet<'pktbuf>)
+    Packet(Packet<'pktbuf>),
+    TestPacket(TestPacket)
 }
 
 pub struct OutboundSend<'pktbuf> {
@@ -99,5 +134,13 @@ impl<'pktbuf> OutboundSend<'pktbuf> {
 
     pub async fn enqueue_packet(&self, packet: Packet<'pktbuf>) {
         self.sender.send(OutboundSendMessage::Packet(packet)).await.unwrap();
+    }
+
+    pub async fn enqueue_test_packet(&self) -> Result<TestPacketMetrics, RecvError> {
+        let test_tuple = TestPacket::create();
+
+        self.sender.send(OutboundSendMessage::TestPacket(test_tuple.0)).await.unwrap();
+
+        Ok(test_tuple.1.await?)
     }
 }
