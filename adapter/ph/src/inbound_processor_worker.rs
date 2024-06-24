@@ -20,8 +20,7 @@ async fn worker<'pktbuf>(
         for pkt in pkts.drain(..) {
             match pkt {
                 InboundProcessorMessage::Packet(pkt) => { handle_packets(pkt, asm).await; }
-            }
-            
+            }   
         }
     }
 }
