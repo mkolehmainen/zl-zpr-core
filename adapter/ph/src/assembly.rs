@@ -1,7 +1,9 @@
 use crate::buffer_stack::BufferStack;
+use crate::capture_worker::CaptureWorker;
 use crate::config;
 use crate::counter::*;
 use crate::counters_enum::*;
+use crate::flow_control::FlowControl;
 use crate::queues::*;
 use enum_map::EnumMap;
 // Interface to full assembly of all stages.
@@ -35,7 +37,12 @@ pub struct Assembly<'pktbuf> {
     pub outbound_send: OutboundSend<'pktbuf>,
 
     #[allow(dead_code)]
-    pub capture: Capture<'pktbuf>,
+    pub capture_queue: Capture<'pktbuf>,
+    #[allow(dead_code)]
+    pub capture_worker: CaptureWorker,
+
+    #[allow(dead_code)]
+    pub flow_control: FlowControl,
 
     pub counters: EnumMap<CounterType, Counter>,
 }
