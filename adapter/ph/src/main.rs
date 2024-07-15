@@ -107,7 +107,8 @@ fn main() -> ExitCode {
     let outbound_processor_batch_size = 16;
     let outbound_send_queue_size = 16;
     let outbound_send_batch_size = 8;
-    let capture_queue_size = 8;
+    let capture_queue_size = 16;
+    let capture_batch_size = 8;
     let tun_queue_count = 1;
 
     let buf_storage = vec![[0u8; config::PACKET_BUFFER_SIZE]; 256];
@@ -131,7 +132,7 @@ fn main() -> ExitCode {
     let (os_inq, os_outq) = mpsc::channel(outbound_send_queue_size);
     let outbound_send = OutboundSend::new(os_inq);
 
-    let (cap_inq, _cap_outq) = mpsc::channel(capture_queue_size);
+    let (cap_inq, cap_outq) = mpsc::channel(capture_queue_size);
     let capture_queue = Capture::new(cap_inq);
     let capture_worker = CaptureWorker::new();
 
@@ -256,6 +257,16 @@ fn main() -> ExitCode {
                 },
                 &*asm,
                 op_outq,
+            ));
+
+            js.spawn(rpc_worker::launch(&*asm, &*unix_socket));
+
+            js.spawn(capture_worker::launch(
+                &capture_worker::Config {
+                    batch_size: capture_batch_size,
+                },
+                &*asm,
+                cap_outq,
             ));
 
             // TODO: initiate the DTLS connection asynchronously; for now, keep this at the end
