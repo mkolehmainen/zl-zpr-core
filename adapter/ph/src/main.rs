@@ -136,10 +136,11 @@ fn main() -> ExitCode {
 
     let (cap_inq, cap_outq) = mpsc::channel(capture_queue_size);
     let capture_queue = Capture::new(cap_inq);
+
     let capture_worker = CaptureWorker::new();
+    let flow_control = FlowControl::new();
 
     let counters = enum_map! { _ => Counter::new(), };
-    let flow_control = FlowControl::new();
 
     let mut ssl_context_builder = ssl::SslContext::builder(ssl::SslMethod::dtls()).unwrap();
     ssl_context_builder.set_options(
