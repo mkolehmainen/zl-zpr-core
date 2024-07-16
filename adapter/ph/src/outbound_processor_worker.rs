@@ -1,4 +1,5 @@
 use crate::assembly::Assembly;
+use crate::counters_enum::CounterType;
 use crate::packet::Packet;
 use crate::queues::{Direction, TryEnqueueError};
 use crate::zdp::*;
@@ -65,6 +66,7 @@ fn clone_cap_packs<'pktbuf>(
 ) {
     let mut bufs = Vec::new();
     let _ = asm.buffer_stack.try_get_buffers(count, &mut bufs);
+    let mut num_enqueued: u64 = 0;
     for pkt in pkts {
         match pkt {
             // Splits between Packets and TestPackets
@@ -80,7 +82,10 @@ fn clone_cap_packs<'pktbuf>(
                         Direction::Outbound,
                     ) {
                         // Checks to see if the packet enqueue was successful
-                        Ok(()) => (),
+                        Ok(()) => {
+                            asm.counters[CounterType::OutCapPacksWrite].increment();
+                            num_enqueued += 1;
+                        }
                         Err(TryEnqueueError::Full(ret_packet)) => {
                             let ret_buf = ret_packet.destroy();
                             asm.buffer_stack.put_buffer(ret_buf);
@@ -94,4 +99,5 @@ fn clone_cap_packs<'pktbuf>(
         }
     }
     asm.buffer_stack.put_buffers(bufs.into_iter());
+    asm.counters[CounterType::OutCapPacksDrop].increase_by(pkts.len() as u64 - num_enqueued)
 }
