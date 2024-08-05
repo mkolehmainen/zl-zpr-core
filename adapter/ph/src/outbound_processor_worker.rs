@@ -1,5 +1,7 @@
 use crate::assembly::Assembly;
+use crate::counters_enum::CounterType;
 use crate::defs::Direction;
+use crate::ext::std::mem::drop_guard;
 use crate::fastpath::*;
 use crate::packet::Packet;
 use crate::queues::OutboundProcessorMessage;
@@ -74,5 +76,14 @@ async fn handle_packet<'pktbuf>(mut pkt: Packet<'pktbuf>, asm: &Assembly<'pktbuf
     maybe_capture(asm, Direction::Outbound, [&mut pkt]); // FIXME: batch
 
     // forward encapsulated packet on
-    asm.outbound_send.enqueue_packet(pkt).await;
+    match asm
+        .outbound_send
+        .enqueue_packet(drop_guard(pkt, |p| {
+            asm.buffer_stack.put_buffer(p.destroy())
+        }))
+        .await
+    {
+        Ok(()) => asm.counters[CounterType::OutPacksSent].increment(),
+        Err(_) => asm.counters[CounterType::OutPacksErr].increment(),
+    }
 }
