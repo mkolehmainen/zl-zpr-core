@@ -66,8 +66,15 @@ async fn handle_packet<'pktbuf>(
 
     let base_hdr = ZdpBaseHeader::read_from_buf(&mut pkt).expect("too-short ZDP message");
 
-    if base_hdr.packet_type.is_response() {
-        let channel = asm.get_sender();
+    // copy out relevant header info
+    let packet_type = base_hdr.packet_type;
+    let _sequence_number = base_hdr.sequence_number;
+
+    // strip base header
+    pkt.advance(std::mem::size_of::<ZdpBaseHeader>());
+
+    if packet_type.is_response() {
+        let channel = asm.sync_req_state.get_sender();
         match channel {
             Some(channel) => match channel.send(pkt) {
                 Ok(()) => (),
