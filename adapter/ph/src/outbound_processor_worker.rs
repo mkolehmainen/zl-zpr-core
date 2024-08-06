@@ -1,13 +1,13 @@
 use crate::assembly::Assembly;
 use crate::counters_enum::CounterType;
 use crate::defs::Direction;
-use crate::ext::std::mem::drop_guard;
 use crate::fastpath::*;
 use crate::packet::Packet;
 use crate::queues::OutboundProcessorMessage;
 use crate::zdp::*;
 use core::future::Future;
 use tokio::sync::mpsc;
+use zpr_ext::std::mem::drop_guard;
 
 #[derive(Copy, Clone)]
 pub struct Config {
