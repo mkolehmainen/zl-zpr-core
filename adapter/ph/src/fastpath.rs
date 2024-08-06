@@ -106,7 +106,7 @@ pub fn maybe_capture_batch<'a, 'pktbuf: 'a>(
         ll_hdr.direction = zdp_ll::encode_direction(dir);
 
         // FIXME: ideally, take an RCU reference to the program once on function entry
-        let caplen = asm.flow_control.check_packet(pkt.body());
+        let caplen = asm.flow_control.check_packet(pkt.body()) as usize;
         if caplen > 0 {
             match bufs.pop().or_else(|| {
                 if out_of_bufs {
@@ -116,16 +116,17 @@ pub fn maybe_capture_batch<'a, 'pktbuf: 'a>(
                 }
             }) {
                 Some(buf) => {
-                    let pkt_clone: Packet = pkt.clone_into(buf);
+                    let orig_len = pkt.body().len();
+                    let pkt_clone: Packet =
+                        pkt.clone_prefix_into(buf, std::cmp::min(caplen, orig_len));
                     // remove direction indicator from beginning of packet
                     pkt.advance(std::mem::size_of::<zdp_ll::ZdpLinkP2P>());
 
                     // Checks to see if the packet enqueue was successful
-                    match asm.capture_queue.try_enqueue_packet(
-                        pkt_clone,
-                        capture_time,
-                        caplen, // TODO: pass full packet length instead, and only copy caplen bytes
-                    ) {
+                    match asm
+                        .capture_queue
+                        .try_enqueue_packet(pkt_clone, capture_time, orig_len)
+                    {
                         Ok(()) => num_captured += 1,
 
                         Err(TryEnqueueError::Full(ret_packet)) => {
