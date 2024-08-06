@@ -3,7 +3,7 @@ use crate::classifier::classify;
 use crate::config;
 use crate::counters_enum::CounterType;
 use crate::defs::Direction;
-use crate::fastpath::*;
+use crate::fastpath;
 use crate::options::PhMode;
 use crate::packet::Packet;
 use crate::queues::InboundProcessorMessage;
@@ -31,9 +31,8 @@ async fn worker<'pktbuf>(
     while let count @ 1.. = queue.recv_many(&mut msgs, config.batch_size).await {
         for msg in msgs.drain(..) {
             match msg {
-                InboundProcessorMessage::Packet(mut pkt) => {
-                    maybe_capture(asm, Direction::Inbound, [&mut pkt]); // FIXME: batch
-                    handle_packet(config, pkt, asm).await;
+                InboundProcessorMessage::Packet(pkt) => {
+                    handle_packet(config, asm, pkt).await;
                 }
                 InboundProcessorMessage::TestPacket(pkt) => {
                     pkt.acknowledge(queue.len(), count);
@@ -57,10 +56,26 @@ where
 
 async fn handle_packet<'pktbuf>(
     config: &Config,
-    mut pkt: Packet<'pktbuf>,
     asm: &Assembly<'pktbuf>,
+    mut pkt: Packet<'pktbuf>,
 ) {
-    pkt.advance(std::mem::size_of::<u8>()); // Account for extra byte at beginning because of ZPI
+    match fastpath::decrypt(asm, 0, &mut pkt) {
+        Ok(()) => (),
+        Err(err) => {
+            fastpath::drop_and_count(asm, pkt, err);
+            return;
+        }
+    }
+
+    fastpath::maybe_capture(asm, Direction::Inbound, &mut pkt);
+
+    let _zpi = match fastpath::decap_zpi(asm, 0, &mut pkt) {
+        Ok(zpi) => zpi,
+        Err(err) => {
+            fastpath::drop_and_count(asm, pkt, err);
+            return;
+        }
+    };
 
     let base_hdr = ZdpBaseHeader::read_from_buf(&mut pkt).expect("too-short ZDP message");
 

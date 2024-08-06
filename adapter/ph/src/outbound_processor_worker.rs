@@ -1,7 +1,7 @@
 use crate::assembly::Assembly;
 use crate::counters_enum::CounterType;
 use crate::defs::Direction;
-use crate::fastpath::*;
+use crate::fastpath;
 use crate::packet::Packet;
 use crate::queues::OutboundProcessorMessage;
 use crate::zdp::*;
@@ -71,9 +71,11 @@ async fn handle_packet<'pktbuf>(asm: &Assembly<'pktbuf>, mut pkt: Packet<'pktbuf
     // fill in metadata
     pkt.metadata_mut().flow_id = 0; // TODO: fill from IP header
 
-    let _: &u8 = pkt.alloc_zeroed_header(); // account for fact we don't yet have ZPI
+    fastpath::encap_zpi(asm, 0, 0, &mut pkt);
 
-    maybe_capture(asm, Direction::Outbound, [&mut pkt]); // FIXME: batch
+    fastpath::maybe_capture(asm, Direction::Outbound, &mut pkt);
+
+    fastpath::encrypt(asm, 0, &mut pkt);
 
     // forward encapsulated packet on
     match asm

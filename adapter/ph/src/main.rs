@@ -40,6 +40,7 @@ mod test_packet;
 mod tun_ctl;
 mod zdp;
 mod zdp_ll;
+mod zpr;
 
 use assembly::{Assembly, SyncReqState};
 use buffer_stack::BufferStack;
