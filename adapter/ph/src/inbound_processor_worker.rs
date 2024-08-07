@@ -12,7 +12,6 @@ use bytes::Buf;
 use std::future::Future;
 use tokio::sync::mpsc;
 use zerocopy::FromBytes;
-use zpr_ext::std::mem::drop_guard;
 use zpr_ext::zerocopy::*;
 
 #[derive(Copy, Clone)]
@@ -112,13 +111,7 @@ async fn handle_packet<'pktbuf>(
                     let _ = classify(&mut pkt);
                 }
 
-                // send out decapsulated packet
-                asm.inbound_send
-                    .enqueue_packet(drop_guard(pkt, |p| {
-                        asm.buffer_stack.put_buffer(p.destroy())
-                    }))
-                    .await;
-                asm.counters[CounterType::InPacksSent].increment();
+                fastpath::agent_input(asm, 0, pkt);
             }
 
             packet_type => panic!("unhandled inbound packet type {}", packet_type.0),
