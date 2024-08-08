@@ -86,6 +86,7 @@ impl<'pktbuf> SyncReqState<'pktbuf> {
         self.inner_req.lock().unwrap().reply_channel.take()
     }
 
+    // Private to prevent a rogue agent from setting the sender.
     fn set_sender(&self, sender: Option<Sender<(Packet<'pktbuf>, ZdpPacketType)>>) {
         let mut inner_req = self.inner_req.lock().unwrap();
         inner_req.reply_channel = sender;
@@ -100,6 +101,56 @@ pub enum SyncReqError {
 }
 
 impl<'pktbuf> Assembly<'pktbuf> {
+    /// Sender function for non-per flow request management packet.
+    /// Requires the type of ZDP packet being sent as well as the type of the
+    /// expected response packet.
+    /// pkt_fn allows the function to create the proper body of the ZDP packet to send
+    /// Returns the received packet without any ZdpHeader (just management response body) or an error
+    pub async fn send_sync_non_flow_req(
+        &self,
+        zdp_request_type: ZdpPacketType,
+        zdp_response_type: ZdpPacketType,
+        pkt_fn: impl Fn(&mut Packet<'_>) + Send + 'static,
+    ) -> Result<Packet<'pktbuf>, SyncReqError> {
+        self.send_sync_req_helper(zdp_request_type, zdp_response_type, None, pkt_fn)
+            .await
+    }
+
+    /// Sender function for per flow request management packet.
+    /// Requires the type of ZDP packet being sent as well as the type of the
+    /// expected response packet. Also requires stream_id of the packet.
+    /// pkt_fn allows the function to create the proper body of the ZDP packet to send
+    /// Returns the received packet without any ZdpHeader (just management response body) or an error
+    #[allow(dead_code)]
+    pub async fn send_sync_per_flow_req(
+        &self,
+        zdp_request_type: ZdpPacketType,
+        zdp_response_type: ZdpPacketType,
+        stream_id: u32,
+        pkt_fn: impl Fn(&mut Packet<'_>) + Send + 'static,
+    ) -> Result<(u32, Packet<'pktbuf>), SyncReqError> {
+        match self
+            .send_sync_req_helper(zdp_request_type, zdp_response_type, Some(stream_id), pkt_fn)
+            .await
+        {
+            Ok(mut pkt) => {
+                let per_flow_hdr = ZdpPerFlowHeader::ref_from_prefix(pkt.body())
+                    .expect("too-short inbound packet");
+                let stream_id = per_flow_hdr.stream_id;
+                pkt.advance(std::mem::size_of::<ZdpPerFlowHeader>());
+                Ok((stream_id.into(), pkt))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Helper for send management request function
+    /// Requires the type of ZDP packet being sent as well as the type of the
+    /// expected response packet. The Option determines whether the function is helping the per-flow or
+    /// non-per flow sender.
+    /// pkt_fn allows the function to create the proper body of the ZDP packet to send
+    /// Returns the received packet without the ZdpBaseHeader, but still any other Zdp header information
+    /// not included in the ZdpBaseHeader, or an error
     async fn send_sync_req_helper(
         &self,
         zdp_request_type: ZdpPacketType,
@@ -163,39 +214,6 @@ impl<'pktbuf> Assembly<'pktbuf> {
                 return Ok(rec_tuple.0);
             }
             Err(_) => return Err(err_type),
-        }
-    }
-    #[allow(dead_code)]
-    pub async fn send_sync_non_flow_req(
-        &self,
-        zdp_request_type: ZdpPacketType,
-        zdp_response_type: ZdpPacketType,
-        pkt_fn: impl Fn(&mut Packet<'_>) + Send + 'static,
-    ) -> Result<Packet<'pktbuf>, SyncReqError> {
-        self.send_sync_req_helper(zdp_request_type, zdp_response_type, None, pkt_fn)
-            .await
-    }
-
-    #[allow(dead_code)]
-    pub async fn send_sync_per_flow_req(
-        &self,
-        zdp_request_type: ZdpPacketType,
-        zdp_response_type: ZdpPacketType,
-        stream_id: u32,
-        pkt_fn: impl Fn(&mut Packet<'_>) + Send + 'static,
-    ) -> Result<(u32, Packet<'pktbuf>), SyncReqError> {
-        match self
-            .send_sync_req_helper(zdp_request_type, zdp_response_type, Some(stream_id), pkt_fn)
-            .await
-        {
-            Ok(mut pkt) => {
-                let per_flow_hdr = ZdpPerFlowHeader::ref_from_prefix(pkt.body())
-                    .expect("too-short inbound packet");
-                let stream_id = per_flow_hdr.stream_id;
-                pkt.advance(std::mem::size_of::<ZdpPerFlowHeader>());
-                Ok((stream_id.into(), pkt))
-            }
-            Err(err) => Err(err),
         }
     }
 
