@@ -257,9 +257,11 @@ pub fn substrate_egress<'pktbuf>(
         todo!("link routing");
     }
 
-    match asm.outbound_send.try_enqueue_packet(drop_guard(pkt, |p| {
-        drop_and_count(asm, p, CounterType::OutPacksSent)
-    })) {
+    match asm
+        .substrate_egress
+        .try_enqueue_packet(drop_guard(pkt, |p| {
+            drop_and_count(asm, p, CounterType::OutPacksSent)
+        })) {
         Ok(()) => (),
         Err(TryEnqueueError::Full(pkt)) => {
             drop_and_count(asm, pkt.into_inner(), CounterType::OutPacksErr)
@@ -306,7 +308,7 @@ pub fn substrate_ingress<'pktbuf>(
         // (instead of this silly code to restore it?)
         *pkt.alloc_zeroed_header() = base_hdr;
 
-        match asm.inbound_processor.try_enqueue_packet(pkt) {
+        match asm.mgmt_processor.try_enqueue_packet(pkt) {
             Ok(()) => (),
             Err(TryEnqueueError::Full(pkt)) => drop_and_count(asm, pkt, CounterType::InPacksDrop),
         }
@@ -332,7 +334,7 @@ pub fn agent_input<'pktbuf>(
     // TODO: decompress
 
     // send out decapsulated packet
-    match asm.inbound_send.try_enqueue_packet(drop_guard(pkt, |p| {
+    match asm.agent_input.try_enqueue_packet(drop_guard(pkt, |p| {
         drop_and_count(asm, p, CounterType::InPacksSent)
     })) {
         Ok(()) => (),
