@@ -176,7 +176,8 @@ impl<'pktbuf> Assembly<'pktbuf> {
                         zdp_request_type,
                         stream_id,
                         packet.into_inner(),
-                    );
+                    )
+                    .await;
                 }
                 None => {
                     mgmt::send_non_flow_mgmt(
@@ -184,7 +185,8 @@ impl<'pktbuf> Assembly<'pktbuf> {
                         zpr::ADAPTER_DOCKING_SESSION_ID, /* FIXME */
                         zdp_request_type,
                         packet.into_inner(),
-                    );
+                    )
+                    .await;
                 }
             }
             tokio::select! {
