@@ -1,4 +1,5 @@
 #![cfg_attr(feature = "ci", deny(warnings))]
+
 use clap::Parser;
 use enum_map::{enum_map, EnumMap};
 use std::fs;

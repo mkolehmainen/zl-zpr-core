@@ -8,12 +8,17 @@ use clap::Parser;
 use ctrlc;
 use pcap::{Capture, Linktype};
 use std::borrow::Borrow;
+use std::fs::OpenOptions;
 use std::io::prelude::*;
+use std::io::{BufReader, Error, IoSlice};
 use std::net::Shutdown;
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
+use zpr_ext::std::os::unix::net::{SocketAncillary, UnixStreamExt};
+const ANCILLARY_BUFFER_SIZE: usize = 128;
 
 const NUM_COUNTERS: usize = 23;
 
@@ -154,9 +159,44 @@ fn handle_perf_sample(duration: u64, frequency: u64, port: &str) -> std::io::Res
 }
 
 fn handle_set_capture(file_path: String, port: &str) -> std::io::Result<()> {
-    let command = format!("SET-CAPTURE {}\n", file_path);
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(file_path)
+        .unwrap();
 
-    basic_call_response(&command, port)?;
+    let mut ancillary_buffer = [0; ANCILLARY_BUFFER_SIZE];
+    let mut ancillary = SocketAncillary::new(&mut ancillary_buffer);
+    ancillary.add_fds(&[file.as_fd()]);
+
+    let buf = [1; 1]; // Must send some data with the ancillary data
+    let bufs = &mut [IoSlice::new(&buf)];
+
+    // Establish connection with RPC worker, send command
+    let stream = &mut UnixStream::connect(port).unwrap();
+    stream.write_all("SET-CAPTURE\n".as_bytes())?;
+    stream.flush()?;
+
+    // Receive response from RPC worker, ensure that it sent the correct response and
+    // is expecting the file descriptor
+    let mut confirmation = String::new();
+    let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
+    buf_reader.read_line(&mut confirmation)?;
+    buf_reader.read_line(&mut confirmation)?;
+    if confirmation != "Message Received\nSEND ANCILLARY\n" {
+        return Err(Error::other("Incorrect Message Received"));
+    }
+    confirmation.pop(); // Removes \n at end of message, simply makes output look nicer
+    println!("{confirmation}");
+
+    // Create fd, ancillary buffer, data buffer, and send ancillary data
+    #[allow(unstable_name_collisions)]
+    stream.send_vectored_with_ancillary(bufs, &mut ancillary)?;
+
+    // Read response from
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?; // Read rest of response
+    println!("{response}");
 
     Ok(())
 }
