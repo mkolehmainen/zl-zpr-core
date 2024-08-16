@@ -175,22 +175,72 @@ impl<T> Cslab<T> {
 // from an `RcuCslab`!  Our internal safety guarantees rely on
 // accesses being performed _only_ through the `RcuCslab`.
 
+struct RcuCslabGenInner<T> {
+    pending_removes: Vec<usize>,
+    next_gen: Option<Arc<RcuCslabGen<T>>>,
+}
+
+struct RcuCslabGen<T> {
+    writer: Arc<Mutex<Cslab<T>>>,
+    inner: Mutex<RcuCslabGenInner<T>>,  // FIXME: repalce with SyncUnsafeCell; we are always holding the writer mutex
+}
+
+impl<T> Drop for RcuCslabGen<T> {
+    fn drop(&mut self) {
+        let pending_drops: Box<[_]> = {
+            let mut writer = self.writer.lock().unwrap();
+            // SAFETY: all items in pending_removes have been marked
+            // SAFETY: being RCU-dropped means we have synchronized with the writer
+            self.inner.get_mut().unwrap().pending_removes.iter().map(|&idx|
+                unsafe { writer.finalize_remove(idx) }).collect()
+        };
+
+        // drop items outside the mutex to prevent deadlocks
+        std::mem::drop(pending_drops);
+    }
+}
+
+pub struct RcuCslabReader<T> {
+    reader: CslabReader<T>,
+    gen: Arc<RcuCslabGen<T>>,
+}
+
+impl<T> RcuCslabReader<T> {
+    pub fn get(&self, idx: usize) -> Option<&T> {
+        self.reader.get(idx)
+    }
+}
+
+impl<T> Clone for RcuCslabReader<T> {
+    fn clone(&self) -> Self {
+        Self {
+            reader: self.reader.clone(),
+            gen: self.gen.clone(),
+        }
+    }
+}
+
 pub struct RcuCslab<T> {	
     capacity: usize,
     writer: Arc<Mutex<Cslab<T>>>,
     reader: CslabReader<T>,
-    pending_removes: Mutex<Vec<usize>>,  // FIXME: repalce with SyncUnsafeCell; we are always holding the writer mutex
+    cur_gen: Arc<RcuCslabGen<T>>,
 }
 
 impl<T> RcuCslab<T> {
     pub fn with_fixed_capacity(capacity: usize) -> Self {
         let cslab = Cslab::with_fixed_capacity(capacity);
         let reader = cslab.reader();
+        let writer = Arc::new(Mutex::new(cslab));
+        let cur_gen = Arc::new(RcuCslabGen {
+            writer: writer.clone(),
+            inner: Mutex::new(RcuCslabGenInner { pending_removes: Vec::new(), next_gen: None })
+        });
         Self {
-            capacity: cslab.capacity(),
-            writer: Arc::new(Mutex::new(cslab)),
+            capacity,
+            writer,
             reader,
-            pending_removes: Mutex::new(Vec::new()),
+            cur_gen,
         }
     }
 
@@ -202,48 +252,37 @@ impl<T> RcuCslab<T> {
         self.reader.get(idx)
     }
 
+    pub fn reader(&self) -> RcuCslabReader<T> {
+        RcuCslabReader {
+            reader: self.reader.clone(),
+            gen: self.cur_gen.clone(),
+        }
+    }
+
     pub fn insert(&self, item: T) -> Result<usize, ()> {
         self.writer.lock().unwrap().insert(item)
     }
 
     pub fn remove(&self, idx: usize) {
-        let mut writer = self.writer.lock().unwrap();
-        let mut pending_removes = self.pending_removes.lock().unwrap();
-        writer.mark_removed(idx);
-        pending_removes.push(idx);
+        // NOTE: order here doesn't matter; no-one will do anything with
+        // `pending_removes` until `collect()` (which is mut) releases the references
+        // to `cur_gen`
+        self.writer.lock().unwrap().mark_removed(idx);
+        self.cur_gen.inner.lock().unwrap().pending_removes.push(idx);
     }
-}
 
-// FIXME: we need to DISALLOW anyone but the "writer" from removing stuff!
-// only one writer can be removing things!!
-
-// FIXME: we need to somehow prevent OUT-OF-ORDER cleanups!!
-// either prevent having multiple read versions,
-// or somehow ensure they're cleaned in order...
-// older one holds reference to newer one???
-
-impl<T> Clone for RcuCslab<T> {
-    fn clone(&self) -> Self {
-        Self {
-            capacity: self.capacity,
+    pub fn collect(&mut self) {
+        let next_gen = Arc::new(RcuCslabGen {
             writer: self.writer.clone(),
-            reader: self.reader.clone(),
-            pending_removes: Mutex::new(Vec::new()),
+            inner: Mutex::new(RcuCslabGenInner { pending_removes: Vec::new(), next_gen: None })
+        });
+
+        {
+            let mut cur_gen_inner = self.cur_gen.inner.lock().unwrap();
+            debug_assert!(cur_gen_inner.next_gen.is_none());
+            cur_gen_inner.next_gen = Some(next_gen.clone());
         }
-    }
-}
 
-impl<T> Drop for RcuCslab<T> {
-    fn drop(&mut self) {
-        let pending_drops: Box<[_]> = {
-            let mut writer = self.writer.lock().unwrap();
-            // SAFETY: all items in pending_removes have been marked
-            // SAFETY: being RCU-dropped means we have synchronized with the writer
-            self.pending_removes.get_mut().unwrap().iter().map(|&idx|
-                unsafe { writer.finalize_remove(idx) }).collect()
-        };
-
-        // drop items outside the mutex to prevent deadlocks
-        std::mem::drop(pending_drops);
+        self.cur_gen = next_gen;
     }
 }
