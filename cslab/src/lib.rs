@@ -176,13 +176,21 @@ impl<T> Cslab<T> {
 // accesses being performed _only_ through the `RcuCslab`.
 
 struct RcuCslabGenInner<T> {
+    // list of indexes whose removal we can finalize once this generation
+    // is dropped (since all future active generations will have read the removal mark)
     pending_removes: Vec<usize>,
+
+    // a reference count used to prevent newer generations from
+    // being collected before older generations
     next_gen: Option<Arc<RcuCslabGen<T>>>,
 }
 
 struct RcuCslabGen<T> {
+    // a reference to the writer, used to perform removal finalization
     writer: Arc<Mutex<Cslab<T>>>,
-    inner: Mutex<RcuCslabGenInner<T>>,  // FIXME: repalce with SyncUnsafeCell; we are always holding the writer mutex
+
+    // the actual generation info, protected by a mutex
+    inner: Mutex<RcuCslabGenInner<T>>,
 }
 
 impl<T> Drop for RcuCslabGen<T> {
@@ -201,7 +209,10 @@ impl<T> Drop for RcuCslabGen<T> {
 }
 
 pub struct RcuCslabReader<T> {
+    // unsynchronized read access to the slab
     reader: CslabReader<T>,
+
+    // reference to the generation we were created in
     gen: Arc<RcuCslabGen<T>>,
 }
 
@@ -221,9 +232,16 @@ impl<T> Clone for RcuCslabReader<T> {
 }
 
 pub struct RcuCslab<T> {	
+    // unsynchronized access to capacity
     capacity: usize,
+
+    // main reference to the writer
     writer: Arc<Mutex<Cslab<T>>>,
+
+    // an unsynchronized reader we can clone cheaply
     reader: CslabReader<T>,
+
+    // reference to the current generation of readers
     cur_gen: Arc<RcuCslabGen<T>>,
 }
 
@@ -236,6 +254,7 @@ impl<T> RcuCslab<T> {
             writer: writer.clone(),
             inner: Mutex::new(RcuCslabGenInner { pending_removes: Vec::new(), next_gen: None })
         });
+
         Self {
             capacity,
             writer,
@@ -258,6 +277,9 @@ impl<T> RcuCslab<T> {
             gen: self.cur_gen.clone(),
         }
     }
+
+    // NOTE: it's a happy accident of the implementation that `insert()` and
+    // `remove()` become non-mut.  I don't see a downside and it's convenient.
 
     pub fn insert(&self, item: T) -> Result<usize, ()> {
         self.writer.lock().unwrap().insert(item)
