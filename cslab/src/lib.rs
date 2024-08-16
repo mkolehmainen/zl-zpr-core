@@ -171,16 +171,27 @@ impl<T> Cslab<T> {
     }
 }
 
+// NOTE: it is unsafe to allow arbitrary `CslabReader`s to be cloned
+// from an `RcuCslab`!  Our internal safety guarantees rely on
+// accesses being performed _only_ through the `RcuCslab`.
+
 pub struct RcuCslab<T> {	
     capacity: usize,
     writer: Arc<Mutex<Cslab<T>>>,
     reader: CslabReader<T>,
-    pending_removes: Mutex<Vec<usize>>,  // FIXME: we don't need this mutex; we are always holding the writer mutex
+    pending_removes: Mutex<Vec<usize>>,  // FIXME: repalce with SyncUnsafeCell; we are always holding the writer mutex
 }
 
 impl<T> RcuCslab<T> {
     pub fn with_fixed_capacity(capacity: usize) -> Self {
-        Self::from(Cslab::with_fixed_capacity(capacity))
+        let cslab = Cslab::with_fixed_capacity(capacity);
+        let reader = cslab.reader();
+        Self {
+            capacity: cslab.capacity(),
+            writer: Arc::new(Mutex::new(cslab)),
+            reader,
+            pending_removes: Mutex::new(Vec::new()),
+        }
     }
 
     pub fn capacity(&self) -> usize {
@@ -202,6 +213,14 @@ impl<T> RcuCslab<T> {
         pending_removes.push(idx);
     }
 }
+
+// FIXME: we need to DISALLOW anyone but the "writer" from removing stuff!
+// only one writer can be removing things!!
+
+// FIXME: we need to somehow prevent OUT-OF-ORDER cleanups!!
+// either prevent having multiple read versions,
+// or somehow ensure they're cleaned in order...
+// older one holds reference to newer one???
 
 impl<T> Clone for RcuCslab<T> {
     fn clone(&self) -> Self {
@@ -226,17 +245,5 @@ impl<T> Drop for RcuCslab<T> {
 
         // drop items outside the mutex to prevent deadlocks
         std::mem::drop(pending_drops);
-    }
-}
-
-impl<T> From<Cslab<T>> for RcuCslab<T> {
-    fn from(cslab: Cslab<T>) -> Self {
-        let reader = cslab.reader();
-        Self {
-            capacity: cslab.capacity(),
-            writer: Arc::new(Mutex::new(cslab)),
-            reader,
-            pending_removes: Mutex::new(Vec::new()),
-        }
     }
 }
