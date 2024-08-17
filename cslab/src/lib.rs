@@ -1,9 +1,17 @@
 use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
-use std::sync::{atomic::{AtomicU8, Ordering}, Arc, Mutex};
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex};
+
+// OH NO, FIXME!!
+// we need a dropper...
+// dropper needs to be in terms of CslabShared...
+// table and bitmap need to be linked... = single Arc...
+// how to allocate both under single Arc???
+
+// TODO: it would be nice to have a policy to control FIFO vs. LIFO reuse
 
 type CslabTable<T> = [UnsafeCell<Entry<T>>];
-type CslabBitmap = [AtomicU8];
+type CslabBitmap = [AtomicUsize];
 
 union Entry<T> {
     next_free: isize,  // offset to next empty; neighbor is 0 so zero-alloced array is initialized
@@ -17,8 +25,12 @@ struct CslabShared<T> {
 
 impl<T> CslabShared<T> {
     pub fn get(&self, idx: usize) -> Option<&T> {
+        if idx >= self.table.len() {
+            return None;
+        }
+
         // check flag
-        if (self.bitmap[idx >> 3].load(Ordering::Acquire) >> (idx & 7)) & 1 != 0 {
+        if (self.bitmap[idx / usize::BITS as usize].load(Ordering::Acquire) >> (idx % usize::BITS as usize)) & 1 != 0 {
             // load item
             // SAFETY: the bitmap has told us there is an item
             Some(unsafe { &(*self.table[idx].get()).item })
@@ -52,9 +64,10 @@ impl<T> Clone for CslabReader<T> {
 }
 
 pub struct Cslab<T> {
-    capacity: usize,
     first_free: usize, // >= capacity indicates empty freelist
     last_free: usize, // valid only if freelist is not empty
+    in_use: usize,
+    allocated: usize,
     shared: CslabShared<T>,
 }
 
@@ -63,13 +76,14 @@ impl<T> Cslab<T> {
         let mut table = Vec::with_capacity(capacity);
         table.resize_with(capacity, || UnsafeCell::new(Entry { next_free: 0 }));
 
-        let mut bitmap = Vec::with_capacity(capacity);
-        bitmap.resize_with(capacity, || AtomicU8::new(0));
+        let mut bitmap = Vec::with_capacity((capacity + usize::BITS as usize - 1) / usize::BITS as usize);
+        bitmap.resize_with(capacity, || AtomicUsize::new(0));
 
         Self {
-            capacity,
             first_free: 0,
             last_free: capacity - 1,
+            in_use: 0,
+            allocated: 0,
             shared: CslabShared {
                 table: table.into_boxed_slice().into(),
                 bitmap: bitmap.into_boxed_slice().into(),
@@ -78,7 +92,15 @@ impl<T> Cslab<T> {
     }
 
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.shared.table.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.in_use
+    }
+
+    pub fn allocated(&self) -> usize {
+        self.allocated
     }
 
     pub fn get(&self, idx: usize) -> Option<&T> {
@@ -92,7 +114,7 @@ impl<T> Cslab<T> {
     pub fn insert(&mut self, item: T) -> Result<usize, ()> {
         let idx = self.first_free;
 
-        if idx >= self.capacity {
+        if idx >= self.shared.table.len() {
             return Err(());
         }
 
@@ -105,28 +127,33 @@ impl<T> Cslab<T> {
         unsafe { (*self.shared.table[idx].get()).item = ManuallyDrop::new(item) };
 
         // mark in bitmap
-        let mask = self.shared.bitmap[idx >> 3].load(Ordering::Relaxed);
-        debug_assert!((mask >> (idx & 7)) & 1 == 0);
-        self.shared.bitmap[idx >> 3].store(mask | (1 << (idx & 7)), Ordering::Release);
+        let mask = self.shared.bitmap[idx / usize::BITS as usize].load(Ordering::Relaxed);
+        debug_assert!((mask >> (idx % usize::BITS as usize)) & 1 == 0);
+        self.shared.bitmap[idx / usize::BITS as usize].store(mask | (1 << (idx % usize::BITS as usize)), Ordering::Release);
 
         // W:store item -> W:store(Rel) flag -> R:load(Acq) flag -> R:load item
+
+        self.in_use += 1;
+        self.allocated += 1;
 
         Ok(idx)
     }
 
     pub fn mark_removed(&mut self, idx: usize) {
-        let mask = self.shared.bitmap[idx >> 3].load(Ordering::Relaxed);
+        let mask = self.shared.bitmap[idx / usize::BITS as usize].load(Ordering::Relaxed);
 
         // confirm we're deleting something that's present
         // (this is really a requirement of `finalize_remove()`
-        assert!((mask >> (idx & 7)) & 1 == 1);
+        assert!((mask >> (idx % usize::BITS as usize)) & 1 == 1);
 
         // mark the item as free (but don't actually free it)
-        self.shared.bitmap[idx >> 3].store(mask & !(1 << (idx & 7)), Ordering::Relaxed);
+        self.shared.bitmap[idx / usize::BITS as usize].store(mask & !(1 << (idx % usize::BITS as usize)), Ordering::Relaxed);
 
         // W:store(Rlx) flag -> W:update(Rel) -> R:update(Acq) -> R:load(Rlx) flag
         // R:update(Acq) -> R:sync(Rel)
         // R:load item -> R:sync(Rel) -> W:sync(Acq) -> W:delete item
+
+        self.in_use -= 1;
     }
 
     /// Actually free an index which has been marked free with `mark_removed()`.
@@ -142,8 +169,8 @@ impl<T> Cslab<T> {
     /// this notification.
     pub unsafe fn finalize_remove(&mut self, idx: usize) -> T {
         // confirm item is not visible
-        let mask = self.shared.bitmap[idx >> 3].load(Ordering::Relaxed);
-        assert!((mask >> (idx & 7)) & 1 == 0);
+        let mask = self.shared.bitmap[idx / usize::BITS as usize].load(Ordering::Relaxed);
+        assert!((mask >> (idx % usize::BITS as usize)) & 1 == 0);
 
         // drop item
         // SAFETY: we know only we can access this item from our safety requirement
@@ -153,9 +180,10 @@ impl<T> Cslab<T> {
 
         // add entry to end of freelist
         // SAFETY: we have removed the item
-        entry.next_free = (self.capacity - idx) as isize - 1;
+        let capacity = self.shared.table.len();
+        entry.next_free = (capacity - idx) as isize - 1;
 
-        if self.first_free < self.capacity {
+        if self.first_free < capacity {
             // freelist was non-empty, update final entry
             // SAFETY: any index in the freelist has no item
             unsafe { (*self.shared.table[self.last_free].get()).next_free =
@@ -167,7 +195,112 @@ impl<T> Cslab<T> {
 
         self.last_free = idx;
 
+        self.allocated -= 1;
+
         item
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic_test() {
+        let mut slab = Cslab::with_fixed_capacity(4);
+        assert_eq!(slab.capacity(), 4);
+        let i = slab.insert(123).unwrap();
+        let j = slab.insert(456).unwrap();
+        assert_eq!(slab.capacity(), 4);
+        assert_eq!(slab.len(), 2);
+        assert_eq!(slab.allocated(), 2);
+        assert_eq!(*slab.get(i).unwrap(), 123);
+        assert_eq!(*slab.get(j).unwrap(), 456);
+        assert_eq!(slab.get(j + 1), None);
+        assert_eq!(slab.get(slab.capacity()), None);
+        assert_eq!(slab.get(usize::MAX), None);
+    }
+
+    #[test]
+    fn at_capacity_test() {
+        let mut slab = Cslab::with_fixed_capacity(4);
+        assert_eq!(slab.capacity(), 4);
+        slab.insert(123).unwrap();
+        slab.insert(456).unwrap();
+        slab.insert(234).unwrap();
+        slab.insert(567).unwrap();
+        slab.insert(345).unwrap_err();
+        assert_eq!(slab.len(), 4);
+        assert_eq!(slab.allocated(), 4);
+    }
+
+    #[test]
+    fn removal_test() {
+        let mut slab = Cslab::with_fixed_capacity(4);
+        let i = slab.insert(123).unwrap();
+        let j = slab.insert(456).unwrap();
+        slab.mark_removed(i);
+        assert_eq!(slab.get(i), None);
+        assert_eq!(*slab.get(j).unwrap(), 456);
+        assert_ne!(slab.insert(234).unwrap(), i);
+        assert_ne!(slab.insert(567).unwrap(), i);
+        slab.insert(345).unwrap_err();
+        assert_eq!(unsafe { slab.finalize_remove(i) }, 123);
+        let ii = slab.insert(345).unwrap();
+        assert_eq!(ii, i);
+        assert_eq!(*slab.get(ii).unwrap(), 345);
+    }
+
+    #[test]
+    fn reader_test() {
+        let mut slab = Cslab::with_fixed_capacity(4);
+        assert_eq!(slab.capacity(), 4);
+        let i = slab.insert(123).unwrap();
+        let reader = slab.reader();
+        let j = slab.insert(456).unwrap();
+        let clone = reader.clone();
+        assert_eq!(*reader.get(i).unwrap(), 123);
+        assert_eq!(*reader.get(j).unwrap(), 456);
+        assert_eq!(*clone.get(i).unwrap(), 123);
+        assert_eq!(*clone.get(j).unwrap(), 456);
+    }
+
+    struct OnDrop<'a>(&'a dyn Fn());
+    impl Drop for OnDrop<'_> {
+        fn drop(&mut self) {
+            self.0();
+        }
+    }
+
+    #[test]
+    fn removal_drop_test() {
+        let mut slab = Cslab::with_fixed_capacity(4);
+        let dropped = std::cell::Cell::new(false);
+        let dropper = || assert!(!dropped.replace(true));
+        let i = slab.insert(OnDrop(&dropper)).unwrap();
+        slab.mark_removed(i);
+        assert!(!dropped.get());
+        let item = unsafe { slab.finalize_remove(i) };
+        assert!(!dropped.get());
+        std::mem::drop(item);
+        assert!(dropped.get());
+        std::mem::drop(slab);
+    }
+
+    #[test]
+    fn container_drop_test() {
+        let mut slab = Cslab::with_fixed_capacity(4);
+        let i_dropped = std::cell::Cell::new(false);
+        let j_dropped = std::cell::Cell::new(false);
+        let i_dropper = || assert!(!i_dropped.replace(true));
+        let j_dropper = || assert!(!j_dropped.replace(true));
+        let i = slab.insert(OnDrop(&i_dropper)).unwrap();
+        slab.insert(OnDrop(&j_dropper)).unwrap();
+        slab.mark_removed(i);
+        assert!(!i_dropped.get());
+        std::mem::drop(slab);
+        assert!(i_dropped.get());
+        assert!(j_dropped.get());
     }
 }
 
@@ -265,6 +398,14 @@ impl<T> RcuCslab<T> {
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    pub fn len(&self) -> usize {
+        self.writer.lock().unwrap().len()
+    }
+
+    pub fn allocated(&self) -> usize {
+        self.writer.lock().unwrap().allocated()
     }
 
     pub fn get(&self, idx: usize) -> Option<&T> {
