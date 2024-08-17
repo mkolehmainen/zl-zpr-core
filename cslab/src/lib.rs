@@ -1,3 +1,4 @@
+use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
 use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex};
@@ -8,7 +9,7 @@ use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex};
 // table and bitmap need to be linked... = single Arc...
 // how to allocate both under single Arc???
 
-// TODO: it would be nice to have a policy to control FIFO vs. LIFO reuse
+// TODO FIXME: we should do LIFO to avoid excessive memory usage!!
 
 type CslabTable<T> = [UnsafeCell<Entry<T>>];
 type CslabBitmap = [AtomicUsize];
@@ -18,42 +19,82 @@ union Entry<T> {
     item: ManuallyDrop<T>,
 }
 
-struct CslabShared<T> {
-    table: Arc<CslabTable<T>>,
-    bitmap: Arc<CslabBitmap>,
+struct CslabStorage<T> {
+    size: usize,
+    ptr: *mut u8,
+    bitmap_offset: usize,
+    phantom: std::marker::PhantomData<T>,
 }
 
-impl<T> CslabShared<T> {
-    pub fn get(&self, idx: usize) -> Option<&T> {
-        if idx >= self.table.len() {
-            return None;
-        }
+impl<T: Sized> CslabStorage<T> {
+    fn table_layout(n: usize) -> Layout {
+        Layout::array::<<usize as std::slice::SliceIndex::<CslabTable<T>>>::Output>(n).unwrap()
+    }
 
-        // check flag
-        if (self.bitmap[idx / usize::BITS as usize].load(Ordering::Acquire) >> (idx % usize::BITS as usize)) & 1 != 0 {
-            // load item
-            // SAFETY: the bitmap has told us there is an item
-            Some(unsafe { &(*self.table[idx].get()).item })
-        } else {
-            None
-        }
+    fn bitmap_layout(n: usize) -> Layout {
+        Layout::array::<<usize as std::slice::SliceIndex::<CslabBitmap>>::Output>((n + usize::BITS as usize - 1) / usize::BITS as usize).unwrap()
+    }
+
+    fn storage_layout(n: usize) -> (Layout, usize) {
+        Self::table_layout(n).extend(Self::bitmap_layout(n)).unwrap()
+    }
+
+    pub fn with_fixed_capacity(size: usize) -> Self {
+        assert!(size > 0);
+
+        let (layout, bitmap_offset) = Self::storage_layout(size);
+
+        // SAFETY: layout is not 0-sized
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+
+        Self { size, ptr, bitmap_offset, phantom: std::marker::PhantomData }
+    }
+
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    pub fn table(&self) -> &CslabTable<T> {
+        // SAFETY: we've correctly allocated memory
+        unsafe { std::slice::from_raw_parts(self.ptr.cast(), self.size) }
+    }
+
+    pub fn table_mut(&mut self) -> &mut CslabTable<T> {
+        // SAFETY: we've correctly allocated memory
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.cast(), self.size) }
+    }
+
+    pub fn bitmap(&self) -> &CslabBitmap {
+        // SAFETY: we've correctly allocated memory
+        unsafe { std::slice::from_raw_parts(self.ptr.add(self.bitmap_offset).cast(), self.size) }
+    }
+
+    pub fn bitmap_mut(&mut self) -> &mut CslabBitmap {
+        // SAFETY: we've correctly allocated memory
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(self.bitmap_offset).cast(), self.size) }
     }
 }
 
-impl<T> Clone for CslabShared<T> {
-    fn clone(&self) -> Self {
-        Self {
-            table: self.table.clone(),
-            bitmap: self.bitmap.clone(),
-        }
+fn get_impl<T>(storage: &CslabStorage<T>, idx: usize) -> Option<&T> {
+    if idx >= storage.len() {
+        return None;
+    }
+
+    // check flag
+    if (storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Acquire) >> (idx % usize::BITS as usize)) & 1 != 0 {
+        // load item
+        // SAFETY: the bitmap has told us there is an item
+        Some(unsafe { &(*storage.table()[idx].get()).item })
+    } else {
+        None
     }
 }
 
-pub struct CslabReader<T>(CslabShared<T>);
+pub struct CslabReader<T>(Arc<CslabStorage<T>>);
 
 impl<T> CslabReader<T> {
     pub fn get(&self, idx: usize) -> Option<&T> {
-        self.0.get(idx)
+        get_impl(&*self.0, idx)
     }
 }
 
@@ -68,31 +109,22 @@ pub struct Cslab<T> {
     last_free: usize, // valid only if freelist is not empty
     in_use: usize,
     allocated: usize,
-    shared: CslabShared<T>,
+    storage: Arc<CslabStorage<T>>,
 }
 
 impl<T> Cslab<T> {
     pub fn with_fixed_capacity(capacity: usize) -> Self {
-        let mut table = Vec::with_capacity(capacity);
-        table.resize_with(capacity, || UnsafeCell::new(Entry { next_free: 0 }));
-
-        let mut bitmap = Vec::with_capacity((capacity + usize::BITS as usize - 1) / usize::BITS as usize);
-        bitmap.resize_with(capacity, || AtomicUsize::new(0));
-
         Self {
             first_free: 0,
             last_free: capacity - 1,
             in_use: 0,
             allocated: 0,
-            shared: CslabShared {
-                table: table.into_boxed_slice().into(),
-                bitmap: bitmap.into_boxed_slice().into(),
-            }
+            storage: Arc::new(CslabStorage::with_fixed_capacity(capacity))
         }
     }
 
     pub fn capacity(&self) -> usize {
-        self.shared.table.len()
+        self.storage.len()
     }
 
     pub fn len(&self) -> usize {
@@ -104,32 +136,32 @@ impl<T> Cslab<T> {
     }
 
     pub fn get(&self, idx: usize) -> Option<&T> {
-        self.shared.get(idx)
+        get_impl(&*self.storage, idx)
     }
 
     pub fn reader(&self) -> CslabReader<T> {
-        CslabReader(self.shared.clone())
+        CslabReader(self.storage.clone())
     }
 
     pub fn insert(&mut self, item: T) -> Result<usize, ()> {
         let idx = self.first_free;
 
-        if idx >= self.shared.table.len() {
+        if idx >= self.storage.table().len() {
             return Err(());
         }
 
         // update freelist
         // SAFETY: any index in the freelist has no item
-        self.first_free = (idx as isize + 1 + unsafe { (*self.shared.table[idx].get()).next_free }) as usize;
+        self.first_free = (idx as isize + 1 + unsafe { (*self.storage.table()[idx].get()).next_free }) as usize;
 
         // store item
         // SAFETY: any index in the freelist has no item
-        unsafe { (*self.shared.table[idx].get()).item = ManuallyDrop::new(item) };
+        unsafe { (*self.storage.table()[idx].get()).item = ManuallyDrop::new(item) };
 
         // mark in bitmap
-        let mask = self.shared.bitmap[idx / usize::BITS as usize].load(Ordering::Relaxed);
+        let mask = self.storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Relaxed);
         debug_assert!((mask >> (idx % usize::BITS as usize)) & 1 == 0);
-        self.shared.bitmap[idx / usize::BITS as usize].store(mask | (1 << (idx % usize::BITS as usize)), Ordering::Release);
+        self.storage.bitmap()[idx / usize::BITS as usize].store(mask | (1 << (idx % usize::BITS as usize)), Ordering::Release);
 
         // W:store item -> W:store(Rel) flag -> R:load(Acq) flag -> R:load item
 
@@ -140,14 +172,14 @@ impl<T> Cslab<T> {
     }
 
     pub fn mark_removed(&mut self, idx: usize) {
-        let mask = self.shared.bitmap[idx / usize::BITS as usize].load(Ordering::Relaxed);
+        let mask = self.storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Relaxed);
 
         // confirm we're deleting something that's present
         // (this is really a requirement of `finalize_remove()`
         assert!((mask >> (idx % usize::BITS as usize)) & 1 == 1);
 
         // mark the item as free (but don't actually free it)
-        self.shared.bitmap[idx / usize::BITS as usize].store(mask & !(1 << (idx % usize::BITS as usize)), Ordering::Relaxed);
+        self.storage.bitmap()[idx / usize::BITS as usize].store(mask & !(1 << (idx % usize::BITS as usize)), Ordering::Relaxed);
 
         // W:store(Rlx) flag -> W:update(Rel) -> R:update(Acq) -> R:load(Rlx) flag
         // R:update(Acq) -> R:sync(Rel)
@@ -169,24 +201,24 @@ impl<T> Cslab<T> {
     /// this notification.
     pub unsafe fn finalize_remove(&mut self, idx: usize) -> T {
         // confirm item is not visible
-        let mask = self.shared.bitmap[idx / usize::BITS as usize].load(Ordering::Relaxed);
+        let mask = self.storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Relaxed);
         assert!((mask >> (idx % usize::BITS as usize)) & 1 == 0);
 
         // drop item
         // SAFETY: we know only we can access this item from our safety requirement
-        let entry = &mut *self.shared.table[idx].get();
+        let entry = &mut *self.storage.table()[idx].get();
         // SAFETY: we know there is an item from our safety requirement
         let item = unsafe { ManuallyDrop::take(&mut entry.item) };
 
         // add entry to end of freelist
         // SAFETY: we have removed the item
-        let capacity = self.shared.table.len();
+        let capacity = self.storage.table().len();
         entry.next_free = (capacity - idx) as isize - 1;
 
         if self.first_free < capacity {
             // freelist was non-empty, update final entry
             // SAFETY: any index in the freelist has no item
-            unsafe { (*self.shared.table[self.last_free].get()).next_free =
+            unsafe { (*self.storage.table()[self.last_free].get()).next_free =
                 idx as isize - self.last_free as isize; }
         } else {
             // freelist was empty, update head pointer
