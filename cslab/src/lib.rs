@@ -55,19 +55,20 @@ impl<T> CslabStorage<T> {
 
     pub fn bitmap(&self) -> &CslabBitmap {
         // SAFETY: we've correctly allocated memory
-        unsafe { std::slice::from_raw_parts(self.ptr.add(self.bitmap_offset).cast(), self.size) }
+        unsafe { std::slice::from_raw_parts(self.ptr.add(self.bitmap_offset).cast(), (self.size + usize::BITS as usize - 1) / usize::BITS as usize) }
     }
 
     pub fn parts_mut(&mut self) -> (&mut CslabTable<T>, &mut CslabBitmap) {
         // SAFETY: we've correctly allocated memory
         (unsafe { std::slice::from_raw_parts_mut(self.ptr.cast(), self.size) },
-            unsafe { std::slice::from_raw_parts_mut(self.ptr.add(self.bitmap_offset).cast(), self.size) })
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.add(self.bitmap_offset).cast(), (self.size + usize::BITS as usize - 1) / usize::BITS as usize) })
     }
 }
 
 impl<T> Drop for CslabStorage<T> {
     fn drop(&mut self) {
         // FIXME: this is inefficient for very large tables
+        // NOTE: we can (a) use bitscanning, and (b) keep a count of how many values remaining
 
         let size = self.size;
         let (table, bitmap) = self.parts_mut();
@@ -85,6 +86,10 @@ impl<T> Drop for CslabStorage<T> {
                 }
             }
         }
+
+        let (layout, _) = Self::storage_layout(self.size);
+        // SAFETY: we are dropping; no-one else has a pointer to this
+        unsafe { std::alloc::dealloc(self.ptr, layout); }
     }
 }
 
