@@ -1,7 +1,10 @@
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
-use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 // TODO FIXME: we should do LIFO to avoid excessive memory usage!!
 
@@ -9,7 +12,7 @@ type CslabTable<T> = [UnsafeCell<Entry<T>>];
 type CslabBitmap = [AtomicUsize];
 
 union Entry<T> {
-    next_free: isize,  // offset to next empty; neighbor is 0 so zero-alloced array is initialized
+    next_free: isize, // offset to next empty; neighbor is 0 so zero-alloced array is initialized
     item: ManuallyDrop<T>,
 }
 
@@ -22,15 +25,20 @@ struct CslabStorage<T> {
 
 impl<T> CslabStorage<T> {
     fn table_layout(n: usize) -> Layout {
-        Layout::array::<<usize as std::slice::SliceIndex::<CslabTable<T>>>::Output>(n).unwrap()
+        Layout::array::<<usize as std::slice::SliceIndex<CslabTable<T>>>::Output>(n).unwrap()
     }
 
     fn bitmap_layout(n: usize) -> Layout {
-        Layout::array::<<usize as std::slice::SliceIndex::<CslabBitmap>>::Output>((n + usize::BITS as usize - 1) / usize::BITS as usize).unwrap()
+        Layout::array::<<usize as std::slice::SliceIndex<CslabBitmap>>::Output>(
+            (n + usize::BITS as usize - 1) / usize::BITS as usize,
+        )
+        .unwrap()
     }
 
     fn storage_layout(n: usize) -> (Layout, usize) {
-        Self::table_layout(n).extend(Self::bitmap_layout(n)).unwrap()
+        Self::table_layout(n)
+            .extend(Self::bitmap_layout(n))
+            .unwrap()
     }
 
     pub fn with_fixed_capacity(size: usize) -> Self {
@@ -41,7 +49,12 @@ impl<T> CslabStorage<T> {
         // SAFETY: layout is not 0-sized
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
 
-        Self { size, ptr, bitmap_offset, phantom: std::marker::PhantomData }
+        Self {
+            size,
+            ptr,
+            bitmap_offset,
+            phantom: std::marker::PhantomData,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -55,13 +68,25 @@ impl<T> CslabStorage<T> {
 
     pub fn bitmap(&self) -> &CslabBitmap {
         // SAFETY: we've correctly allocated memory
-        unsafe { std::slice::from_raw_parts(self.ptr.add(self.bitmap_offset).cast(), (self.size + usize::BITS as usize - 1) / usize::BITS as usize) }
+        unsafe {
+            std::slice::from_raw_parts(
+                self.ptr.add(self.bitmap_offset).cast(),
+                (self.size + usize::BITS as usize - 1) / usize::BITS as usize,
+            )
+        }
     }
 
     pub fn parts_mut(&mut self) -> (&mut CslabTable<T>, &mut CslabBitmap) {
         // SAFETY: we've correctly allocated memory
-        (unsafe { std::slice::from_raw_parts_mut(self.ptr.cast(), self.size) },
-            unsafe { std::slice::from_raw_parts_mut(self.ptr.add(self.bitmap_offset).cast(), (self.size + usize::BITS as usize - 1) / usize::BITS as usize) })
+        (
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.cast(), self.size) },
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.ptr.add(self.bitmap_offset).cast(),
+                    (self.size + usize::BITS as usize - 1) / usize::BITS as usize,
+                )
+            },
+        )
     }
 }
 
@@ -77,7 +102,9 @@ impl<T> Drop for CslabStorage<T> {
             let x = bme.load(Ordering::Relaxed);
             for j in 0..usize::BITS as usize {
                 let idx = (i * usize::BITS as usize) + j;
-                if idx >= size { break; }
+                if idx >= size {
+                    break;
+                }
                 if (x >> j) & 1 != 0 {
                     // SAFETY: we know an element is present from the bit being set
                     // and our requirement that `finalize_remove()` be called
@@ -89,7 +116,9 @@ impl<T> Drop for CslabStorage<T> {
 
         let (layout, _) = Self::storage_layout(self.size);
         // SAFETY: we are dropping; no-one else has a pointer to this
-        unsafe { std::alloc::dealloc(self.ptr, layout); }
+        unsafe {
+            std::alloc::dealloc(self.ptr, layout);
+        }
     }
 }
 
@@ -99,7 +128,11 @@ fn get_impl<T>(storage: &CslabStorage<T>, idx: usize) -> Option<&T> {
     }
 
     // check flag
-    if (storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Acquire) >> (idx % usize::BITS as usize)) & 1 != 0 {
+    if (storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Acquire)
+        >> (idx % usize::BITS as usize))
+        & 1
+        != 0
+    {
         // load item
         // SAFETY: the bitmap has told us there is an item
         Some(unsafe { &(*storage.table()[idx].get()).item })
@@ -124,7 +157,7 @@ impl<T> Clone for CslabReader<T> {
 
 pub struct Cslab<T> {
     first_free: usize, // >= capacity indicates empty freelist
-    last_free: usize, // valid only if freelist is not empty
+    last_free: usize,  // valid only if freelist is not empty
     in_use: usize,
     allocated: usize,
     storage: Arc<CslabStorage<T>>,
@@ -137,7 +170,7 @@ impl<T> Cslab<T> {
             last_free: capacity - 1,
             in_use: 0,
             allocated: 0,
-            storage: Arc::new(CslabStorage::with_fixed_capacity(capacity))
+            storage: Arc::new(CslabStorage::with_fixed_capacity(capacity)),
         }
     }
 
@@ -170,7 +203,8 @@ impl<T> Cslab<T> {
 
         // update freelist
         // SAFETY: any index in the freelist has no item
-        self.first_free = (idx as isize + 1 + unsafe { (*self.storage.table()[idx].get()).next_free }) as usize;
+        self.first_free =
+            (idx as isize + 1 + unsafe { (*self.storage.table()[idx].get()).next_free }) as usize;
 
         // store item
         // SAFETY: any index in the freelist has no item
@@ -179,7 +213,10 @@ impl<T> Cslab<T> {
         // mark in bitmap
         let mask = self.storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Relaxed);
         debug_assert!((mask >> (idx % usize::BITS as usize)) & 1 == 0);
-        self.storage.bitmap()[idx / usize::BITS as usize].store(mask | (1 << (idx % usize::BITS as usize)), Ordering::Release);
+        self.storage.bitmap()[idx / usize::BITS as usize].store(
+            mask | (1 << (idx % usize::BITS as usize)),
+            Ordering::Release,
+        );
 
         // W:store item -> W:store(Rel) flag -> R:load(Acq) flag -> R:load item
 
@@ -200,7 +237,10 @@ impl<T> Cslab<T> {
         assert!((mask >> (idx % usize::BITS as usize)) & 1 == 1);
 
         // mark the item as free (but don't actually free it)
-        self.storage.bitmap()[idx / usize::BITS as usize].store(mask & !(1 << (idx % usize::BITS as usize)), Ordering::Relaxed);
+        self.storage.bitmap()[idx / usize::BITS as usize].store(
+            mask & !(1 << (idx % usize::BITS as usize)),
+            Ordering::Relaxed,
+        );
 
         // W:store(Rlx) flag -> W:update(Rel) -> R:update(Acq) -> R:load(Rlx) flag
         // R:update(Acq) -> R:sync(Rel)
@@ -216,7 +256,7 @@ impl<T> Cslab<T> {
     /// `mark_removed()` must first have been called.  (It is an undetectable
     /// error to call this on an already-freed item.)
     ///
-    /// It must be known that there will be no further reads of this index. 
+    /// It must be known that there will be no further reads of this index.
     /// This can be guaranteed after calling `mark_removed()` by notifying all
     /// readers of this update, then waiting for all readers to acknowledge
     /// this notification.
@@ -239,8 +279,10 @@ impl<T> Cslab<T> {
         if self.first_free < capacity {
             // freelist was non-empty, update final entry
             // SAFETY: any index in the freelist has no item
-            unsafe { (*self.storage.table()[self.last_free].get()).next_free =
-                idx as isize - self.last_free as isize; }
+            unsafe {
+                (*self.storage.table()[self.last_free].get()).next_free =
+                    idx as isize - self.last_free as isize;
+            }
         } else {
             // freelist was empty, update head pointer
             self.first_free = idx;
@@ -292,7 +334,9 @@ mod tests {
         let mut slab = Cslab::with_fixed_capacity(4);
         let i = slab.insert(123).unwrap();
         let j = slab.insert(456).unwrap();
-        unsafe { slab.mark_removed(i); }
+        unsafe {
+            slab.mark_removed(i);
+        }
         assert_eq!(slab.get(i), None);
         assert_eq!(*slab.get(j).unwrap(), 456);
         assert_ne!(slab.insert(234).unwrap(), i);
@@ -331,7 +375,9 @@ mod tests {
         let dropped = std::cell::Cell::new(false);
         let dropper = || assert!(!dropped.replace(true));
         let i = slab.insert(OnDrop(&dropper)).unwrap();
-        unsafe { slab.mark_removed(i); }
+        unsafe {
+            slab.mark_removed(i);
+        }
         assert!(!dropped.get());
         let item = unsafe { slab.finalize_remove(i) };
         assert!(!dropped.get());
@@ -349,7 +395,10 @@ mod tests {
         let j_dropper = || assert!(!j_dropped.replace(true));
         let i = slab.insert(OnDrop(&i_dropper)).unwrap();
         slab.insert(OnDrop(&j_dropper)).unwrap();
-        unsafe { slab.mark_removed(i); slab.finalize_remove(i); }
+        unsafe {
+            slab.mark_removed(i);
+            slab.finalize_remove(i);
+        }
         assert!(i_dropped.get());
         std::mem::drop(slab);
         assert!(j_dropped.get());
@@ -384,8 +433,13 @@ impl<T> Drop for RcuCslabGen<T> {
             let mut writer = self.writer.lock().unwrap();
             // SAFETY: all items in pending_removes have been marked
             // SAFETY: being RCU-dropped means we have synchronized with the writer
-            self.inner.get_mut().unwrap().pending_removes.iter().map(|&idx|
-                unsafe { writer.finalize_remove(idx) }).collect()
+            self.inner
+                .get_mut()
+                .unwrap()
+                .pending_removes
+                .iter()
+                .map(|&idx| unsafe { writer.finalize_remove(idx) })
+                .collect()
         };
 
         // drop items outside the mutex to prevent deadlocks
@@ -416,7 +470,7 @@ impl<T> Clone for RcuCslabReader<T> {
     }
 }
 
-pub struct RcuCslab<T> {	
+pub struct RcuCslab<T> {
     // unsynchronized access to capacity
     capacity: usize,
 
@@ -437,7 +491,10 @@ impl<T> RcuCslab<T> {
         let writer = Arc::new(Mutex::new(cslab));
         let cur_gen = Arc::new(RcuCslabGen {
             writer: writer.clone(),
-            inner: Mutex::new(RcuCslabGenInner { pending_removes: Vec::new(), next_gen: None })
+            inner: Mutex::new(RcuCslabGenInner {
+                pending_removes: Vec::new(),
+                next_gen: None,
+            }),
         });
 
         Self {
@@ -483,14 +540,19 @@ impl<T> RcuCslab<T> {
         // `pending_removes` until `collect()` (which is mut) releases the references
         // to `cur_gen`
         // SAFETY: we eventually call `finalize_remove()` on drop
-        unsafe { self.writer.lock().unwrap().mark_removed(idx); }
+        unsafe {
+            self.writer.lock().unwrap().mark_removed(idx);
+        }
         self.cur_gen.inner.lock().unwrap().pending_removes.push(idx);
     }
 
     pub fn collect(&mut self) {
         let next_gen = Arc::new(RcuCslabGen {
             writer: self.writer.clone(),
-            inner: Mutex::new(RcuCslabGenInner { pending_removes: Vec::new(), next_gen: None })
+            inner: Mutex::new(RcuCslabGenInner {
+                pending_removes: Vec::new(),
+                next_gen: None,
+            }),
         });
 
         {
