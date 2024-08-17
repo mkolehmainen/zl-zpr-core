@@ -1,7 +1,17 @@
-use std::alloc::Layout;
+#[cfg(not(loom))]
+use std::alloc::{self, Layout};
+#[cfg(loom)]
+use loom::alloc::{self, Layout};
+//#[cfg(not(loom))]
 use std::cell::UnsafeCell;
+//#[cfg(loom)]
+//use loom::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
-use std::sync::{
+#[cfg(not(loom))]
+use std::sync;
+#[cfg(loom)]
+use loom::sync;
+use sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
@@ -47,7 +57,16 @@ impl<T> CslabStorage<T> {
         let (layout, bitmap_offset) = Self::storage_layout(size);
 
         // SAFETY: layout is not 0-sized
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = unsafe { alloc::alloc_zeroed(layout) };
+
+        #[cfg(loom)]
+        {
+            let bitmap: &mut [std::mem::MaybeUninit<AtomicUsize>] =
+                unsafe { std::slice::from_raw_parts_mut(ptr.add(bitmap_offset).cast(), (size + usize::BITS as usize - 1) / usize::BITS as usize) };
+            for bme in bitmap {
+                bme.write(AtomicUsize::new(0));
+            }
+        }
 
         Self {
             size,
@@ -117,7 +136,7 @@ impl<T> Drop for CslabStorage<T> {
         let (layout, _) = Self::storage_layout(self.size);
         // SAFETY: we are dropping; no-one else has a pointer to this
         unsafe {
-            std::alloc::dealloc(self.ptr, layout);
+            alloc::dealloc(self.ptr, layout);
         }
     }
 }
@@ -296,7 +315,7 @@ impl<T> Cslab<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
@@ -404,6 +423,63 @@ mod tests {
         assert!(j_dropped.get());
     }
 }
+
+#[cfg(all(test, loom))]
+mod tests {
+    // NOTE: `loom` (and the similar `shuttle` is VERY limited for testing
+    // atomic interactions.  Notably, they assume that atomic operations
+    // occur _in the order they are issued_, which means they don't test
+    // _any_ reorderings in a single-writer/single-reader interaction.
+
+    use super::*;
+    use loom::{thread, model};
+
+    #[test]
+    fn concurrent_insert_get_test() {
+        model(|| {
+            let mut slab = Cslab::with_fixed_capacity(4);
+
+            let reader = slab.reader();
+            thread::spawn(move || {
+                match reader.get(0) {
+                    Some(&x) => assert_eq!(x, 123),
+                    None => (),
+                }
+            });
+
+            slab.insert(123).unwrap();
+        });
+    }
+
+    #[test]
+    fn concurrent_remove_get_test() {
+        model(|| {
+            let mut slab = Cslab::with_fixed_capacity(4);
+
+            let idx = slab.insert(123).unwrap();
+
+            let reader = slab.reader();
+            let t1 = thread::spawn(move || {
+                match reader.get(idx) {
+                    Some(&x) => assert_eq!(x, 123),
+                    None => (),
+                }
+            });
+
+            unsafe { slab.mark_removed(idx); }
+
+            t1.join().unwrap();
+
+            let reader = slab.reader();
+            thread::spawn(move || {
+                assert_eq!(reader.get(idx), None);
+            });
+
+            unsafe { slab.finalize_remove(idx); }
+        });
+    }
+}
+
 
 // NOTE: it is unsafe to allow arbitrary `CslabReader`s to be cloned
 // from an `RcuCslab`!  Our internal safety guarantees rely on
