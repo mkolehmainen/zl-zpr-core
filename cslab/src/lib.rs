@@ -3,12 +3,6 @@ use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
 use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex};
 
-// OH NO, FIXME!!
-// we need a dropper...
-// dropper needs to be in terms of CslabShared...
-// table and bitmap need to be linked... = single Arc...
-// how to allocate both under single Arc???
-
 // TODO FIXME: we should do LIFO to avoid excessive memory usage!!
 
 type CslabTable<T> = [UnsafeCell<Entry<T>>];
@@ -26,7 +20,7 @@ struct CslabStorage<T> {
     phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: Sized> CslabStorage<T> {
+impl<T> CslabStorage<T> {
     fn table_layout(n: usize) -> Layout {
         Layout::array::<<usize as std::slice::SliceIndex::<CslabTable<T>>>::Output>(n).unwrap()
     }
@@ -59,19 +53,38 @@ impl<T: Sized> CslabStorage<T> {
         unsafe { std::slice::from_raw_parts(self.ptr.cast(), self.size) }
     }
 
-    pub fn table_mut(&mut self) -> &mut CslabTable<T> {
-        // SAFETY: we've correctly allocated memory
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.cast(), self.size) }
-    }
-
     pub fn bitmap(&self) -> &CslabBitmap {
         // SAFETY: we've correctly allocated memory
         unsafe { std::slice::from_raw_parts(self.ptr.add(self.bitmap_offset).cast(), self.size) }
     }
 
-    pub fn bitmap_mut(&mut self) -> &mut CslabBitmap {
+    pub fn parts_mut(&mut self) -> (&mut CslabTable<T>, &mut CslabBitmap) {
         // SAFETY: we've correctly allocated memory
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(self.bitmap_offset).cast(), self.size) }
+        (unsafe { std::slice::from_raw_parts_mut(self.ptr.cast(), self.size) },
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.add(self.bitmap_offset).cast(), self.size) })
+    }
+}
+
+impl<T> Drop for CslabStorage<T> {
+    fn drop(&mut self) {
+        // FIXME: this is inefficient for very large tables
+
+        let size = self.size;
+        let (table, bitmap) = self.parts_mut();
+
+        for (i, bme) in bitmap.iter().enumerate() {
+            let x = bme.load(Ordering::Relaxed);
+            for j in 0..usize::BITS as usize {
+                let idx = (i * usize::BITS as usize) + j;
+                if idx >= size { break; }
+                if (x >> j) & 1 != 0 {
+                    // SAFETY: we know an element is present from the bit being set
+                    // and our requirement that `finalize_remove()` be called
+                    // for every `mark_removed()`
+                    unsafe { ManuallyDrop::drop(&mut (*table[idx].get()).item) }
+                }
+            }
+        }
     }
 }
 
@@ -171,7 +184,10 @@ impl<T> Cslab<T> {
         Ok(idx)
     }
 
-    pub fn mark_removed(&mut self, idx: usize) {
+    /// # Safety
+    ///
+    /// The item must eventually be removed with `finalize_remove()`.
+    pub unsafe fn mark_removed(&mut self, idx: usize) {
         let mask = self.storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Relaxed);
 
         // confirm we're deleting something that's present
@@ -271,7 +287,7 @@ mod tests {
         let mut slab = Cslab::with_fixed_capacity(4);
         let i = slab.insert(123).unwrap();
         let j = slab.insert(456).unwrap();
-        slab.mark_removed(i);
+        unsafe { slab.mark_removed(i); }
         assert_eq!(slab.get(i), None);
         assert_eq!(*slab.get(j).unwrap(), 456);
         assert_ne!(slab.insert(234).unwrap(), i);
@@ -310,7 +326,7 @@ mod tests {
         let dropped = std::cell::Cell::new(false);
         let dropper = || assert!(!dropped.replace(true));
         let i = slab.insert(OnDrop(&dropper)).unwrap();
-        slab.mark_removed(i);
+        unsafe { slab.mark_removed(i); }
         assert!(!dropped.get());
         let item = unsafe { slab.finalize_remove(i) };
         assert!(!dropped.get());
@@ -328,10 +344,9 @@ mod tests {
         let j_dropper = || assert!(!j_dropped.replace(true));
         let i = slab.insert(OnDrop(&i_dropper)).unwrap();
         slab.insert(OnDrop(&j_dropper)).unwrap();
-        slab.mark_removed(i);
-        assert!(!i_dropped.get());
-        std::mem::drop(slab);
+        unsafe { slab.mark_removed(i); slab.finalize_remove(i); }
         assert!(i_dropped.get());
+        std::mem::drop(slab);
         assert!(j_dropped.get());
     }
 }
@@ -462,7 +477,8 @@ impl<T> RcuCslab<T> {
         // NOTE: order here doesn't matter; no-one will do anything with
         // `pending_removes` until `collect()` (which is mut) releases the references
         // to `cur_gen`
-        self.writer.lock().unwrap().mark_removed(idx);
+        // SAFETY: we eventually call `finalize_remove()` on drop
+        unsafe { self.writer.lock().unwrap().mark_removed(idx); }
         self.cur_gen.inner.lock().unwrap().pending_removes.push(idx);
     }
 
