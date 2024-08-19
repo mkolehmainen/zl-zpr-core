@@ -272,10 +272,19 @@ fn get_impl<T>(storage: &CslabStorage<T>, idx: usize) -> Option<&T> {
     }
 }
 
-/// Cloneable read-only interface to a `Cslab`.
+/// Cloneable read-only handle to a `Cslab`.
 pub struct CslabReader<T>(Arc<CslabStorage<T>>);
 
 impl<T> CslabReader<T> {
+    /// Lookup an item by its index in the slab.
+    ///
+    /// If no item is present at the given index, or the index is out of
+    /// range, returns `None`.
+    ///
+    /// Unlike `Cslab::get()`, until removal finalization has been
+    /// synchronized, it is possible for this method to return items which
+    /// have been marked for removal by the writer thread.  (The item
+    /// returned is however still valid.)
     pub fn get(&self, idx: usize) -> Option<&T> {
         get_impl(&*self.0, idx)
     }
@@ -287,14 +296,24 @@ impl<T> Clone for CslabReader<T> {
     }
 }
 
+/// A concurrent slab.
 pub struct Cslab<T> {
+    // Index of the first item in the freelist.
     first_free: usize, // >= capacity indicates empty freelist
+    // Number of elements in use.  Used only to report back to callees.
     in_use: usize,
+    // Number of elements allocated.  Used only to report back to callees.
     allocated: usize,
+    // Shared pointer to table & bitmap storage.
     storage: Arc<CslabStorage<T>>,
 }
 
 impl<T> Cslab<T> {
+    /// Create a new slab with the given capacity.
+    ///
+    /// All slab indices will be an integer less than the specified capacity.
+    ///
+    /// NOTE: Slabs cannot be resized.
     pub fn with_fixed_capacity(capacity: usize) -> Self {
         Self {
             first_free: 0,
@@ -304,26 +323,50 @@ impl<T> Cslab<T> {
         }
     }
 
+    /// Returns the total capacity of the slab.
     pub fn capacity(&self) -> usize {
         self.storage.len()
     }
 
+    /// Returns the number of elements present in the slab.
     pub fn len(&self) -> usize {
         self.in_use
     }
 
+    /// Returns the number of slots allocated in the slab.
+    ///
+    /// This is always >= the number of elements present (`.len()`).
+    /// The difference indicates how many elements have been marked for
+    /// removal but not yet finalized.
+    ///
+    /// The difference between this and the capacity indicates
+    /// how many more elements may be added.
     pub fn allocated(&self) -> usize {
         self.allocated
     }
 
+    /// Lookup an item by its index in the slab.  If no item is present at
+    /// the given index, or the index is out of range, returns `None`.
+    ///
+    /// Unlike `CslabReader::get()`, it is _not_ possible for this method to
+    /// return items which have been marked for removal.
     pub fn get(&self, idx: usize) -> Option<&T> {
         get_impl(&*self.storage, idx)
     }
 
+    /// Return a clonable read-only handle to the slab.
+    ///
+    /// This handle may be used to perform read accesses concurrently with
+    /// write accesses through the slab directly.
     pub fn reader(&self) -> CslabReader<T> {
         CslabReader(self.storage.clone())
     }
 
+    /// Allocate a slot in the slab and insert the given item into it.
+    ///
+    /// The allocated index will be returned.
+    ///
+    /// If there is no space remaining, an error is returned.
     pub fn insert(&mut self, item: T) -> Result<usize, ()> {
         let idx = self.first_free;
 
@@ -354,9 +397,17 @@ impl<T> Cslab<T> {
         Ok(idx)
     }
 
+    /// Mark an element to be removed.
+    ///
+    /// Panics if there is no element present at the given index.
+    ///
+    /// The indexed slot will appear empty to any readers who have performed
+    /// a release-acquire synchronization with this thread.
+    ///
     /// # Safety
     ///
     /// The item must eventually be removed with `finalize_remove()`.
+    /// (Else, double-frees will occur on drop.)
     pub unsafe fn mark_removed(&mut self, idx: usize) {
         let mask = self.storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Relaxed);
 
@@ -370,14 +421,12 @@ impl<T> Cslab<T> {
             Ordering::Relaxed,
         ) /* [Rb] */;
 
-        // W:store(Rlx) flag -> W:update(Rel) -> R:update(Acq) -> R:load(Rlx) flag
-        // R:update(Acq) -> R:sync(Rel)
-        // R:load item -> R:sync(Rel) -> W:sync(Acq) -> W:delete item
-
         self.in_use -= 1;
     }
 
     /// Actually free an index which has been marked free with `mark_removed()`.
+    ///
+    /// Returns the removed item.
     ///
     /// # Safety
     ///
@@ -385,9 +434,10 @@ impl<T> Cslab<T> {
     /// error to call this on an already-freed item.)
     ///
     /// It must be known that there will be no further reads of this index.
-    /// This can be guaranteed after calling `mark_removed()` by notifying all
-    /// readers of this update, then waiting for all readers to acknowledge
-    /// this notification.
+    /// This can be guaranteed after calling `mark_removed()` by notifying
+    /// all readers of this update via a release-acquire synchronization,
+    /// then waiting for all readers to acknowledge this notification, again
+    /// with release-acquire synchronization.
     pub unsafe fn finalize_remove(&mut self, idx: usize) -> T {
         // confirm item is not visible
         let mask = self.storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Relaxed);
@@ -520,7 +570,7 @@ mod tests {
 }
 
 #[cfg(all(test, loom))]
-mod tests {
+mod loom_tests {
     // NOTE: `loom` (and the similar `shuttle` is VERY limited for testing
     // atomic interactions.  Notably, they assume that atomic operations
     // occur _in the order they are issued_, which means they don't test
@@ -575,6 +625,47 @@ mod tests {
     }
 }
 
+// FURTHER DESIGN NOTES
+//
+// Above, we left unsolved the problem of tracking items marked for removal,
+// so that we finalize removal of the correct items at the correct time.
+// This is the role of `RcuCslab` -- so named as it is a
+// read-copy-update/RCU-friendly structure.
+//
+// The design of `RcuCslab` is as follows.  The `RcuCslab` structure is the
+// "writer" interface.  It provides fully synchronized read-write access to
+// the slab.  Reader handles may be cloned from this.  Each reader handle is
+// associated (_n_-to-1) with a "generation" -- reads performed in a given
+// generation definitively cannot see items removed prior to the creation of
+// the generation.  Generations are totally ordered.  New generations are
+// created explicitly by calling `.collect()` on the writer.  Removals are
+// finalized when the generation in which they were removed becomes
+// unreferenced.
+//
+// Specifically, item removal proceeds as follows.  The writer may at any
+// time mark an item to be removed with the `.mark_removed()` method.  (The
+// item will then immediately appear as removed to the writer, to any
+// readers of future generations, and eventually, to the readers of current
+// and previous generations.) Beside marking the item removed,
+// `.mark_removed()` also adds the item's index to a finalization list
+// associated with the current generation.
+//
+// The writer should then call `.schedule_finalization()`.  This creates a
+// new current generation, dropping the writer's reference to the previous
+// current generation.  A reference to the new generation is returned, and
+// should be communicated to all readers.  Once all references to the
+// previous generation are dropped, finalization will occur: the list of
+// marked items in the previous generation is walked; each is finalized and
+// dropped.  This finalization occurs in the context of the last dropper,
+// which is either the writer (if no other references existed), or, for RCU,
+// the RCU finalization thread.  Note that this synchronization and
+// guarantee of finalization fulfills the safety requirements on the removal
+// methods of `Cslab`.
+//
+// In order to maintain consistency when there are multiple outstanding
+// generations, each noncurrent generation retains a reference to its
+// successor.  Generations are thus finalized in strict creation order.
+
 // NOTE: it is unsafe to allow arbitrary `CslabReader`s to be cloned
 // from an `RcuCslab`!  Our internal safety guarantees rely on
 // accesses being performed _only_ through the `RcuCslab`.
@@ -617,6 +708,16 @@ impl<T> Drop for RcuCslabGen<T> {
     }
 }
 
+/// Read handle for an `RcuCslab`.
+///
+/// These handles are what should be communicated through an RCU structure
+/// to the readers.
+///
+/// Items marked for removal are only actually removed once all reader
+/// handles which could have seen the items present have been dropped.
+///
+/// Read handles may be cloned for convenience.  Cloned handles share the
+/// same generation.
 pub struct RcuCslabReader<T> {
     // unsynchronized read access to the slab
     reader: CslabReader<T>,
@@ -626,6 +727,15 @@ pub struct RcuCslabReader<T> {
 }
 
 impl<T> RcuCslabReader<T> {
+    /// Lookup an item by its index in the slab.
+    ///
+    /// If no item is present at the given index, or the index is out of
+    /// range, returns `None`.
+    ///
+    /// Unlike `RcuCslab::get()`, until removal finalization has been
+    /// synchronized, it is possible for this method to return items which
+    /// have been marked for removal by the writer thread.  (The item
+    /// returned is however still valid.)
     pub fn get(&self, idx: usize) -> Option<&T> {
         self.reader.get(idx)
     }
@@ -640,6 +750,7 @@ impl<T> Clone for RcuCslabReader<T> {
     }
 }
 
+/// An RCU-friendly concurrent slab.
 pub struct RcuCslab<T> {
     // unsynchronized access to capacity
     capacity: usize,
@@ -655,6 +766,11 @@ pub struct RcuCslab<T> {
 }
 
 impl<T> RcuCslab<T> {
+    /// Create a new slab with the given capacity.
+    ///
+    /// All slab indices will be an integer less than the specified capacity.
+    ///
+    /// NOTE: Slabs cannot be resized.
     pub fn with_fixed_capacity(capacity: usize) -> Self {
         let cslab = Cslab::with_fixed_capacity(capacity);
         let reader = cslab.reader();
@@ -675,22 +791,45 @@ impl<T> RcuCslab<T> {
         }
     }
 
+    /// Returns the total capacity of the slab.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
+    /// Returns the number of elements present in the slab.
     pub fn len(&self) -> usize {
         self.writer.lock().unwrap().len()
     }
 
+    /// Returns the number of slots allocated in the slab.
+    ///
+    /// This is always >= the number of elements present (`.len()`).
+    /// The difference indicates how many elements have been marked for
+    /// removal but not yet finalized.
+    ///
+    /// The difference between this and the capacity indicates
+    /// how many more elements may be added.
     pub fn allocated(&self) -> usize {
         self.writer.lock().unwrap().allocated()
     }
 
+    /// Lookup an item by its index in the slab.  If no item is present at
+    /// the given index, or the index is out of range, returns `None`.
+    ///
+    /// Unlike `RcuCslabReader::get()`, it is _not_ possible for this method to
+    /// return items which have been marked for removal.
     pub fn get(&self, idx: usize) -> Option<&T> {
         self.reader.get(idx)
     }
 
+    /// Return a clonable read-only handle to the slab, associated with the
+    /// current generation.
+    ///
+    /// This handle may be used to perform read accesses concurrently with
+    /// write accesses through the slab directly.
+    ///
+    /// Calling this method is equivalent to cloning a reader of the current
+    /// generation.
     pub fn reader(&self) -> RcuCslabReader<T> {
         RcuCslabReader {
             reader: self.reader.clone(),
@@ -698,14 +837,28 @@ impl<T> RcuCslab<T> {
         }
     }
 
-    // NOTE: it's a happy accident of the implementation that `insert()` and
-    // `remove()` become non-mut.  I don't see a downside and it's convenient.
+    // NOTE/CAUTION: because the writer is fully synchronized, we _could_
+    // make `insert()` and `remove()` `&` instead of `&mut` here.  But that
+    // would require us to make `get()` take the writer mutex (since it
+    // performs reads not protected by a generation), which seems excessive.
 
-    pub fn insert(&self, item: T) -> Result<usize, ()> {
+    /// Allocate a slot in the slab and insert the given item into it.
+    ///
+    /// The allocated index will be returned.
+    ///
+    /// If there is no space remaining, an error is returned.
+    pub fn insert(&mut self, item: T) -> Result<usize, ()> {
         self.writer.lock().unwrap().insert(item)
     }
 
-    pub fn remove(&self, idx: usize) {
+    /// Mark an element to be removed.
+    ///
+    /// Panics if there is no element present at the given index.
+    ///
+    /// The indexed slot will deterministically appear empty to all readers
+    /// of future generations, and _may_ appear empty to readers of the
+    /// current or previous generations.
+    pub fn mark_removed(&mut self, idx: usize) {
         // NOTE: order here doesn't matter; no-one will do anything with
         // `pending_removes` until `collect()` (which is mut) releases the references
         // to `cur_gen`
@@ -716,7 +869,19 @@ impl<T> RcuCslab<T> {
         self.cur_gen.inner.lock().unwrap().pending_removes.push(idx);
     }
 
-    pub fn collect(&mut self) {
+    /// Schedule removal finalization of the current generation, and create
+    /// a new generation.
+    ///
+    /// Returns a read handle associated with the new generation.
+    /// (Same as will be returned by any calls to `.reader()`
+    /// after return from this method.)
+    ///
+    /// Removal finalization will occur once all read handles of the
+    /// previous current generation, and all older previous generations,
+    /// are no longer referenced, in the context of the drop of the
+    /// last such reference.  (Or, if there are no such remaining references,
+    /// finalization will occur immediately during this method call.)
+    pub fn schedule_finalization(&mut self) -> RcuCslabReader<T> {
         let next_gen = Arc::new(RcuCslabGen {
             writer: self.writer.clone(),
             inner: Mutex::new(RcuCslabGenInner {
@@ -731,6 +896,21 @@ impl<T> RcuCslab<T> {
             cur_gen_inner.next_gen = Some(next_gen.clone());
         }
 
+        // Replace the previous generation with the current generation.
+        // Note that if no other references remain to the previous generation,
+        // the finalization will be performed immedaitely here.
+        // Hence we are careful not to hold any locks.
         self.cur_gen = next_gen;
+
+        self.reader()
+    }
+
+    /// A convenience method for marking and scheduling finalization of a single item.
+    ///
+    /// Returns a reader with which the removal is visible.  Once all references to
+    /// older readers are dropped, finalization will occur immediately.
+    pub fn remove(&mut self, idx: usize) -> RcuCslabReader<T> {
+        self.mark_removed(idx);
+        self.schedule_finalization()
     }
 }
