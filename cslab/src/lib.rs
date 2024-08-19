@@ -1,31 +1,139 @@
-#[cfg(not(loom))]
-use std::alloc::{self, Layout};
+//! An RCU-friendly concurrent slab
+
 #[cfg(loom)]
 use loom::alloc::{self, Layout};
+#[cfg(not(loom))]
+use std::alloc::{self, Layout};
 //#[cfg(not(loom))]
 use std::cell::UnsafeCell;
 //#[cfg(loom)]
 //use loom::cell::UnsafeCell;
+#[cfg(loom)]
+use loom::sync;
 use std::mem::ManuallyDrop;
 #[cfg(not(loom))]
 use std::sync;
-#[cfg(loom)]
-use loom::sync;
 use sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
-// TODO FIXME: we should do LIFO to avoid excessive memory usage!!
-
-type CslabTable<T> = [UnsafeCell<Entry<T>>];
-type CslabBitmap = [AtomicUsize];
+// DESIGN NOTES
+//
+// The slab itself is a traditional freelist design: an allocated
+// entry simply contains the item stored at that location; a free
+// entry simply contains a pointer to the next free slot.  The only
+// addition to this structure is a bitmap we use to allow querying for
+// whether an item is present in a given slot.
+//
+// The complexity of the remainder of the design springs from the goal
+// to allow readers to operate concurrently with a writer, while
+// maintaining near-zero-cost lookups for readers.
+//
+// There are only three core operations on an active slab: insert [I],
+// remove [R], and get [G] (which notably returns a reference, not a copy).
+// A slab may also of course be dropped [D] at the end of its lifetime.
+//
+// Dropping is enforced by the Rust runtime to only occur once all
+// references to the slab have disappeared.  Therefore it can only
+// execute exclusively of any other operation.
+//
+// Since writers can be "slow", we assume a single writer (enforced
+// by requiring a mut reference).  Therefore, insert [I] and remove [R]
+// execute exclusive of each other.
+//
+// Get [G] however, may execute concurrently with any other operation.
+// Notably, we provide a method `reader()` to obtain a "reader" handle
+// which allows performing get [G] operations concurrently with insert [I]
+// and remove [R].
+//
+// Therefore, the concurrency stories we must consider are [I] with [G],
+// and [R] with [G].
+//
+// Insert [I] with get [G] is straightforward.  We require that [I] first
+// store the item itself in the slab, _then_ mark the item as present in the
+// bitmap.  [G] must likewise first check the bitmap _before_ attempting to
+// read an item.  The cross-thread ordering is enforced by a release-acquire
+// operation pair on the bitmap element:
+//
+//          WRITER             |        READER
+//                             |
+//   store item [Ii]           |
+//        ↓                    |
+//   store flag [Ib] (release) |
+//                             ⇘
+//                             | (acquire) load flag [Gb]
+//                             |               ↓
+//                             |           load item [Gi]
+//
+// (as marked in the source code).
+//
+// The complex case is remove [R] with get [G].  The key issue is that a
+// writer may wish to remove an item from the slab while a reader is still
+// accessing it.  One approach to prevent this would be to have the reader,
+// while accessing the item, recheck the flag before any operation which
+// would be potentially unsafe in the case that corrupt data had been read.
+// This however is intrusive for complex items and suffers from the A/B/A
+// problem.
+//
+// So instead, we follow a model informed by the read-copy-update (RCU)
+// family of algorithms.  Remove [R] is split into two phases:
+// `mark_removed()`, and `finalize_remove()`.  Both must be performed in
+// sequence to remove any item.  Marking may be performed at any time.
+// Finalizing however, may only be performed after synchronizing with the
+// reader(s) to ensure that no accesses to that item are outstanding.  This
+// corresponds directly with the notion of RCU synchronization, in which a
+// "cleanup" operation can be scheduled to run after all active read-side
+// critical sections have completed.
+//
+// `mark_removed()` then, simply clears the item's mark in the bitmap.  Get
+// [G] operations may safely race this.  They will safely return either the
+// item (which has not yet actually been deleted from slab storage), or a
+// not found indication.  The writer then must signal the reader(s) that it
+// is waiting for all outstanding read-side critical sections to complete
+// (this would be e.g.  an RCU update operation).  This signal is
+// effectively a release-acquire pair, after which all readers will
+// henceforth read the item's bitmap mark clear (and return not found).
+//
+// The reader(s) then must signal the writer when their outstanding
+// read-side critical sections have completed (this would be e.g.  an RCU
+// synchronization callback).  This signal again is effectively a
+// release-acquire pair.  It's now known to the writer that no reader
+// remains accessing the marked item.  `finalize_remove()` may then be
+// called, and the item is actually deleted, and the slot returned to the
+// slab's freelist.
+//
+// This complex ordering is illustrated as follows:
+//
+//        WRITER            |       READER
+//                          |
+//     store flag [Rb]      |    load flag [Gb]  }
+//          ↓               |         ↓          } any number; safely races writer
+//     RCU update (release) |   ?load item [Gi]  }
+//                          ⇘      |
+//                          | (acquire) RCU update
+//                          |      ↓  ↓  |
+//                          | (release) RCU callback
+//                          ⇙            ↓
+//   RCU callback (acquire) |    load flag [Gb]  } now reads as clear
+//          ↓               |
+//    delete item [Ri]      |
+//
+// Of course, it's critical for writers to correctly track the visibility of
+// remove [R] operations to readers.  The `Cslab` data structure does not
+// provide this.  Instead, the `RcuCslab` data structure builds upon `Cslab`
+// to provide this functionality.  It is described below.
 
 union Entry<T> {
     next_free: isize, // offset to next empty; neighbor is 0 so zero-alloced array is initialized
     item: ManuallyDrop<T>,
 }
 
+type CslabTable<T> = [UnsafeCell<Entry<T>>];
+type CslabBitmap = [AtomicUsize];
+
+// `CslabStorage` "glues together" the table and bitmap allocations into one.
+// This allows us to write a `Drop` implementation which uses both of them.
 struct CslabStorage<T> {
     size: usize,
     ptr: *mut u8,
@@ -61,8 +169,12 @@ impl<T> CslabStorage<T> {
 
         #[cfg(loom)]
         {
-            let bitmap: &mut [std::mem::MaybeUninit<AtomicUsize>] =
-                unsafe { std::slice::from_raw_parts_mut(ptr.add(bitmap_offset).cast(), (size + usize::BITS as usize - 1) / usize::BITS as usize) };
+            let bitmap: &mut [std::mem::MaybeUninit<AtomicUsize>] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    ptr.add(bitmap_offset).cast(),
+                    (size + usize::BITS as usize - 1) / usize::BITS as usize,
+                )
+            };
             for bme in bitmap {
                 bme.write(AtomicUsize::new(0));
             }
@@ -147,19 +259,20 @@ fn get_impl<T>(storage: &CslabStorage<T>, idx: usize) -> Option<&T> {
     }
 
     // check flag
-    if (storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Acquire)
+    if (storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Acquire) /* [Gb] */
         >> (idx % usize::BITS as usize))
         & 1
         != 0
     {
         // load item
         // SAFETY: the bitmap has told us there is an item
-        Some(unsafe { &(*storage.table()[idx].get()).item })
+        Some(unsafe { &(*storage.table()[idx].get()).item }) /* [Gi] */
     } else {
         None
     }
 }
 
+/// Cloneable read-only interface to a `Cslab`.
 pub struct CslabReader<T>(Arc<CslabStorage<T>>);
 
 impl<T> CslabReader<T> {
@@ -176,7 +289,6 @@ impl<T> Clone for CslabReader<T> {
 
 pub struct Cslab<T> {
     first_free: usize, // >= capacity indicates empty freelist
-    last_free: usize,  // valid only if freelist is not empty
     in_use: usize,
     allocated: usize,
     storage: Arc<CslabStorage<T>>,
@@ -186,7 +298,6 @@ impl<T> Cslab<T> {
     pub fn with_fixed_capacity(capacity: usize) -> Self {
         Self {
             first_free: 0,
-            last_free: capacity - 1,
             in_use: 0,
             allocated: 0,
             storage: Arc::new(CslabStorage::with_fixed_capacity(capacity)),
@@ -227,7 +338,7 @@ impl<T> Cslab<T> {
 
         // store item
         // SAFETY: any index in the freelist has no item
-        unsafe { (*self.storage.table()[idx].get()).item = ManuallyDrop::new(item) };
+        unsafe { (*self.storage.table()[idx].get()).item = ManuallyDrop::new(item) } /* [Ii] */;
 
         // mark in bitmap
         let mask = self.storage.bitmap()[idx / usize::BITS as usize].load(Ordering::Relaxed);
@@ -235,9 +346,7 @@ impl<T> Cslab<T> {
         self.storage.bitmap()[idx / usize::BITS as usize].store(
             mask | (1 << (idx % usize::BITS as usize)),
             Ordering::Release,
-        );
-
-        // W:store item -> W:store(Rel) flag -> R:load(Acq) flag -> R:load item
+        ) /* [Ib] */;
 
         self.in_use += 1;
         self.allocated += 1;
@@ -259,7 +368,7 @@ impl<T> Cslab<T> {
         self.storage.bitmap()[idx / usize::BITS as usize].store(
             mask & !(1 << (idx % usize::BITS as usize)),
             Ordering::Relaxed,
-        );
+        ) /* [Rb] */;
 
         // W:store(Rlx) flag -> W:update(Rel) -> R:update(Acq) -> R:load(Rlx) flag
         // R:update(Acq) -> R:sync(Rel)
@@ -288,26 +397,12 @@ impl<T> Cslab<T> {
         // SAFETY: we know only we can access this item from our safety requirement
         let entry = &mut *self.storage.table()[idx].get();
         // SAFETY: we know there is an item from our safety requirement
-        let item = unsafe { ManuallyDrop::take(&mut entry.item) };
+        let item = unsafe { ManuallyDrop::take(&mut entry.item) } /* [Ri] */;
 
-        // add entry to end of freelist
+        // add entry to front of freelist
         // SAFETY: we have removed the item
-        let capacity = self.storage.table().len();
-        entry.next_free = (capacity - idx) as isize - 1;
-
-        if self.first_free < capacity {
-            // freelist was non-empty, update final entry
-            // SAFETY: any index in the freelist has no item
-            unsafe {
-                (*self.storage.table()[self.last_free].get()).next_free =
-                    idx as isize - self.last_free as isize;
-            }
-        } else {
-            // freelist was empty, update head pointer
-            self.first_free = idx;
-        }
-
-        self.last_free = idx;
+        entry.next_free = self.first_free as isize - idx as isize;
+        self.first_free = idx;
 
         self.allocated -= 1;
 
@@ -432,7 +527,7 @@ mod tests {
     // _any_ reorderings in a single-writer/single-reader interaction.
 
     use super::*;
-    use loom::{thread, model};
+    use loom::{model, thread};
 
     #[test]
     fn concurrent_insert_get_test() {
@@ -440,11 +535,9 @@ mod tests {
             let mut slab = Cslab::with_fixed_capacity(4);
 
             let reader = slab.reader();
-            thread::spawn(move || {
-                match reader.get(0) {
-                    Some(&x) => assert_eq!(x, 123),
-                    None => (),
-                }
+            thread::spawn(move || match reader.get(0) {
+                Some(&x) => assert_eq!(x, 123),
+                None => (),
             });
 
             slab.insert(123).unwrap();
@@ -459,14 +552,14 @@ mod tests {
             let idx = slab.insert(123).unwrap();
 
             let reader = slab.reader();
-            let t1 = thread::spawn(move || {
-                match reader.get(idx) {
-                    Some(&x) => assert_eq!(x, 123),
-                    None => (),
-                }
+            let t1 = thread::spawn(move || match reader.get(idx) {
+                Some(&x) => assert_eq!(x, 123),
+                None => (),
             });
 
-            unsafe { slab.mark_removed(idx); }
+            unsafe {
+                slab.mark_removed(idx);
+            }
 
             t1.join().unwrap();
 
@@ -475,11 +568,12 @@ mod tests {
                 assert_eq!(reader.get(idx), None);
             });
 
-            unsafe { slab.finalize_remove(idx); }
+            unsafe {
+                slab.finalize_remove(idx);
+            }
         });
     }
 }
-
 
 // NOTE: it is unsafe to allow arbitrary `CslabReader`s to be cloned
 // from an `RcuCslab`!  Our internal safety guarantees rely on
