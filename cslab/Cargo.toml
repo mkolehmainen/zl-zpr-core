@@ -1,0 +1,9 @@
+[package]
+name = "cslab"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
