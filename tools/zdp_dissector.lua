@@ -64,7 +64,7 @@ function zdp_proto.dissector(buffer, pinfo, tree)
     local type = buffer(1, 1):uint()
     local type_name = get_type_name(type)
     zdp_header_subtree:add(zdp_type, buffer(1, 1)):append_text(" (" .. type_name .. ")")
-
+    pinfo.cols.info = type_name
     zdp_header_subtree:add(excess_len, buffer(2, 1))
     zdp_header_subtree:add(seq_num, buffer(3, 2))
 
@@ -74,10 +74,10 @@ function zdp_proto.dissector(buffer, pinfo, tree)
         -- Transit Packet
         zdp_header_subtree:add(stream_id, buffer(5, 4))
         zdp_header_subtree:add(pad, buffer(9, 8))
-        zdp_header_subtree:add(mac_addr, buffer(17, 4))
-        zdp_header_subtree:add(d2d_said, buffer(21, 1))
-        zdp_header_subtree:add(agent_packet, buffer(22, real_len - 26))
-        zdp_header_subtree:add(d2d_mac, buffer(real_len - 4, 4))
+        zdp_header_subtree:add(d2d_said, buffer(17, 1))
+        zdp_header_subtree:add(agent_packet, buffer(18, real_len - 22))
+        zdp_header_subtree:add(d2d_mac, buffer(real_len - 8, 4))
+        zdp_header_subtree:add(mac_addr, buffer(real_len - 4, 4))
 
         local agent_header_subtree = tree:add(zdp_proto, buffer(), "Compressed Agent Packet Header Data")
         local v4_v6 = get_first_four(buffer(22, 1):uint())
@@ -108,16 +108,25 @@ function zdp_proto.dissector(buffer, pinfo, tree)
     elseif type <= 127 then 
         -- Stream-oriented Management Message
         zdp_header_subtree:add(stream_id, buffer(5, 4))
-        zdp_header_subtree:add(management_packet, buffer(9, real_len - 21))
-        zdp_header_subtree:add(pad, buffer(real_len - 12, 8))
-        zdp_header_subtree:add(mac_addr, buffer(real_len - 4, 4))
-        decode_management(type, buffer(9, real_len - 21), tree)
+        if real_len > 11 then
+            zdp_header_subtree:add(management_packet, buffer(9, real_len - 11))
+        end
+        -- zdp_header_subtree:add(pad, buffer(real_len - 12, 8))
+        zdp_header_subtree:add(mac_addr, buffer(real_len - 2, 2))
+
+        if real_len > 11 then
+            decode_management(type, buffer(9, real_len - 11), tree)
+        end
     else 
         -- Other Management Message
-        zdp_header_subtree:add(management_packet, buffer(5, real_len - 17))
-        zdp_header_subtree:add(pad, buffer(real_len - 12, 8))
-        zdp_header_subtree:add(mac_addr, buffer(real_len - 4, 4))
-        decode_management(type, buffer(5, real_len - 17), tree)
+        if real_len > 7 then
+            zdp_header_subtree:add(management_packet, buffer(5, real_len - 7))
+        end
+        -- zdp_header_subtree:add(pad, buffer(real_len - 12, 8))
+        zdp_header_subtree:add(mac_addr, buffer(real_len - 2, 2))
+        if real_len > 7 then
+            decode_management(type, buffer(5, real_len - 7), tree)
+        end
     end
 end
 -- Idiomatic way of doing this may be to actually create a whole new dissector, although that might be challenging

@@ -14,9 +14,10 @@ use crate::zdp;
 use crate::zdp_ll;
 use crate::zpr;
 use bytes::{Buf, BufMut};
+use std::mem::size_of;
 use std::net::SocketAddr;
 use std::time::SystemTime;
-use zerocopy::FromBytes;
+use zerocopy::{AsBytes, FromBytes};
 use zpr_ext::std::mem::{drop_guard, DropGuard};
 use zpr_ext::zerocopy::*;
 
@@ -372,10 +373,14 @@ pub fn substrate_ingress<'pktbuf>(
 pub fn agent_input<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     _stream_id: zpr::StreamId, // TODO: should we keep this in metadata? or per-flow header?
-    pkt: Packet<'pktbuf>,
+    mut pkt: Packet<'pktbuf>,
 ) {
     // TODO: decompress
 
+    // Add empty A2A SAID
+    pkt.advance(size_of::<zdp::ZdpSaidHeader>());
+    pkt.shrink(size_of::<zdp::ZdpMicvEnd>());
+    // pkt.put_u32(0);
     // send out decapsulated packet
     match asm.agent_input.try_enqueue_packet(drop_guard(pkt, |p| {
         drop_and_count(asm, p, CounterType::InPacksSent)
@@ -389,12 +394,14 @@ pub fn agent_input<'pktbuf>(
 
 /// Process uncompressed packet from the agent.
 /// The packet will be compressed, or trigger a Bind request.
-pub fn agent_output<'pktbuf>(asm: &Assembly<'pktbuf>, pkt: Packet<'pktbuf>) {
+pub fn agent_output<'pktbuf>(asm: &Assembly<'pktbuf>, mut pkt: Packet<'pktbuf>) {
     // TODO: lookup in ALT
     let stream_id = 0; // TODO: should we keep this in metadata? or as per-flow header?
 
     // TODO: compress
-
+    pkt.alloc_zeroed_header::<zdp::ZdpSaidHeader>().a2a_said = 0;
+    let micv: zdp::ZdpMicvEnd = zdp::ZdpMicvEnd { micv: 0 };
+    pkt.put(micv.as_bytes());
     forward(asm, zpr::AGENT_LINK_ID, stream_id, pkt);
 }
 
