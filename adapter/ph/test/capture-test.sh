@@ -31,7 +31,7 @@ function set_program() {
 
   if [ "$PROGRAM" != "None" ]
   then "$PH_DEBUG_BIN" -c SET-CAPTURE-PROGRAM -p "$SOCKET" --program "$PROGRAM"
-  fi 
+  fi
 }
 
 function close_program() {
@@ -112,9 +112,9 @@ close_program "$B_ZPR_SOCK"
 
 # Make sure correct number of incoming packets were captured, either 23 or 24 depending 
 # on whether two hello requests are received 
-tcpdump -r "$TMPDIR/cap_test1.pcap" 'link[0] = 1 or link[0] == 0' > "$TMPDIR/checker.pcap"
-HELLO_COUNT="$(grep -c '0x0000:  0100 8800 0000' "$TMPDIR/checker.pcap")"
-PACKET_COUNT="$(grep -c '0x0000:  0' "$TMPDIR/checker.pcap")"
+tcpdump -r "$TMPDIR/cap_test1.pcap" 'link[0] = 1 or link[0] == 0' > "$TMPDIR/checker.txt"
+HELLO_COUNT="$(grep -c '0x0000:  0100 8800 0000' "$TMPDIR/checker.txt" || true)"
+PACKET_COUNT="$(grep -c '0x0000:  0' "$TMPDIR/checker.txt" || true)"
 
 if [[ ("$PACKET_COUNT" != "23" || "$HELLO_COUNT" != "1") &&  ("$PACKET_COUNT" != "24" || "$HELLO_COUNT" != "2") ]]
 then PASS=1
@@ -131,8 +131,9 @@ fi
 # Cleanup
 #
 
-kill "${CHILDREN[@]}" 2> /dev/null || true
+sudo kill "${CHILDREN[@]}" 2> /dev/null || true
 sleep 1  # FIXME: let's do something better here
+stty sane || true
 
 #
 # Report status
