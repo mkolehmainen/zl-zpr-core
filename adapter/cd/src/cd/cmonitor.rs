@@ -1,11 +1,11 @@
 use std::io;
+use std::net::SocketAddr;
 use std::time::Instant;
 
 use tokio::sync::mpsc::{self, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use tracing::info;
@@ -117,6 +117,7 @@ impl CMonitor {
 
         let zpr: Zpr;
         let addr_port: String;
+        let noise_key: [u8; 32];
         let old_cli: Option<ClientRec>;
         {
             let state = self.shared.state.lock().unwrap();
@@ -129,6 +130,15 @@ impl CMonitor {
                     ));
                 }
                 Some(ap) => ap,
+            };
+            noise_key = match zpr.copy_dock_noise_key(&configuration) {
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "No connection string found",
+                    ));
+                }
+                Some(k) => k,
             };
             old_cli = state.cli.client.clone();
         }
@@ -161,19 +171,18 @@ impl CMonitor {
 
         let ctok = CancellationToken::new();
         let passed_ctok = ctok.clone();
-
-        let remote_addr: SocketAddr = match addr_port.parse() {
+        let dock_addr: SocketAddr = match addr_port.parse() {
             Ok(addr) => addr,
             Err(e) => {
                 return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("failed to parse address: {}", e),
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid dock address: {}", e),
                 ));
             }
         };
 
         let handle: JoinHandle<io::Result<()>> = tokio::spawn(async move {
-            let cli = client::ZDPClient::new(&remote_addr);
+            let cli = client::ZDPClient::new(&dock_addr, noise_key);
             cli.run(passed_ctok).await // blocking, long running
         });
         // well hopefully that launched!

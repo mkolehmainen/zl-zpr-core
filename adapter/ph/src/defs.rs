@@ -1,7 +1,7 @@
 //! Common definitions that have no more specific place to live.
 
 use crate::net_defs;
-use zerocopy_derive::{AsBytes, FromBytes, FromZeroes};
+use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 /// Packet direction with respect to an interface.
 /// Primary use is for constructing libpcap link-layer header.

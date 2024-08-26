@@ -126,6 +126,16 @@ impl Zpr {
         Some(format!("{}:{}", conf.get_dock_host(), conf.get_dock_port()))
     }
 
+    /// Returns noise public key for dock
+    pub fn copy_dock_noise_key(&self, name: &str) -> Option<[u8; 32]> {
+        let state = self.shared.state.lock().unwrap();
+        let cfg = state.configs.get(name);
+        cfg?;
+        let (conf, _) = cfg.unwrap();
+        let key = conf.get_dock_noise_public_key();
+        Some(*key)
+    }
+
     pub fn get_configuration_state(&self, name: &str) -> Option<ConfigState> {
         let state = self.shared.state.lock().unwrap();
         let cfg = state.configs.get(name);
@@ -302,6 +312,7 @@ p/oYQcQrtBHsdvdZ/8IRR7/9HJNanbhTuKdkdmVjt4rPoUDc2zqzEZUEG33E2Glh
             [dock]
             host_or_ip = "localhost"
             port = 2242
+            noise_public_key = "ABfny3qb3/RSLJqJAvl0+d8pYAcf9wb9F2Er+sXEEGo="
             [adapter]
             certificate = "@CERT"
             private_key = "@KEY"
@@ -339,6 +350,7 @@ p/oYQcQrtBHsdvdZ/8IRR7/9HJNanbhTuKdkdmVjt4rPoUDc2zqzEZUEG33E2Glh
             [dock]
             host_or_ip = "localhost"
             port = 2242
+            noise_public_key = "ABfny3qb3/RSLJqJAvl0+d8pYAcf9wb9F2Er+sXEEGo="
             [adapter]
             certificate = "@CERT"
             private_key = "@KEY"
@@ -385,6 +397,7 @@ p/oYQcQrtBHsdvdZ/8IRR7/9HJNanbhTuKdkdmVjt4rPoUDc2zqzEZUEG33E2Glh
             [dock]
             host_or_ip = "localhost"
             port = 2242
+            noise_public_key = "ABfny3qb3/RSLJqJAvl0+d8pYAcf9wb9F2Er+sXEEGo="
             [adapter]
             certificate = "@CERT"
             private_key = "@KEY"
@@ -419,6 +432,7 @@ p/oYQcQrtBHsdvdZ/8IRR7/9HJNanbhTuKdkdmVjt4rPoUDc2zqzEZUEG33E2Glh
             [dock]
             host_or_ip = "another.localhost"
             port = 2243
+            noise_public_key = "ABfny3qb3/RSLJqJAvl0+d8pYAcf9wb9F2Er+sXEEGo="
             [adapter]
             certificate = "@CERT"
             private_key = "@KEY"
@@ -463,6 +477,7 @@ p/oYQcQrtBHsdvdZ/8IRR7/9HJNanbhTuKdkdmVjt4rPoUDc2zqzEZUEG33E2Glh
             [dock]
             host_or_ip = "localhost"
             port = 2242
+            noise_public_key = "ABfny3qb3/RSLJqJAvl0+d8pYAcf9wb9F2Er+sXEEGo="
             [adapter]
             certificate = "@CERT"
             private_key = "@KEY"

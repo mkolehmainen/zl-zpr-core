@@ -12,14 +12,12 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use std::mem;
 use std::time::Duration;
 
 use std::fmt;
-use std::io;
 use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 
 use zerocopy::FromBytes;
 
@@ -27,54 +25,89 @@ use tracing::{error, info};
 
 use crate::config;
 use crate::packet::Packet;
-use crate::zdp::{ZdpBaseHeader, ZdpPacketType, ZdpPerFlowHeader};
+use crate::zdp::{ZdpBaseHeader, ZdpPacketType, ZdpZpiHeader};
 use crate::zpr;
 
-/*
-        According to 6.2.8 the key management packets can run in native mode
-        when running over a an IP substrate.
+#[derive(Debug)]
+pub enum KMError {
+    ConfigurationError,
+    InvalidState,
+    InvalidPacketType,
+    EncryptionError,
+    HandshakeError,
+    NoHeadroom,
+    ShortPacket,
+    SaIdZero,
+    SaIdMismatch,
+    EnqueueFailed,
+    MachineError(String),
+    IoError(std::io::Error),
+}
 
+impl fmt::Display for KMError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            KMError::InvalidState => {
+                write!(f, "InvalidState")
+            }
+            KMError::EncryptionError => {
+                write!(f, "EncryptionError")
+            }
+            KMError::HandshakeError => {
+                write!(f, "HandshakeError")
+            }
+            KMError::ConfigurationError => {
+                write!(f, "ConfigurationError")
+            }
+            KMError::MachineError(ref s) => {
+                write!(f, "MachineError: {}", s)
+            }
+            KMError::IoError(ref e) => {
+                write!(f, "IoError: {}", e)
+            }
+            KMError::InvalidPacketType => {
+                write!(f, "InvalidPacketType")
+            }
+            KMError::NoHeadroom => {
+                write!(f, "NoHeadroom")
+            }
+            KMError::ShortPacket => {
+                write!(f, "ShortPacket")
+            }
+            KMError::SaIdZero => {
+                write!(f, "SaIdZero")
+            }
+            KMError::SaIdMismatch => {
+                write!(f, "SaIdMismatch")
+            }
+            KMError::EnqueueFailed => {
+                write!(f, "EnqueueFailed")
+            }
+        }
+    }
+}
 
-         non per-flow management packet
+impl From<std::io::Error> for KMError {
+    fn from(e: std::io::Error) -> KMError {
+        KMError::IoError(e)
+    }
+}
 
-         0    1    ZPI   (for KM this is always set 0)
-         1    1    TYPE  (KM = 0x81)    sec. 6.2.8
-         2    1    excess len (0)
-         3    2    seqnum
-         5    x    MANAGEMENT_DATA (km packet)
-         x    x    PADDING
-         x    x    MAC    (w/ ZPI=0 this is just internet checksum)
+// Copying of off std::io::Result
+pub type KMResult<T> = Result<T, KMError>;
 
+/// Signals emitted by the KeyManager (see the [KeyManager::start] method).
+#[derive(Debug)]
+pub enum KMSignal {
+    /// After [KeyManagerStateMachine::reset] is called.
+    Reset,
 
-         The managemnt data looks like:
+    /// If the state machine transitions into the error state.
+    Error,
 
-         0    2    TYPE       0=none, 1=ikeV2, 2=noise
-         2    2    LENGTH     includes type and length
-         4    x    KM_PACKET
-
-
-         ZDP management packets (non-km) are fully encrypted, so we
-         can pass full buffer to the transport encrypt/decrypt.
-
-         0    1    ZPI
-         1    n    payload (encrypted by KM transport routine)
-
-
-         ZDP transit packets are more complicated.
-
-         0    1    ZPI
-         1    n    ZPR header (encrypted by KM transport routine)
-         n+1  m    agent data (d2d-sa + data + micv) -- not encrypted by KM transport
-
-         In order to properly decrypt a transit packet, the KM routine should
-         put the encrypted length on the front of the buffer AND protect that with AEAD.
-         So something like:
-
-         encr_len = u16::from_be_bytes(payload[0], payload[1]);
-         plaintext = decrypt_aead(payload[2..encr_len+2], [ZPI, payload[0], payload[1]]);
-
-         Those two bytes need to be taken into consideration when computing padding.
-*/
+    /// When the SA_ID changes.
+    SaIdChange { old: zpr::SaId, new: zpr::SaId },
+}
 
 /// Stateful key manager for ZDP.  Requires an instance of a [KeyManagerStateMachine] to do the actual work.
 #[derive(Debug, Clone)]
@@ -142,82 +175,77 @@ impl KeyManager<'_> {
     /// This overwrites the plaintext ZDP header at least.
     /// For everything except transit packets, this also overwrites the payload.
     ///
-    /// For all packets, there must be enough padding included in the body length to
-    /// accomodate any expansion caused by encryption.
+    /// For all packets, there must be enough space remaining in the packet buffer to
+    /// accomodate expansion caused by encryption.
     ///
-    /// For transit packets the padding space must be between the ZDP header and the
-    /// agent data bits.
+    /// Note that we encrypt body.len() bytes from body index 0.  Body length will expand by
+    /// the PADLEN indicated in the KM algorithm.
+    ///
+    /// We also write into the headroom of the packet:
+    ///
+    /// ```text
+    ///     00     ZPI
+    ///     01,02  LENGTH of encrypted payload
+    /// ```
+    ///
+    /// TODO: Not sure this works at all for transit packet encryption -- if we are doing that.
     ///
     /// `message` is expected to be a ZDP message wihout a ZPI value.  We add a ZPI
     /// value to the front of the message -- note that the value we add is just the
     /// SA_ID.  It's up to caller to mix in the configuration ID value.
-    pub fn encrypt_transport(&self, message: &mut Packet) -> io::Result<()> {
+    pub fn encrypt_transport(&self, message: &mut Packet) -> KMResult<()> {
         let base_hdr =
             ZdpBaseHeader::ref_from_prefix(message.body()).expect("too-short ZDP message");
         if message.headroom_available() < 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "insufficient headroom",
-            ));
+            return Err(KMError::NoHeadroom);
         }
 
-        let encr: Box<dyn TransportEncr>;
-        let sa_id: u8;
-        {
-            let state = self.shared.state.lock().unwrap();
-            if state.statemachine.get_state() != KMSMState::Transport {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "SA not in transport state",
-                ));
-            }
-            if state.sa_id == 0 {
-                // programming error
-                panic!("SA_ID is zero");
-            }
-            encr = state.statemachine.get_transport_encryptor();
-            sa_id = state.sa_id;
+        let mut state = self.shared.state.lock().unwrap();
+        if state.statemachine.get_state() != KMSMState::Transport {
+            return Err(KMError::InvalidState);
+        }
+        if state.sa_id == 0 {
+            return Err(KMError::SaIdZero);
         }
 
         // The assumption here is that caller has already built in space of any padding required by key manager protocol.
-        let encr_len: usize;
-        match base_hdr.packet_type {
+        let encr_len: usize = match base_hdr.packet_type {
             ZdpPacketType::KeyManagement => {
                 // Programmer error
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Key Management packets should not be sent here",
-                ));
+                return Err(KMError::InvalidPacketType);
             }
             ZdpPacketType::TransitPacket => {
-                // So the data to be encrypted is ZDP header plus stream ID.  Padding is still assumed to after that.
-                encr_len = mem::size_of::<ZdpBaseHeader>() + mem::size_of::<ZdpPerFlowHeader>();
+                panic!("Transit packet encryption not implemented");
             }
-            _ => {
-                encr_len = message.body().len();
-            }
-        }
+            _ => message.body().len(),
+        };
 
         // TODO: Ability to encrypt in place. Not sure how to accomplish. At very least we could use our own buffer pool.
         let mut encr_buf = [0u8; config::PACKET_BUFFER_SIZE];
-
-        // TODO: Pass sa_id into encrypt/decrypt
-        match encr.encrypt_transport(sa_id, &message.body()[0..encr_len], &mut encr_buf) {
+        match state
+            .statemachine
+            .encrypt_transport(&message.body()[0..encr_len], &mut encr_buf)
+        {
             Ok(len) => {
+                info!(
+                    "noise: encrypt input {} bytes, output {} bytes",
+                    encr_len, len
+                );
                 // Copy the encrypted data back into the message -- there should be sufficient room for it since
                 // caller should know our required padding space and alignment.
-                message.body_mut()[0..len].copy_from_slice(&encr_buf[0..len]);
 
-                // Now we need to push a our SA id onto the front.
-                // (Note ZPI should be part of integrity protected data)
-                let zpi_buf = message.alloc_zeroed_headroom(1);
-                zpi_buf[0] = sa_id;
+                message.shrink(message.body().len()); // remove body
+                message.put(&encr_buf[0..len]); // write a new body
+
+                // Now write our headroom info:
+                let head_buf = message.alloc_zeroed_headroom(3); // ZPI + LEN
+                head_buf[0] = state.sa_id;
+
+                let szbytes = (len as u16).to_be_bytes();
+                head_buf[1..3].copy_from_slice(&szbytes);
             }
             Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("encrypt failed: {}", e),
-                ));
+                return Err(KMError::MachineError(e.to_string()));
             }
         }
         Ok(())
@@ -227,52 +255,50 @@ impl KeyManager<'_> {
     /// We assume that packet ZPI value has been clensed of the config ID and is only the SA_ID.
     /// Key Management packets should not be sent here.
     /// Does not remove the ZPI/SA_ID value.
-    pub fn decrypt_transport(&self, message: &mut Packet) -> io::Result<()> {
-        if message.body().len() < 1 {
-            return Err(io::Error::new(io::ErrorKind::Other, "message too short"));
+    pub fn decrypt_transport(&self, message: &mut Packet) -> KMResult<()> {
+        if message.body().len() < 3 {
+            // ZPI + LEN
+            return Err(KMError::ShortPacket);
         }
-        let encr: Box<dyn TransportEncr>;
-        let sa_id: u8;
-        {
-            let state = self.shared.state.lock().unwrap();
-            if message.body()[0] == 0 {
-                return Err(io::Error::new(io::ErrorKind::Other, "ZPI value is 0"));
-            }
-            if state.sa_id != message.body()[0] {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "SA_ID mismatch: expect {}, found {}",
-                        state.sa_id,
-                        message.body()[0]
-                    ),
-                ));
-            }
-            if state.statemachine.get_state() != KMSMState::Transport {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "SA not in transport state",
-                ));
-            }
-            encr = state.statemachine.get_transport_encryptor();
-            sa_id = state.sa_id;
+        let mut state = self.shared.state.lock().unwrap();
+        if message.body()[0] == 0 {
+            return Err(KMError::SaIdZero);
+        }
+        if state.sa_id != message.body()[0] {
+            return Err(KMError::SaIdMismatch);
+        }
+        if state.statemachine.get_state() != KMSMState::Transport {
+            return Err(KMError::InvalidState);
         }
 
         // TODO: Ability to decrypt in place. Not sure how to accomplish.  At very least we could use our own buffer pool.
         let mut decr_buf = [0u8; config::PACKET_BUFFER_SIZE];
 
-        // TODO: pass sa_id into decrypt
-        match encr.decrypt_transport(sa_id, &message.body()[1..], &mut decr_buf) {
+        // read the size of the encrypted payload.  Size follows the ZPI/SA_ID value:
+        let encr_len: usize = u16::from_be_bytes([message.body()[1], message.body()[2]]) as usize;
+
+        if encr_len + 3 > message.body().len() {
+            return Err(KMError::ShortPacket);
+        }
+
+        match state
+            .statemachine
+            .decrypt_transport(&message.body()[3..3 + encr_len], &mut decr_buf)
+        {
             Ok(len) => {
-                // Copy the decrypted data back into the message.
-                // Note at this point the "padding" space on the message is probably filled with leftover ciphertext.
-                message.body_mut()[1..len + 1].copy_from_slice(&decr_buf[0..len]);
+                info!(
+                    "noise: decrypt input {} bytes, output {} bytes",
+                    message.body().len(),
+                    len
+                );
+                // Copy the decrypted data back into the message -- do not overwrite ZPI.
+                message.shrink(message.body().len()); // remove body
+                message.put(&decr_buf[0..len]); // write a new body
+
+                message.alloc_zeroed_header::<ZdpZpiHeader>().zpi = state.sa_id;
             }
             Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("decrypt failed: {}", e),
-                ));
+                return Err(KMError::MachineError(e.to_string()));
             }
         }
         Ok(())
@@ -282,7 +308,7 @@ impl KeyManager<'_> {
     /// This waits until space available in our KM message queue.
     ///
     /// We copy the payload into our own buffer for processing asynchronously. Caller should free buffer.
-    pub async fn handle_km_message(&self, message: &[u8]) -> io::Result<()> {
+    pub async fn handle_km_message(&self, message: &[u8]) -> KMResult<()> {
         let tx: mpsc::Sender<Bytes>;
         {
             let state = self.shared.state.lock().unwrap();
@@ -291,20 +317,14 @@ impl KeyManager<'_> {
                     tx = t.clone();
                 }
                 None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "KeyManager not running",
-                    ));
+                    return Err(KMError::InvalidState);
                 }
             }
         }
         let km_buf = Bytes::copy_from_slice(message);
-        match tx.send(km_buf.into()).await {
+        match tx.send(km_buf).await {
             Ok(_) => Ok(()),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "failed to enqueue inbound KM message",
-            )),
+            Err(_) => Err(KMError::EnqueueFailed),
         }
     }
 
@@ -312,7 +332,7 @@ impl KeyManager<'_> {
     /// This will fail if there is no space in queue.
     ///
     /// We copy the payload into our own buffer for processing asynchronously. Caller should free buffer.
-    pub fn try_handle_km_message(&self, message: &[u8]) -> io::Result<()> {
+    pub fn try_handle_km_message(&self, message: &[u8]) -> KMResult<()> {
         let tx: mpsc::Sender<Bytes>;
         {
             let state = self.shared.state.lock().unwrap();
@@ -321,20 +341,14 @@ impl KeyManager<'_> {
                     tx = t.clone();
                 }
                 None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "KeyManager not running",
-                    ));
+                    return Err(KMError::InvalidState);
                 }
             }
         }
         let km_buf = Bytes::copy_from_slice(message);
-        match tx.try_send(km_buf.into()) {
+        match tx.try_send(km_buf) {
             Ok(_) => Ok(()),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "failed to enqueue inbound KM message",
-            )),
+            Err(_) => Err(KMError::EnqueueFailed),
         }
     }
 
@@ -346,14 +360,13 @@ impl KeyManager<'_> {
     /// `km_buffers_out` will be filled with outbound ZDP Key Management messages for our peer. These are
     /// just the payloads.  The caller is responsible for adding the ZPI header, if required.
     ///
-    /// If `initiate` is true, the key manager will initiate a new handshake.  In the adapter-dock
-    /// scenario, the adapter should be the initiator and the node should not.
+    /// `km_signals_out` will be recieve signals from the machine.
     pub async fn start(
         &mut self,
-        initiate: bool,
         ctok: CancellationToken,
         km_buffers_out: mpsc::Sender<Bytes>,
-    ) -> io::Result<()> {
+        km_signals_out: mpsc::Sender<KMSignal>,
+    ) -> KMResult<()> {
         let (km_tx, mut km_rx) = mpsc::channel(16);
         let tick_interval: Duration;
         {
@@ -367,17 +380,21 @@ impl KeyManager<'_> {
         let handshake: Option<Bytes>;
         {
             let mut state = self.shared.state.lock().unwrap();
-            handshake = state.statemachine.reset(initiate);
+            handshake = match state.statemachine.reset() {
+                Ok(h) => h,
+                Err(e) => return Err(KMError::MachineError(e.to_string())),
+            };
+        }
+        match km_signals_out.send(KMSignal::Reset).await {
+            Ok(_) => {}
+            Err(_) => {
+                error!("failed to enqueue reset signal")
+            }
         }
         if let Some(handshake) = handshake {
             match km_buffers_out.send(handshake).await {
                 Ok(_) => {}
-                Err(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "failed to enqueue outbound KM message",
-                    ))
-                }
+                Err(_) => return Err(KMError::EnqueueFailed),
             }
         };
 
@@ -393,10 +410,29 @@ impl KeyManager<'_> {
             match prev_state {
                 KMSMState::Error => {
                     // If error, send reset and loop again
+                    match km_signals_out.send(KMSignal::Error).await {
+                        Ok(_) => {}
+                        Err(_) => {
+                            error!("failed to enqueue error signal, aborting");
+                            return Err(KMError::EnqueueFailed);
+                        }
+                    }
                     let resp: Option<Bytes>;
                     {
                         let mut state = self.shared.state.lock().unwrap();
-                        resp = state.statemachine.reset(initiate);
+                        resp = match state.statemachine.reset() {
+                            Ok(h) => h,
+                            Err(e) => {
+                                return Err(KMError::MachineError(e.to_string()));
+                            }
+                        };
+                    }
+                    match km_signals_out.send(KMSignal::Reset).await {
+                        Ok(_) => {}
+                        Err(_) => {
+                            error!("failed to enqueue reset signal, aborting");
+                            return Err(KMError::EnqueueFailed);
+                        }
                     }
                     if let Some(resp) = resp {
                         match km_buffers_out.send(resp).await {
@@ -418,7 +454,13 @@ impl KeyManager<'_> {
                             let resp: Option<Bytes>;
                             {
                                 let mut state = self.shared.state.lock().unwrap();
-                                resp = state.statemachine.handle_message(&inmsg);
+                                resp = match state.statemachine.handle_message(&inmsg) {
+                                    Ok(h) => h,
+                                    Err(e) => {
+                                        error!("failed to handle key manager message: {}", e);
+                                        None
+                                    }
+                                };
                             }
                             if let Some(resp) = resp {
                                 match km_buffers_out.send(resp).await {
@@ -434,7 +476,13 @@ impl KeyManager<'_> {
                             let resp: Option<Bytes>;
                             {
                                 let mut state = self.shared.state.lock().unwrap();
-                                resp = state.statemachine.tick();
+                                resp = match state.statemachine.tick() {
+                                    Ok(h) => h,
+                                    Err(e) => {
+                                        error!("failed to tick key manager: {}", e);
+                                        None
+                                    }
+                                };
                             }
                             if let Some(resp) = resp {
                                 match km_buffers_out.send(resp).await {
@@ -455,37 +503,41 @@ impl KeyManager<'_> {
             }
 
             if next_state != prev_state {
-                // state transition
                 info!("KM state transition {:?} -> {:?}", prev_state, next_state);
-
                 if next_state == KMSMState::Transport {
-                    let mut state = self.shared.state.lock().unwrap();
-                    state.sa_id += 1;
-                    if state.sa_id == 0 {
-                        state.sa_id = 1;
+                    let prev_id: zpr::SaId;
+                    let cur_id: zpr::SaId;
+                    {
+                        let mut state = self.shared.state.lock().unwrap();
+                        prev_id = state.sa_id;
+                        state.sa_id += 1;
+                        if state.sa_id == 0 {
+                            state.sa_id = 1;
+                        }
+                        cur_id = state.sa_id;
                     }
-                    info!("KM: New SA_ID: {}", state.sa_id);
+                    info!("KM: New SA_ID: {}", cur_id);
+                    match km_signals_out
+                        .send(KMSignal::SaIdChange {
+                            old: prev_id,
+                            new: cur_id,
+                        })
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(_) => {
+                            error!("failed to enqueue SaIdChange signal")
+                        }
+                    }
                 }
             } else if next_state == KMSMState::Error {
                 error!("KM: stuck in error state");
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Key Manager in error state",
-                ));
+                return Err(KMError::MachineError(String::from("stuck in error state")));
                 // TODO: Maybe use a timer and keep trying to reset?
             }
         }
 
         Ok(())
-    }
-}
-
-/// Generic encryption error (to be fleshed out later).
-pub struct EncryptionError;
-
-impl fmt::Display for EncryptionError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "EncryptionError")
     }
 }
 
@@ -519,6 +571,7 @@ pub struct KMSettings {
     pub zdp_km_type: zpr::KmId,
 
     /// Number of additional bytes required to encrypt a payload for transport.
+    /// Note that the KM itself adds 2 bytes for a length field.
     pub padlen: usize,
 
     /// If non-zero, then `payload`+`padlen` must be a multiple of `alignment`.
@@ -526,30 +579,6 @@ pub struct KMSettings {
 
     /// How often the statement runloop should call into [KeyManagerStateMachine::tick].
     pub tick_interval: Duration,
-}
-
-/// Interface for a thing which can encrypt and decrypt ZDP trasport payloads.
-/// Not to be used for Key Management messages.
-pub trait TransportEncr: Send + Sync {
-    /// Encrypt `payload` into `message`.
-    ///
-    /// `sa_id` is the Security Association ID in use.
-    fn encrypt_transport(
-        self: &Self,
-        sa_id: u8,
-        payload: &[u8],
-        message: &mut [u8],
-    ) -> Result<usize, EncryptionError>;
-
-    /// Decrypt `payload` into `message`
-    ///
-    /// `sa_id` is the Security Association ID in use.
-    fn decrypt_transport(
-        self: &Self,
-        sa_id: u8,
-        payload: &[u8],
-        message: &mut [u8],
-    ) -> Result<usize, EncryptionError>;
 }
 
 /// Interface to a Key Management protocol.
@@ -560,203 +589,79 @@ pub trait KeyManagerStateMachine: Send + Sync {
     /// State can only change through handle_message, tick, or reset.
     fn get_state(self: &Self) -> KMSMState;
 
-    /// Reset state machine and optionally initiate a new handshake.
+    /// Reset state machine. This is always called as the state machine is
+    /// started (prior to first tick).  If this is the initiator this should initiate a
+    /// new handshake message.
     /// Must clear error state.
-    fn reset(self: &mut Self, initiate: bool) -> Option<Bytes>;
+    fn reset(self: &mut Self) -> Result<Option<Bytes>, KMError>;
 
     /// Process an inbound KM message.
     /// May produce an output message.
     /// May transition internal state.
-    fn handle_message(self: &mut Self, message: &[u8]) -> Option<Bytes>;
+    fn handle_message(self: &mut Self, message: &[u8]) -> Result<Option<Bytes>, KMError>;
 
     /// Optional outbound KM message
     /// May transition internal state
-    fn tick(self: &mut Self) -> Option<Bytes>;
+    /// If this returns error, internal state should be error too.
+    fn tick(self: &mut Self) -> Result<Option<Bytes>, KMError>;
 
-    /// The encrypt/decrypt should not alter internal state of SA. So any state needed
-    /// must be part of the message. Not sure about this assumption -- but hoping to
-    /// avoid locking whole machine during encrypt/decrypt.
-    fn get_transport_encryptor(self: &Self) -> Box<dyn TransportEncr>;
-}
-
-/// Placeholder code -- will be removed once we have a real key manager implementation.
-pub struct SillyKeyManager {
-    state: KMSMState,
-    settings: KMSettings,
-    hello_t: time::Instant,
-    initiate: bool,
-}
-
-impl SillyKeyManager {
-    pub fn new() -> SillyKeyManager {
-        SillyKeyManager {
-            state: KMSMState::Configuring,
-            settings: KMSettings {
-                zdp_km_type: zpr::KM_ID_EXPERIMENTAL,
-                padlen: 2, // we need 2 extra bytes
-                alignment: 0,
-                tick_interval: Duration::from_millis(1000),
-            },
-            hello_t: time::Instant::now(),
-            initiate: false,
-        }
-    }
-}
-
-struct SillyEncr;
-
-impl TransportEncr for SillyEncr {
-    // Copy payload into message with a SIZE preamble.
+    /// Encrypt `payload` into `message`.
+    ///
+    /// `sa_id` is the Security Association ID in use.
     fn encrypt_transport(
-        self: &Self,
-        _sa_id: u8,
+        self: &mut Self,
         payload: &[u8],
         message: &mut [u8],
-    ) -> Result<usize, EncryptionError> {
-        let sz = payload.len() + 2; // SIZE includes the 2 byte size field.
-        if sz > std::u16::MAX as usize {
-            return Err(EncryptionError);
-        }
-        let szbytes = (sz as u16).to_be_bytes();
-        message[0..3].copy_from_slice(&szbytes); // write SIZE as u16 to front of buffer
-        message[2..sz].copy_from_slice(payload); // then copy rest of payload
-        Ok(sz)
-    }
+    ) -> Result<usize, KMError>;
 
-    // Check and remove the SIZE preamble, return the payload
+    /// Decrypt `payload` into `message`
+    ///
+    /// `sa_id` is the Security Association ID in use.
     fn decrypt_transport(
-        self: &Self,
-        _sa_id: u8,
+        self: &mut Self,
         payload: &[u8],
         message: &mut [u8],
-    ) -> Result<usize, EncryptionError> {
-        let buf_sz = payload.len();
-        if buf_sz < 2 {
-            return Err(EncryptionError);
-        }
-        let msg_sz: u16 = u16::from_be_bytes([payload[0], payload[1]]);
-        if buf_sz < msg_sz as usize {
-            return Err(EncryptionError);
-        }
-        let msg_len: usize = (msg_sz - 2) as usize;
-        message[..msg_len].copy_from_slice(&payload[2..]);
-        Ok(msg_len)
-    }
-}
-
-impl KeyManagerStateMachine for SillyKeyManager {
-    fn get_settings(&self) -> KMSettings {
-        return self.settings.clone();
-    }
-
-    fn get_state(&self) -> KMSMState {
-        self.state.clone()
-    }
-
-    fn reset(&mut self, initiate: bool) -> Option<Bytes> {
-        self.initiate = initiate;
-        self.state = KMSMState::Configuring;
-        if initiate {
-            let handshake = Bytes::from_static(&[0, 255, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8]); // TYPE | LEN | PAYLOAD
-            self.hello_t = time::Instant::now();
-            Some(handshake)
-        } else {
-            None
-        }
-    }
-
-    fn handle_message(&mut self, _message: &[u8]) -> Option<Bytes> {
-        if self.state == KMSMState::Configuring {
-            self.state = KMSMState::Transport;
-            if !self.initiate {
-                // Did not initiate, so send a reply back.
-                let handshake_reply = Bytes::from_static(&[0, 255, 0, 12, 8, 7, 6, 5, 4, 3, 2, 1]); // TYPE | LEN | PAYLOAD
-                return Some(handshake_reply);
-            }
-        }
-        None
-    }
-
-    fn tick(&mut self) -> Option<Bytes> {
-        if self.state == KMSMState::Configuring {
-            if self.initiate && self.hello_t.elapsed() > Duration::from_secs(5) {
-                // too long, send another hello.
-                let handshake = Bytes::from_static(&[0, 255, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8]); // TYPE | LEN | PAYLOAD
-                self.hello_t = time::Instant::now();
-                return Some(handshake);
-            }
-        }
-        None
-    }
-
-    fn get_transport_encryptor(self: &Self) -> Box<dyn TransportEncr> {
-        return Box::new(SillyEncr {});
-    }
+    ) -> Result<usize, KMError>;
 }
 
 #[cfg(test)]
 mod test {
     use tokio::task::yield_now;
     use tokio::time::sleep;
-    // use zerocopy::AsBytes;
     use zpr_ext::zerocopy::*;
 
     use crate::config::PACKET_BUFFER_SIZE;
-    use crate::zdp::ZdpZpiHeader;
 
     use super::*;
 
+    #[allow(dead_code)]
     struct TestKM {
         state: KMSMState,
         shared: Arc<TestKMShared>,
+        initiator: bool,
     }
 
     struct TestKMShared {
         state: Mutex<TestKMInternals>,
     }
     struct TestKMInternals {
-        initiator: Option<bool>,
         reset_count: u8,
         handle_count: u8,
         tick_count: u8,
     }
 
-    struct TestEncr;
-
-    impl TransportEncr for TestEncr {
-        fn encrypt_transport(
-            self: &Self,
-            _sa_id: u8,
-            payload: &[u8],
-            message: &mut [u8],
-        ) -> Result<usize, EncryptionError> {
-            message[0..payload.len()].copy_from_slice(payload);
-            Ok(payload.len())
-        }
-
-        fn decrypt_transport(
-            self: &Self,
-            _sa_id: u8,
-            payload: &[u8],
-            message: &mut [u8],
-        ) -> Result<usize, EncryptionError> {
-            message[0..payload.len()].copy_from_slice(payload);
-            Ok(payload.len())
-        }
-    }
-
     impl TestKM {
-        pub fn new(initial_state: KMSMState) -> TestKM {
+        pub fn new(initiate: bool, initial_state: KMSMState) -> TestKM {
             TestKM {
                 state: initial_state,
                 shared: Arc::new(TestKMShared {
                     state: Mutex::new(TestKMInternals {
-                        initiator: None,
                         reset_count: 0,
                         handle_count: 0,
                         tick_count: 0,
                     }),
                 }),
+                initiator: initiate,
             }
         }
     }
@@ -765,8 +670,8 @@ mod test {
         fn get_settings(&self) -> KMSettings {
             KMSettings {
                 zdp_km_type: zpr::KM_ID_EXPERIMENTAL,
-                padlen: 8,
-                alignment: 8,
+                padlen: 0,
+                alignment: 0,
                 tick_interval: Duration::from_millis(200),
             }
         }
@@ -775,64 +680,78 @@ mod test {
             return self.state.clone();
         }
 
-        fn reset(&mut self, initiate: bool) -> Option<Bytes> {
+        fn reset(&mut self) -> Result<Option<Bytes>, KMError> {
             let mut internals = self.shared.state.lock().unwrap();
-            internals.initiator = Some(initiate);
             internals.reset_count += 1;
             self.state = KMSMState::Configuring;
-            None
+            Ok(None)
         }
 
-        fn handle_message(&mut self, _message: &[u8]) -> Option<Bytes> {
+        fn handle_message(&mut self, _message: &[u8]) -> Result<Option<Bytes>, KMError> {
             let mut internals = self.shared.state.lock().unwrap();
             internals.handle_count += 1;
-            None
+            Ok(None)
         }
 
-        fn tick(&mut self) -> Option<Bytes> {
+        fn tick(&mut self) -> Result<Option<Bytes>, KMError> {
             let mut internals = self.shared.state.lock().unwrap();
             internals.tick_count += 1;
-            None
+            Ok(None)
         }
 
-        fn get_transport_encryptor(self: &Self) -> Box<dyn TransportEncr> {
-            Box::new(TestEncr {})
+        fn encrypt_transport(
+            self: &mut Self,
+            payload: &[u8],
+            message: &mut [u8],
+        ) -> Result<usize, KMError> {
+            message[0..payload.len()].copy_from_slice(payload);
+            Ok(payload.len())
+        }
+
+        fn decrypt_transport(
+            self: &mut Self,
+            payload: &[u8],
+            message: &mut [u8],
+        ) -> Result<usize, KMError> {
+            message[0..payload.len()].copy_from_slice(payload);
+            Ok(payload.len())
         }
     }
 
     #[tokio::test]
     async fn test_km_sends_initiator_msg() {
-        let kmb = Box::new(TestKM::new(KMSMState::Configuring));
+        let kmb = Box::new(TestKM::new(true, KMSMState::Configuring));
         let kinternals = kmb.shared.clone();
         let mut km = KeyManager::new(kmb);
         let ctok = CancellationToken::new();
         let (tx, mut _rx) = mpsc::channel(4);
+        let (sig_tx, mut _sig_rx) = mpsc::channel(4);
 
         let sp_ctok = ctok.clone();
         tokio::spawn(async move {
-            let _ = km.start(true, sp_ctok, tx).await;
+            let _ = km.start(sp_ctok, tx, sig_tx).await;
         });
 
         yield_now().await;
 
         // Upon startup this should call reset with initiate.
         assert!(kinternals.state.lock().unwrap().reset_count == 1);
-        assert!(kinternals.state.lock().unwrap().initiator == Some(true));
 
         ctok.cancel()
     }
 
     #[tokio::test]
     async fn test_km_ticks() {
-        let kmb = Box::new(TestKM::new(KMSMState::Configuring));
+        let kmb = Box::new(TestKM::new(true, KMSMState::Configuring));
         let kinternals = kmb.shared.clone();
         let mut km = KeyManager::new(kmb);
         let ctok = CancellationToken::new();
         let (tx, mut _rx) = mpsc::channel(4);
+        let (sig_tx, mut _sig_rx) = mpsc::channel(4);
 
         let sp_ctok = ctok.clone();
         tokio::spawn(async move {
-            let _ = km.start(true, sp_ctok, tx).await;
+            let _ = km.start(sp_ctok, tx, sig_tx).await;
         });
 
         sleep(Duration::from_millis(900)).await;
@@ -845,17 +764,18 @@ mod test {
 
     #[tokio::test]
     async fn test_km_passes_inbound_msg() {
-        let kmb = Box::new(TestKM::new(KMSMState::Configuring));
+        let kmb = Box::new(TestKM::new(true, KMSMState::Configuring));
         let kinternals = kmb.shared.clone();
         let km = KeyManager::new(kmb);
 
         let ctok = CancellationToken::new();
         let (tx, mut _rx) = mpsc::channel(4);
+        let (sig_tx, mut _sig_rx) = mpsc::channel(4);
 
         let sp_ctok = ctok.clone();
         let mut sp_km = km.clone();
         tokio::spawn(async move {
-            let _ = sp_km.start(true, sp_ctok, tx).await;
+            let _ = sp_km.start(sp_ctok, tx, sig_tx).await;
         });
         yield_now().await;
 
@@ -874,17 +794,18 @@ mod test {
 
     #[tokio::test]
     async fn test_km_passes_inbound_msg_no_buffer() {
-        let kmb = Box::new(TestKM::new(KMSMState::Configuring));
+        let kmb = Box::new(TestKM::new(true, KMSMState::Configuring));
         let kinternals = kmb.shared.clone();
         let km = KeyManager::new(kmb);
 
         let ctok = CancellationToken::new();
         let (tx, mut _rx) = mpsc::channel(4);
+        let (sig_tx, mut _sig_rx) = mpsc::channel(4);
 
         let sp_ctok = ctok.clone();
         let mut sp_km = km.clone();
         tokio::spawn(async move {
-            let _ = sp_km.start(true, sp_ctok, tx).await;
+            let _ = sp_km.start(sp_ctok, tx, sig_tx).await;
         });
         yield_now().await;
 
@@ -903,7 +824,7 @@ mod test {
 
     #[tokio::test]
     async fn test_km_encrypt_transport_non_transit() {
-        let kmb = Box::new(TestKM::new(KMSMState::Transport));
+        let kmb = Box::new(TestKM::new(true, KMSMState::Transport));
         let km = KeyManager::new(kmb);
 
         // No need to start the machine since encrypt only cares about transport state and SA_ID.
@@ -919,7 +840,6 @@ mod test {
         //let hbytes = hdr.as_bytes();
         //pkt.body_mut()[0..hbytes.len()].copy_from_slice(&hbytes);
         hdr.write_to_buf(&mut pkt);
-
         match km.encrypt_transport(&mut pkt) {
             Ok(_) => {}
             Err(e) => {
@@ -930,8 +850,9 @@ mod test {
         // The encrypt function writes a SA_ID to first byte.
         assert!(pkt.body()[0] == 33);
 
+        // Rest of input is after the length...
         let encr_hdr =
-            ZdpBaseHeader::ref_from_prefix(&pkt.body()[1..]).expect("failed to read back header");
+            ZdpBaseHeader::ref_from_prefix(&pkt.body()[3..]).expect("failed to read back header");
 
         assert!(encr_hdr.packet_type == hdr.packet_type);
         assert!(encr_hdr.excess_length == hdr.excess_length);
@@ -940,25 +861,29 @@ mod test {
 
     #[tokio::test]
     async fn test_km_decrypt_transport_non_transit() {
-        let kmb = Box::new(TestKM::new(KMSMState::Transport));
+        let kmb = Box::new(TestKM::new(true, KMSMState::Transport));
         let km = KeyManager::new(kmb);
 
         // No need to start the machine since encrypt only cares about transport state and SA_ID.
         km.set_sa_id(33);
 
-        let zpi_hdr = ZdpZpiHeader { zpi: 33 };
+        let mut buf = [0u8; PACKET_BUFFER_SIZE];
+        let mut pkt = Packet::new(&mut buf, 64);
 
         let hdr = ZdpBaseHeader {
             packet_type: ZdpPacketType::EchoRequest,
-            excess_length: 22u8,
-            sequence_number: 19u16.into(),
+            excess_length: 0u8,
+            sequence_number: 0u16.into(),
         };
-        let mut buf = [0u8; PACKET_BUFFER_SIZE];
-        let mut pkt = Packet::new(&mut buf, 64);
+        //let hbytes = hdr.as_bytes();
+        //pkt.body_mut()[0..hbytes.len()].copy_from_slice(&hbytes);
         hdr.write_to_buf(&mut pkt);
-        *pkt.alloc_zeroed_header::<ZdpZpiHeader>() = zpi_hdr;
-
-        assert!(pkt.body()[0] == 33); // sanity check
+        match km.encrypt_transport(&mut pkt) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("encrypt_transport failed: {}", e);
+            }
+        }
 
         match km.decrypt_transport(&mut pkt) {
             Ok(_) => {}
