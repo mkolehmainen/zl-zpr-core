@@ -16,6 +16,7 @@ use tokio_tun::TunBuilder;
 use tracing::warn;
 use zpr_ext::tokio::net::UdpSocketExt;
 
+mod adapter_manager_worker;
 mod adapter_tables;
 mod agent_output_worker;
 mod assembly;
@@ -110,14 +111,19 @@ fn main() -> ExitCode {
     let capture_queue_size = 16;
     let capture_batch_size = 8;
     let tun_queue_count = 4;
+    let adapter_manager_queue_size = 16;
 
     let buf_storage = vec![[0u8; config::PACKET_BUFFER_SIZE]; 256];
     let buffer_stack = BufferStack::new(buf_storage.leak::<'static>());
+
     let (mp_inq, mp_outq) = mpsc::channel(mgmt_processor_queue_size);
     let mgmt_processor = MgmtProcessor::new(mp_inq);
 
     let (cap_inq, cap_outq) = mpsc::channel(capture_queue_size);
     let capture_queue = Capture::new(cap_inq);
+
+    let (am_inq, am_outq) = mpsc::channel(adapter_manager_queue_size);
+    let adapter_manager = AdapterManager::new(am_inq);
 
     let capture_worker = CaptureWorker::new();
     let flow_control = FlowControl::new();
@@ -172,32 +178,6 @@ fn main() -> ExitCode {
 
             let alt = adapter_tables::AgentLookupTable::new();
             let dlt = adapter_tables::DockLookupTable::new();
-
-            // TEMP HACK: fill ALT & DLT based on TUN local & remote addresses
-            for (remote_stream_id, protocol) in [1, 6, 17].into_iter().enumerate() {
-                let five_tuple = defs::FiveTuple::new(
-                    zpr::L3Type::Ipv4,
-                    tun_devs[0].address().unwrap().into(),
-                    tun_devs[0].destination().unwrap().into(),
-                    protocol,
-                    0,
-                    0,
-                );
-                alt.insert(
-                    five_tuple,
-                    adapter_tables::AltPep {
-                        compression_mode: 0,
-                        stream_id: remote_stream_id as zpr::StreamId, /* TOTAL HACK */
-                    },
-                );
-                let local_stream_id = dlt
-                    .insert(adapter_tables::DltPep {
-                        compression_mode: 0,
-                        five_tuple: five_tuple.reverse(),
-                    })
-                    .unwrap();
-                assert_eq!(local_stream_id, remote_stream_id as zpr::StreamId); // VERY HACK
-            }
 
             // Open ingress sockets.
             let mut sockets = Vec::new();
@@ -306,6 +286,7 @@ fn main() -> ExitCode {
                 adapter_docking_session_id,
                 alt,
                 dlt,
+                adapter_manager,
             }));
 
             // TODO signal handler goes here
@@ -339,6 +320,7 @@ fn main() -> ExitCode {
             });
 
             js.spawn(mgmt_processor_worker::launch(&*asm, mp_outq));
+            js.spawn(adapter_manager_worker::launch(&*asm, am_outq));
 
             for (worker_index, tun_dev) in tun_devs.iter().enumerate() {
                 js.spawn(agent_output_worker::launch(
@@ -378,7 +360,9 @@ fn main() -> ExitCode {
 
             mgmt::send_report(asm, asm.adapter_docking_session_id, "Reporting for Duty!").await;
             mgmt::send_discard(asm, asm.adapter_docking_session_id).await;
-            asm.send_hello_req().await;
+            mgmt::send_hello_request(asm, asm.adapter_docking_session_id)
+                .await
+                .unwrap();
 
             while let Some(res) = js.join_next().await {
                 res.unwrap();
