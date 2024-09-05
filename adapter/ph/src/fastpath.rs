@@ -18,7 +18,6 @@ use crate::zdp_ll;
 use crate::zpr;
 use blake3;
 use bytes::{Buf, BufMut};
-use std::net::SocketAddr;
 use std::time::SystemTime;
 use zerocopy::FromBytes;
 use zpr_ext::std::mem::{drop_guard, DropGuard};
@@ -319,7 +318,7 @@ pub async fn substrate_egress_blocking<'pktbuf>(
 /// Process packets ingressing from the specified SA.
 pub fn substrate_ingress<'pktbuf>(
     asm: &Assembly<'pktbuf>,
-    peer_sa: &SocketAddr,
+    peer_sa: &zpr::SubstrateAddr,
     mut pkt: Packet<'pktbuf>,
 ) {
     asm.counters[CounterType::InPacksRec].increment();
