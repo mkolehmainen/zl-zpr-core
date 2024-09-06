@@ -7,6 +7,7 @@ use crate::counters_enum::{self, CounterType};
 use crate::defs::*;
 use crate::dock_tables;
 use crate::fastpath;
+use crate::km_multiplexor;
 use crate::packet::{self, Packet};
 use crate::sync_req;
 use crate::zdp;
@@ -15,6 +16,7 @@ use bytes::{Buf, BufMut};
 use std::time::Duration;
 use tokio::sync::oneshot::channel;
 use tokio::time::sleep;
+use tracing::error;
 use zpr_ext::std::mem::{drop_guard, DropGuard};
 use zpr_ext::zerocopy::{AsBytesExt, FromBytesExt};
 
@@ -31,13 +33,7 @@ pub async fn send_non_flow_mgmt<'pktbuf>(
     let hdr = packet.alloc_zeroed_header::<zdp::ZdpBaseHeader>();
     hdr.packet_type = packet_type;
 
-    fastpath::substrate_egress_blocking(
-        asm,
-        link_id,
-        zpr::ZPI_0, // TODO
-        packet,
-    )
-    .await;
+    fastpath::substrate_egress_blocking(asm, link_id, packet).await;
 }
 
 /// Send a unidirectional per-flow management message on the given link.
@@ -57,13 +53,7 @@ pub async fn send_per_flow_mgmt<'pktbuf>(
     let hdr = packet.alloc_zeroed_header::<zdp::ZdpBaseHeader>();
     hdr.packet_type = packet_type;
 
-    fastpath::substrate_egress_blocking(
-        asm,
-        link_id,
-        zpr::ZPI_0, // TODO
-        packet,
-    )
-    .await;
+    fastpath::substrate_egress_blocking(asm, link_id, packet).await;
 }
 
 /// Sender function for non-per flow request management packet.
@@ -381,6 +371,8 @@ pub enum HandleMgmtError {
     UnknownType(u8),
     UnexpectedMgmtResponse,
     BadStructure,
+    UnknownKeyManagementType(u16),
+    KeyManagementError(String),
 }
 
 impl From<HandleMgmtError> for counters_enum::CounterType {
@@ -389,6 +381,8 @@ impl From<HandleMgmtError> for counters_enum::CounterType {
             HandleMgmtError::UnknownType(_type) => Self::UnknownType,
             HandleMgmtError::UnexpectedMgmtResponse => Self::UnexpectedMgmtResponse,
             HandleMgmtError::BadStructure => Self::BadStructure,
+            HandleMgmtError::UnknownKeyManagementType(_type) => Self::OtherError,
+            HandleMgmtError::KeyManagementError(_desc) => Self::OtherError,
         }
     }
 }
@@ -692,6 +686,68 @@ pub async fn handle_bind_agent_address_request<'pktbuf>(
         rsp_pkt,
     )
     .await;
+
+    Ok(())
+}
+
+/// Send a key management message out the given link.
+pub async fn send_key_management<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    link_id: zpr::LinkId,
+    km_id: zpr::KmId,
+    payload: &[u8],
+) {
+    let buf = asm.buffer_stack.get_buffer().await;
+    let mut pkt = Packet::new(buf, config::DEFAULT_MESSAGE_HEADROOM);
+
+    let km_hdr = pkt.alloc_zeroed_header::<zdp::ZdpKeyManagementHeader>();
+    km_hdr.message_type = km_id.into();
+    km_hdr.message_length = (payload.len() as u16).into();
+
+    pkt.put(payload);
+
+    send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::KeyManagement, pkt).await;
+}
+
+// ZPI and Base header is already gone by the time we get here.  So we expect
+// to parse starting from the KeyManagement header.
+pub async fn handle_key_management<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    ingress_link_id: zpr::LinkId,
+    mut pkt: Packet<'pktbuf>,
+) -> HandleMgmtResult<'pktbuf> {
+    let Some(km_hdr) = zdp::ZdpKeyManagementHeader::read_from_buf(&mut pkt) else {
+        error!("KeyManagement packet arrived with unparseable header");
+        return Err((HandleMgmtError::BadStructure, pkt));
+    };
+    if !km_hdr.is_noise() {
+        error!(
+            "KeyManagement packet not using NOISE - type is {}",
+            km_hdr.message_type
+        );
+        return Err((
+            HandleMgmtError::UnknownKeyManagementType(km_hdr.message_type.into()),
+            pkt,
+        ));
+    }
+    let km_msg_len = usize::from(km_hdr.message_length);
+    if pkt.remaining() < km_msg_len {
+        error!("KeyManagement packet arrived with truncated payload");
+        return Err((HandleMgmtError::BadStructure, pkt));
+    }
+    match km_multiplexor::handle_inbound_km_msg(asm, ingress_link_id, &pkt.body()[..km_msg_len])
+        .await
+    {
+        Ok(()) => (),
+        Err(e) => {
+            error!(
+                "key management handling failed on link {}: {:?}",
+                ingress_link_id, e
+            );
+            return Err((HandleMgmtError::KeyManagementError(format!("{:?}", e)), pkt));
+        }
+    };
+    asm.buffer_stack.put_buffer(pkt.destroy());
 
     Ok(())
 }

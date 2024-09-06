@@ -3,6 +3,7 @@
 use cbpf_rs::bpf_code;
 use clap::Parser;
 use enum_map::{enum_map, EnumMap};
+use std::default::Default;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -14,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_tun::TunBuilder;
 use tracing::warn;
+use tracing_subscriber;
 use zpr_ext::tokio::net::UdpSocketExt;
 
 mod adapter_manager_worker;
@@ -31,6 +33,9 @@ mod defs;
 mod dock_tables;
 mod fastpath;
 mod flow_control;
+mod km;
+mod km_multiplexor;
+mod km_noise;
 mod mgmt;
 mod mgmt_processor_worker;
 mod net_defs;
@@ -49,12 +54,14 @@ mod zdp;
 mod zdp_ll;
 mod zpr;
 
-use assembly::{Assembly, PhMode};
+use assembly::{Assembly, PhFlags, PhMode};
 use buffer_stack::BufferStack;
 use capture_worker::CaptureWorker;
 use counter::*;
 use counters_enum::*;
 use flow_control::FlowControl;
+use km::ZPIPair;
+use km_multiplexor::KmState;
 use queues::*;
 use tun_ctl::TunCtl;
 
@@ -87,6 +94,12 @@ struct CmdLine {
 
     #[arg(long)]
     tun_if: Option<String>,
+
+    #[arg(long)]
+    disable_km: bool,
+
+    #[arg(long)]
+    allow_insecure_zpi_zero: bool,
 }
 
 fn emit_counts(system_name: &String, counts_map: &EnumMap<CounterType, Counter>) {
@@ -97,6 +110,7 @@ fn emit_counts(system_name: &String, counts_map: &EnumMap<CounterType, Counter>)
 }
 
 fn main() -> ExitCode {
+    tracing_subscriber::fmt::init();
     let cmd_line = CmdLine::parse();
 
     let system_name = cmd_line.name;
@@ -107,6 +121,13 @@ fn main() -> ExitCode {
     let _ca_file = cmd_line.ca_file;
     let _cert_file = cmd_line.certificate_file;
     let _priv_key_file = cmd_line.private_key_file;
+    let disable_km = cmd_line.disable_km;
+    let allow_insecure_zpi_zero = cmd_line.allow_insecure_zpi_zero;
+    if allow_insecure_zpi_zero {
+        warn!(
+            "Insecure ZPI ZERO is enabled.  This is insecure and should only be used for testing."
+        );
+    }
     let ph_mode;
 
     // TODO: These batch sizes are placeholders for now.  So are the queue
@@ -120,6 +141,7 @@ fn main() -> ExitCode {
     let capture_batch_size = 8;
     let tun_queue_count = 4;
     let adapter_manager_queue_size = 16;
+    let km_message_queue_size = 16;
 
     let buf_storage = vec![[0u8; config::PACKET_BUFFER_SIZE]; 256];
     let buffer_stack = BufferStack::new(buf_storage.leak::<'static>());
@@ -134,6 +156,10 @@ fn main() -> ExitCode {
     let flow_control = FlowControl::new();
 
     let counters = enum_map! { _ => Counter::new(), };
+
+    let (km_sig_tx, km_sig_rx) = mpsc::channel(16); // TODO: name this constant
+    let (km_tx, km_rx) = mpsc::channel(km_message_queue_size);
+    let km_state = KmState::new(km_tx, km_sig_tx);
 
     /*let mut ssl_context_builder = ssl::SslContext::builder(ssl::SslMethod::dtls()).unwrap();
     ssl_context_builder.set_options(
@@ -273,7 +299,11 @@ fn main() -> ExitCode {
             let agent_input = AgentInput::new(tun_devs.iter());
             let substrate_egress = SubstrateEgress::new(sockets.iter());
 
+            let mut flags: PhFlags = Default::default();
+            flags.allow_insecure_zpi_zero = allow_insecure_zpi_zero;
+
             let asm = Box::leak(Box::new(Assembly {
+                flags,
                 ph_mode,
                 system_name,
                 buffer_stack,
@@ -289,15 +319,27 @@ fn main() -> ExitCode {
                 alt,
                 dlt,
                 adapter_manager,
+                km_state,
             }));
 
             // TEMP HACK to statically install peers
+            let dock_noise_public_key = [0; 32]; // XXX TODO
             if let Some(pa2) = peer_addr2 {
                 let peer_id2 = asm
                     .hack_add_peer(peer_table::PeerType::Adapter, pa2)
                     .unwrap();
 
                 asm.peer_ids.lock().unwrap().push(peer_id2);
+
+                if !disable_km {
+                    km_multiplexor::add_adapter_link(
+                        asm,
+                        peer_id2,
+                        ZPIPair::new(1, 2),
+                        dock_noise_public_key,
+                    )
+                    .unwrap();
+                }
             }
 
             let peer_id = asm
@@ -311,6 +353,33 @@ fn main() -> ExitCode {
                 .unwrap();
 
             asm.peer_ids.lock().unwrap().push(peer_id);
+            if !disable_km {
+                if ph_mode == PhMode::Adapter {
+                    km_multiplexor::add_adapter_link(
+                        asm,
+                        peer_id,
+                        ZPIPair::new(3, 4),
+                        dock_noise_public_key,
+                    )
+                    .unwrap();
+                } else {
+                    let dock_keypair = snow::Keypair {
+                        // XXX also TODO!
+                        private: [0; 32].to_vec(),
+                        public: [0; 32].to_vec(),
+                    };
+                    km_multiplexor::add_node_link(asm, peer_id, ZPIPair::new(5, 6), dock_keypair)
+                        .unwrap();
+                }
+                let dock_noise_public_key = [0; 32]; // XXX TODO
+                km_multiplexor::add_adapter_link(
+                    asm,
+                    peer_id,
+                    ZPIPair::new(1, 2),
+                    dock_noise_public_key,
+                )
+                .unwrap();
+            }
             // END HACK
 
             // TODO signal handler goes here
@@ -365,6 +434,12 @@ fn main() -> ExitCode {
                 &*asm,
                 cap_outq,
             ));
+
+            if !disable_km {
+                // Start key managemenent workers
+                js.spawn(km_multiplexor::launch_signal_worker(&*asm, km_sig_rx));
+                js.spawn(km_multiplexor::launch_message_worker(&*asm, km_rx));
+            }
 
             eprintln!("{}: connecting...", asm.system_name);
             eprintln!("{}: connected!", asm.system_name); // FIXME: it's a lie

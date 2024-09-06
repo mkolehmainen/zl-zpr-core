@@ -5,14 +5,18 @@ use crate::config;
 use crate::counter::*;
 use crate::counters_enum::*;
 use crate::flow_control::FlowControl;
+use crate::km_multiplexor::KmState;
 use crate::mgmt_processor_worker;
 use crate::peer_table;
 use crate::queues::*;
 use crate::tun_ctl::TunCtl;
 use crate::zpr;
-use enum_map::EnumMap;
 
-#[derive(Clone, Copy)]
+use enum_map::EnumMap;
+use std::default::Default;
+use std::result::Result;
+
+#[derive(Clone, Copy, PartialEq)]
 pub enum PhMode {
     Node,
     Adapter,
@@ -35,6 +39,7 @@ pub enum PhMode {
 /// visible queue becoming full.
 
 pub struct Assembly<'pktbuf> {
+    pub flags: PhFlags,
     pub ph_mode: PhMode,
 
     // Shared resources.  These may be accessed by any part of the system.
@@ -63,6 +68,21 @@ pub struct Assembly<'pktbuf> {
     pub dlt: adapter_tables::DockLookupTable,
 
     pub adapter_manager: AdapterManager<'pktbuf>,
+    pub km_state: KmState,
+}
+
+pub struct PhFlags {
+    /// If set TRUE this allows any messages on ZPI 0.  VERY INSECURE!!
+    pub allow_insecure_zpi_zero: bool,
+}
+
+impl Default for PhFlags {
+    /// Reasonable (and secure) defaults
+    fn default() -> Self {
+        Self {
+            allow_insecure_zpi_zero: false,
+        }
+    }
 }
 
 impl Assembly<'_> {
@@ -104,6 +124,7 @@ pub mod test {
     #[derive(Default)]
     pub struct TestAssemblyBuilder<'a> {
         pub ph_mode: Option<PhMode>,
+        pub flags: Option<PhFlags>,
         pub system_name: Option<String>,
         pub buffer_stack: Option<BufferStack<'a, { config::PACKET_BUFFER_SIZE }>>,
         pub agent_input: Option<AgentInput<'a>>,
@@ -118,6 +139,7 @@ pub mod test {
         pub alt: Option<adapter_tables::AgentLookupTable>,
         pub dlt: Option<adapter_tables::DockLookupTable>,
         pub adapter_manager: Option<AdapterManager<'a>>,
+        pub km_state: Option<KmState>,
     }
 
     #[allow(dead_code)]
@@ -128,15 +150,14 @@ pub mod test {
         }
     }
 
-    #[allow(dead_code)]
     impl TestAssemblyBuilder<'_> {
         pub fn new() -> Self {
             Self::default()
         }
     }
 
-    #[allow(dead_code)]
     pub fn create_assembly(builder: TestAssemblyBuilder) -> Assembly {
+        let flags = builder.flags.unwrap_or_else(|| Default::default());
         let ph_mode = builder.ph_mode.unwrap_or(PhMode::Adapter);
         let system_name = builder.system_name.unwrap_or("test".into());
         let buffer_stack = builder.buffer_stack.unwrap_or_else(|| {
@@ -177,8 +198,14 @@ pub mod test {
             let (cq_inq, _cq_outq) = mpsc::channel(1);
             AdapterManager::new(cq_inq)
         });
+        let km_state = builder.km_state.unwrap_or_else(|| {
+            let (km_sig_tx, _km_sig_rx) = mpsc::channel(1);
+            let (km_tx, _km_rx) = mpsc::channel(1);
+            KmState::new(km_tx, km_sig_tx)
+        });
 
         Assembly {
+            flags,
             ph_mode,
             system_name,
             buffer_stack,
@@ -194,6 +221,7 @@ pub mod test {
             alt,
             dlt,
             adapter_manager,
+            km_state,
         }
     }
 }
