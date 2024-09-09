@@ -523,9 +523,7 @@ pub fn substrate_ingress<'pktbuf>(
     // In ZPI zero only KM messages are allowed (well, and APR ARP which we don't support yet)
     // Can be overridden (FOR TESTING ONLY) in the flags.
     if !secure && base_hdr.packet_type != zdp::ZdpPacketType::KeyManagement {
-        if asm.flags.allow_insecure_zpi_zero {
-            warn!("operating in insecure mode - allow_insecure_zpi_zero is ENABLED");
-        } else {
+        if !asm.flags.allow_insecure_zpi_zero {
             warn!(
                 "ingress: link {}: ZPI 0 only allows key management messages, not {:?}",
                 ingress_link_id, base_hdr.packet_type

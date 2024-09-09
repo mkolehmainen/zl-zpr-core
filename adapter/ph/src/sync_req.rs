@@ -12,7 +12,7 @@ pub struct SyncReqState<'pktbuf> {
 }
 
 struct ListenerState<'pktbuf> {
-    response_listener: Option<oneshot::Sender<Response<'pktbuf>>>,
+    response_listener: Option<(zpr::SeqNum, oneshot::Sender<Response<'pktbuf>>)>,
 }
 
 struct WindowState {
@@ -91,7 +91,7 @@ impl<'pktbuf> SyncReqState<'pktbuf> {
     pub fn install_response_listener(&self, permit: &Permit) -> ResponseFuture<'pktbuf> {
         assert!(self.is_associated_permit(permit));
         let (sender, receiver) = oneshot::channel();
-        self.listener_state.lock().unwrap().response_listener = Some(sender);  // TODO: seq_num
+        self.listener_state.lock().unwrap().response_listener = Some((permit.seq_num(), sender));
         ResponseFuture { receiver }
     }
 
@@ -100,14 +100,22 @@ impl<'pktbuf> SyncReqState<'pktbuf> {
         self.listener_state.lock().unwrap().response_listener = None;
     }
 
-    pub fn forward_response(&self, response: Response<'pktbuf>) -> Result<(), Packet<'pktbuf>> {
-        match self.listener_state.lock().unwrap().response_listener.take() {
-            Some(sender) => match sender.send(response) {
-                Ok(()) => Ok(()),
-                Err(response) => Err(response.1),
-            },
+    pub fn forward_response(&self, seq_num: zpr::SeqNum, response: Response<'pktbuf>) -> Result<(), Packet<'pktbuf>> {
+        let listener = &mut self.listener_state.lock().unwrap().response_listener;
+        match listener {
+            Some((expected_seq_num, _)) => {
+                if seq_num != *expected_seq_num {
+                    eprintln!("expected seq num {} got {}", expected_seq_num, seq_num);
+                    return Err(response.1);
+                }
 
-            None => Err(response.1),
+                match listener.take().unwrap().1.send(response) {
+                    Ok(()) => Ok(()),
+                    Err(response) => Err(response.1),
+                }
+            }
+
+            _ => Err(response.1),
         }
     }
 }

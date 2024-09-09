@@ -31,6 +31,7 @@ pub async fn send_non_flow_mgmt<'pktbuf>(
 
 /// Send a unidirectional per-flow management message on the given link.
 /// The packet should contain only the message body.
+#[allow(dead_code)]
 pub async fn send_per_flow_mgmt<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     link_id: zpr::LinkId,
@@ -39,6 +40,27 @@ pub async fn send_per_flow_mgmt<'pktbuf>(
     packet: Packet<'pktbuf>,
 ) {
     send_mgmt_helper(asm, link_id, packet_type, Some(stream_id), None, packet).await
+}
+
+pub async fn send_non_flow_mgmt_response<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    link_id: zpr::LinkId,
+    packet_type: zdp::ZdpPacketType,
+    sequence_number: zpr::SeqNum,
+    packet: Packet<'pktbuf>,
+) {
+    send_mgmt_helper(asm, link_id, packet_type, None, Some(sequence_number), packet).await
+}
+
+pub async fn send_per_flow_mgmt_response<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    link_id: zpr::LinkId,
+    packet_type: zdp::ZdpPacketType,
+    stream_id: zpr::StreamId,
+    sequence_number: zpr::SeqNum,
+    packet: Packet<'pktbuf>,
+) {
+    send_mgmt_helper(asm, link_id, packet_type, Some(stream_id), Some(sequence_number), packet).await
 }
 
 async fn send_mgmt_helper<'pktbuf>(
@@ -60,6 +82,7 @@ async fn send_mgmt_helper<'pktbuf>(
     hdr.packet_type = packet_type;
 
     if let Some(sequence_number) = sequence_number {
+        // uses only suffix of sequence number
         hdr.sequence_number = (sequence_number as u16).into();
     }
 
@@ -377,6 +400,25 @@ pub async fn send_bind_agent_address_request<'a, 'pktbuf>(
     }
 }
 
+/// Send a key management message out the given link.
+pub async fn send_key_management<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    link_id: zpr::LinkId,
+    km_id: zpr::KmId,
+    payload: &[u8],
+) {
+    let buf = asm.buffer_stack.get_buffer().await;
+    let mut pkt = Packet::new(buf, config::DEFAULT_MESSAGE_HEADROOM);
+
+    let km_hdr = pkt.alloc_zeroed_header::<zdp::ZdpKeyManagementHeader>();
+    km_hdr.message_type = km_id.into();
+    km_hdr.message_length = (payload.len() as u16).into();
+
+    pkt.put(payload);
+
+    send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::KeyManagement, pkt).await;
+}
+
 pub enum HandleMgmtError {
     UnknownType(u8),
     UnexpectedMgmtResponse,
@@ -443,6 +485,7 @@ pub async fn handle_discard<'pktbuf>(
 pub async fn handle_hello_request<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     ingress_link_id: zpr::LinkId,
+    seq_num: zpr::SeqNum,
     pkt: Packet<'pktbuf>,
 ) -> HandleMgmtResult<'pktbuf> {
     let mut rsp_pkt = Packet::new(pkt.destroy(), config::DEFAULT_MESSAGE_HEADROOM);
@@ -451,10 +494,11 @@ pub async fn handle_hello_request<'pktbuf>(
 
     eprintln!("{}: Received HelloRequest", asm.system_name);
 
-    send_non_flow_mgmt(
+    send_non_flow_mgmt_response(
         asm,
         ingress_link_id,
         zdp::ZdpPacketType::HelloResponse,
+        seq_num,
         rsp_pkt,
     )
     .await;
@@ -467,6 +511,7 @@ pub async fn handle_bind_agent_address_request<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     ingress_link_id: zpr::LinkId,
     _stream_id: zpr::StreamId, // ignored
+    seq_num: zpr::SeqNum,
     mut pkt: Packet<'pktbuf>,
 ) -> HandleMgmtResult<'pktbuf> {
     let Some(hdr) = zdp::ZdpBindAgentAddressRequestHeader::read_from_buf(&mut pkt) else {
@@ -688,35 +733,17 @@ pub async fn handle_bind_agent_address_request<'pktbuf>(
     );
 
     // respond to requestor
-    send_per_flow_mgmt(
+    send_per_flow_mgmt_response(
         asm,
         ingress_link_id,
         zdp::ZdpPacketType::BindAgentAddressResponse,
         ingress_tether_id,
+        seq_num,
         rsp_pkt,
     )
     .await;
 
     Ok(())
-}
-
-/// Send a key management message out the given link.
-pub async fn send_key_management<'pktbuf>(
-    asm: &Assembly<'pktbuf>,
-    link_id: zpr::LinkId,
-    km_id: zpr::KmId,
-    payload: &[u8],
-) {
-    let buf = asm.buffer_stack.get_buffer().await;
-    let mut pkt = Packet::new(buf, config::DEFAULT_MESSAGE_HEADROOM);
-
-    let km_hdr = pkt.alloc_zeroed_header::<zdp::ZdpKeyManagementHeader>();
-    km_hdr.message_type = km_id.into();
-    km_hdr.message_length = (payload.len() as u16).into();
-
-    pkt.put(payload);
-
-    send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::KeyManagement, pkt).await;
 }
 
 // ZPI and Base header is already gone by the time we get here.  So we expect
