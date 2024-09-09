@@ -54,14 +54,14 @@ async fn handle_packet<'pktbuf>(
     ingress_link_id: zpr::LinkId,
     mut pkt: Packet<'pktbuf>,
 ) -> HandleMgmtResult<'pktbuf> {
-    eprintln!(
-        "{}: handling mgmt message from {}",
-        asm.system_name, ingress_link_id
-    );
-
     let Some(base_hdr) = ZdpBaseHeader::read_from_buf(&mut pkt) else {
         return Err((HandleMgmtError::BadStructure, pkt));
     };
+
+    eprintln!(
+        "{}: handling mgmt message from {} type {:?} seq_num {}",
+        asm.system_name, ingress_link_id, base_hdr.packet_type, base_hdr.sequence_number
+    );
 
     let packet_type = base_hdr.packet_type;
 

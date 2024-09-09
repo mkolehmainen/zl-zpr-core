@@ -1,21 +1,38 @@
 use crate::packet::Packet;
 use crate::zdp;
+use crate::zpr;
 use std::future::Future;
-use std::sync::Mutex;
-use tokio::sync::{oneshot, SemaphorePermit, Semaphore, TryAcquireError};
+use std::sync::Mutex as StdMutex;
+use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
+use tokio::sync::oneshot;
 
 pub struct SyncReqState<'pktbuf> {
-    state: Mutex<SyncReqStateInner<'pktbuf>>,
-    permit_semaphore: Semaphore,
+    listener_state: StdMutex<ListenerState<'pktbuf>>,
+    window_state: TokioMutex<WindowState>,
 }
 
-struct SyncReqStateInner<'pktbuf> {
+struct ListenerState<'pktbuf> {
     response_listener: Option<oneshot::Sender<Response<'pktbuf>>>,
+}
+
+struct WindowState {
+    next_seq_num: zpr::SeqNum,
 }
 
 pub type Response<'pktbuf> = (zdp::ZdpPacketType, Packet<'pktbuf>);
 
-pub type Permit<'a> = SemaphorePermit<'a>;
+pub struct Permit<'a> {
+    /// use our lock on the window state as a semaphore
+    /// (this is an appropriate use of a tokio-Mutex which is
+    /// essentially just a semaphore)
+    window_state: TokioMutexGuard<'a, WindowState>,
+    /// sequence number associated with this permit
+    seq_num: zpr::SeqNum,
+}
+
+impl Permit<'_> {
+    pub fn seq_num(&self) -> zpr::SeqNum { self.seq_num }
+}
 
 pub struct ResponseError();
 
@@ -47,46 +64,44 @@ impl<'pktbuf> Future for ResponseFuture<'pktbuf> {
 impl<'pktbuf> SyncReqState<'pktbuf> {
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(SyncReqStateInner {
+            listener_state: StdMutex::new(ListenerState {
                 response_listener: None,
             }),
-            permit_semaphore: Semaphore::new(1),
+            // NOTE/TODO/FIXME: all the synchronization logic in this file
+            // is only correct with window size == 1.  Growing the window
+            // size (and implementing it correctly) is pending further
+            // design decisions.
+            window_state: TokioMutex::new(WindowState {
+                next_seq_num: 0,
+            }),
         }
     }
 
     pub async fn acquire_permit(&self) -> Permit {
-        self.permit_semaphore.acquire()
-                .await
-                .expect("coding error: semaphore closed")
+        let mut window_state = self.window_state.lock().await;
+        let seq_num = window_state.next_seq_num;
+        window_state.next_seq_num += 1;
+        Permit { window_state, seq_num }
     }
 
-    pub fn is_associated_permit(&self, _permit: &Permit) -> bool {
-        true  // TODO
-    }
-
-    #[allow(dead_code)]
-    pub fn try_acquire_permit(&self) -> Option<Permit> {
-        match self.permit_semaphore.try_acquire() {
-            Ok(permit) => Some(permit),
-            Err(TryAcquireError::Closed) => panic!("coding error: semaphore closed"),
-            Err(TryAcquireError::NoPermits) => None,
-        }
+    pub fn is_associated_permit(&self, permit: &Permit) -> bool {
+        std::ptr::eq(TokioMutexGuard::mutex(&permit.window_state), &self.window_state)
     }
 
     pub fn install_response_listener(&self, permit: &Permit) -> ResponseFuture<'pktbuf> {
         assert!(self.is_associated_permit(permit));
         let (sender, receiver) = oneshot::channel();
-        self.state.lock().unwrap().response_listener = Some(sender);
+        self.listener_state.lock().unwrap().response_listener = Some(sender);  // TODO: seq_num
         ResponseFuture { receiver }
     }
 
     pub fn clear_response_listener(&self, permit: &Permit) {
         assert!(self.is_associated_permit(permit));
-        self.state.lock().unwrap().response_listener = None;
+        self.listener_state.lock().unwrap().response_listener = None;
     }
 
     pub fn forward_response(&self, response: Response<'pktbuf>) -> Result<(), Packet<'pktbuf>> {
-        match self.state.lock().unwrap().response_listener.take() {
+        match self.listener_state.lock().unwrap().response_listener.take() {
             Some(sender) => match sender.send(response) {
                 Ok(()) => Ok(()),
                 Err(response) => Err(response.1),

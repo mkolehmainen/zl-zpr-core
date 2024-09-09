@@ -24,14 +24,9 @@ pub async fn send_non_flow_mgmt<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     link_id: zpr::LinkId,
     packet_type: zdp::ZdpPacketType,
-    mut packet: Packet<'pktbuf>,
+    packet: Packet<'pktbuf>,
 ) {
-    debug_assert!(!packet_type.is_per_flow());
-
-    let hdr = packet.alloc_zeroed_header::<zdp::ZdpBaseHeader>();
-    hdr.packet_type = packet_type;
-
-    fastpath::substrate_egress_blocking(asm, link_id, packet).await;
+    send_mgmt_helper(asm, link_id, packet_type, None, None, packet).await
 }
 
 /// Send a unidirectional per-flow management message on the given link.
@@ -41,15 +36,32 @@ pub async fn send_per_flow_mgmt<'pktbuf>(
     link_id: zpr::LinkId,
     packet_type: zdp::ZdpPacketType,
     stream_id: zpr::StreamId,
+    packet: Packet<'pktbuf>,
+) {
+    send_mgmt_helper(asm, link_id, packet_type, Some(stream_id), None, packet).await
+}
+
+async fn send_mgmt_helper<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    link_id: zpr::LinkId,
+    packet_type: zdp::ZdpPacketType,
+    stream_id: Option<zpr::StreamId>,
+    sequence_number: Option<zpr::SeqNum>,
     mut packet: Packet<'pktbuf>,
 ) {
-    debug_assert!(packet_type.is_per_flow());
+    debug_assert_eq!(stream_id.is_some(), packet_type.is_per_flow());
 
-    let per_flow_hdr = packet.alloc_zeroed_header::<zdp::ZdpPerFlowHeader>();
-    per_flow_hdr.stream_id = stream_id.into();
+    if let Some(stream_id) = stream_id {
+        let per_flow_hdr = packet.alloc_zeroed_header::<zdp::ZdpPerFlowHeader>();
+        per_flow_hdr.stream_id = stream_id.into();
+    }
 
     let hdr = packet.alloc_zeroed_header::<zdp::ZdpBaseHeader>();
     hdr.packet_type = packet_type;
+
+    if let Some(sequence_number) = sequence_number {
+        hdr.sequence_number = (sequence_number as u16).into();
+    }
 
     fastpath::substrate_egress_blocking(asm, link_id, packet).await;
 }
@@ -154,22 +166,16 @@ async fn send_sync_req_helper<'pktbuf>(
         let mut packet = Packet::new_guarded(buf, config::DEFAULT_MESSAGE_HEADROOM);
         pkt_fn(&mut packet);
 
-        // Determine if sending a non-flow or per-flow message
-        match stream_id {
-            Some(stream_id) => {
-                send_per_flow_mgmt(
-                    asm,
-                    link_id,
-                    zdp_request_type,
-                    stream_id,
-                    packet.into_inner(),
-                )
-                .await;
-            }
-            None => {
-                send_non_flow_mgmt(asm, link_id, zdp_request_type, packet.into_inner()).await;
-            }
-        }
+        send_mgmt_helper(
+            asm,
+            link_id,
+            zdp_request_type,
+            stream_id,
+            Some(permit.seq_num()),
+            packet.into_inner(),
+        )
+        .await;
+
         tokio::select! {
             response = &mut response_future => {
                 drop(permit);
