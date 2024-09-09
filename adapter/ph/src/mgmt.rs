@@ -49,7 +49,15 @@ pub async fn send_non_flow_mgmt_response<'pktbuf>(
     sequence_number: zpr::SeqNum,
     packet: Packet<'pktbuf>,
 ) {
-    send_mgmt_helper(asm, link_id, packet_type, None, Some(sequence_number), packet).await
+    send_mgmt_helper(
+        asm,
+        link_id,
+        packet_type,
+        None,
+        Some(sequence_number),
+        packet,
+    )
+    .await
 }
 
 pub async fn send_per_flow_mgmt_response<'pktbuf>(
@@ -60,7 +68,15 @@ pub async fn send_per_flow_mgmt_response<'pktbuf>(
     sequence_number: zpr::SeqNum,
     packet: Packet<'pktbuf>,
 ) {
-    send_mgmt_helper(asm, link_id, packet_type, Some(stream_id), Some(sequence_number), packet).await
+    send_mgmt_helper(
+        asm,
+        link_id,
+        packet_type,
+        Some(stream_id),
+        Some(sequence_number),
+        packet,
+    )
+    .await
 }
 
 async fn send_mgmt_helper<'pktbuf>(

@@ -64,7 +64,7 @@ async fn handle_packet<'pktbuf>(
     );
 
     let packet_type = base_hdr.packet_type;
-    let seq_num = base_hdr.sequence_number.get() as u64;  // TODO: reconstitute full seq num given expected seq num state
+    let seq_num = base_hdr.sequence_number.get() as u64; // TODO: reconstitute full seq num given expected seq num state
 
     if packet_type.is_response() {
         eprintln!("{}: got response from {}", asm.system_name, ingress_link_id);
@@ -72,7 +72,7 @@ async fn handle_packet<'pktbuf>(
         // Gets the designated sender, attempts to send the response, if not drops
         // the packet and increments corresponding counter
         let Some(peer_state) = asm.peer_table.get(ingress_link_id) else {
-            return Err((HandleMgmtError::UnexpectedMgmtResponse, pkt))
+            return Err((HandleMgmtError::UnexpectedMgmtResponse, pkt));
         };
 
         peer_state
@@ -89,8 +89,16 @@ async fn handle_packet<'pktbuf>(
         match base_hdr.packet_type {
             ZdpPacketType::TransitPacket => panic!("unexpected Transit Packet in management path"),
 
-            ZdpPacketType::BindAgentAddressRequest =>
-                mgmt::handle_bind_agent_address_request(asm, ingress_link_id, stream_id, seq_num, pkt).await,
+            ZdpPacketType::BindAgentAddressRequest => {
+                mgmt::handle_bind_agent_address_request(
+                    asm,
+                    ingress_link_id,
+                    stream_id,
+                    seq_num,
+                    pkt,
+                )
+                .await
+            }
 
             packet_type => Err((HandleMgmtError::UnknownType(packet_type.0), pkt)),
         }
@@ -100,11 +108,13 @@ async fn handle_packet<'pktbuf>(
 
             ZdpPacketType::Discard => mgmt::handle_discard(asm, ingress_link_id, pkt).await,
 
-            ZdpPacketType::KeyManagement =>
-                mgmt::handle_key_management(asm, ingress_link_id, pkt).await,
+            ZdpPacketType::KeyManagement => {
+                mgmt::handle_key_management(asm, ingress_link_id, pkt).await
+            }
 
-            ZdpPacketType::HelloRequest =>
-                mgmt::handle_hello_request(asm, ingress_link_id, seq_num, pkt).await,
+            ZdpPacketType::HelloRequest => {
+                mgmt::handle_hello_request(asm, ingress_link_id, seq_num, pkt).await
+            }
 
             packet_type => Err((HandleMgmtError::UnknownType(packet_type.0), pkt)),
         }

@@ -3,8 +3,8 @@ use crate::zdp;
 use crate::zpr;
 use std::future::Future;
 use std::sync::Mutex as StdMutex;
-use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
 use tokio::sync::oneshot;
+use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
 
 pub struct SyncReqState<'pktbuf> {
     listener_state: StdMutex<ListenerState<'pktbuf>>,
@@ -31,7 +31,9 @@ pub struct Permit<'a> {
 }
 
 impl Permit<'_> {
-    pub fn seq_num(&self) -> zpr::SeqNum { self.seq_num }
+    pub fn seq_num(&self) -> zpr::SeqNum {
+        self.seq_num
+    }
 }
 
 pub struct ResponseError();
@@ -71,9 +73,7 @@ impl<'pktbuf> SyncReqState<'pktbuf> {
             // is only correct with window size == 1.  Growing the window
             // size (and implementing it correctly) is pending further
             // design decisions.
-            window_state: TokioMutex::new(WindowState {
-                next_seq_num: 0,
-            }),
+            window_state: TokioMutex::new(WindowState { next_seq_num: 0 }),
         }
     }
 
@@ -81,11 +81,17 @@ impl<'pktbuf> SyncReqState<'pktbuf> {
         let mut window_state = self.window_state.lock().await;
         let seq_num = window_state.next_seq_num;
         window_state.next_seq_num += 1;
-        Permit { window_state, seq_num }
+        Permit {
+            window_state,
+            seq_num,
+        }
     }
 
     pub fn is_associated_permit(&self, permit: &Permit) -> bool {
-        std::ptr::eq(TokioMutexGuard::mutex(&permit.window_state), &self.window_state)
+        std::ptr::eq(
+            TokioMutexGuard::mutex(&permit.window_state),
+            &self.window_state,
+        )
     }
 
     pub fn install_response_listener(&self, permit: &Permit) -> ResponseFuture<'pktbuf> {
@@ -100,7 +106,11 @@ impl<'pktbuf> SyncReqState<'pktbuf> {
         self.listener_state.lock().unwrap().response_listener = None;
     }
 
-    pub fn forward_response(&self, seq_num: zpr::SeqNum, response: Response<'pktbuf>) -> Result<(), Packet<'pktbuf>> {
+    pub fn forward_response(
+        &self,
+        seq_num: zpr::SeqNum,
+        response: Response<'pktbuf>,
+    ) -> Result<(), Packet<'pktbuf>> {
         let listener = &mut self.listener_state.lock().unwrap().response_listener;
         match listener {
             Some((expected_seq_num, _)) => {
