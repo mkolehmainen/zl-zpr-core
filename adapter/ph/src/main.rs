@@ -1,5 +1,6 @@
 #![cfg_attr(feature = "ci", deny(warnings))]
 
+use base64::prelude::*;
 use cbpf_rs::bpf_code;
 use clap::Parser;
 use enum_map::{enum_map, EnumMap};
@@ -17,7 +18,6 @@ use tokio_tun::TunBuilder;
 use tracing::warn;
 use tracing_subscriber;
 use zpr_ext::tokio::net::UdpSocketExt;
-use base64::prelude::*;
 
 mod adapter_manager_worker;
 mod adapter_tables;
@@ -64,8 +64,8 @@ use flow_control::FlowControl;
 use km::ZPIPair;
 use km_multiplexor::KmState;
 use queues::*;
-use tun_ctl::TunCtl;
 use tracing::info;
+use tun_ctl::TunCtl;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -325,7 +325,11 @@ fn main() -> ExitCode {
             }));
 
             // TEMP HACK to statically install peers
-            let dock_noise_private_key:[u8; 32] = BASE64_STANDARD.decode("AB2eP6zV7ve0A4eQgNVNXlAM2q0rYerCPXFMl+/ntUw=").unwrap().try_into().unwrap();
+            let dock_noise_private_key: [u8; 32] = BASE64_STANDARD
+                .decode("AB2eP6zV7ve0A4eQgNVNXlAM2q0rYerCPXFMl+/ntUw=")
+                .unwrap()
+                .try_into()
+                .unwrap();
             let dock_noise_public_key = km_noise::derive_public_key(&dock_noise_private_key);
 
             if let Some(pa2) = peer_addr2 {
@@ -454,18 +458,27 @@ fn main() -> ExitCode {
             if matches!(ph_mode, PhMode::Adapter) {
                 let dsid = asm.hack_get_adapter_docking_session_id();
 
-                info!("adapter: {}: waiting for KM to be established on my docking session link {}", asm.system_name,dsid);
+                info!(
+                    "adapter: {}: waiting for KM to be established on my docking session link {}",
+                    asm.system_name, dsid
+                );
                 while !asm.peer_table.is_security_assocaition_established(dsid) {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
-                info!("adapter: {}: KM ESTABLISHED on link {}", asm.system_name,dsid);
+                info!(
+                    "adapter: {}: KM ESTABLISHED on link {}",
+                    asm.system_name, dsid
+                );
 
                 mgmt::send_report(asm, dsid, "Reporting for Duty!").await;
                 mgmt::send_discard(asm, dsid).await;
                 match mgmt::send_hello_request(asm, dsid).await {
                     Ok(_) => (),
                     Err(e) => {
-                        warn!("adapter: {}: failed to send hello request: {:?}", asm.system_name, e);
+                        warn!(
+                            "adapter: {}: failed to send hello request: {:?}",
+                            asm.system_name, e
+                        );
                     }
                 }
             }
