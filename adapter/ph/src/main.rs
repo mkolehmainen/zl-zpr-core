@@ -17,6 +17,7 @@ use tokio_tun::TunBuilder;
 use tracing::warn;
 use tracing_subscriber;
 use zpr_ext::tokio::net::UdpSocketExt;
+use base64::prelude::*;
 
 mod adapter_manager_worker;
 mod adapter_tables;
@@ -64,6 +65,7 @@ use km::ZPIPair;
 use km_multiplexor::KmState;
 use queues::*;
 use tun_ctl::TunCtl;
+use tracing::info;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -323,7 +325,9 @@ fn main() -> ExitCode {
             }));
 
             // TEMP HACK to statically install peers
-            let dock_noise_public_key = [0; 32]; // XXX TODO
+            let dock_noise_private_key:[u8; 32] = BASE64_STANDARD.decode("AB2eP6zV7ve0A4eQgNVNXlAM2q0rYerCPXFMl+/ntUw=").unwrap().try_into().unwrap();
+            let dock_noise_public_key = km_noise::derive_public_key(&dock_noise_private_key);
+
             if let Some(pa2) = peer_addr2 {
                 let peer_id2 = asm
                     .hack_add_peer(peer_table::PeerType::Adapter, pa2)
@@ -364,21 +368,12 @@ fn main() -> ExitCode {
                     .unwrap();
                 } else {
                     let dock_keypair = snow::Keypair {
-                        // XXX also TODO!
-                        private: [0; 32].to_vec(),
-                        public: [0; 32].to_vec(),
+                        private: dock_noise_private_key.to_vec(),
+                        public: dock_noise_public_key.to_vec(),
                     };
                     km_multiplexor::add_node_link(asm, peer_id, ZPIPair::new(5, 6), dock_keypair)
                         .unwrap();
                 }
-                let dock_noise_public_key = [0; 32]; // XXX TODO
-                km_multiplexor::add_adapter_link(
-                    asm,
-                    peer_id,
-                    ZPIPair::new(1, 2),
-                    dock_noise_public_key,
-                )
-                .unwrap();
             }
             // END HACK
 
@@ -458,9 +453,21 @@ fn main() -> ExitCode {
 
             if matches!(ph_mode, PhMode::Adapter) {
                 let dsid = asm.hack_get_adapter_docking_session_id();
+
+                info!("adapter: {}: waiting for KM to be established on my docking session link {}", asm.system_name,dsid);
+                while !asm.peer_table.is_security_assocaition_established(dsid) {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                info!("adapter: {}: KM ESTABLISHED on link {}", asm.system_name,dsid);
+
                 mgmt::send_report(asm, dsid, "Reporting for Duty!").await;
                 mgmt::send_discard(asm, dsid).await;
-                mgmt::send_hello_request(asm, dsid).await.unwrap();
+                match mgmt::send_hello_request(asm, dsid).await {
+                    Ok(_) => (),
+                    Err(e) => {
+                        warn!("adapter: {}: failed to send hello request: {:?}", asm.system_name, e);
+                    }
+                }
             }
 
             while let Some(res) = js.join_next().await {
