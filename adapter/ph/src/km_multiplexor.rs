@@ -90,10 +90,10 @@ async fn signal_worker<'pktbuf>(
                 let now = time::Instant::now();
                 for (link_id, stat) in status.iter_mut() {
                     if stat.error_count > 0 && stat.last_error_t >= stat.restart_t && now - stat.last_error_t > time::Duration::from_secs(stat.error_count as u64) {
-                        info!("km_multiplexor: restarting KM on link {}", link_id);
                         if let Some(km) = asm.peer_table.clone_km_manager(*link_id) {
                             match km.restart() {
                                 Ok(_) => {
+                                    info!("km_multiplexor: restarted key manager on link {} (error_count = {})", link_id, stat.error_count);
                                     stat.restart_t = now;
                                 }
                                 Err(e) => {
@@ -101,6 +101,8 @@ async fn signal_worker<'pktbuf>(
                                     stat.error_count += 1;
                                 }
                             }
+                        } else {
+                            error!("km_multiplexor: unable to restart key manager on link {}: not found in peer table", link_id);
                         }
                     }
                 }
