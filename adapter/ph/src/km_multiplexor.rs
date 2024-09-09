@@ -5,10 +5,17 @@ use crate::mgmt;
 use crate::peer_table::KmHandle;
 use crate::zpr;
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::future::Future;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+/// How often the signal monitor worker checks the error conditions
+/// on the KeyManager state machines.  Indirectly, this controls how
+/// quickly the KeyManager state machines will restart the handshake
+/// process in case of error.
+const CHECK_ERROR_INTERVAL: time::Duration = time::Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum KmMsgProcessingError {
@@ -51,6 +58,13 @@ impl KmState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ErrorStatus {
+    error_count: usize,
+    last_error_t: time::Instant,
+    restart_t: time::Instant,
+}
+
 /// This is one of the multiplexor related workers, the other one is in main.rs.
 /// This watches for signals from the running KeyManagers and updates the SAState
 /// when SA's are established.
@@ -62,6 +76,9 @@ async fn signal_worker<'pktbuf>(
 ) {
     let sp_ctok = asm.km_state.ctok.clone();
 
+    let mut status: HashMap<zpr::LinkId, ErrorStatus> = HashMap::new();
+    let mut interval = time::interval(CHECK_ERROR_INTERVAL);
+
     loop {
         tokio::select! {
             _ = sp_ctok.cancelled() => {
@@ -69,11 +86,36 @@ async fn signal_worker<'pktbuf>(
                 break;
             }
 
+            _ = interval.tick() => {
+                let now = time::Instant::now();
+                for (link_id, stat) in status.iter_mut() {
+                    if stat.error_count > 0 && stat.last_error_t >= stat.restart_t {
+                        if now - stat.last_error_t > time::Duration::from_secs(stat.error_count as u64) {
+                            info!("km_multiplexor: restarting KM on link {}", link_id);
+                            if let Some(km) = asm.peer_table.clone_km_manager(*link_id) {
+                                match km.restart() {
+                                    Ok(_) => {
+                                        stat.restart_t = now;
+                                    }
+                                    Err(e) => {
+                                        error!("km_multiplexor: failed to restart KM on link {}: {:?}", link_id, e);
+                                        stat.error_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             Some(linkmsg) = sig_queue.recv() => {
                 info!("km_multiplexor: signal {:?} on link {}", linkmsg.msg, linkmsg.link_id);
                 match linkmsg.msg {
                     KmSignal::SaIdChange { old, new } => {
                         info!("km_multiplexor: SA ID change on link {}: {} -> {}", linkmsg.link_id, old, new);
+                        if old == 0 {
+                            let _ = status.remove(&linkmsg.link_id);
+                        }
                     }
                     KmSignal::SaEstablished(sa) => {
                         match asm.peer_table.set_security_association(linkmsg.link_id, sa) {
@@ -82,8 +124,37 @@ async fn signal_worker<'pktbuf>(
                                 error!("km_multiplexor: failed to set SA established: {:?}", e);
                             }
                         }
+                        match status.get_mut(&linkmsg.link_id) {
+                            Some(s) if s.error_count == 0 => {
+                                s.error_count = 0;
+                            }
+                            Some(_) => {}
+                            None => (),
+                        }
                     }
-                    _ => { warn!("km_multiplexor: unhandled signal on link {}: {:?}", linkmsg.link_id, linkmsg.msg); }
+                    KmSignal::Reset => { }
+                    KmSignal::Error => {
+                        let stat = match status.get_mut(&linkmsg.link_id) {
+                            Some(s) => s,
+                            None => {
+                                let ts = time::Instant::now();
+                                let estat = ErrorStatus {
+                                    error_count: 0,
+                                    last_error_t: ts,
+                                    restart_t: ts,
+                                };
+                                status.insert(linkmsg.link_id, estat);
+                                status.get_mut(&linkmsg.link_id).unwrap()
+                            }
+                        };
+                        stat.error_count += 1;
+                        stat.last_error_t = time::Instant::now();
+                        warn!("km_multiplexor: Error signal on link {}", linkmsg.link_id);
+                    }
+                    KmSignal::Termination => {
+                        let _ = status.remove(&linkmsg.link_id);
+                        info!("km_multiplexor: termination signal on link {}", linkmsg.link_id);
+                    }
                 }
             }
         }
