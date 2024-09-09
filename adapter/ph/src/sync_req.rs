@@ -1,12 +1,12 @@
 use crate::packet::Packet;
 use crate::zdp;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use std::sync::Mutex;
+use tokio::sync::{oneshot, SemaphorePermit, Semaphore, TryAcquireError};
 
 pub struct SyncReqState<'pktbuf> {
     state: Mutex<SyncReqStateInner<'pktbuf>>,
-    permit_semaphore: Arc<Semaphore>,
+    permit_semaphore: Semaphore,
 }
 
 struct SyncReqStateInner<'pktbuf> {
@@ -15,7 +15,7 @@ struct SyncReqStateInner<'pktbuf> {
 
 pub type Response<'pktbuf> = (zdp::ZdpPacketType, Packet<'pktbuf>);
 
-pub type Permit = OwnedSemaphorePermit;
+pub type Permit<'a> = SemaphorePermit<'a>;
 
 pub struct ResponseError();
 
@@ -50,26 +50,23 @@ impl<'pktbuf> SyncReqState<'pktbuf> {
             state: Mutex::new(SyncReqStateInner {
                 response_listener: None,
             }),
-            permit_semaphore: Arc::new(Semaphore::new(1)),
+            permit_semaphore: Semaphore::new(1),
         }
     }
 
-    pub fn acquire_permit(&self) -> impl Future<Output = Permit> {
-        let sem = self.permit_semaphore.clone();
-        async {
-            sem.acquire_owned()
+    pub async fn acquire_permit(&self) -> Permit {
+        self.permit_semaphore.acquire()
                 .await
                 .expect("coding error: semaphore closed")
-        }
     }
 
-    pub fn is_associated_permit(&self, permit: &Permit) -> bool {
-        Arc::ptr_eq(permit.semaphore(), &self.permit_semaphore)
+    pub fn is_associated_permit(&self, _permit: &Permit) -> bool {
+        true  // TODO
     }
 
     #[allow(dead_code)]
     pub fn try_acquire_permit(&self) -> Option<Permit> {
-        match self.permit_semaphore.clone().try_acquire_owned() {
+        match self.permit_semaphore.try_acquire() {
             Ok(permit) => Some(permit),
             Err(TryAcquireError::Closed) => panic!("coding error: semaphore closed"),
             Err(TryAcquireError::NoPermits) => None,

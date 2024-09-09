@@ -138,21 +138,14 @@ async fn send_sync_req_helper<'pktbuf>(
     zdp_request_type: zdp::ZdpPacketType,
     zdp_response_type: zdp::ZdpPacketType,
     stream_id: Option<zpr::StreamId>,
-    pkt_fn: impl Fn(&mut Packet<'_>) + Send + 'static,
+    pkt_fn: impl Fn(&mut Packet<'_>) + 'static,
 ) -> Result<Packet<'pktbuf>, SyncReqError> {
     // acquire a permit to send a manamgement message
-    let Some(permit_future) = asm.peer_table.inspect(link_id, |peer_state| {
-        peer_state.sync_req_state.acquire_permit()
-    }) else {
+    let Some(peer_state) = asm.peer_table.get(link_id) else {
         return Err(SyncReqError::LinkClosed);
     };
-    let permit = permit_future.await;
-
-    let Some(mut response_future) = asm.peer_table.inspect(link_id, |peer_state| {
-        peer_state.sync_req_state.install_response_listener(&permit)
-    }) else {
-        return Err(SyncReqError::LinkClosed);
-    };
+    let permit = peer_state.sync_req_state.acquire_permit().await;
+    let mut response_future = peer_state.sync_req_state.install_response_listener(&permit);
 
     for _i in 0..=config::DEFAULT_REQUEST_RETRY_COUNT {
         let buf = drop_guard(asm.buffer_stack.get_buffer().await, |buf| {
@@ -186,11 +179,11 @@ async fn send_sync_req_helper<'pktbuf>(
             _ = sleep(Duration::from_secs(config::DEFAULT_REQUEST_RETRY_TIMER as u64)) => ()
         }
     }
-    asm.peer_table.inspect(link_id, |peer_state| {
-        peer_state.sync_req_state.clear_response_listener(&permit)
-    });
+
+    peer_state.sync_req_state.clear_response_listener(&permit);
     let response = response_future.hangup();
     drop(permit);
+
     match_received(asm, response, SyncReqError::Timeout, zdp_response_type)
 }
 
