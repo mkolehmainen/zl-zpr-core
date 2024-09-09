@@ -60,9 +60,9 @@ impl KmState {
 
 #[derive(Debug, Clone)]
 struct ErrorStatus {
-    error_count: usize,
-    last_error_t: time::Instant,
-    restart_t: time::Instant,
+    error_count: usize,          // if zero then no error
+    last_error_t: time::Instant, // Last time error occurred
+    restart_t: time::Instant,    // Last time we restarted the KM
 }
 
 /// This is one of the multiplexor related workers, the other one is in main.rs.
@@ -89,18 +89,16 @@ async fn signal_worker<'pktbuf>(
             _ = interval.tick() => {
                 let now = time::Instant::now();
                 for (link_id, stat) in status.iter_mut() {
-                    if stat.error_count > 0 && stat.last_error_t >= stat.restart_t {
-                        if now - stat.last_error_t > time::Duration::from_secs(stat.error_count as u64) {
-                            info!("km_multiplexor: restarting KM on link {}", link_id);
-                            if let Some(km) = asm.peer_table.clone_km_manager(*link_id) {
-                                match km.restart() {
-                                    Ok(_) => {
-                                        stat.restart_t = now;
-                                    }
-                                    Err(e) => {
-                                        error!("km_multiplexor: failed to restart KM on link {}: {:?}", link_id, e);
-                                        stat.error_count += 1;
-                                    }
+                    if stat.error_count > 0 && stat.last_error_t >= stat.restart_t && now - stat.last_error_t > time::Duration::from_secs(stat.error_count as u64) {
+                        info!("km_multiplexor: restarting KM on link {}", link_id);
+                        if let Some(km) = asm.peer_table.clone_km_manager(*link_id) {
+                            match km.restart() {
+                                Ok(_) => {
+                                    stat.restart_t = now;
+                                }
+                                Err(e) => {
+                                    error!("km_multiplexor: failed to restart KM on link {}: {:?}", link_id, e);
+                                    stat.error_count += 1;
                                 }
                             }
                         }
