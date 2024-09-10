@@ -306,7 +306,7 @@ fn main() -> ExitCode {
     let mut flags: PhFlags = Default::default();
     flags.allow_insecure_zpi_zero = allow_insecure_zpi_zero;
 
-            // TEMP HACK to statically install peers
+    // TEMP HACK to statically install peers
     let asm = Box::leak(Box::new(Assembly {
         flags,
         ph_mode,
