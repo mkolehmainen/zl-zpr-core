@@ -361,9 +361,7 @@ mod test {
         };
 
         // Now send the reply back into our link.
-        handle_inbound_km_msg(asm, adapter_link_id, &handshake_reply)
-            .await
-            .unwrap();
+        handle_inbound_km_msg(asm, adapter_link_id, &handshake_reply).unwrap();
 
         yield_now().await;
 
