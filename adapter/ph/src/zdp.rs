@@ -106,7 +106,6 @@ pub struct ZdpPerFlowHeader {
     pub stream_id: U32,
 }
 
-
 #[derive(FromZeroes, FromBytes, AsBytes, Unaligned)]
 #[repr(packed)]
 pub struct ZdpEchoHeader {
@@ -178,7 +177,6 @@ pub struct ZdpA2aHeader {
 
 /// Config-specified size of A2A MAC.  Algorithm-specified MAC may be smaller (but not larger).
 pub const ZDP_A2A_MAC_SIZE: usize = 8;
-
 
 /// Size of the ZDP "link" HMAC which is set link-by-link for transit packets.
 /// This HMAC is tacked on to the end of the packet (following the A2A HMAC).

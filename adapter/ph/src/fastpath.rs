@@ -193,12 +193,12 @@ pub fn encrypt_null<'pktbuf>(pkt: &mut Packet<'pktbuf>) {
     );
 }
 
-
 /// Slap an HMAC onto the end of the packet.
 pub fn encrypt_hmac<'pktbuf>(send_hmac_key: [u8; 32], pkt: &mut Packet<'pktbuf>) {
     let mut link_mac = [0u8; zdp::ZDP_PACKET_MAC_SIZE];
-    link_mac[..zdp::ZDP_PACKET_MAC_SIZE]
-        .copy_from_slice(&blake3::keyed_hash(&send_hmac_key, pkt.body()).as_bytes()[..zdp::ZDP_PACKET_MAC_SIZE]);
+    link_mac[..zdp::ZDP_PACKET_MAC_SIZE].copy_from_slice(
+        &blake3::keyed_hash(&send_hmac_key, pkt.body()).as_bytes()[..zdp::ZDP_PACKET_MAC_SIZE],
+    );
     pkt.put(&link_mac[..zdp::ZDP_PACKET_MAC_SIZE]);
 }
 
@@ -263,7 +263,6 @@ pub fn decrypt_hmac<'pktbuf>(
     recv_hmac_key: [u8; 32],
     pkt: &mut Packet<'pktbuf>,
 ) -> Result<(), DecryptError> {
-
     if pkt.body().len() < zdp::ZDP_PACKET_MAC_SIZE {
         return Err(DecryptError::BadStructure);
     }
@@ -273,7 +272,9 @@ pub fn decrypt_hmac<'pktbuf>(
     link_mac.copy_from_slice(&pkt.body()[pkt.body().len() - zdp::ZDP_PACKET_MAC_SIZE..]);
     pkt.shrink_by(zdp::ZDP_PACKET_MAC_SIZE);
 
-    if &blake3::keyed_hash(&recv_hmac_key, &pkt.body()).as_bytes()[..zdp::ZDP_PACKET_MAC_SIZE] != &link_mac[..zdp::ZDP_PACKET_MAC_SIZE] {
+    if &blake3::keyed_hash(&recv_hmac_key, &pkt.body()).as_bytes()[..zdp::ZDP_PACKET_MAC_SIZE]
+        != &link_mac[..zdp::ZDP_PACKET_MAC_SIZE]
+    {
         return Err(DecryptError::MicvFailure);
     }
 
@@ -781,13 +782,11 @@ mod test {
 
         assert!(pkt.body().len() == orig_len + zdp::ZDP_PACKET_MAC_SIZE); // did add hmac
 
-
         let res = decrypt_hmac(key, &mut pkt);
         assert!(res.is_ok());
 
         assert!(pkt.body().len() == orig_len); // did remove hmac
     }
-
 
     #[test]
     fn test_add_and_check_hmac_fail() {
@@ -808,5 +807,4 @@ mod test {
         let res = decrypt_hmac(wrong_key, &mut pkt);
         assert!(res.is_err());
     }
-
 }
