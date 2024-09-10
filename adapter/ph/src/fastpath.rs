@@ -11,6 +11,7 @@ use crate::counters_enum::CounterType;
 use crate::defs::Direction;
 use crate::km::Codec;
 use crate::km_noise::NOISE_PADLEN;
+use crate::mgmt;
 use crate::net_defs;
 use crate::packet::Packet;
 use crate::peer_table::PeerState;
@@ -22,7 +23,7 @@ use crate::{compress, km};
 use blake3;
 use bytes::{Buf, BufMut};
 use std::time::SystemTime;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use zerocopy::FromBytes;
 use zpr_ext::std::mem::{drop_guard, DropGuard};
 use zpr_ext::zerocopy::*;
@@ -34,7 +35,7 @@ pub fn drop_and_count<'pktbuf>(
     reason: impl Into<CounterType>,
 ) {
     let reason = reason.into();
-    eprintln!("{}: dropping packet because {}", asm.system_name, reason);
+    debug!("{}: dropping packet because {}", asm.system_name, reason);
     asm.buffer_stack.put_buffer(pkt.destroy());
     asm.counters[reason.into()].increment();
 }
@@ -448,8 +449,6 @@ pub fn substrate_ingress<'pktbuf>(
 ) {
     asm.counters[CounterType::InPacksRec].increment();
 
-    eprintln!("{}: got packet from {}", asm.system_name, peer_sa);
-
     let Some(ingress_link_id) = asm.peer_table.lookup_peer(peer_sa) else {
         drop_and_count(asm, pkt, CounterType::UnknownPeer);
         return;
@@ -539,9 +538,7 @@ pub fn substrate_ingress<'pktbuf>(
     // In ZPI zero only KM messages are allowed (well, and APR ARP which we don't support yet)
     // Can be overridden (FOR TESTING ONLY) in the flags.
     if !secure && base_hdr.packet_type != zdp::ZdpPacketType::KeyManagement {
-        if asm.flags.allow_insecure_zpi_zero {
-            warn!("operating in insecure mode - allow_insecure_zpi_zero is ENABLED");
-        } else {
+        if !asm.flags.allow_insecure_zpi_zero {
             warn!(
                 "ingress: link {}: ZPI 0 only allows key management messages, not {:?}",
                 ingress_link_id, base_hdr.packet_type
@@ -556,21 +553,7 @@ pub fn substrate_ingress<'pktbuf>(
         // TODO: should we peel off the ZDP header here??
         // (instead of this silly code to restore it?)
         *pkt.alloc_zeroed_header() = base_hdr;
-
-        eprintln!("{}: enqueueing!", asm.system_name);
-
-        let Some(peer_state) = asm.peer_table.get(ingress_link_id) else {
-            drop_and_count(asm, pkt, CounterType::PeerRemoved);
-            return;
-        };
-
-        match peer_state.mgmt_processor.try_enqueue_packet(pkt) {
-            Ok(()) => (),
-            Err(TryEnqueueError::Full(pkt)) => {
-                eprintln!("{}: queue backpressure!", asm.system_name);
-                drop_and_count(asm, pkt, CounterType::QueueBackpressure);
-            }
-        }
+        mgmt::dispatch_mgmt_packet(asm, ingress_link_id, pkt);
         return;
     }
 
