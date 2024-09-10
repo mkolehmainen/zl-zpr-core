@@ -321,6 +321,7 @@ fn handle_response<'pktbuf>(
 }
 
 /// send a Report message (RFC 6.5 § 6.3.13)
+#[allow(dead_code)]
 pub async fn send_report(asm: &Assembly<'_>, link_id: zpr::LinkId, report: &str) {
     // TODO this condition will need to be adjusted when we have complete ZPR packets
     // with the information at the end of the packet at well
@@ -336,6 +337,7 @@ pub async fn send_report(asm: &Assembly<'_>, link_id: zpr::LinkId, report: &str)
 }
 
 /// send a Discard message (RFC 6.5 § 6.3.1)
+#[allow(dead_code)]
 pub async fn send_discard(asm: &Assembly<'_>, link_id: zpr::LinkId) {
     let buf = asm.buffer_stack.get_buffer().await;
     let pkt = Packet::new(buf, config::DEFAULT_MESSAGE_HEADROOM);
@@ -343,6 +345,7 @@ pub async fn send_discard(asm: &Assembly<'_>, link_id: zpr::LinkId) {
 }
 
 /// send a Hello Request and wait for the Response (RFC 6.5 § 6.3.4)
+#[allow(dead_code)]
 pub async fn send_hello_request<'a, 'pktbuf>(
     asm: &'a Assembly<'pktbuf>,
     link_id: zpr::LinkId,

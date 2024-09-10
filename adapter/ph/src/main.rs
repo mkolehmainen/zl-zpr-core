@@ -460,13 +460,6 @@ fn main() -> ExitCode {
             ));
         }
 
-        if matches!(ph_mode, PhMode::Adapter) {
-            let dsid = asm.hack_get_adapter_docking_session_id();
-            mgmt::send_report(asm, dsid, "Reporting for Duty!").await;
-            mgmt::send_discard(asm, dsid).await;
-            mgmt::send_hello_request(asm, dsid).await.unwrap();
-        }
-
         while let Some(res) = js.join_next().await {
             res.unwrap();
         }
