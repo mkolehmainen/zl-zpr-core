@@ -28,7 +28,7 @@ async fn worker<'pktbuf>(
 pub fn launch<'pktbuf>(
     asm: impl std::ops::Deref<Target = Assembly<'pktbuf>> + Send + Sync + 'pktbuf,
     mut queue: mpsc::Receiver<AdapterManagerMessage<'pktbuf>>,
-) -> impl Future<Output = ()> + Send + 'pktbuf {
+) -> impl Future<Output = ()> + 'pktbuf {
     async move { worker(&*asm, &mut queue).await }
 }
 
@@ -51,7 +51,7 @@ async fn do_request_tether_id<'pktbuf>(asm: &Assembly<'pktbuf>, pkt: Packet<'pkt
 
     // if there's already an entry, this is a duplicate request
     // (NOTE: we should be the only ones modifying this table!)
-    if asm.alt.inspect(&five_tuple, |_entry| ()).is_some() {
+    if asm.alt.get(&five_tuple).is_some() {
         return;
     }
 

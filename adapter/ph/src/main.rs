@@ -64,7 +64,6 @@ use flow_control::FlowControl;
 use km::ZPIPair;
 use km_multiplexor::KmState;
 use queues::*;
-use tracing::info;
 use tun_ctl::TunCtl;
 
 #[derive(Parser)]
@@ -191,302 +190,287 @@ fn main() -> ExitCode {
         ph_mode = PhMode::Adapter;
     }
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .unwrap()
-        .block_on(async {
-            let tun_devs = TunBuilder::new()
-                .name(cmd_line.tun_if.unwrap_or(String::new()).as_str())
-                .try_build_mq(tun_queue_count)
-                .expect("unable to open TUN device")
-                .leak();
+        .unwrap();
 
-            let tun_ctl = Box::new(tun_ctl::TunCtlImpl::new(&tun_devs[0]));
+    let tun_devs = runtime.block_on(async {
+        TunBuilder::new()
+            .name(cmd_line.tun_if.unwrap_or(String::new()).as_str())
+            .try_build_mq(tun_queue_count)
+            .expect("unable to open TUN device")
+            .leak()
+    });
 
-            tun_ctl.set_carrier(false).unwrap();
+    let tun_ctl = Box::new(tun_ctl::TunCtlImpl::new(&tun_devs[0]));
 
-            let alt = adapter_tables::AgentLookupTable::new();
-            let dlt = adapter_tables::DockLookupTable::new();
+    tun_ctl.set_carrier(false).unwrap();
 
-            // Open ingress sockets.
-            let mut sockets = Vec::new();
-            for _i in 0..substrate_socket_count {
-                let socket = socket2::Socket::new(
-                    socket2::Domain::for_address(self_addr),
-                    socket2::Type::DGRAM,
-                    None,
-                )
-                .unwrap();
-                socket.set_nonblocking(true).unwrap();
-                socket.set_reuse_port(true).unwrap();
-                socket
-                    .bind(&socket2::SockAddr::from(self_addr))
-                    .expect("unable to bind to self addr");
-                sockets.push(UdpSocket::from_std(socket.into()).unwrap());
-            }
+    let alt = adapter_tables::AgentLookupTable::new();
+    let dlt = adapter_tables::DockLookupTable::new();
 
-            // Configure packet steering to separate flows for better load balancing.
-            // It's OK if this fails; flows will still be pinned to a queue;
-            // they'll just be pinned there with all other flows from the same link.
-            #[cfg(any(target_os = "android", target_os = "linux"))]
-            {
-                use crate::zdp::*;
-                use bpf_code::*;
-                use libc::sock_filter as sf;
-                use std::mem::{offset_of, size_of};
+    // Open ingress sockets.
+    let mut sockets = Vec::new();
+    runtime.block_on(async {
+        for _i in 0..substrate_socket_count {
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(self_addr),
+                socket2::Type::DGRAM,
+                None,
+            )
+            .unwrap();
+            socket.set_nonblocking(true).unwrap();
+            socket.set_reuse_port(true).unwrap();
+            socket
+                .bind(&socket2::SockAddr::from(self_addr))
+                .expect("unable to bind to self addr");
+            sockets.push(UdpSocket::from_std(socket.into()).unwrap());
+        }
+    });
 
-                // TODO/FIXME: Ideally we want to select the queue by the _sum_ of the
-                // hash and stream ID, thus avoiding clumping due to correlated stream IDs between
-                // links.  That requires eBPF though, since the hash value is only present for
-                // eBPF programs (see <https://github.com/torvalds/linux/blob/master/net/core/sock_reuseport.c#L595-L598>).
-                // (`[SKF_AD_RXHASH]` just reads as 0!)
-                let prog = &[
-                    // [0] load ZPI and packet type
-                    sf {
-                        code: LD | H | ABS,
-                        jt: 0,
-                        jf: 0,
-                        k: 0,
-                    },
-                    // [1] if packet is encrypted, or packet is non-flow, fall back to hash
-                    sf {
-                        code: JMP | JSET | K,
-                        jt: 3,
-                        jf: 0,
-                        k: ((zpr::ZPI_ENCRYPTED_HEADER_FLAG as u32) << 8)
-                            | ZDP_PACKET_TYPE_NON_FLOW_FLAG as u32,
-                    },
-                    // [2] load stream ID
-                    sf {
-                        code: LD | W | ABS,
-                        jt: 0,
-                        jf: 0,
-                        k: (size_of::<ZdpZpiHeader>()
-                            + size_of::<ZdpBaseHeader>()
-                            + offset_of!(ZdpPerFlowHeader, stream_id))
-                            as u32,
-                    },
-                    // [3] modulo # of queues
-                    sf {
-                        code: ALU | MOD | K,
-                        jt: 0,
-                        jf: 0,
-                        k: substrate_socket_count,
-                    },
-                    // [4] return as selected queue #
-                    sf {
-                        code: RET | A,
-                        jt: 0,
-                        jf: 0,
-                        k: 0,
-                    },
-                    // [5] return huge value to force fallback to hash-based steering
-                    sf {
-                        code: RET | K,
-                        jt: 0,
-                        jf: 0,
-                        k: u32::MAX,
-                    },
-                ];
+    // Configure packet steering to separate flows for better load balancing.
+    // It's OK if this fails; flows will still be pinned to a queue;
+    // they'll just be pinned there with all other flows from the same link.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        use crate::zdp::*;
+        use bpf_code::*;
+        use libc::sock_filter as sf;
+        use std::mem::{offset_of, size_of};
 
-                match sockets[0].attach_reuse_port_cbpf(prog) {
-                    Ok(()) => (),
-                    Err(err) => warn!("Unable to enable ingress packet steering: {err}"),
-                }
-            }
+        // TODO/FIXME: Ideally we want to select the queue by the _sum_ of the
+        // hash and stream ID, thus avoiding clumping due to correlated stream IDs between
+        // links.  That requires eBPF though, since the hash value is only present for
+        // eBPF programs (see <https://github.com/torvalds/linux/blob/master/net/core/sock_reuseport.c#L595-L598>).
+        // (`[SKF_AD_RXHASH]` just reads as 0!)
+        let prog = &[
+            // [0] load ZPI and packet type
+            sf {
+                code: LD | H | ABS,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            // [1] if packet is encrypted, or packet is non-flow, fall back to hash
+            sf {
+                code: JMP | JSET | K,
+                jt: 3,
+                jf: 0,
+                k: ((zpr::ZPI_ENCRYPTED_HEADER_FLAG as u32) << 8)
+                    | ZDP_PACKET_TYPE_NON_FLOW_FLAG as u32,
+            },
+            // [2] load stream ID
+            sf {
+                code: LD | W | ABS,
+                jt: 0,
+                jf: 0,
+                k: (size_of::<ZdpZpiHeader>()
+                    + size_of::<ZdpBaseHeader>()
+                    + offset_of!(ZdpPerFlowHeader, stream_id)) as u32,
+            },
+            // [3] modulo # of queues
+            sf {
+                code: ALU | MOD | K,
+                jt: 0,
+                jf: 0,
+                k: substrate_socket_count,
+            },
+            // [4] return as selected queue #
+            sf {
+                code: RET | A,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            // [5] return huge value to force fallback to hash-based steering
+            sf {
+                code: RET | K,
+                jt: 0,
+                jf: 0,
+                k: u32::MAX,
+            },
+        ];
 
-            let sockets = sockets.leak();
+        match sockets[0].attach_reuse_port_cbpf(prog) {
+            Ok(()) => (),
+            Err(err) => warn!("Unable to enable ingress packet steering: {err}"),
+        }
+    }
 
-            let agent_input = AgentInput::new(tun_devs.iter());
-            let substrate_egress = SubstrateEgress::new(sockets.iter());
+    let sockets = sockets.leak();
 
-            let mut flags: PhFlags = Default::default();
-            flags.allow_insecure_zpi_zero = allow_insecure_zpi_zero;
+    let agent_input = AgentInput::new(tun_devs.iter());
+    let substrate_egress = SubstrateEgress::new(sockets.iter());
 
-            let asm = Box::leak(Box::new(Assembly {
-                flags,
-                ph_mode,
-                system_name,
-                buffer_stack,
-                agent_input,
-                substrate_egress,
-                capture_queue,
-                capture_worker,
-                flow_control,
-                counters,
-                tun_ctl,
-                peer_table: peer_table::PeerTable::new(),
-                peer_ids: std::sync::Mutex::new(Vec::new()),
-                alt,
-                dlt,
-                adapter_manager,
-                km_state,
-            }));
+    let mut flags: PhFlags = Default::default();
+    flags.allow_insecure_zpi_zero = allow_insecure_zpi_zero;
 
             // TEMP HACK to statically install peers
-            let dock_noise_private_key: [u8; 32] = BASE64_STANDARD
-                .decode("AB2eP6zV7ve0A4eQgNVNXlAM2q0rYerCPXFMl+/ntUw=")
-                .unwrap()
-                .try_into()
+    let asm = Box::leak(Box::new(Assembly {
+        flags,
+        ph_mode,
+        system_name,
+        buffer_stack,
+        agent_input,
+        substrate_egress,
+        capture_queue,
+        capture_worker,
+        flow_control,
+        counters,
+        tun_ctl,
+        peer_table: peer_table::PeerTable::new(),
+        peer_ids: std::sync::Mutex::new(Vec::new()),
+        alt,
+        dlt,
+        adapter_manager,
+        km_state,
+    }));
+
+    tokio::task::LocalSet::new().block_on(&runtime, async {
+        // TEMP HACK to statically install peers
+
+        let dock_noise_private_key: [u8; 32] = BASE64_STANDARD
+            .decode("AB2eP6zV7ve0A4eQgNVNXlAM2q0rYerCPXFMl+/ntUw=")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let dock_noise_public_key = km_noise::derive_public_key(&dock_noise_private_key);
+
+        if let Some(pa2) = peer_addr2 {
+            let peer_id2 = asm
+                .hack_add_peer(peer_table::PeerType::Adapter, pa2)
                 .unwrap();
-            let dock_noise_public_key = km_noise::derive_public_key(&dock_noise_private_key);
 
-            if let Some(pa2) = peer_addr2 {
-                let peer_id2 = asm
-                    .hack_add_peer(peer_table::PeerType::Adapter, pa2)
-                    .unwrap();
+            asm.peer_ids.lock().unwrap().push(peer_id2);
 
-                asm.peer_ids.lock().unwrap().push(peer_id2);
-
-                if !disable_km {
-                    km_multiplexor::add_adapter_link(
-                        asm,
-                        peer_id2,
-                        ZPIPair::new(1, 2),
-                        dock_noise_public_key,
-                    )
-                    .unwrap();
-                }
-            }
-
-            let peer_id = asm
-                .hack_add_peer(
-                    match ph_mode {
-                        PhMode::Node => peer_table::PeerType::Adapter,
-                        PhMode::Adapter => peer_table::PeerType::Node,
-                    },
-                    peer_addr1,
+            if !disable_km {
+                km_multiplexor::add_adapter_link(
+                    asm,
+                    peer_id2,
+                    ZPIPair::new(1, 2),
+                    dock_noise_public_key,
                 )
                 .unwrap();
-
-            asm.peer_ids.lock().unwrap().push(peer_id);
-            if !disable_km {
-                if ph_mode == PhMode::Adapter {
-                    km_multiplexor::add_adapter_link(
-                        asm,
-                        peer_id,
-                        ZPIPair::new(3, 4),
-                        dock_noise_public_key,
-                    )
-                    .unwrap();
-                } else {
-                    let dock_keypair = snow::Keypair {
-                        private: dock_noise_private_key.to_vec(),
-                        public: dock_noise_public_key.to_vec(),
-                    };
-                    km_multiplexor::add_node_link(asm, peer_id, ZPIPair::new(5, 6), dock_keypair)
-                        .unwrap();
-                }
             }
-            // END HACK
+        }
 
-            // TODO signal handler goes here
-
-            fs::remove_file(&sock_path)
-                .or_else(|e| {
-                    if e.kind() == ErrorKind::NotFound {
-                        Ok(())
-                    } else {
-                        Err(e)
-                    }
-                })
-                .unwrap();
-            let unix_socket = Box::leak(Box::new(UnixListener::bind(sock_path).unwrap())); //TODO not sure if this needs the Box leak wrapper
-
-            let mut js = JoinSet::new();
-
-            let usr1_stream = Box::leak(Box::new(signal(SignalKind::user_defined1()).unwrap()));
-            let term_stream = Box::leak(Box::new(signal(SignalKind::terminate()).unwrap()));
-
-            js.spawn(async {
-                loop {
-                    tokio::select! {
-                        _ = usr1_stream.recv() => emit_counts(&asm.system_name, &asm.counters),
-                        _ = term_stream.recv() => {
-                            emit_counts(&asm.system_name, &asm.counters);
-                            std::process::exit(128 + SignalKind::terminate().as_raw_value())
-                        }
-                    }
-                }
-            });
-
-            js.spawn(adapter_manager_worker::launch(&*asm, am_outq));
-
-            for (worker_index, tun_dev) in tun_devs.iter().enumerate() {
-                js.spawn(agent_output_worker::launch(
-                    &agent_output_worker::Config {
-                        worker_index,
-                        batch_size: agent_output_batch_size,
-                    },
-                    &*asm,
-                    tun_dev,
-                ));
-            }
-
-            js.spawn(rpc_worker::launch(&*asm, &*unix_socket));
-
-            js.spawn(capture_worker::launch(
-                &capture_worker::Config {
-                    batch_size: capture_batch_size,
+        let peer_id = asm
+            .hack_add_peer(
+                match ph_mode {
+                    PhMode::Node => peer_table::PeerType::Adapter,
+                    PhMode::Adapter => peer_table::PeerType::Node,
                 },
-                &*asm,
-                cap_outq,
-            ));
+                peer_addr1,
+            )
+            .unwrap();
 
-            if !disable_km {
-                // Start key managemenent workers
-                js.spawn(km_multiplexor::launch_signal_worker(&*asm, km_sig_rx));
-                js.spawn(km_multiplexor::launch_message_worker(&*asm, km_rx));
+        asm.peer_ids.lock().unwrap().push(peer_id);
+        if !disable_km {
+            if ph_mode == PhMode::Adapter {
+                km_multiplexor::add_adapter_link(
+                    asm,
+                    peer_id,
+                    ZPIPair::new(3, 4),
+                    dock_noise_public_key,
+                )
+                .unwrap();
+            } else {
+                let dock_keypair = snow::Keypair {
+                    private: dock_noise_private_key.to_vec(),
+                    public: dock_noise_public_key.to_vec(),
+                };
+                km_multiplexor::add_node_link(asm, peer_id, ZPIPair::new(5, 6), dock_keypair)
+                    .unwrap();
             }
+        }
+        // END HACK
 
-            eprintln!("{}: connecting...", asm.system_name);
-            eprintln!("{}: connected!", asm.system_name); // FIXME: it's a lie
-            asm.tun_ctl.set_carrier(true).unwrap();
+        // TODO signal handler goes here
 
-            for (worker_index, socket) in sockets.iter().enumerate() {
-                js.spawn(substrate_ingress_worker::launch(
-                    &substrate_ingress_worker::Config {
-                        worker_index,
-                        batch_size: substrate_ingress_batch_size,
-                    },
-                    &*asm,
-                    socket,
-                ));
-            }
-
-            if matches!(ph_mode, PhMode::Adapter) {
-                let dsid = asm.hack_get_adapter_docking_session_id();
-
-                info!(
-                    "adapter: {}: waiting for KM to be established on my docking session link {}",
-                    asm.system_name, dsid
-                );
-                while !asm.peer_table.is_security_assocaition_established(dsid) {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        fs::remove_file(&sock_path)
+            .or_else(|e| {
+                if e.kind() == ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
                 }
-                info!(
-                    "adapter: {}: KM ESTABLISHED on link {}",
-                    asm.system_name, dsid
-                );
+            })
+            .unwrap();
+        let unix_socket = Box::leak(Box::new(UnixListener::bind(sock_path).unwrap())); //TODO not sure if this needs the Box leak wrapper
 
-                mgmt::send_report(asm, dsid, "Reporting for Duty!").await;
-                mgmt::send_discard(asm, dsid).await;
-                match mgmt::send_hello_request(asm, dsid).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        warn!(
-                            "adapter: {}: failed to send hello request: {:?}",
-                            asm.system_name, e
-                        );
+        let mut js = JoinSet::new();
+
+        let usr1_stream = Box::leak(Box::new(signal(SignalKind::user_defined1()).unwrap()));
+        let term_stream = Box::leak(Box::new(signal(SignalKind::terminate()).unwrap()));
+
+        js.spawn(async {
+            loop {
+                tokio::select! {
+                    _ = usr1_stream.recv() => emit_counts(&asm.system_name, &asm.counters),
+                    _ = term_stream.recv() => {
+                        emit_counts(&asm.system_name, &asm.counters);
+                        std::process::exit(128 + SignalKind::terminate().as_raw_value())
                     }
                 }
-            }
-
-            while let Some(res) = js.join_next().await {
-                res.unwrap();
             }
         });
+
+        js.spawn_local(adapter_manager_worker::launch(&*asm, am_outq));
+
+        for (worker_index, tun_dev) in tun_devs.iter().enumerate() {
+            js.spawn(agent_output_worker::launch(
+                &agent_output_worker::Config {
+                    worker_index,
+                    batch_size: agent_output_batch_size,
+                },
+                &*asm,
+                tun_dev,
+            ));
+        }
+
+        js.spawn_local(rpc_worker::launch(&*asm, &*unix_socket));
+
+        js.spawn(capture_worker::launch(
+            &capture_worker::Config {
+                batch_size: capture_batch_size,
+            },
+            &*asm,
+            cap_outq,
+        ));
+
+        if !disable_km {
+            // Start key managemenent workers
+            js.spawn(km_multiplexor::launch_signal_worker(&*asm, km_sig_rx));
+            js.spawn(km_multiplexor::launch_message_worker(&*asm, km_rx));
+        }
+
+        eprintln!("{}: connecting...", asm.system_name);
+        eprintln!("{}: connected!", asm.system_name); // FIXME: it's a lie
+        asm.tun_ctl.set_carrier(true).unwrap();
+
+        for (worker_index, socket) in sockets.iter().enumerate() {
+            js.spawn(substrate_ingress_worker::launch(
+                &substrate_ingress_worker::Config {
+                    worker_index,
+                    batch_size: substrate_ingress_batch_size,
+                },
+                &*asm,
+                socket,
+            ));
+        }
+
+        if matches!(ph_mode, PhMode::Adapter) {
+            let dsid = asm.hack_get_adapter_docking_session_id();
+            mgmt::send_report(asm, dsid, "Reporting for Duty!").await;
+            mgmt::send_discard(asm, dsid).await;
+            mgmt::send_hello_request(asm, dsid).await.unwrap();
+        }
+
+        while let Some(res) = js.join_next().await {
+            res.unwrap();
+        }
+    });
 
     ExitCode::SUCCESS
 }
