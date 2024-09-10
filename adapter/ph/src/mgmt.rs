@@ -9,12 +9,14 @@ use crate::dock_tables;
 use crate::fastpath;
 use crate::km_multiplexor;
 use crate::packet::{self, Packet};
+use crate::queues;
 use crate::zdp;
 use crate::zpr;
 use bytes::{Buf, BufMut};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::error;
+use zerocopy::FromBytes;
 use zpr_ext::std::mem::{drop_guard, DropGuard};
 use zpr_ext::zerocopy::{AsBytesExt, FromBytesExt};
 
@@ -215,9 +217,69 @@ fn match_received<'pktbuf>(
     }
 }
 
+pub fn route_mgmt_packet<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    ingress_link_id: zpr::LinkId,
+    pkt: Packet<'pktbuf>,
+) {
+    match zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()) {
+        Some(base_hdr) if base_hdr.packet_type.is_response() => {
+            match handle_response(asm, ingress_link_id, pkt) {
+                Ok(()) => (),
+                Err((err, pkt)) => fastpath::drop_and_count(asm, pkt, err),
+            }
+        }
+
+        _ => {
+            eprintln!("{}: enqueueing!", asm.system_name);
+
+            let Some(peer_state) = asm.peer_table.get(ingress_link_id) else {
+                fastpath::drop_and_count(asm, pkt, CounterType::PeerRemoved);
+                return;
+            };
+
+            match peer_state.mgmt_processor.try_enqueue_packet(pkt) {
+                Ok(()) => (),
+                Err(queues::TryEnqueueError::Full(pkt)) => {
+                    eprintln!("{}: queue backpressure!", asm.system_name);
+                    fastpath::drop_and_count(asm, pkt, CounterType::QueueBackpressure);
+                }
+            }
+        }
+    }
+}
+
+fn handle_response<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    ingress_link_id: zpr::LinkId,
+    mut pkt: Packet<'pktbuf>,
+) -> HandleMgmtResult<'pktbuf> {
+    let Some(base_hdr) = zdp::ZdpBaseHeader::read_from_buf(&mut pkt) else {
+        return Err((HandleMgmtError::BadStructure, pkt));
+    };
+
+    let packet_type = base_hdr.packet_type;
+
+    debug_assert!(packet_type.is_response(), "stray mgmt request in handle_response()");
+
+    eprintln!("{}: got response from {}", asm.system_name, ingress_link_id);
+
+    // Gets the designated sender, attempts to send the response, if not drops
+    // the packet and increments corresponding counter
+    let mut pkt = Some(pkt);
+    asm.peer_table
+        .inspect(ingress_link_id, |peer_state| {
+            peer_state
+                .sync_req_state
+                .forward_response((packet_type, pkt.take().unwrap()))
+                .map_err(|pkt| (HandleMgmtError::UnexpectedMgmtResponse, pkt))
+        })
+        .unwrap_or_else(|| Err((HandleMgmtError::UnexpectedMgmtResponse, pkt.take().unwrap())))
+}
+
 /// send a Report message (RFC 6.5 § 6.3.13)
-pub async fn send_report<'pktbuf>(
-    asm: &'pktbuf Assembly<'pktbuf>,
+pub async fn send_report(
+    asm: &Assembly<'_>,
     link_id: zpr::LinkId,
     report: &str,
 ) {
@@ -235,7 +297,7 @@ pub async fn send_report<'pktbuf>(
 }
 
 /// send a Discard message (RFC 6.5 § 6.3.1)
-pub async fn send_discard<'pktbuf>(asm: &'pktbuf Assembly<'pktbuf>, link_id: zpr::LinkId) {
+pub async fn send_discard(asm: &Assembly<'_>, link_id: zpr::LinkId) {
     let buf = asm.buffer_stack.get_buffer().await;
     let pkt = Packet::new(buf, config::DEFAULT_MESSAGE_HEADROOM);
     send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::Discard, pkt).await;

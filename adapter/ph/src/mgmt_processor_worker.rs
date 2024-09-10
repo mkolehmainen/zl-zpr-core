@@ -23,13 +23,17 @@ async fn worker<'pktbuf>(
         match msg {
             MgmtProcessorMessage::Packet(pkt) => {
                 eprintln!(
-                    "{}: dequeued mgmt message from {}",
+                    "{}: ENTER dequeued mgmt message from {}",
                     asm.system_name, config.link_id
                 );
                 match handle_packet(asm, config.link_id, pkt).await {
                     Ok(()) => (),
                     Err((err, pkt)) => fastpath::drop_and_count(asm, pkt, err),
                 }
+                eprintln!(
+                    "{}: LEAVE dequeued mgmt message from {}",
+                    asm.system_name, config.link_id
+                );
             }
 
             MgmtProcessorMessage::TestPacket(pkt) => pkt.acknowledge(queue.len(), 1),
@@ -65,21 +69,9 @@ async fn handle_packet<'pktbuf>(
 
     let packet_type = base_hdr.packet_type;
 
-    if packet_type.is_response() {
-        eprintln!("{}: got response from {}", asm.system_name, ingress_link_id);
+    debug_assert!(!packet_type.is_response(), "stray mgmt response in mgmt processor");
 
-        // Gets the designated sender, attempts to send the response, if not drops
-        // the packet and increments corresponding counter
-        let mut pkt = Some(pkt);
-        asm.peer_table
-            .inspect(ingress_link_id, |peer_state| {
-                peer_state
-                    .sync_req_state
-                    .forward_response((packet_type, pkt.take().unwrap()))
-                    .map_err(|pkt| (HandleMgmtError::UnexpectedMgmtResponse, pkt))
-            })
-            .unwrap_or_else(|| Err((HandleMgmtError::UnexpectedMgmtResponse, pkt.take().unwrap())))
-    } else if base_hdr.packet_type.is_per_flow() {
+    if base_hdr.packet_type.is_per_flow() {
         let Some(per_flow_hdr) = ZdpPerFlowHeader::read_from_buf(&mut pkt) else {
             return Err((HandleMgmtError::BadStructure, pkt));
         };
