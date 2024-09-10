@@ -216,7 +216,7 @@ fn match_received<'pktbuf>(
     }
 }
 
-pub fn route_mgmt_packet<'pktbuf>(
+pub fn dispatch_mgmt_packet<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     ingress_link_id: zpr::LinkId,
     pkt: Packet<'pktbuf>,

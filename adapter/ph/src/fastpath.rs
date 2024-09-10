@@ -537,7 +537,7 @@ pub fn substrate_ingress<'pktbuf>(
         // TODO: should we peel off the ZDP header here??
         // (instead of this silly code to restore it?)
         *pkt.alloc_zeroed_header() = base_hdr;
-        mgmt::route_mgmt_packet(asm, ingress_link_id, pkt);
+        mgmt::dispatch_mgmt_packet(asm, ingress_link_id, pkt);
         return;
     }
 
