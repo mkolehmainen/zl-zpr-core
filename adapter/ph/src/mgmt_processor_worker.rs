@@ -22,10 +22,6 @@ async fn worker<'pktbuf>(
     while let Some(msg) = queue.recv().await {
         match msg {
             MgmtProcessorMessage::Packet(pkt) => {
-                eprintln!(
-                    "{}: dequeued mgmt message from {}",
-                    asm.system_name, config.link_id
-                );
                 match handle_packet(asm, config.link_id, pkt).await {
                     Ok(()) => (),
                     Err((err, pkt)) => fastpath::drop_and_count(asm, pkt, err),
@@ -54,32 +50,23 @@ async fn handle_packet<'pktbuf>(
     ingress_link_id: zpr::LinkId,
     mut pkt: Packet<'pktbuf>,
 ) -> HandleMgmtResult<'pktbuf> {
-    eprintln!(
-        "{}: handling mgmt message from {}",
-        asm.system_name, ingress_link_id
-    );
-
     let Some(base_hdr) = ZdpBaseHeader::read_from_buf(&mut pkt) else {
         return Err((HandleMgmtError::BadStructure, pkt));
     };
 
-    let packet_type = base_hdr.packet_type;
+    eprintln!(
+        "{}: handling mgmt message from {} type {:?} seq_num {}",
+        asm.system_name, ingress_link_id, base_hdr.packet_type, base_hdr.sequence_number
+    );
 
-    if packet_type.is_response() {
-        eprintln!("{}: got response from {}", asm.system_name, ingress_link_id);
+    debug_assert!(
+        !base_hdr.packet_type.is_response(),
+        "stray mgmt response in mgmt processor"
+    );
 
-        // Gets the designated sender, attempts to send the response, if not drops
-        // the packet and increments corresponding counter
-        let mut pkt = Some(pkt);
-        asm.peer_table
-            .inspect(ingress_link_id, |peer_state| {
-                peer_state
-                    .sync_req_state
-                    .forward_response((packet_type, pkt.take().unwrap()))
-                    .map_err(|pkt| (HandleMgmtError::UnexpectedMgmtResponse, pkt))
-            })
-            .unwrap_or_else(|| Err((HandleMgmtError::UnexpectedMgmtResponse, pkt.take().unwrap())))
-    } else if base_hdr.packet_type.is_per_flow() {
+    let seq_num = base_hdr.sequence_number.get() as u64; // TODO: reconstitute full seq num given expected seq num state
+
+    if base_hdr.packet_type.is_per_flow() {
         let Some(per_flow_hdr) = ZdpPerFlowHeader::read_from_buf(&mut pkt) else {
             return Err((HandleMgmtError::BadStructure, pkt));
         };
@@ -90,7 +77,14 @@ async fn handle_packet<'pktbuf>(
             ZdpPacketType::TransitPacket => panic!("unexpected Transit Packet in management path"),
 
             ZdpPacketType::BindAgentAddressRequest => {
-                mgmt::handle_bind_agent_address_request(asm, ingress_link_id, stream_id, pkt).await
+                mgmt::handle_bind_agent_address_request(
+                    asm,
+                    ingress_link_id,
+                    stream_id,
+                    seq_num,
+                    pkt,
+                )
+                .await
             }
 
             packet_type => Err((HandleMgmtError::UnknownType(packet_type.0), pkt)),
@@ -102,11 +96,11 @@ async fn handle_packet<'pktbuf>(
             ZdpPacketType::Discard => mgmt::handle_discard(asm, ingress_link_id, pkt).await,
 
             ZdpPacketType::KeyManagement => {
-                mgmt::handle_key_management(asm, ingress_link_id, pkt).await
+                panic!("unexpected Key Management message in mgmt processor")
             }
 
             ZdpPacketType::HelloRequest => {
-                mgmt::handle_hello_request(asm, ingress_link_id, pkt).await
+                mgmt::handle_hello_request(asm, ingress_link_id, seq_num, pkt).await
             }
 
             packet_type => Err((HandleMgmtError::UnknownType(packet_type.0), pkt)),

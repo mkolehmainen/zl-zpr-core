@@ -9,12 +9,14 @@ use crate::dock_tables;
 use crate::fastpath;
 use crate::km_multiplexor;
 use crate::packet::{self, Packet};
+use crate::queues;
 use crate::zdp;
 use crate::zpr;
 use bytes::{Buf, BufMut};
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::error;
+use tracing::{error, info, warn};
+use zerocopy::FromBytes;
 use zpr_ext::std::mem::{drop_guard, DropGuard};
 use zpr_ext::zerocopy::{AsBytesExt, FromBytesExt};
 
@@ -24,32 +26,83 @@ pub async fn send_non_flow_mgmt<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     link_id: zpr::LinkId,
     packet_type: zdp::ZdpPacketType,
-    mut packet: Packet<'pktbuf>,
+    packet: Packet<'pktbuf>,
 ) {
-    debug_assert!(!packet_type.is_per_flow());
-
-    let hdr = packet.alloc_zeroed_header::<zdp::ZdpBaseHeader>();
-    hdr.packet_type = packet_type;
-
-    fastpath::substrate_egress_blocking(asm, link_id, packet).await;
+    send_mgmt_helper(asm, link_id, packet_type, None, None, packet).await
 }
 
 /// Send a unidirectional per-flow management message on the given link.
 /// The packet should contain only the message body.
+#[allow(dead_code)]
 pub async fn send_per_flow_mgmt<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     link_id: zpr::LinkId,
     packet_type: zdp::ZdpPacketType,
     stream_id: zpr::StreamId,
+    packet: Packet<'pktbuf>,
+) {
+    send_mgmt_helper(asm, link_id, packet_type, Some(stream_id), None, packet).await
+}
+
+pub async fn send_non_flow_mgmt_response<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    link_id: zpr::LinkId,
+    packet_type: zdp::ZdpPacketType,
+    sequence_number: zpr::SeqNum,
+    packet: Packet<'pktbuf>,
+) {
+    send_mgmt_helper(
+        asm,
+        link_id,
+        packet_type,
+        None,
+        Some(sequence_number),
+        packet,
+    )
+    .await
+}
+
+pub async fn send_per_flow_mgmt_response<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    link_id: zpr::LinkId,
+    packet_type: zdp::ZdpPacketType,
+    stream_id: zpr::StreamId,
+    sequence_number: zpr::SeqNum,
+    packet: Packet<'pktbuf>,
+) {
+    send_mgmt_helper(
+        asm,
+        link_id,
+        packet_type,
+        Some(stream_id),
+        Some(sequence_number),
+        packet,
+    )
+    .await
+}
+
+async fn send_mgmt_helper<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    link_id: zpr::LinkId,
+    packet_type: zdp::ZdpPacketType,
+    stream_id: Option<zpr::StreamId>,
+    sequence_number: Option<zpr::SeqNum>,
     mut packet: Packet<'pktbuf>,
 ) {
-    debug_assert!(packet_type.is_per_flow());
+    debug_assert_eq!(stream_id.is_some(), packet_type.is_per_flow());
 
-    let per_flow_hdr = packet.alloc_zeroed_header::<zdp::ZdpPerFlowHeader>();
-    per_flow_hdr.stream_id = stream_id.into();
+    if let Some(stream_id) = stream_id {
+        let per_flow_hdr = packet.alloc_zeroed_header::<zdp::ZdpPerFlowHeader>();
+        per_flow_hdr.stream_id = stream_id.into();
+    }
 
     let hdr = packet.alloc_zeroed_header::<zdp::ZdpBaseHeader>();
     hdr.packet_type = packet_type;
+
+    if let Some(sequence_number) = sequence_number {
+        // uses only suffix of sequence number
+        hdr.sequence_number = (sequence_number as u16).into();
+    }
 
     fastpath::substrate_egress_blocking(asm, link_id, packet).await;
 }
@@ -138,21 +191,14 @@ async fn send_sync_req_helper<'pktbuf>(
     zdp_request_type: zdp::ZdpPacketType,
     zdp_response_type: zdp::ZdpPacketType,
     stream_id: Option<zpr::StreamId>,
-    pkt_fn: impl Fn(&mut Packet<'_>) + Send + 'static,
+    pkt_fn: impl Fn(&mut Packet<'_>) + 'static,
 ) -> Result<Packet<'pktbuf>, SyncReqError> {
     // acquire a permit to send a manamgement message
-    let Some(permit_future) = asm.peer_table.inspect(link_id, |peer_state| {
-        peer_state.sync_req_state.acquire_permit()
-    }) else {
+    let Some(peer_state) = asm.peer_table.get(link_id) else {
         return Err(SyncReqError::LinkClosed);
     };
-    let permit = permit_future.await;
-
-    let Some(mut response_future) = asm.peer_table.inspect(link_id, |peer_state| {
-        peer_state.sync_req_state.install_response_listener(&permit)
-    }) else {
-        return Err(SyncReqError::LinkClosed);
-    };
+    let permit = peer_state.sync_req_state.acquire_permit().await;
+    let mut response_future = peer_state.sync_req_state.install_response_listener(&permit);
 
     for _i in 0..=config::DEFAULT_REQUEST_RETRY_COUNT {
         let buf = drop_guard(asm.buffer_stack.get_buffer().await, |buf| {
@@ -161,36 +207,29 @@ async fn send_sync_req_helper<'pktbuf>(
         let mut packet = Packet::new_guarded(buf, config::DEFAULT_MESSAGE_HEADROOM);
         pkt_fn(&mut packet);
 
-        // Determine if sending a non-flow or per-flow message
-        match stream_id {
-            Some(stream_id) => {
-                send_per_flow_mgmt(
-                    asm,
-                    link_id,
-                    zdp_request_type,
-                    stream_id,
-                    packet.into_inner(),
-                )
-                .await;
-            }
-            None => {
-                send_non_flow_mgmt(asm, link_id, zdp_request_type, packet.into_inner()).await;
-            }
-        }
+        send_mgmt_helper(
+            asm,
+            link_id,
+            zdp_request_type,
+            stream_id,
+            Some(permit.seq_num()),
+            packet.into_inner(),
+        )
+        .await;
+
         tokio::select! {
             response = &mut response_future => {
                 drop(permit);
-                eprintln!("{}: received response from {} via channel!", asm.system_name, link_id);
                 return match_received(asm, response.ok(), SyncReqError::LinkClosed, zdp_response_type);
             }
             _ = sleep(Duration::from_secs(config::DEFAULT_REQUEST_RETRY_TIMER as u64)) => ()
         }
     }
-    asm.peer_table.inspect(link_id, |peer_state| {
-        peer_state.sync_req_state.clear_response_listener(&permit)
-    });
+
+    peer_state.sync_req_state.clear_response_listener(&permit);
     let response = response_future.hangup();
     drop(permit);
+
     match_received(asm, response, SyncReqError::Timeout, zdp_response_type)
 }
 
@@ -215,12 +254,74 @@ fn match_received<'pktbuf>(
     }
 }
 
-/// send a Report message (RFC 6.5 § 6.3.13)
-pub async fn send_report<'pktbuf>(
-    asm: &'pktbuf Assembly<'pktbuf>,
-    link_id: zpr::LinkId,
-    report: &str,
+pub fn dispatch_mgmt_packet<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    ingress_link_id: zpr::LinkId,
+    mut pkt: Packet<'pktbuf>,
 ) {
+    match zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()) {
+        Some(base_hdr) if base_hdr.packet_type == zdp::ZdpPacketType::KeyManagement => {
+            pkt.advance(std::mem::size_of::<zdp::ZdpBaseHeader>());
+            match handle_key_management(asm, ingress_link_id, pkt) {
+                Ok(()) => (),
+                Err((err, pkt)) => fastpath::drop_and_count(asm, pkt, err),
+            }
+        }
+
+        Some(base_hdr) if base_hdr.packet_type.is_response() => {
+            match handle_response(asm, ingress_link_id, pkt) {
+                Ok(()) => (),
+                Err((err, pkt)) => fastpath::drop_and_count(asm, pkt, err),
+            }
+        }
+
+        _ => {
+            let Some(peer_state) = asm.peer_table.get(ingress_link_id) else {
+                fastpath::drop_and_count(asm, pkt, CounterType::PeerRemoved);
+                return;
+            };
+
+            match peer_state.mgmt_processor.try_enqueue_packet(pkt) {
+                Ok(()) => (),
+                Err(queues::TryEnqueueError::Full(pkt)) => {
+                    fastpath::drop_and_count(asm, pkt, CounterType::QueueBackpressure);
+                }
+            }
+        }
+    }
+}
+
+fn handle_response<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    ingress_link_id: zpr::LinkId,
+    mut pkt: Packet<'pktbuf>,
+) -> HandleMgmtResult<'pktbuf> {
+    let Some(base_hdr) = zdp::ZdpBaseHeader::read_from_buf(&mut pkt) else {
+        return Err((HandleMgmtError::BadStructure, pkt));
+    };
+
+    let packet_type = base_hdr.packet_type;
+    let seq_num = base_hdr.sequence_number.get() as u64; // TODO: reconstitute full seq num given expected seq num state
+
+    debug_assert!(
+        packet_type.is_response(),
+        "stray mgmt request in handle_response()"
+    );
+
+    // Gets the designated sender, attempts to send the response, if not drops
+    // the packet and increments corresponding counter
+    let Some(peer_state) = asm.peer_table.get(ingress_link_id) else {
+        return Err((HandleMgmtError::UnexpectedMgmtResponse, pkt));
+    };
+
+    peer_state
+        .sync_req_state
+        .forward_response(seq_num, (packet_type, pkt))
+        .map_err(|pkt| (HandleMgmtError::UnexpectedMgmtResponse, pkt))
+}
+
+/// send a Report message (RFC 6.5 § 6.3.13)
+pub async fn send_report(asm: &Assembly<'_>, link_id: zpr::LinkId, report: &str) {
     // TODO this condition will need to be adjusted when we have complete ZPR packets
     // with the information at the end of the packet at well
     if packet::PACKET_BUFFER_MAX_BODY_SIZE - config::DEFAULT_MESSAGE_HEADROOM < report.len() {
@@ -235,7 +336,7 @@ pub async fn send_report<'pktbuf>(
 }
 
 /// send a Discard message (RFC 6.5 § 6.3.1)
-pub async fn send_discard<'pktbuf>(asm: &'pktbuf Assembly<'pktbuf>, link_id: zpr::LinkId) {
+pub async fn send_discard(asm: &Assembly<'_>, link_id: zpr::LinkId) {
     let buf = asm.buffer_stack.get_buffer().await;
     let pkt = Packet::new(buf, config::DEFAULT_MESSAGE_HEADROOM);
     send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::Discard, pkt).await;
@@ -262,13 +363,13 @@ pub async fn send_hello_request<'a, 'pktbuf>(
                 return Err(());
             };
             let status = hdr.status;
-            eprintln!("Received HelloResponse, status: {}", status);
+            info!("Received HelloResponse, status: {}", status);
             asm.buffer_stack.put_buffer(hello_res.destroy());
             Ok(())
         }
 
         Err(err) => {
-            eprintln!("{} error with HelloRequest", err);
+            warn!("{} error with HelloRequest", err);
             Err(())
         }
     }
@@ -297,11 +398,6 @@ pub async fn send_bind_agent_address_request<'a, 'pktbuf>(
     compression_mode: zpr::CompressionMode,
     five_tuple: FiveTuple,
 ) -> Result<zpr::StreamId, BindAgentAddressError> {
-    eprintln!(
-        "{}: sending bind req for {} to {}",
-        asm.system_name, five_tuple, link_id
-    );
-
     let response = send_sync_per_flow_req(
         asm,
         link_id,
@@ -378,6 +474,25 @@ pub async fn send_bind_agent_address_request<'a, 'pktbuf>(
     }
 }
 
+/// Send a key management message out the given link.
+pub async fn send_key_management<'pktbuf>(
+    asm: &Assembly<'pktbuf>,
+    link_id: zpr::LinkId,
+    km_id: zpr::KmId,
+    payload: &[u8],
+) {
+    let buf = asm.buffer_stack.get_buffer().await;
+    let mut pkt = Packet::new(buf, config::DEFAULT_MESSAGE_HEADROOM);
+
+    let km_hdr = pkt.alloc_zeroed_header::<zdp::ZdpKeyManagementHeader>();
+    km_hdr.message_type = km_id.into();
+    km_hdr.message_length = (payload.len() as u16).into();
+
+    pkt.put(payload);
+
+    send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::KeyManagement, pkt).await;
+}
+
 pub enum HandleMgmtError {
     UnknownType(u8),
     UnexpectedMgmtResponse,
@@ -414,8 +529,7 @@ pub async fn handle_report<'pktbuf>(
     let report_data_length: usize = hdr.report_data_length.into();
     pkt.advance(std::mem::size_of::<zdp::ZdpReportHeader>());
     if pkt.body().len() >= report_data_length {
-        // TODO printing to stderr blocks indefinitely, this is just temporary
-        eprintln!(
+        info!(
             "{}: {}",
             ingress_link_id,
             std::str::from_utf8(&pkt.body()[..report_data_length]).unwrap()
@@ -432,7 +546,7 @@ pub async fn handle_discard<'pktbuf>(
     pkt: Packet<'pktbuf>,
 ) -> HandleMgmtResult<'pktbuf> {
     // TODO print to debug log, when implemented
-    eprintln!(
+    info!(
         "{}: Discard message received from {}",
         asm.system_name, ingress_link_id
     );
@@ -444,18 +558,20 @@ pub async fn handle_discard<'pktbuf>(
 pub async fn handle_hello_request<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     ingress_link_id: zpr::LinkId,
+    seq_num: zpr::SeqNum,
     pkt: Packet<'pktbuf>,
 ) -> HandleMgmtResult<'pktbuf> {
     let mut rsp_pkt = Packet::new(pkt.destroy(), config::DEFAULT_MESSAGE_HEADROOM);
     let hdr = rsp_pkt.alloc_zeroed_header::<zdp::ZdpHelloResponseHeader>();
     hdr.status = 0.into();
 
-    eprintln!("{}: Received HelloRequest", asm.system_name);
+    info!("{}: Received HelloRequest", asm.system_name);
 
-    send_non_flow_mgmt(
+    send_non_flow_mgmt_response(
         asm,
         ingress_link_id,
         zdp::ZdpPacketType::HelloResponse,
+        seq_num,
         rsp_pkt,
     )
     .await;
@@ -468,6 +584,7 @@ pub async fn handle_bind_agent_address_request<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     ingress_link_id: zpr::LinkId,
     _stream_id: zpr::StreamId, // ignored
+    seq_num: zpr::SeqNum,
     mut pkt: Packet<'pktbuf>,
 ) -> HandleMgmtResult<'pktbuf> {
     let Some(hdr) = zdp::ZdpBindAgentAddressRequestHeader::read_from_buf(&mut pkt) else {
@@ -547,11 +664,6 @@ pub async fn handle_bind_agent_address_request<'pktbuf>(
         ip_protocol,
         src_port,
         dst_port,
-    );
-
-    eprintln!(
-        "{}: handling bind req for {} from {}",
-        asm.system_name, five_tuple, ingress_link_id
     );
 
     // recycle request buffer for response
@@ -642,8 +754,6 @@ pub async fn handle_bind_agent_address_request<'pktbuf>(
         }
 
         PhMode::Adapter => {
-            eprintln!("{}: I'm an adapter!", asm.system_name);
-
             // form PEP
             let pep = adapter_tables::DltPep {
                 compression_mode,
@@ -683,17 +793,13 @@ pub async fn handle_bind_agent_address_request<'pktbuf>(
         }
     }
 
-    eprintln!(
-        "{}: responding to {} with {} for {}!",
-        asm.system_name, ingress_link_id, ingress_tether_id, five_tuple
-    );
-
     // respond to requestor
-    send_per_flow_mgmt(
+    send_per_flow_mgmt_response(
         asm,
         ingress_link_id,
         zdp::ZdpPacketType::BindAgentAddressResponse,
         ingress_tether_id,
+        seq_num,
         rsp_pkt,
     )
     .await;
@@ -701,28 +807,9 @@ pub async fn handle_bind_agent_address_request<'pktbuf>(
     Ok(())
 }
 
-/// Send a key management message out the given link.
-pub async fn send_key_management<'pktbuf>(
-    asm: &Assembly<'pktbuf>,
-    link_id: zpr::LinkId,
-    km_id: zpr::KmId,
-    payload: &[u8],
-) {
-    let buf = asm.buffer_stack.get_buffer().await;
-    let mut pkt = Packet::new(buf, config::DEFAULT_MESSAGE_HEADROOM);
-
-    let km_hdr = pkt.alloc_zeroed_header::<zdp::ZdpKeyManagementHeader>();
-    km_hdr.message_type = km_id.into();
-    km_hdr.message_length = (payload.len() as u16).into();
-
-    pkt.put(payload);
-
-    send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::KeyManagement, pkt).await;
-}
-
 // ZPI and Base header is already gone by the time we get here.  So we expect
 // to parse starting from the KeyManagement header.
-pub async fn handle_key_management<'pktbuf>(
+pub fn handle_key_management<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     ingress_link_id: zpr::LinkId,
     mut pkt: Packet<'pktbuf>,
@@ -746,9 +833,7 @@ pub async fn handle_key_management<'pktbuf>(
         error!("KeyManagement packet arrived with truncated payload");
         return Err((HandleMgmtError::BadStructure, pkt));
     }
-    match km_multiplexor::handle_inbound_km_msg(asm, ingress_link_id, &pkt.body()[..km_msg_len])
-        .await
-    {
+    match km_multiplexor::handle_inbound_km_msg(asm, ingress_link_id, &pkt.body()[..km_msg_len]) {
         Ok(()) => (),
         Err(e) => {
             error!(
