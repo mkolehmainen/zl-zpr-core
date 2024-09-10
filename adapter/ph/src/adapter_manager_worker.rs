@@ -43,12 +43,6 @@ async fn do_request_tether_id<'pktbuf>(asm: &Assembly<'pktbuf>, pkt: Packet<'pkt
     let five_tuple = *pkt.metadata().five_tuple();
     fastpath::drop_and_count(asm, pkt, CounterType::DroppedAwaitingBind);
 
-    // VERY HACK: there's some race condition which IPv6's
-    // rapid link-local config traffic exacerbates
-    if five_tuple.l3_type == zpr::L3Type::Ipv6 {
-        return;
-    }
-
     // if there's already an entry, this is a duplicate request
     // (NOTE: we should be the only ones modifying this table!)
     if asm.alt.get(&five_tuple).is_some() {
