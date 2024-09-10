@@ -56,7 +56,10 @@ async fn handle_packet<'pktbuf>(
 
     let packet_type = base_hdr.packet_type;
 
-    debug_assert!(!packet_type.is_response(), "stray mgmt response in mgmt processor");
+    debug_assert!(
+        !packet_type.is_response(),
+        "stray mgmt response in mgmt processor"
+    );
 
     if base_hdr.packet_type.is_per_flow() {
         let Some(per_flow_hdr) = ZdpPerFlowHeader::read_from_buf(&mut pkt) else {

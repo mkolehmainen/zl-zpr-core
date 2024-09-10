@@ -256,7 +256,10 @@ fn handle_response<'pktbuf>(
 
     let packet_type = base_hdr.packet_type;
 
-    debug_assert!(packet_type.is_response(), "stray mgmt request in handle_response()");
+    debug_assert!(
+        packet_type.is_response(),
+        "stray mgmt request in handle_response()"
+    );
 
     // Gets the designated sender, attempts to send the response, if not drops
     // the packet and increments corresponding counter
@@ -272,11 +275,7 @@ fn handle_response<'pktbuf>(
 }
 
 /// send a Report message (RFC 6.5 § 6.3.13)
-pub async fn send_report(
-    asm: &Assembly<'_>,
-    link_id: zpr::LinkId,
-    report: &str,
-) {
+pub async fn send_report(asm: &Assembly<'_>, link_id: zpr::LinkId, report: &str) {
     // TODO this condition will need to be adjusted when we have complete ZPR packets
     // with the information at the end of the packet at well
     if packet::PACKET_BUFFER_MAX_BODY_SIZE - config::DEFAULT_MESSAGE_HEADROOM < report.len() {
