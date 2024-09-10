@@ -219,9 +219,17 @@ fn match_received<'pktbuf>(
 pub fn dispatch_mgmt_packet<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     ingress_link_id: zpr::LinkId,
-    pkt: Packet<'pktbuf>,
+    mut pkt: Packet<'pktbuf>,
 ) {
     match zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()) {
+        Some(base_hdr) if base_hdr.packet_type == zdp::ZdpPacketType::KeyManagement => {
+            pkt.advance(std::mem::size_of::<zdp::ZdpBaseHeader>());
+            match handle_key_management(asm, ingress_link_id, pkt) {
+                Ok(()) => (),
+                Err((err, pkt)) => fastpath::drop_and_count(asm, pkt, err),
+            }
+        }
+
         Some(base_hdr) if base_hdr.packet_type.is_response() => {
             match handle_response(asm, ingress_link_id, pkt) {
                 Ok(()) => (),
@@ -759,7 +767,7 @@ pub async fn send_key_management<'pktbuf>(
 
 // ZPI and Base header is already gone by the time we get here.  So we expect
 // to parse starting from the KeyManagement header.
-pub async fn handle_key_management<'pktbuf>(
+pub fn handle_key_management<'pktbuf>(
     asm: &Assembly<'pktbuf>,
     ingress_link_id: zpr::LinkId,
     mut pkt: Packet<'pktbuf>,
@@ -783,9 +791,7 @@ pub async fn handle_key_management<'pktbuf>(
         error!("KeyManagement packet arrived with truncated payload");
         return Err((HandleMgmtError::BadStructure, pkt));
     }
-    match km_multiplexor::handle_inbound_km_msg(asm, ingress_link_id, &pkt.body()[..km_msg_len])
-        .await
-    {
+    match km_multiplexor::handle_inbound_km_msg(asm, ingress_link_id, &pkt.body()[..km_msg_len]) {
         Ok(()) => (),
         Err(e) => {
             error!(
