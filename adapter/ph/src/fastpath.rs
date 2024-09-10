@@ -23,7 +23,7 @@ use crate::{compress, km};
 use blake3;
 use bytes::{Buf, BufMut};
 use std::time::SystemTime;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use zerocopy::FromBytes;
 use zpr_ext::std::mem::{drop_guard, DropGuard};
 use zpr_ext::zerocopy::*;
@@ -35,7 +35,7 @@ pub fn drop_and_count<'pktbuf>(
     reason: impl Into<CounterType>,
 ) {
     let reason = reason.into();
-    eprintln!("{}: dropping packet because {}", asm.system_name, reason);
+    debug!("{}: dropping packet because {}", asm.system_name, reason);
     asm.buffer_stack.put_buffer(pkt.destroy());
     asm.counters[reason.into()].increment();
 }
@@ -432,8 +432,6 @@ pub fn substrate_ingress<'pktbuf>(
     mut pkt: Packet<'pktbuf>,
 ) {
     asm.counters[CounterType::InPacksRec].increment();
-
-    eprintln!("{}: got packet from {}", asm.system_name, peer_sa);
 
     let Some(ingress_link_id) = asm.peer_table.lookup_peer(peer_sa) else {
         drop_and_count(asm, pkt, CounterType::UnknownPeer);

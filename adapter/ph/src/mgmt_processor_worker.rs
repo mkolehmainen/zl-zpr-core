@@ -22,18 +22,10 @@ async fn worker<'pktbuf>(
     while let Some(msg) = queue.recv().await {
         match msg {
             MgmtProcessorMessage::Packet(pkt) => {
-                eprintln!(
-                    "{}: ENTER dequeued mgmt message from {}",
-                    asm.system_name, config.link_id
-                );
                 match handle_packet(asm, config.link_id, pkt).await {
                     Ok(()) => (),
                     Err((err, pkt)) => fastpath::drop_and_count(asm, pkt, err),
                 }
-                eprintln!(
-                    "{}: LEAVE dequeued mgmt message from {}",
-                    asm.system_name, config.link_id
-                );
             }
 
             MgmtProcessorMessage::TestPacket(pkt) => pkt.acknowledge(queue.len(), 1),
@@ -58,11 +50,6 @@ async fn handle_packet<'pktbuf>(
     ingress_link_id: zpr::LinkId,
     mut pkt: Packet<'pktbuf>,
 ) -> HandleMgmtResult<'pktbuf> {
-    eprintln!(
-        "{}: handling mgmt message from {}",
-        asm.system_name, ingress_link_id
-    );
-
     let Some(base_hdr) = ZdpBaseHeader::read_from_buf(&mut pkt) else {
         return Err((HandleMgmtError::BadStructure, pkt));
     };

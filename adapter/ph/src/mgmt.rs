@@ -15,7 +15,7 @@ use crate::zpr;
 use bytes::{Buf, BufMut};
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::error;
+use tracing::{error, info, warn};
 use zerocopy::FromBytes;
 use zpr_ext::std::mem::{drop_guard, DropGuard};
 use zpr_ext::zerocopy::{AsBytesExt, FromBytesExt};
@@ -182,7 +182,6 @@ async fn send_sync_req_helper<'pktbuf>(
         tokio::select! {
             response = &mut response_future => {
                 drop(permit);
-                eprintln!("{}: received response from {} via channel!", asm.system_name, link_id);
                 return match_received(asm, response.ok(), SyncReqError::LinkClosed, zdp_response_type);
             }
             _ = sleep(Duration::from_secs(config::DEFAULT_REQUEST_RETRY_TIMER as u64)) => ()
@@ -231,8 +230,6 @@ pub fn route_mgmt_packet<'pktbuf>(
         }
 
         _ => {
-            eprintln!("{}: enqueueing!", asm.system_name);
-
             let Some(peer_state) = asm.peer_table.get(ingress_link_id) else {
                 fastpath::drop_and_count(asm, pkt, CounterType::PeerRemoved);
                 return;
@@ -241,7 +238,6 @@ pub fn route_mgmt_packet<'pktbuf>(
             match peer_state.mgmt_processor.try_enqueue_packet(pkt) {
                 Ok(()) => (),
                 Err(queues::TryEnqueueError::Full(pkt)) => {
-                    eprintln!("{}: queue backpressure!", asm.system_name);
                     fastpath::drop_and_count(asm, pkt, CounterType::QueueBackpressure);
                 }
             }
@@ -261,8 +257,6 @@ fn handle_response<'pktbuf>(
     let packet_type = base_hdr.packet_type;
 
     debug_assert!(packet_type.is_response(), "stray mgmt request in handle_response()");
-
-    eprintln!("{}: got response from {}", asm.system_name, ingress_link_id);
 
     // Gets the designated sender, attempts to send the response, if not drops
     // the packet and increments corresponding counter
@@ -324,13 +318,13 @@ pub async fn send_hello_request<'a, 'pktbuf>(
                 return Err(());
             };
             let status = hdr.status;
-            eprintln!("Received HelloResponse, status: {}", status);
+            info!("Received HelloResponse, status: {}", status);
             asm.buffer_stack.put_buffer(hello_res.destroy());
             Ok(())
         }
 
         Err(err) => {
-            eprintln!("{} error with HelloRequest", err);
+            warn!("{} error with HelloRequest", err);
             Err(())
         }
     }
@@ -359,11 +353,6 @@ pub async fn send_bind_agent_address_request<'a, 'pktbuf>(
     compression_mode: zpr::CompressionMode,
     five_tuple: FiveTuple,
 ) -> Result<zpr::StreamId, BindAgentAddressError> {
-    eprintln!(
-        "{}: sending bind req for {} to {}",
-        asm.system_name, five_tuple, link_id
-    );
-
     let response = send_sync_per_flow_req(
         asm,
         link_id,
@@ -476,8 +465,7 @@ pub async fn handle_report<'pktbuf>(
     let report_data_length: usize = hdr.report_data_length.into();
     pkt.advance(std::mem::size_of::<zdp::ZdpReportHeader>());
     if pkt.body().len() >= report_data_length {
-        // TODO printing to stderr blocks indefinitely, this is just temporary
-        eprintln!(
+        info!(
             "{}: {}",
             ingress_link_id,
             std::str::from_utf8(&pkt.body()[..report_data_length]).unwrap()
@@ -494,7 +482,7 @@ pub async fn handle_discard<'pktbuf>(
     pkt: Packet<'pktbuf>,
 ) -> HandleMgmtResult<'pktbuf> {
     // TODO print to debug log, when implemented
-    eprintln!(
+    info!(
         "{}: Discard message received from {}",
         asm.system_name, ingress_link_id
     );
@@ -512,7 +500,7 @@ pub async fn handle_hello_request<'pktbuf>(
     let hdr = rsp_pkt.alloc_zeroed_header::<zdp::ZdpHelloResponseHeader>();
     hdr.status = 0.into();
 
-    eprintln!("{}: Received HelloRequest", asm.system_name);
+    info!("{}: Received HelloRequest", asm.system_name);
 
     send_non_flow_mgmt(
         asm,
@@ -611,11 +599,6 @@ pub async fn handle_bind_agent_address_request<'pktbuf>(
         dst_port,
     );
 
-    eprintln!(
-        "{}: handling bind req for {} from {}",
-        asm.system_name, five_tuple, ingress_link_id
-    );
-
     // recycle request buffer for response
     let mut rsp_pkt = Packet::new(pkt.destroy(), config::DEFAULT_MESSAGE_HEADROOM);
 
@@ -704,8 +687,6 @@ pub async fn handle_bind_agent_address_request<'pktbuf>(
         }
 
         PhMode::Adapter => {
-            eprintln!("{}: I'm an adapter!", asm.system_name);
-
             // form PEP
             let pep = adapter_tables::DltPep {
                 compression_mode,
@@ -744,11 +725,6 @@ pub async fn handle_bind_agent_address_request<'pktbuf>(
             }
         }
     }
-
-    eprintln!(
-        "{}: responding to {} with {} for {}!",
-        asm.system_name, ingress_link_id, ingress_tether_id, five_tuple
-    );
 
     // respond to requestor
     send_per_flow_mgmt(

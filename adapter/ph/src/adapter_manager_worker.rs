@@ -8,6 +8,7 @@ use crate::queues::AdapterManagerMessage;
 use crate::zpr;
 use std::future::Future;
 use tokio::sync::mpsc;
+use tracing::debug;
 
 async fn worker<'pktbuf>(
     asm: &Assembly<'pktbuf>,
@@ -56,7 +57,7 @@ async fn do_request_tether_id<'pktbuf>(asm: &Assembly<'pktbuf>, pkt: Packet<'pkt
     // compress only IP addresses for now
     let compression_mode: zpr::CompressionMode = 0;
 
-    eprintln!(
+    debug!(
         "{}: Issuing bind request for {}",
         asm.system_name, five_tuple
     );
@@ -73,7 +74,7 @@ async fn do_request_tether_id<'pktbuf>(asm: &Assembly<'pktbuf>, pkt: Packet<'pkt
     {
         Ok(tether_id) => {
             // Bind succeeded; add to ALT.
-            eprintln!(
+            debug!(
                 "{}: Bind of {} succeeded: {}",
                 asm.system_name, five_tuple, tether_id
             );
@@ -90,7 +91,7 @@ async fn do_request_tether_id<'pktbuf>(asm: &Assembly<'pktbuf>, pkt: Packet<'pkt
 
         Err(err) => {
             // Bind failed; remove pending entry from ALT.
-            eprintln!(
+            debug!(
                 "{}: Bind of {} failed: {}",
                 asm.system_name, five_tuple, err
             );
