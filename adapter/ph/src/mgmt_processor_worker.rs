@@ -7,6 +7,7 @@ use crate::zdp::*;
 use crate::zpr;
 use std::future::Future;
 use tokio::sync::mpsc;
+use tracing::debug;
 use zpr_ext::zerocopy::*;
 
 #[derive(Clone, Copy)]
@@ -54,12 +55,17 @@ async fn handle_packet<'pktbuf>(
         return Err((HandleMgmtError::BadStructure, pkt));
     };
 
-    let packet_type = base_hdr.packet_type;
+    debug!(
+        "{}: handling mgmt message from {} type {:?} seq_num {}",
+        asm.system_name, ingress_link_id, base_hdr.packet_type, base_hdr.sequence_number
+    );
 
     assert!(
-        !packet_type.is_response(),
+        !base_hdr.packet_type.is_response(),
         "stray mgmt response in mgmt processor"
     );
+
+    let seq_num = base_hdr.sequence_number.get() as u64; // TODO: reconstitute full seq num given expected seq num state
 
     if base_hdr.packet_type.is_per_flow() {
         let Some(per_flow_hdr) = ZdpPerFlowHeader::read_from_buf(&mut pkt) else {
@@ -72,7 +78,14 @@ async fn handle_packet<'pktbuf>(
             ZdpPacketType::TransitPacket => panic!("unexpected Transit Packet in management path"),
 
             ZdpPacketType::BindAgentAddressRequest => {
-                mgmt::handle_bind_agent_address_request(asm, ingress_link_id, stream_id, pkt).await
+                mgmt::handle_bind_agent_address_request(
+                    asm,
+                    ingress_link_id,
+                    stream_id,
+                    seq_num,
+                    pkt,
+                )
+                .await
             }
 
             packet_type => Err((HandleMgmtError::UnknownType(packet_type.0), pkt)),
@@ -88,7 +101,7 @@ async fn handle_packet<'pktbuf>(
             }
 
             ZdpPacketType::HelloRequest => {
-                mgmt::handle_hello_request(asm, ingress_link_id, pkt).await
+                mgmt::handle_hello_request(asm, ingress_link_id, seq_num, pkt).await
             }
 
             packet_type => Err((HandleMgmtError::UnknownType(packet_type.0), pkt)),
