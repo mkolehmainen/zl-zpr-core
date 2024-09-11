@@ -23,7 +23,7 @@ use bytes::{BufMut, Bytes};
 
 use zerocopy::FromBytes;
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config;
 use crate::packet::Packet;
@@ -172,6 +172,9 @@ pub enum KmSignal {
 
     /// When a security association is established.
     SaEstablished(KmTransportSA),
+
+    /// Sent during a clean shutdown of the KeyManager (when the CancellationToken is cancelled).
+    Termination,
 }
 
 /// Encapsulates all the "state" set up by an SA.
@@ -263,6 +266,8 @@ struct KmState {
     sa_id: zpr::SaId,                     // current SA identifier
     mgmt_tx: Option<mpsc::Sender<Bytes>>, // Internal queue for key management messages to be processed.
     ts: KmTransportSA,
+    restart_request: bool,
+    error_signaled: bool,
 }
 
 impl fmt::Debug for KmState {
@@ -290,6 +295,8 @@ impl KeyManager {
                     sa_id: 0,
                     mgmt_tx: None,
                     ts: Default::default(),
+                    restart_request: false,
+                    error_signaled: false,
                 }),
             }),
         }
@@ -362,6 +369,19 @@ impl KeyManager {
         }
     }
 
+    /// Indicate that the KM state machine should restart out of the error state.
+    /// For an initiator type link, this will trigger generation of a new handshake message.
+    ///
+    /// [KmError::InvalidState] is returned if state machine is not in error state.
+    pub fn restart(&self) -> KmResult<()> {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.statemachine.get_state() != KmSMState::Error {
+            return Err(KmError::InvalidState);
+        }
+        state.restart_request = true;
+        Ok(())
+    }
+
     /// Blocking run loop for the key manager.  This runs the key management algorithm
     /// state machine handing KM messages in and out.
     ///
@@ -389,32 +409,12 @@ impl KeyManager {
 
         let mut interval = time::interval(tick_interval);
 
-        let handshake: Option<Bytes>;
-        {
-            let mut state = self.shared.state.lock().unwrap();
-            handshake = match state.statemachine.reset() {
-                Ok(h) => h,
-                Err(e) => return Err(KmError::MachineError(e.to_string())),
-            };
-        }
-        match km_signals_out
-            .send(KmLinkMsg::new(link_id, KmSignal::Reset))
+        self.start_state_machine_internal(link_id, &km_signals_out, &km_buffers_out)
             .await
-        {
-            Ok(_) => {}
-            Err(_) => {
-                error!("failed to enqueue reset signal")
-            }
-        }
-        if let Some(handshake) = handshake {
-            match km_buffers_out
-                .send(KmLinkMsg::new(link_id, handshake))
-                .await
-            {
-                Ok(_) => {}
-                Err(_) => return Err(KmError::EnqueueFailed),
-            }
-        };
+            .or_else(|e| {
+                error!("failed to start state machine: {}", e);
+                Err(e)
+            })?;
 
         let mut prev_state: KmSMState;
         let mut next_state: KmSMState;
@@ -425,104 +425,33 @@ impl KeyManager {
                 prev_state = state.statemachine.get_state();
             }
 
-            match prev_state {
-                KmSMState::Error => {
-                    // If error, send reset and loop again
-                    match km_signals_out
-                        .send(KmLinkMsg::new(link_id, KmSignal::Error))
-                        .await
-                    {
+            tokio::select! {
+                _ = ctok.cancelled() => {
+                    match self.send_signal(&km_signals_out, link_id, KmSignal::Termination).await {
                         Ok(_) => {}
-                        Err(_) => {
-                            error!("failed to enqueue error signal, aborting");
-                            return Err(KmError::EnqueueFailed);
-                        }
-                    }
-                    let resp: Option<Bytes>;
-                    {
-                        let mut state = self.shared.state.lock().unwrap();
-                        resp = match state.statemachine.reset() {
-                            Ok(h) => h,
-                            Err(e) => {
-                                return Err(KmError::MachineError(e.to_string()));
-                            }
-                        };
-                    }
-                    match km_signals_out
-                        .send(KmLinkMsg::new(link_id, KmSignal::Reset))
-                        .await
-                    {
+                        Err(_) => {}
+                    };
+                    break;
+                }
+
+                Some(inmsg) = km_rx.recv() => {
+                    match self.dispatch_km_message(inmsg, link_id, &km_buffers_out).await {
                         Ok(_) => {}
-                        Err(_) => {
-                            error!("failed to enqueue reset signal, aborting");
-                            return Err(KmError::EnqueueFailed);
-                        }
-                    }
-                    if let Some(resp) = resp {
-                        match km_buffers_out.send(KmLinkMsg::new(link_id, resp)).await {
-                            Ok(_) => {}
-                            Err(_) => {
-                                error!("failed to enqueue outbound KM message");
-                                return Err(KmError::EnqueueFailed);
-                            }
+                        Err(e) => {
+                            return Err(e);
                         }
                     }
                 }
 
-                _ => {
-                    tokio::select! {
-                        _ = ctok.cancelled() => {
-                            break;
-                        }
-
-                        Some(inmsg) = km_rx.recv() => {
-                            let resp: Option<Bytes>;
-                            {
-                                let mut state = self.shared.state.lock().unwrap();
-                                resp = match state.statemachine.handle_message(&inmsg) {
-                                    Ok(h) => h,
-                                    Err(e) => {
-                                        error!("failed to handle key manager message: {}", e);
-                                        None
-                                    }
-                                };
-                            }
-                            if let Some(resp) = resp {
-                                match km_buffers_out.send(KmLinkMsg::new(link_id, resp)).await {
-                                    Ok(_) => {},
-                                    Err(_) => {
-                                        error!("failed to enqueue outbound KM message");
-                                        return Err(KmError::EnqueueFailed);
-                                    }
-                                }
-                            }
-                        }
-
-                        _ = interval.tick() => {
-                            let resp: Option<Bytes>;
-                            {
-                                let mut state = self.shared.state.lock().unwrap();
-                                resp = match state.statemachine.tick() {
-                                    Ok(h) => h,
-                                    Err(e) => {
-                                        error!("failed to tick key manager: {}", e);
-                                        None
-                                    }
-                                };
-                            }
-                            if let Some(resp) = resp {
-                                match km_buffers_out.send(KmLinkMsg::new(link_id, resp)).await {
-                                    Ok(_) => {},
-                                    Err(_) => {
-                                        error!("failed to enqueue oubound KM message");
-                                        return Err(KmError::EnqueueFailed);
-                                    }
-                                }
-                            }
+                _ = interval.tick() => {
+                    match self.tick_statemachine(link_id, &km_buffers_out, &km_signals_out, &prev_state).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Err(e);
                         }
                     }
                 }
-            };
+            }
 
             {
                 let state = self.shared.state.lock().unwrap();
@@ -530,61 +459,59 @@ impl KeyManager {
             }
 
             if next_state != prev_state {
-                info!("KM state transition {:?} -> {:?}", prev_state, next_state);
-                match next_state {
-                    KmSMState::Transport(ts) => {
-                        let prev_id: zpr::SaId;
-                        let cur_id: zpr::SaId;
-                        let mut my_sa = ts.clone();
-                        {
-                            let mut state = self.shared.state.lock().unwrap();
-                            prev_id = state.sa_id;
-                            state.sa_id += 1;
-                            if state.sa_id == 0 {
-                                state.sa_id = 1;
-                            }
-                            cur_id = state.sa_id;
-                            // Capture the SA and update the SA_ID.
-                            my_sa.sa_id = cur_id;
-                            state.ts = my_sa.clone();
-                        }
-                        info!("KM: New SA_ID: {}", cur_id);
-                        match self
-                            .send_signal(
-                                &km_signals_out,
-                                link_id,
-                                KmSignal::SaIdChange {
-                                    old: prev_id,
-                                    new: cur_id,
-                                },
-                            )
-                            .await
-                        {
-                            Ok(_) => {}
-                            Err(_) => {
-                                error!("failed to enqueue SaIdChange signal");
-                                return Err(KmError::EnqueueFailed);
-                            }
-                        }
-                        match self
-                            .send_signal(&km_signals_out, link_id, KmSignal::SaEstablished(my_sa))
-                            .await
-                        {
-                            Ok(_) => {}
-                            Err(_) => {
-                                error!("failed to enqueue SaIdEstablished signal");
-                                return Err(KmError::EnqueueFailed);
-                            }
-                        }
+                match self
+                    .handle_state_transition(prev_state, next_state, link_id, &km_signals_out)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(e);
                     }
-                    _ => {}
                 }
-            } else if next_state == KmSMState::Error {
-                error!("KM: stuck in error state");
-                return Err(KmError::MachineError(String::from("stuck in error state")));
-                // TODO: Maybe use a timer and keep trying to reset?
             }
         }
+
+        Ok(())
+    }
+
+    /// Kick off the [KeyManagerStateMachine] by calling its reset method.
+    /// As a side effect this also sends the [KmSignal::Reset] signal out our signal channel.
+    /// If the state machine produces a handshake message as a result of reset, then that
+    /// is sent our our message channel.
+    async fn start_state_machine_internal(
+        &self,
+        link_id: zpr::LinkId,
+        km_signals_out: &mpsc::Sender<KmLinkMsg<KmSignal>>,
+        km_buffers_out: &mpsc::Sender<KmLinkMsg<Bytes>>,
+    ) -> KmResult<()> {
+        let handshake: Option<Bytes>;
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            handshake = match state.statemachine.reset() {
+                Ok(h) => h,
+                Err(e) => return Err(KmError::MachineError(e.to_string())),
+            };
+        }
+
+        match self
+            .send_signal(&km_signals_out, link_id, KmSignal::Reset)
+            .await
+        {
+            Ok(_) => {}
+            Err(_) => {
+                error!("failed to enqueue reset signal")
+            }
+        };
+
+        if let Some(handshake) = handshake {
+            match km_buffers_out
+                .send(KmLinkMsg::new(link_id, handshake))
+                .await
+            {
+                Ok(_) => {}
+                Err(_) => return Err(KmError::EnqueueFailed),
+            }
+        };
 
         Ok(())
     }
@@ -597,6 +524,201 @@ impl KeyManager {
         signal: KmSignal,
     ) -> impl Future<Output = Result<(), mpsc::error::SendError<KmLinkMsg<KmSignal>>>> + 'a {
         chan.send(KmLinkMsg::new(link_id, signal))
+    }
+
+    /// Calls the state machine's tick method and sends any resulting message.
+    async fn tick_statemachine(
+        &self,
+        link_id: zpr::LinkId,
+        km_buffers_out: &mpsc::Sender<KmLinkMsg<Bytes>>,
+        km_signals_out: &mpsc::Sender<KmLinkMsg<KmSignal>>,
+        cur_state: &KmSMState,
+    ) -> KmResult<()> {
+        let mut resp: Option<Bytes> = None;
+        let mut did_reset = false;
+
+        if *cur_state == KmSMState::Error {
+            {
+                let mut state = self.shared.state.lock().unwrap();
+                if state.restart_request {
+                    resp = match state.statemachine.reset() {
+                        Ok(h) => {
+                            did_reset = true;
+                            h
+                        }
+                        Err(e) => {
+                            return Err(KmError::MachineError(e.to_string()));
+                        }
+                    };
+                    state.restart_request = false;
+                }
+            }
+            if let Some(r) = resp {
+                match km_buffers_out.send(KmLinkMsg::new(link_id, r)).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        error!("failed to enqueue outbound KM message");
+                        return Err(KmError::EnqueueFailed);
+                    }
+                }
+            }
+            if did_reset {
+                match self
+                    .send_signal(km_signals_out, link_id, KmSignal::Reset)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(_) => {
+                        error!("failed to enqueue reset signal, aborting");
+                        return Err(KmError::EnqueueFailed);
+                    }
+                }
+            }
+        }
+
+        // Unless we did a reset, tick machine, even during error.
+        if !did_reset {
+            let resp: Option<Bytes>;
+            {
+                let mut state = self.shared.state.lock().unwrap();
+                resp = match state.statemachine.tick() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!("error during tick processing: {}", e);
+                        None
+                    }
+                };
+            }
+            if let Some(r) = resp {
+                match km_buffers_out.send(KmLinkMsg::new(link_id, r)).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        error!("failed to enqueue oubound KM message");
+                        return Err(KmError::EnqueueFailed);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_state_transition(
+        &self,
+        prev_state: KmSMState,
+        next_state: KmSMState,
+        link_id: zpr::LinkId,
+        km_signals_out: &mpsc::Sender<KmLinkMsg<KmSignal>>,
+    ) -> KmResult<()> {
+        info!("KM state transition {:?} -> {:?}", prev_state, next_state);
+        if matches!(prev_state, KmSMState::Error) {
+            // We transitioned out of error state -- clear error related settings.
+            let mut state = self.shared.state.lock().unwrap();
+            state.error_signaled = false;
+            state.restart_request = false;
+        }
+        match next_state {
+            KmSMState::Transport(ts) => {
+                let prev_id: zpr::SaId;
+                let cur_id: zpr::SaId;
+                let mut my_sa = ts.clone();
+                {
+                    let mut state = self.shared.state.lock().unwrap();
+                    prev_id = state.sa_id;
+                    state.sa_id += 1;
+                    if state.sa_id == 0 {
+                        state.sa_id = 1;
+                    }
+                    cur_id = state.sa_id;
+                    // Capture the SA and update the SA_ID.
+                    my_sa.sa_id = cur_id;
+                    state.ts = my_sa.clone();
+                }
+                info!("KM: New SA_ID: {}", cur_id);
+                match self
+                    .send_signal(
+                        &km_signals_out,
+                        link_id,
+                        KmSignal::SaIdChange {
+                            old: prev_id,
+                            new: cur_id,
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(_) => {
+                        error!("failed to enqueue SaIdChange signal");
+                        return Err(KmError::EnqueueFailed);
+                    }
+                }
+                match self
+                    .send_signal(&km_signals_out, link_id, KmSignal::SaEstablished(my_sa))
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(_) => {
+                        error!("failed to enqueue SaIdEstablished signal");
+                        return Err(KmError::EnqueueFailed);
+                    }
+                }
+            }
+            KmSMState::Error => {
+                let needs_error_signal: bool;
+                {
+                    let state = self.shared.state.lock().unwrap();
+                    needs_error_signal = !state.error_signaled;
+                }
+                if needs_error_signal {
+                    match self
+                        .send_signal(km_signals_out, link_id, KmSignal::Error)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(_) => {
+                            error!("failed to enqueue error signal, aborting");
+                            return Err(KmError::EnqueueFailed);
+                        }
+                    }
+                    {
+                        let mut state = self.shared.state.lock().unwrap();
+                        state.error_signaled = true;
+                    }
+                }
+            }
+            KmSMState::Configuring => {}
+        };
+        Ok(())
+    }
+
+    /// Deliver a Key Management Payload to the state machine implemntation, forwarding out
+    /// a response message if there is one.
+    async fn dispatch_km_message(
+        &self,
+        inmsg: Bytes,
+        link_id: zpr::LinkId,
+        km_buffers_out: &mpsc::Sender<KmLinkMsg<Bytes>>,
+    ) -> KmResult<()> {
+        let resp: Option<Bytes>;
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            resp = match state.statemachine.handle_message(&inmsg) {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("failed to handle key manager message: {}", e);
+                    None
+                }
+            };
+        }
+        if let Some(r) = resp {
+            match km_buffers_out.send(KmLinkMsg::new(link_id, r)).await {
+                Ok(_) => {}
+                Err(_) => {
+                    error!("failed to enqueue outbound KM message");
+                    return Err(KmError::EnqueueFailed);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -734,6 +856,7 @@ pub fn decrypt_transport_zdp(message: &mut Packet, codec: Arc<dyn Codec>) -> KmR
 ///     Error <-------+
 ///```
 ///
+/// Note that moving from Error back to Configuring requires a an external call to [KeyManager::restart].
 /// Not (yet) accounting for "rekeying".
 ///
 #[derive(Debug, Clone, PartialEq)]

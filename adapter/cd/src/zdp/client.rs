@@ -145,7 +145,6 @@ impl ZDPClient {
                                 continue;
                             }
                             let zpi_hdr = zpi_hdr.unwrap();
-                            let my_sa = mgr.get_transport_state().unwrap();
                             match zpi_hdr.zpi {
                                 0 => {
                                     info!("zdp/client - received ZPI=0 message");
@@ -164,6 +163,13 @@ impl ZDPClient {
                                     }
                                 }
                                 _ => {
+                                    let my_sa = match mgr.get_transport_state() {
+                                        Some(sa) => sa,
+                                        None => {
+                                            info!("zdp/client - got non zpi=0 message before SA established (ZPI={})", zpi_hdr.zpi);
+                                            continue;
+                                        }
+                                    };
                                     if zpi_hdr.zpi == my_sa.recv_zpis.hmac {
                                         info!("zdp/client - received transit ZPI message, discarding");
                                     } else if zpi_hdr.zpi == my_sa.recv_zpis.encr {
