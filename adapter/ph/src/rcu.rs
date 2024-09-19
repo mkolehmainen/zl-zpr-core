@@ -300,3 +300,34 @@ impl<'a, T> TryFrom<RcuGuard<'a, Option<T>>> for RcuOptionGuard<'a, T> {
         }
     }
 }
+
+/// `RcuGuard` for an `RcuCslab` entry known to be present.
+pub struct RcuCslabEntryGuard<'a, T> {
+    guard: RcuGuard<'a, cslab::RcuCslabReader<T>>,
+    key: usize,
+}
+
+impl<T> std::ops::Deref for RcuCslabEntryGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        let entry = self.guard.get(self.key);
+        // SAFETY: this can only be constructed via methods
+        // which validate that the guarded entry is present
+        unsafe { entry.unwrap_unchecked() }
+    }
+}
+
+impl<T> RcuBox<cslab::RcuCslabReader<T>> {
+    /// Like `RcuCslabReader::get()`, but for an `RcuCslabReader` living in
+    /// an `RcuBox` (as it ought to).  Hoists the `Option` outside of the guard
+    /// for efficiency/ease of use.
+    pub fn get_guarded(&self, key: usize) -> Option<RcuCslabEntryGuard<'_, T>> {
+        let guard = self.get();
+        if guard.get(key).is_none() {
+            None
+        } else {
+            Some(RcuCslabEntryGuard { guard, key })
+        }
+    }
+}

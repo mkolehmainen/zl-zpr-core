@@ -6,7 +6,7 @@
 
 use crate::defs::FiveTuple;
 use crate::packet::Packet;
-use crate::rcu::{RcuBox, RcuGuard};
+use crate::rcu::{RcuBox, RcuCslabEntryGuard};
 use crate::zpr::{CompressionMode, StreamId};
 use cslab::{RcuCslab, RcuCslabReader};
 use dashmap::mapref::one::Ref as DashMapRef;
@@ -96,18 +96,7 @@ pub struct DockLookupTable {
     reader: RcuBox<RcuCslabReader<DltPep>>,
 }
 
-pub struct DltPepGuard<'a> {
-    guard: RcuGuard<'a, RcuCslabReader<DltPep>>,
-    key: usize,
-}
-
-impl std::ops::Deref for DltPepGuard<'_> {
-    type Target = DltPep;
-
-    fn deref(&self) -> &Self::Target {
-        self.guard.get(self.key).unwrap()
-    }
-}
+pub type DltPepGuard<'a> = RcuCslabEntryGuard<'a, DltPep>;
 
 impl DockLookupTable {
     pub fn new() -> Self {
@@ -133,14 +122,8 @@ impl DockLookupTable {
     }
 
     pub fn get(&self, tether_id: StreamId) -> Option<DltPepGuard<'_>> {
-        let guard = self.reader.get();
-        if guard.get((tether_id as usize).wrapping_sub(1)).is_none() {
-            return None;
-        }
-        Some(DltPepGuard {
-            guard,
-            key: (tether_id as usize).wrapping_sub(1),
-        })
+        self.reader
+            .get_guarded((tether_id as usize).wrapping_sub(1))
     }
 
     pub fn insert(&self, pep: DltPep) -> Result<StreamId, ()> {
