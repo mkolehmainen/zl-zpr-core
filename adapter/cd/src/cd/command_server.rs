@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::vec;
 use std::{io, sync::Arc};
 
@@ -148,7 +149,7 @@ async fn handle_connect(
             "configuration not found '{}', attempting to load as file",
             parts[1]
         );
-        let configuration = match load_configuration(parts[1]) {
+        let configuration = match load_configuration(Path::new(parts[1])) {
             Ok(c) => c,
             Err(e) => {
                 error!("Error loading configuration {}: {}", parts[1], e);

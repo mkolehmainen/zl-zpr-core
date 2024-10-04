@@ -1,3 +1,4 @@
+use ph::km_noise::NoiseKeypair;
 use serde::Deserialize;
 
 use openssl::pkey::Private;
@@ -9,14 +10,15 @@ use base64::prelude::*;
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Error, ErrorKind, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // "Config" is configuration details for the CD binary.
 pub struct Config {
     pub socket_path: PathBuf,
 }
 
-// "Configuration" is the CD configuration file.
+// "Configuration" is the ZPR connection configuration file.
+// There is one of these for each ZPR network the adapter can conenct to.
 #[derive(Debug, Clone, Deserialize)]
 struct Configuration {
     profile: Profile,
@@ -27,7 +29,7 @@ struct Configuration {
 #[derive(Debug, Clone, Deserialize)]
 struct Profile {
     name: String,
-    root_ca: String, // path to PEM file
+    root_ca: PathBuf, // path to PEM file
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,30 +41,41 @@ struct Dock {
 
 #[derive(Debug, Clone, Deserialize)]
 struct Adapter {
-    certificate: String, // path to PEM file
-    private_key: String, // path to PEM file
+    noise_certificate: PathBuf, // path to PEM file
+    noise_private_key: String,  // base64 encoded private key
 }
 
+/// The bits of the configuration that relate to the cryptography
+/// used in setting up the security assocaition.
+#[derive(Clone, Debug)]
+pub struct CryptoConfig {
+    pub remote_noise_public_key: [u8; 32],
+    pub local_noise_keypair: NoiseKeypair,
+    pub local_certificate: X509,
+    pub root_ca: X509,
+}
+
+/// The ConfigRecord is a parsed and loaded configuration file.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ConfigRecord {
     name: String,
-    source: String, // path name of Configuration that loaded this
+    source: PathBuf, // path name of Configuration that loaded this
     host_or_ip: String,
     port: u16,
-    private_key: Rsa<Private>,
+    adapter_noise_keypair: NoiseKeypair,
     certificate: X509,
     root_ca: X509,
     dock_noise_public_key: [u8; 32],
 }
 
-fn load_cert(path: &str) -> Result<X509, std::io::Error> {
+fn load_cert(path: &Path) -> Result<X509, std::io::Error> {
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
             return Err(Error::new(
                 e.kind(),
-                format!("Error opening certificate file {}: {}", path, e),
+                format!("Error opening certificate file {:#?}: {}", path, e),
             ))
         }
     };
@@ -72,13 +85,14 @@ fn load_cert(path: &str) -> Result<X509, std::io::Error> {
     Ok(cert)
 }
 
-fn load_key(path: &str) -> Result<Rsa<Private>, std::io::Error> {
+#[allow(dead_code)]
+fn load_key(path: &Path) -> Result<Rsa<Private>, std::io::Error> {
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
             return Err(Error::new(
                 e.kind(),
-                format!("Error opening private key file {}: {}", path, e),
+                format!("Error opening private key file {:#?}: {}", path, e),
             ))
         }
     };
@@ -89,7 +103,7 @@ fn load_key(path: &str) -> Result<Rsa<Private>, std::io::Error> {
 }
 
 // Read and parse the configuration, read in all the keys (etc), create and return the ConfigRecord.
-pub fn load_configuration(path: &str) -> Result<ConfigRecord, std::io::Error> {
+pub fn load_configuration(path: &Path) -> Result<ConfigRecord, std::io::Error> {
     let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut toml_text = String::new();
@@ -97,7 +111,7 @@ pub fn load_configuration(path: &str) -> Result<ConfigRecord, std::io::Error> {
     if len == 0 {
         return Err(Error::new(
             ErrorKind::Other,
-            format!("Empty configuration file: {}", path),
+            format!("Empty configuration file: {:#?}", path),
         ));
     }
 
@@ -107,16 +121,36 @@ pub fn load_configuration(path: &str) -> Result<ConfigRecord, std::io::Error> {
         Err(e) => {
             return Err(Error::new(
                 ErrorKind::Other,
-                format!("Error parsing configuration file {}: {}", path, e),
+                format!("Error parsing configuration file {:#?}: {}", path, e),
             ))
         }
     };
 
     let base_path = std::path::Path::new(path).parent().unwrap();
 
-    let root_ca = load_cert(base_path.join(&c.profile.root_ca).to_str().unwrap())?;
-    let cert = load_cert(base_path.join(&c.adapter.certificate).to_str().unwrap())?;
-    let private_key = load_key(base_path.join(&c.adapter.private_key).to_str().unwrap())?;
+    let root_ca = load_cert(&base_path.join(&c.profile.root_ca))?;
+    let cert = load_cert(&base_path.join(&c.adapter.noise_certificate))?;
+
+    let private_key: [u8; 32] = match BASE64_STANDARD.decode(c.adapter.noise_private_key.as_bytes())
+    {
+        Ok(pk) => match pk.try_into() {
+            Ok(pk) => pk,
+            Err(_) => {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!("noise private key length incorrect"),
+                ))
+            }
+        },
+        Err(e) => {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("Error decoding noise private key: {}", e),
+            ))
+        }
+    };
+
+    let adapter_keypar = NoiseKeypair::new(private_key);
 
     let noise_pk: [u8; 32] = match BASE64_STANDARD.decode(c.dock.noise_public_key.as_bytes()) {
         Ok(pk) => match pk.try_into() {
@@ -138,10 +172,10 @@ pub fn load_configuration(path: &str) -> Result<ConfigRecord, std::io::Error> {
 
     let conf_rec = ConfigRecord {
         name: c.profile.name,
-        source: path.to_string(),
+        source: path.to_path_buf(),
         host_or_ip: c.dock.host_or_ip,
         port: c.dock.port,
-        private_key,
+        adapter_noise_keypair: adapter_keypar,
         certificate: cert,
         root_ca,
         dock_noise_public_key: noise_pk,
@@ -172,8 +206,8 @@ impl ConfigRecord {
         self.port
     }
 
-    pub fn get_path(&self) -> &str {
-        self.source.as_str()
+    pub fn get_path(&self) -> &Path {
+        &self.source
     }
 
     pub fn has_same_source_as(&self, other: &ConfigRecord) -> bool {
@@ -182,5 +216,22 @@ impl ConfigRecord {
 
     pub fn get_dock_noise_public_key(&self) -> &[u8; 32] {
         &self.dock_noise_public_key
+    }
+
+    pub fn get_certificate(&self) -> &X509 {
+        &self.certificate
+    }
+
+    pub fn get_root_ca(&self) -> &X509 {
+        &self.root_ca
+    }
+
+    pub fn get_crypto_particulars(&self) -> CryptoConfig {
+        CryptoConfig {
+            remote_noise_public_key: self.dock_noise_public_key,
+            local_noise_keypair: self.adapter_noise_keypair.clone(),
+            local_certificate: self.certificate.clone(),
+            root_ca: self.root_ca.clone(),
+        }
     }
 }

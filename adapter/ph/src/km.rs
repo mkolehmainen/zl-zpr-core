@@ -8,27 +8,22 @@
 //! of a [KeyManagerStateMachine] which does the actual work of creating and
 //! parsing key management ZDP messages.
 
-use tokio::sync::mpsc;
-use tokio::time;
-use tokio_util::sync::CancellationToken;
-
-use std::future::Future;
-use std::time::Duration;
-
-use std::fmt;
-use std::fmt::Debug;
-use std::sync::{Arc, Mutex};
-
-use bytes::{BufMut, Bytes};
-
-use zerocopy::FromBytes;
-
-use tracing::{error, info, warn};
-
 use crate::config;
 use crate::packet::Packet;
 use crate::zdp::{ZdpBaseHeader, ZdpPacketType, ZdpZpiHeader};
 use crate::zpr;
+use bytes::{BufMut, Bytes};
+use openssl::x509::X509;
+use std::fmt;
+use std::fmt::Debug;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+use zerocopy::FromBytes;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -37,6 +32,7 @@ pub enum KmError {
     InvalidState,
     InvalidPacketType,
     HandshakeError,
+    CertExchangeError,
     NoHeadroom,
     ShortPacket,
     SaIdZero,
@@ -117,6 +113,9 @@ impl fmt::Display for KmError {
             }
             KmError::HandshakeError => {
                 write!(f, "HandshakeError")
+            }
+            KmError::CertExchangeError => {
+                write!(f, "CertExchangeError")
             }
             KmError::ConfigurationError => {
                 write!(f, "ConfigurationError")
@@ -225,6 +224,9 @@ pub struct KmTransportSA {
 
     /// This is a pointer to the encode/decode functions associated with the current SA.
     pub codec: Arc<dyn Codec>,
+
+    /// If we got (and validated) a certificate from our peer, it is stored here.
+    pub peer_cert: Option<X509>,
 }
 
 // Does not check the codec.
@@ -240,10 +242,16 @@ impl PartialEq for KmTransportSA {
 // Our debug formatter omits the codec.
 impl fmt::Debug for KmTransportSA {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let cert_str = match &self.peer_cert {
+            Some(c) => {
+                format!("{:?}", c.subject_name())
+            }
+            None => "None".to_string(),
+        };
         write!(
             f,
-            "KMTransportSA {{ sa_id: {}, send_zpis: {}, recv_zpis: {}, send_hmac_key: {:02x?}, recv_hmac_key: {:02x?} }}",
-            self.sa_id, self.send_zpis, self.recv_zpis, self.send_hmac_key, self.recv_hmac_key
+            "KMTransportSA {{ sa_id: {}, send_zpis: {}, recv_zpis: {}, send_hmac_key: {:02x?}, recv_hmac_key: {:02x?}, peer_cert: {}}}",
+            self.sa_id, self.send_zpis, self.recv_zpis, self.send_hmac_key, self.recv_hmac_key, cert_str
         )
     }
 }
@@ -341,6 +349,7 @@ impl KeyManager {
             send_hmac_key: state.ts.send_hmac_key,
             recv_hmac_key: state.ts.recv_hmac_key,
             codec: state.ts.codec.clone(),
+            peer_cert: state.ts.peer_cert.clone(),
         })
     }
 
@@ -753,6 +762,7 @@ impl KmTransportSA {
         send_key: [u8; 32],
         recv_key: [u8; 32],
         codec: Arc<dyn Codec>,
+        peer_cert: Option<X509>,
     ) -> KmTransportSA {
         KmTransportSA {
             sa_id: 0,
@@ -761,6 +771,7 @@ impl KmTransportSA {
             send_hmac_key: send_key,
             recv_hmac_key: recv_key,
             codec,
+            peer_cert,
         }
     }
 
@@ -773,6 +784,7 @@ impl KmTransportSA {
             send_hmac_key: [0u8; 32],
             recv_hmac_key: [0u8; 32],
             codec,
+            peer_cert: None,
         }
     }
 
@@ -786,6 +798,7 @@ impl KmTransportSA {
             send_hmac_key: [0u8; 32],
             recv_hmac_key: [0u8; 32],
             codec: Arc::new(UnimplCodec::new()),
+            peer_cert: None,
         }
     }
 }
@@ -799,6 +812,7 @@ impl Default for KmTransportSA {
             send_hmac_key: [0u8; 32],
             recv_hmac_key: [0u8; 32],
             codec: Arc::new(UnimplCodec::new()),
+            peer_cert: None,
         }
     }
 }
@@ -838,7 +852,7 @@ pub fn encrypt_transport_zdp(message: &mut Packet, codec: Arc<dyn Codec>) -> KmR
     Ok(())
 }
 
-/// Helper function which is ZDP arare.  Does some error checking and leaves the ZPI in place.
+/// Helper function which is ZDP aware.  Does some error checking and leaves the ZPI in place.
 #[allow(dead_code)]
 pub fn decrypt_transport_zdp(message: &mut Packet, codec: Arc<dyn Codec>) -> KmResult<()> {
     if message.body().len() < 1 {

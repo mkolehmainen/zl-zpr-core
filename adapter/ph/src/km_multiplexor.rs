@@ -1,6 +1,7 @@
 use crate::assembly::Assembly;
 use crate::km::*;
-use crate::km_noise::KmNoise;
+use crate::km_cert_exchange::KmCertExchange;
+use crate::km_noise::{KmNoise, NoiseKeypair};
 use crate::mgmt::requests;
 use crate::peer_table::KmHandle;
 use crate::zpr;
@@ -199,7 +200,7 @@ where
     async move { message_worker(&*asm, &mut msg_queue).await }
 }
 
-/// Creates a new KeyManager for the link and starts its state machine.  An adapter link will
+/// Creates a new KeyManager for the link from an adapter to a node and starts its state machine.  An adapter link will
 /// initiate the KM exchange with its peer.
 ///
 ///
@@ -211,14 +212,16 @@ pub fn add_adapter_link(
     asm: &'static Assembly,
     link_id: zpr::LinkId,
     recv_zpis: ZPIPair,
+    local_noise_key: NoiseKeypair,
     peer_noise_key: [u8; 32],
+    certx: KmCertExchange,
 ) -> Result<(), KmSetupError> {
     let noise = match KmNoise::new(
         true,
         Some(peer_noise_key.into()),
-        None,
-        recv_zpis.encr,
-        recv_zpis.hmac,
+        Some(local_noise_key),
+        recv_zpis,
+        certx,
     ) {
         Ok(n) => n,
         Err(e) => {
@@ -228,7 +231,7 @@ pub fn add_adapter_link(
     add_noise_link(asm, link_id, noise)
 }
 
-/// Creates a new KeyManager for the link and starts its state machine.  A node link waits for a
+/// Creates a new KeyManager for the link from a node to an adapter and starts its state machine.  A node link waits for a
 /// KM initiator.
 ///
 /// - `link_id` is the link to the peer, in this case better be a link to an adapter.
@@ -240,15 +243,10 @@ pub fn add_node_link(
     asm: &'static Assembly,
     link_id: zpr::LinkId,
     recv_zpis: ZPIPair,
-    local_noise_key: snow::Keypair,
+    local_noise_key: NoiseKeypair,
+    certx: KmCertExchange,
 ) -> Result<(), KmSetupError> {
-    let noise = match KmNoise::new(
-        false,
-        None,
-        Some(local_noise_key),
-        recv_zpis.encr,
-        recv_zpis.hmac,
-    ) {
+    let noise = match KmNoise::new(false, None, Some(local_noise_key), recv_zpis, certx) {
         Ok(n) => n,
         Err(e) => return Err(KmSetupError::InitializationError(e)),
     };
@@ -358,7 +356,7 @@ mod test {
     use crate::buffer_stack::BufferStack;
     use crate::config;
     use crate::km::KmLinkMsg;
-    use crate::km_noise;
+    use crate::km_testdata::test::*;
     use crate::mgmt_processor_worker;
     use crate::peer_table;
     use base64::prelude::*;
@@ -369,18 +367,24 @@ mod test {
 
     #[tokio::test]
     async fn test_km_multiplexor_updates_assembly_state() {
-        let nk_private_b64 = "AB2eP6zV7ve0A4eQgNVNXlAM2q0rYerCPXFMl+/ntUw=";
-        let nk_private: [u8; 32] = match BASE64_STANDARD.decode(nk_private_b64) {
-            Ok(d) => d.try_into().unwrap(),
-            Err(e) => {
-                panic!("error decoding base64: {:?}", e);
-            }
-        };
-        let nk_public = km_noise::derive_public_key(&nk_private);
-        let node_kp = snow::Keypair {
-            private: nk_private.into(),
-            public: nk_public.into(),
-        };
+        let node_kp = NoiseKeypair::new(
+            BASE64_STANDARD
+                .decode(NODE_NOISE_KEY)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        let adapter_kp = NoiseKeypair::new(
+            BASE64_STANDARD
+                .decode(ADAPTER_NOISE_KEY)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+
+        let adapter_exchanger =
+            KmCertExchange::new_from_pem(ADAPTER_CERT_DATA, CA_CERT_DATA).unwrap();
+        let node_exchanger = KmCertExchange::new_from_pem(NODE_CERT_DATA, CA_CERT_DATA).unwrap();
 
         let (km_sig_tx, km_sig_rx) = mpsc::channel(4);
         let (km_tx, mut km_rx) = mpsc::channel(4);
@@ -424,7 +428,15 @@ mod test {
                 }
 
                 // Adding a link starts a KM
-                add_adapter_link(asm, adapter_link_id, ZPIPair::new(1, 2), nk_public).unwrap();
+                add_adapter_link(
+                    asm,
+                    adapter_link_id,
+                    ZPIPair::new(1, 2),
+                    adapter_kp,
+                    node_kp.public.clone(),
+                    adapter_exchanger,
+                )
+                .unwrap();
 
                 yield_now().await;
 
@@ -438,7 +450,7 @@ mod test {
                     Ok(resp) => match resp {
                         Some(KmLinkMsg { link_id, msg }) => {
                             assert_eq!(link_id, adapter_link_id);
-                            assert_eq!(msg.len(), 130); // should be a KM payload
+                            assert_eq!(msg.len(), 913); // should be a KM payload
                             handshake_req = msg;
                         }
                         None => panic!("Expected KMLinkMessage message"),
@@ -454,7 +466,14 @@ mod test {
                 }
 
                 // Pretend to be a node and send back a valid reply.
-                let mut responder = KmNoise::new(false, None, Some(node_kp), 3, 4).unwrap();
+                let mut responder = KmNoise::new(
+                    false,
+                    None,
+                    Some(node_kp),
+                    ZPIPair::new(3, 4),
+                    node_exchanger,
+                )
+                .unwrap();
                 match responder.reset() {
                     Ok(Some(_m)) => panic!("unexpected message from responder.reset!"),
                     Ok(None) => {} // good

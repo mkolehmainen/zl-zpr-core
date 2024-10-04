@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config;
 
-use libnode::vss;
-use libnode::vsconn::{VSConn, VSOutput, new_node_agent};
 use crate::zdp::server::ZDPServer;
+use libnode::vsconn::{new_node_agent, VSConn, VSOutput};
+use libnode::vss;
 
 pub const VERSION: &str = "0.1.0";
 
@@ -117,7 +117,12 @@ pub async fn tokio_main(nconfig: config::Configuration, opts: CoreOpts) -> io::R
                 ));
             }
         };
-        let zserver = ZDPServer::new(&listen_addr, nconfig.get_noise_private_key());
+        let zserver = ZDPServer::new(
+            &listen_addr,
+            nconfig.get_noise_private_key(),
+            &nconfig.get_noise_cert_path(),
+            &nconfig.get_ca_cert_path(),
+        );
         tasks.spawn(async move {
             match zserver.run(zctok).await {
                 Ok(_) => {
@@ -191,12 +196,13 @@ async fn vs_force_connect(
         node_agent,
         tx.clone(),
         &opts.vsforceconnect.unwrap(),
-        &nconfig.get_cert_path(),
-        &nconfig.get_key_path(),
+        &nconfig.get_rsa_cert_path(),
+        &nconfig.get_rsa_private_key_path(),
         &nconfig.get_node_addr(),
         Some(vss_addr),
-    ).or_else(|e| {
-        error!("VSConn::new failed: {:?}", e);
+    )
+    .or_else(|e| {
+        error!("VSConn::new failed: {}", e);
         Err(io::Error::new(io::ErrorKind::Other, "VSConn::new failed"))
     })?;
 
