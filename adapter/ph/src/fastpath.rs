@@ -38,6 +38,10 @@ pub fn drop_and_count<'pktbuf>(
     asm.counters[reason.into()].increment();
 }
 
+fn format_link_id(link_id: Option<zpr::LinkId>) -> String {
+    link_id.map_or(format!("unknown link"), |id| format!("link {}", id))
+}
+
 /// Add the ZPI header to a packet.
 pub fn encap_zpi<'pktbuf>(
     _asm: &Assembly<'pktbuf>,
@@ -440,10 +444,7 @@ pub fn substrate_ingress<'pktbuf>(
 ) {
     asm.counters[CounterType::InPacksRec].increment();
 
-    let Some(ingress_link_id) = asm.peer_table.lookup_peer(peer_sa) else {
-        drop_and_count(asm, pkt, CounterType::UnknownPeer);
-        return;
-    };
+    let ingress_link_id = asm.peer_table.lookup_peer(peer_sa);
 
     // Read, but do not remove the ZPI header
     let Ok((zpi_hdr, _)) = zdp::ZdpZpiHeader::read_from_prefix(&pkt.body()) else {
@@ -451,55 +452,63 @@ pub fn substrate_ingress<'pktbuf>(
         return;
     };
 
-    let Some(peer_state) = asm.peer_table.get(ingress_link_id) else {
-        drop_and_count(asm, pkt, CounterType::UnknownPeer);
-        return;
-    };
+    let peer_state = ingress_link_id.and_then(|link_id| asm.peer_table.get(link_id));
 
     // If a ZPI is setup on this link, then we expect the message to use one of the valid
     // ZPI values.
     let secure;
-    match peer_state.get_established_transport_association() {
-        Some(ref transport_sa) => {
-            if zpi_hdr.zpi == transport_sa.recv_zpis.hmac {
-                match decrypt_hmac(transport_sa.recv_hmac_key, &mut pkt) {
-                    Ok(()) => secure = true,
-                    Err(err) => {
-                        drop_and_count(asm, pkt, err);
-                        return;
+    match peer_state {
+        Some(state) => match state.get_established_transport_association() {
+            Some(ref transport_sa) => {
+                if zpi_hdr.zpi == transport_sa.recv_zpis.hmac {
+                    match decrypt_hmac(transport_sa.recv_hmac_key, &mut pkt) {
+                        Ok(()) => secure = true,
+                        Err(err) => {
+                            drop_and_count(asm, pkt, err);
+                            return;
+                        }
                     }
-                }
-            } else if zpi_hdr.zpi == transport_sa.recv_zpis.encr {
-                // TODO: Put padlen in state somewhere too
-                match decrypt_full(asm, &*transport_sa.codec, NOISE_PADLEN, &mut pkt) {
-                    Ok(()) => secure = true,
-                    Err(err) => {
-                        drop_and_count(asm, pkt, err);
-                        return;
+                } else if zpi_hdr.zpi == transport_sa.recv_zpis.encr {
+                    // TODO: Put padlen in state somewhere too
+                    match decrypt_full(asm, &*transport_sa.codec, NOISE_PADLEN, &mut pkt) {
+                        Ok(()) => secure = true,
+                        Err(err) => {
+                            drop_and_count(asm, pkt, err);
+                            return;
+                        }
                     }
+                } else {
+                    // We have an SA and ZPI does not match.
+                    info!(
+                        "{}: ingress: link {}: unexpected ZPI value {} (expected {:?})",
+                        asm.system_name,
+                        format_link_id(ingress_link_id),
+                        zpi_hdr.zpi,
+                        transport_sa.recv_zpis
+                    );
+                    drop_and_count(asm, pkt, CounterType::UnknownZpi);
+                    return;
                 }
-            } else {
-                // We have an SA and ZPI does not match.
-                info!(
-                    "{}: ingress: link {}: unexpected ZPI value {} (expected {:?})",
-                    asm.system_name, ingress_link_id, zpi_hdr.zpi, transport_sa.recv_zpis
-                );
-                drop_and_count(asm, pkt, CounterType::UnknownZpi);
-                return;
             }
-        }
+            None => {
+                // Either no security association on link, or it is not yet established.
+                secure = false;
+            }
+        },
         None => {
-            // Either no security associatio on link, or it is not yet established.
+            // No link in peer table
             secure = false;
         }
     };
 
     if !secure {
-        // Not under a security assocation  which means only ZPI 0 is allowed.
-        if zpi_hdr.zpi != zpr::ZPI_0 {
+        // Not under a security assocation, which means only ZPI 0 is allowed.
+        if zpi_hdr.zpi != zpr::ZPI_0 && ingress_link_id.is_some() {
             info!(
-                "{}: ingress: link {}: ZPI {} not allowed on unestablished SA",
-                asm.system_name, ingress_link_id, zpi_hdr.zpi
+                "{}: ingress: {}: ZPI {} not allowed on unestablished SA",
+                asm.system_name,
+                format_link_id(ingress_link_id),
+                zpi_hdr.zpi
             );
             drop_and_count(asm, pkt, CounterType::UnknownZpi);
             return;
@@ -521,6 +530,19 @@ pub fn substrate_ingress<'pktbuf>(
         drop_and_count(asm, pkt, CounterType::BadStructure);
         return;
     }
+
+    let Some(ingress_link_id) = ingress_link_id else {
+        match asm
+            .mgmt_dispatch
+            .try_dispatch_mgmt_packet_with_addr(peer_sa, pkt)
+        {
+            Ok(()) => (),
+            Err(TryEnqueueError::Full(pkt)) => {
+                drop_and_count(asm, pkt, CounterType::QueueBackpressure)
+            }
+        }
+        return;
+    };
 
     let Ok(base_hdr) = zdp::ZdpBaseHeader::read_from_buf(&mut pkt) else {
         return drop_and_count(asm, pkt, CounterType::BadStructure);
@@ -546,7 +568,7 @@ pub fn substrate_ingress<'pktbuf>(
         *pkt.alloc_zeroed_header() = base_hdr;
         match asm
             .mgmt_dispatch
-            .try_dispatch_mgmt_packet(ingress_link_id, pkt)
+            .try_dispatch_mgmt_packet_with_link(ingress_link_id, pkt)
         {
             Ok(()) => (),
             Err(TryEnqueueError::Full(pkt)) => {
