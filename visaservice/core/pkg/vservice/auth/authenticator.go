@@ -328,6 +328,11 @@ func (a *Authenticator) Authenticate(extDsPrefix string,
 	}, nil
 }
 
+// Dispatch the self-authentication to our NodeValidator.
+func (a *Authenticator) SelfAuthenticate(reqAddr netip.Addr, claims map[string]string) (*AuthenticateOK, error) {
+	return a.local.SelfAuthenticate(reqAddr, claims)
+}
+
 // Query runs an attribute query against datasources.
 // Note that the attributes passed in the request will have prefixes on them, and
 // the attributes in the response will too.
@@ -590,8 +595,8 @@ func (a *Authenticator) updateVStoreFromPolicy(p *polio.Policy) error {
 	}
 
 	pool := snauth.NewCertCollection()
-
 	for _, c := range p.GetCertificates() {
+		a.log.Info("found a certifiate", "name", c.Name)
 		if svcName, found := extPrefixes[c.Name]; found {
 			cert, err := x509.ParseCertificate(c.GetAsn1Data())
 			if err != nil {
@@ -604,7 +609,7 @@ func (a *Authenticator) updateVStoreFromPolicy(p *polio.Policy) error {
 			a.log.Info("adding certificate", "prefix", c.Name, "name", svcName)
 		} else {
 			// Must be in internal prefix.
-			a.log.Info("found internal prefix", "prefix", c.Name)
+			a.log.Info("found internally validated prefix", "prefix", c.Name)
 			intPrefixes = append(intPrefixes, c.Name)
 		}
 	}

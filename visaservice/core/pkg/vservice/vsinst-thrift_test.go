@@ -86,10 +86,12 @@ p/oYQcQrtBHsdvdZ/8IRR7/9HJNanbhTuKdkdmVjt4rPoUDc2zqzEZUEG33E2Glh
 func initVisaservice(t *testing.T) *vservice.VSInst {
 	alog := logr.NewTestLogger()
 	vc := &vservice.VSIConfig{
-		Log:                  alog,
-		VSAddr:               netip.MustParseAddr("fc00:3003::1"),
-		HopCount:             99,
-		AllowInvalidPeerAddr: true,
+		Log:                   alog,
+		CN:                    "vs.zpr.org",
+		VSAddr:                netip.MustParseAddr(vservice.VisaServiceAddress),
+		HopCount:              99,
+		AllowInvalidPeerAddr:  true,
+		BootstrapAuthDuration: 1 * time.Hour,
 	}
 	svc, err := vservice.NewVSInst(vc)
 	require.Nil(t, err)
@@ -457,7 +459,7 @@ func TestThriftAuthorizeConnectRespectKey(t *testing.T) {
 	require.NotEmpty(t, apiKey)
 
 	agentClaims := map[string]string{
-		"zpr.addr":    "fc00:3003::1",
+		"zpr.addr":    vservice.VisaServiceAddress,
 		"ca0.x509.cn": "some.agent",
 	}
 
@@ -537,7 +539,7 @@ func TestThriftAuthorizeConnectRealRequest(t *testing.T) {
 	require.NotEmpty(t, apiKey)
 
 	agentClaims := map[string]string{
-		"zpr.addr":    "fc00:3003::1",
+		"zpr.addr":    vservice.VisaServiceAddress,
 		"ca0.x509.cn": "some.agent",
 	}
 

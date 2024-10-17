@@ -21,14 +21,16 @@ import (
 )
 
 type VisaService struct {
-	log               logr.Logger
-	myAddr            netip.Addr // visa serice ZPR contact address
-	authToken         []byte
-	vsWg              sync.WaitGroup
-	shutdownC         chan struct{} // when closed our run() fuction will return
-	initialPolicyFile string
-	authService       auth.AuthService
-	maxAuthDuration   time.Duration
+	log                   logr.Logger
+	cn                    string
+	myAddr                netip.Addr // visa serice ZPR contact address
+	authToken             []byte
+	vsWg                  sync.WaitGroup
+	shutdownC             chan struct{} // when closed our run() fuction will return
+	initialPolicyFile     string
+	authService           auth.AuthService
+	maxAuthDuration       time.Duration
+	bootstrapAuthDuration time.Duration
 
 	keys struct {
 		policyCheckingKey    *rsa.PublicKey  // for checking policy signature
@@ -49,17 +51,23 @@ type VisaService struct {
 	}
 }
 
-const BootstrapAuthLifetime = 1 * time.Hour
-
-func NewVisaService(initialPolicyFile string, privateKey *rsa.PrivateKey, vsServerCreds *tls.Config, maxAuthDuration time.Duration, log logr.Logger) (*VisaService, error) {
+// `bootstrapAuthDuration` is used to set the expiration of the self-authentication
+// for the visa serviec agent as well as the initial visas handed to the first
+// connecting node.  This would normally be short (~1hr).
+func NewVisaService(initialPolicyFile string, vs_cn string, privateKey *rsa.PrivateKey, vsServerCreds *tls.Config, bootstrapAuthDuration, maxAuthDuration time.Duration, log logr.Logger) (*VisaService, error) {
 	if _, err := os.Stat(initialPolicyFile); err != nil {
 		return nil, fmt.Errorf("policy file stat error: %w", err)
 	}
+	if bootstrapAuthDuration > maxAuthDuration {
+		return nil, errors.New("bootstrap auth duration exceeds max auth duration")
+	}
 	svc := &VisaService{
-		log:               log,
-		shutdownC:         make(chan struct{}),
-		initialPolicyFile: initialPolicyFile,
-		maxAuthDuration:   maxAuthDuration,
+		log:                   log,
+		cn:                    vs_cn,
+		shutdownC:             make(chan struct{}),
+		initialPolicyFile:     initialPolicyFile,
+		maxAuthDuration:       maxAuthDuration,
+		bootstrapAuthDuration: bootstrapAuthDuration,
 	}
 	svc.policy.config = policy.InitialConfiguration
 	svc.policy.policy = policy.NewEmptyPolicy()
@@ -93,8 +101,8 @@ func mustNewRandToken() []byte {
 // `vsPort` is the port of the THRIFT visa service.
 // `adminPort` is port for HTTP admin service
 // `issuerName` is used on the JWT tokens we issue.
-func (s *VisaService) Start(issuerName string, vsAddr netip.Addr, vsPort uint16, adminPort uint16) error {
-	s.log.Info("starting visa service", "name", issuerName)
+func (s *VisaService) Start(issuerName string, vsAddr netip.Addr, vsPort uint16, adminPort uint16, validationDisabled bool) error {
+	s.log.Info("starting visa service", "name", issuerName, "bootstrap_auth_duration", s.bootstrapAuthDuration.String(), "max_auth_duration", s.maxAuthDuration.String())
 	s.vsWg.Add(1)
 	defer s.vsWg.Done()
 
@@ -102,12 +110,15 @@ func (s *VisaService) Start(issuerName string, vsAddr netip.Addr, vsPort uint16,
 
 	s.log.Infom("bootstrap: starting visa service")
 	icfg := &VSIConfig{
-		Log:         s.log,
-		VSAddr:      vsAddr,
-		HopCount:    99, // TODO
-		Creds:       s.keys.visaServiceTLSCreds,
-		AccessToken: s.authToken,
-		Constrainer: NewDummyConstraintService(),
+		Log:                      s.log,
+		CN:                       s.cn,
+		VSAddr:                   vsAddr,
+		HopCount:                 99, // TODO
+		Creds:                    s.keys.visaServiceTLSCreds,
+		AccessToken:              s.authToken,
+		Constrainer:              NewDummyConstraintService(),
+		DisableConnectValidation: validationDisabled,
+		BootstrapAuthDuration:    s.bootstrapAuthDuration,
 	}
 	vsinst, err := NewVSInst(icfg)
 	if err != nil {

@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"net/netip"
 	"os"
@@ -25,11 +27,16 @@ const (
 	versionMinor = 1
 	versionPatch = 0
 
-	PIDDir = "/var/run/zpr"
-
 	// Default Max lifetime for authenticated. When they expire we require
-	// re-auth from the peer.
-	DefaultMaxAuthDuration = 6 * time.Hour
+	// re-auth from the peer. For milestone two we do not have real auth
+	// or re-auth, so this is set high.
+	DefaultMaxAuthDuration = 24 * time.Hour
+
+	// The bootstrap auth is used while we are bringing up a visa service
+	// and is also used for the expiration time of temporary visas issued
+	// to nodes prior to auth.  Again, this is set artifically high for
+	// milestone 2.
+	DefaultBootstrapAuthDuration = DefaultMaxAuthDuration
 )
 
 var (
@@ -111,6 +118,12 @@ service using the visa service API.
 		}
 		tconfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 
+		a_cert, err := loadCertFromFile(config.AdapterCert)
+		if err != nil {
+			return fmt.Errorf("failed to load adapter certificate: %w", err)
+		}
+		cn := a_cert.Subject.CommonName
+
 		pidf, err := NewPidFile("vservice")
 		if err != nil {
 			serviceLog.WithError(err).Warnm("failed to write pid file")
@@ -128,8 +141,9 @@ service using the visa service API.
 			return fmt.Errorf("failed to load private key: %w", err)
 		}
 
-		maxAuthDuration := DefaultMaxAuthDuration // TODO: add a command line arg for this
-		service, err := vservice.NewVisaService(c.String("policy"), jwtpk, tconfig, maxAuthDuration, serviceLog)
+		maxAuthDuration := DefaultMaxAuthDuration             // TODO: from config or command line
+		bootstrapAuthDuration := DefaultBootstrapAuthDuration // TODO: from config or command line
+		service, err := vservice.NewVisaService(c.String("policy"), cn, jwtpk, tconfig, bootstrapAuthDuration, maxAuthDuration, serviceLog)
 		if err != nil {
 			return fmt.Errorf("failed to create visa service: %w", err)
 		}
@@ -171,7 +185,11 @@ service using the visa service API.
 			adminPort = vservice.AdminPort // constant
 		}
 
-		err = service.Start(issuerName, vsAddr, vsPort, adminPort) // Blocking!
+		if config.DisableConnectValidation {
+			serviceLog.Warnm("connect validation is disabled")
+		}
+
+		err = service.Start(issuerName, vsAddr, vsPort, adminPort, config.DisableConnectValidation) // Blocking!
 		close(sigExitChan)
 
 		return err
@@ -189,6 +207,18 @@ service using the visa service API.
 		serviceLog.Infom("visa service has exited")
 		serviceLog.Sync()
 	}
+}
+
+func loadCertFromFile(certFile string) (*x509.Certificate, error) {
+	pemdata, err := os.ReadFile(certFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read certificate file: %w", err)
+	}
+	blk, _ := pem.Decode(pemdata)
+	if blk == nil {
+		return nil, fmt.Errorf("no PEM block found")
+	}
+	return x509.ParseCertificate(blk.Bytes)
 }
 
 // This initLogging function copied from the ZPR node code.
@@ -258,7 +288,16 @@ type PidFile struct {
 
 // NewPidFile writes a pid file in the default location.
 func NewPidFile(appname string) (*PidFile, error) {
-	fpath := filepath.Join(PIDDir, "visaservice.pid")
+	datadir := os.Getenv("XDG_DATA_HOME")
+	if datadir == "" {
+		datadir = os.Getenv("HOME")
+		if datadir == "" {
+			datadir = "/var/run"
+		} else {
+			datadir = filepath.Join(datadir, ".local", "share")
+		}
+	}
+	fpath := filepath.Join(datadir, "zpr", "vservice.pid")
 	odir := filepath.Dir(fpath)
 	if err := os.MkdirAll(odir, 0755); err != nil {
 		return nil, err

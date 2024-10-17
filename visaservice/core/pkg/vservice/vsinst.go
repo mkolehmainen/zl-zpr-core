@@ -50,24 +50,26 @@ type VSMsg struct {
 // This is a bit of a mess at the moment as we are in progress of porting this from
 // old code in machine.go and network.go.
 type VSInst struct {
-	log                  logr.Logger
-	vlog                 *Vlog
-	hopCount             uint
-	authr                auth.AuthService
-	attrProx             *AttrProxy
-	visaPushC            chan *adb.PushItem // For pushing visas without needing a request
-	nodeNumber           uint8
-	nodeState            ConstraintService
-	thriftServer         thrift.TServer
-	vsMsgC               chan *VSMsg
-	localAddr            netip.Addr
-	thriftWg             sync.WaitGroup
-	thriftCreds          *tls.Config
-	exitC                chan struct{}
-	reauthBumpTime       time.Duration
-	accessToken          []byte // Access token for special node operations
-	allowInvalidPeerAddr bool   // Set to TRUE for testing only.
-	agentDB              *adb.AgentDB
+	log                   logr.Logger
+	vlog                  *Vlog
+	hopCount              uint
+	authr                 auth.AuthService
+	attrProx              *AttrProxy
+	visaPushC             chan *adb.PushItem // For pushing visas without needing a request
+	nodeNumber            uint8
+	nodeState             ConstraintService
+	thriftServer          thrift.TServer
+	vsMsgC                chan *VSMsg
+	localAddr             netip.Addr
+	thriftWg              sync.WaitGroup
+	thriftCreds           *tls.Config
+	exitC                 chan struct{}
+	reauthBumpTime        time.Duration
+	accessToken           []byte // Access token for special node operations
+	allowInvalidPeerAddr  bool   // Set to TRUE for testing only.
+	agentDB               *adb.AgentDB
+	validationEnabled     bool // normally yes.
+	bootstrapAuthDuration time.Duration
 
 	cfgRemoves struct {
 		sync.Mutex
@@ -110,14 +112,17 @@ type vtableEnt struct {
 
 // VSIConfig is the rather complex configuration bundle for the visa service.
 type VSIConfig struct {
-	Log                    logr.Logger   // General logging
-	VSAddr                 netip.Addr    // Visa service ZPR public address
-	HopCount               uint          // Is set on every visa we create
-	Creds                  *tls.Config   // TLS for the thrift channel
-	ReauthBumpTimeOverride time.Duration // For unit testing (see DefaultReauthBumpTime defined above)
-	AccessToken            []byte        // Auth token for node to access special VS capabilities
-	AllowInvalidPeerAddr   bool          // Set to TRUE for testing only.
-	Constrainer            ConstraintService
+	Log                      logr.Logger   // General logging
+	VSAddr                   netip.Addr    // Visa service ZPR public address
+	HopCount                 uint          // Is set on every visa we create
+	CN                       string        // Visa service CN value used by the vs adapter
+	Creds                    *tls.Config   // TLS for the thrift channel
+	ReauthBumpTimeOverride   time.Duration // For unit testing (see DefaultReauthBumpTime defined above)
+	AccessToken              []byte        // Auth token for node to access special VS capabilities
+	AllowInvalidPeerAddr     bool          // Set to TRUE for testing only.
+	Constrainer              ConstraintService
+	DisableConnectValidation bool // Set to TRUE to disable connect validation for adapters
+	BootstrapAuthDuration    time.Duration
 }
 
 var EMPTY_ADDR = netip.Addr{}
@@ -127,19 +132,24 @@ func NewVSInst(vcf *VSIConfig) (*VSInst, error) {
 	if vcf.VSAddr == EMPTY_ADDR || vcf.VSAddr.IsUnspecified() {
 		return nil, fmt.Errorf("visa service address 'VSAddr' must be set")
 	}
+	if vcf.CN == "" {
+		return nil, fmt.Errorf("visa service CN must be set")
+	}
 
 	vs := &VSInst{
-		log:                  vcf.Log,
-		localAddr:            vcf.VSAddr,
-		hopCount:             vcf.HopCount,
-		visaPushC:            make(chan *adb.PushItem, 128), // Must be large enough to handle a mass revocation event
-		thriftCreds:          vcf.Creds,
-		reauthBumpTime:       DefaultReauthBumpTime,
-		exitC:                make(chan struct{}),
-		accessToken:          vcf.AccessToken,
-		allowInvalidPeerAddr: vcf.AllowInvalidPeerAddr,
-		nodeState:            vcf.Constrainer,
-		vsMsgC:               make(chan *VSMsg, 16),
+		log:                   vcf.Log,
+		localAddr:             vcf.VSAddr,
+		hopCount:              vcf.HopCount,
+		visaPushC:             make(chan *adb.PushItem, 128), // Must be large enough to handle a mass revocation event
+		thriftCreds:           vcf.Creds,
+		reauthBumpTime:        DefaultReauthBumpTime,
+		exitC:                 make(chan struct{}),
+		accessToken:           vcf.AccessToken,
+		allowInvalidPeerAddr:  vcf.AllowInvalidPeerAddr,
+		nodeState:             vcf.Constrainer,
+		vsMsgC:                make(chan *VSMsg, 16),
+		validationEnabled:     !vcf.DisableConnectValidation,
+		bootstrapAuthDuration: vcf.BootstrapAuthDuration,
 	}
 	if vcf.ReauthBumpTimeOverride > 0 {
 		vs.reauthBumpTime = vcf.ReauthBumpTimeOverride
@@ -162,6 +172,9 @@ func NewVSInst(vcf *VSIConfig) (*VSInst, error) {
 	// We need a visa service agent to exist.
 	// TODO: These claims need to come from configuration. Note that the adapter holds the claims
 	//       for the visa service agent.
+	//
+	// TODO: In prototype, the dock attached to the visa service adapter would evetually authenticate with the
+	//       visa service after bootstrap.  We need to do something like that too.
 	visaServiceAgent := agent.NewAgentFromUnsubstantiatedClaims(nil)
 	{
 		visaServiceAgent.SetProvides([]string{
@@ -171,14 +184,18 @@ func NewVSInst(vcf *VSIConfig) (*VSInst, error) {
 		authedClaims := make(map[string]*agent.ClaimV)
 		authedClaims[agent.KAttrVisaServiceAdapter] = &agent.ClaimV{
 			V:   "true",
-			Exp: time.Now().Add(BootstrapAuthLifetime),
+			Exp: time.Now().Add(vs.bootstrapAuthDuration),
 		}
 		authedClaims[agent.KAttrEPID] = &agent.ClaimV{
 			V:   vcf.VSAddr.String(),
-			Exp: time.Now().Add(BootstrapAuthLifetime),
+			Exp: time.Now().Add(vs.bootstrapAuthDuration),
+		}
+		authedClaims["zpr.adapter.cn"] = &agent.ClaimV{
+			V:   vcf.CN,
+			Exp: time.Now().Add(vs.bootstrapAuthDuration),
 		}
 		visaServiceAgent.SetTetherAddr(vcf.VSAddr)
-		visaServiceAgent.SetAuthenticated(authedClaims, time.Now().Add(BootstrapAuthLifetime), nil, nil, 0)
+		visaServiceAgent.SetAuthenticated(authedClaims, time.Now().Add(vs.bootstrapAuthDuration), nil, nil, 0)
 	}
 
 	if err := vs.agentDB.AddAdapter(vcf.VSAddr, visaServiceAgent.GetTetherAddr(), visaServiceAgent); err != nil {

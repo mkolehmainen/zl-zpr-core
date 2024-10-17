@@ -194,7 +194,7 @@ func (suite *VSRunnerSuite) TestAdminListPolicy() {
 
 	serverCreds := &tls.Config{Certificates: []tls.Certificate{cer}}
 
-	svc, err := vservice.NewVisaService(policyFileName, privateKey, serverCreds, 1*time.Hour, alog)
+	svc, err := vservice.NewVisaService(policyFileName, "cn_missing", privateKey, serverCreds, 1*time.Hour, 1*time.Hour, alog)
 	require.Nil(t, err)
 	suite.svc = svc
 
@@ -205,7 +205,7 @@ func (suite *VSRunnerSuite) TestAdminListPolicy() {
 
 	go func() {
 		alog.Info("< TEST > starting visa service")
-		if err := svc.Start("vs0", netip.MustParseAddr("127.0.0.1"), vsPort, adminPort); err != nil {
+		if err := svc.Start("vs0", netip.MustParseAddr("127.0.0.1"), vsPort, adminPort, false); err != nil {
 			alog.WithError(err).Info("< TEST > visa service has stopped")
 		} else {
 			alog.Info("< TEST > visa service has stopped")
@@ -250,7 +250,7 @@ func (suite *VSRunnerSuite) TestGetCurrentPolicy() {
 
 	serverCreds := &tls.Config{Certificates: []tls.Certificate{cer}}
 
-	svc, err := vservice.NewVisaService(policyFileName, privateKey, serverCreds, 1*time.Hour, alog)
+	svc, err := vservice.NewVisaService(policyFileName, "cn_missing", privateKey, serverCreds, 1*time.Hour, 1*time.Hour, alog)
 	require.Nil(t, err)
 	suite.svc = svc
 
@@ -261,7 +261,7 @@ func (suite *VSRunnerSuite) TestGetCurrentPolicy() {
 
 	go func() {
 		alog.Info("< TEST > starting visa service")
-		if err := svc.Start("vs0", netip.MustParseAddr("127.0.0.1"), vsPort, adminPort); err != nil {
+		if err := svc.Start("vs0", netip.MustParseAddr("127.0.0.1"), vsPort, adminPort, false); err != nil {
 			alog.WithError(err).Info("< TEST > visa service has stopped")
 		} else {
 			alog.Info("< TEST > visa service has stopped")
@@ -322,7 +322,7 @@ func (suite *VSRunnerSuite) TestInstallPolicy() {
 
 	serverCreds := &tls.Config{Certificates: []tls.Certificate{cer}}
 
-	svc, err := vservice.NewVisaService(policyFileName, privateKey, serverCreds, 1*time.Hour, alog)
+	svc, err := vservice.NewVisaService(policyFileName, "cn_missing", privateKey, serverCreds, 1*time.Hour, 1*time.Hour, alog)
 	require.Nil(t, err)
 	suite.svc = svc
 
@@ -333,7 +333,7 @@ func (suite *VSRunnerSuite) TestInstallPolicy() {
 
 	go func() {
 		alog.Info("< TEST > starting visa service")
-		if err := svc.Start("vs0", netip.MustParseAddr("127.0.0.1"), vsPort, adminPort); err != nil {
+		if err := svc.Start("vs0", netip.MustParseAddr("127.0.0.1"), vsPort, adminPort, false); err != nil {
 			alog.WithError(err).Info("< TEST > visa service has stopped")
 		} else {
 			alog.Info("< TEST > visa service has stopped")

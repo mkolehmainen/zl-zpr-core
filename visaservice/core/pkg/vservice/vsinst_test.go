@@ -93,6 +93,9 @@ func (tas *TestAS) Authenticate(domain string, epID netip.Addr,
 	chal *zds.Challenge, chalResp []*zds.ChallengeResponse, claims map[string]string) (*auth.AuthenticateOK, error) {
 	return nil, fmt.Errorf("Authenticate not implemented")
 }
+func (tas *TestAS) SelfAuthenticate(_ netip.Addr, _ map[string]string) (*auth.AuthenticateOK, error) {
+	return nil, fmt.Errorf("SelfAuthenticate not implemented")
+}
 func (tas *TestAS) Query(*zds.QueryRequest) (*zds.QueryResponse, error) {
 	return nil, fmt.Errorf("Query not implemented")
 }
@@ -113,10 +116,12 @@ func (ts *TestAS) AddDatasourceProvider(_ string, _ netip.Addr, _ uint64) error 
 func minVSI(t *testing.T, hopcount uint, alog logr.Logger) *vservice.VSIConfig {
 	// Minimal config:
 	return &vservice.VSIConfig{
-		Log:                  alog,
-		VSAddr:               netip.MustParseAddr(vservice.VisaServiceAddress),
-		HopCount:             hopcount,
-		AllowInvalidPeerAddr: true,
+		Log:                   alog,
+		CN:                    "vs.zpr.org",
+		VSAddr:                netip.MustParseAddr(vservice.VisaServiceAddress),
+		HopCount:              hopcount,
+		AllowInvalidPeerAddr:  true,
+		BootstrapAuthDuration: 1 * time.Hour,
 	}
 }
 
@@ -516,7 +521,7 @@ func TestVisaServiceVisasExtended(t *testing.T) {
 
 	alog := logr.NewTestLogger()
 
-	vsaddr := netip.MustParseAddr(vservice.VisaServiceAddress) // fc00:3003::1
+	vsaddr := netip.MustParseAddr(vservice.VisaServiceAddress)
 	vssListenAddr := fmt.Sprintf("127.0.0.1:%d", vservice.VSSDefaultPort)
 
 	// Minimal config:
