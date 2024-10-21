@@ -190,14 +190,17 @@ async fn vs_force_connect(
 
     let (tx, mut rx) = mpsc::channel(VS_OUTPUT_CHANNEL_SIZE);
 
-    let node_agent = new_node_agent(&nconfig.get_node_addr(), nconfig.get_node_name(), &nconfig.get_claims());
+    let node_agent = new_node_agent(
+        &nconfig.get_node_addr(),
+        nconfig.get_node_name(),
+        &nconfig.get_claims(),
+    );
 
     let vs_conn = VSConn::new(
         node_agent,
         tx.clone(),
         &opts.vsforceconnect.unwrap(),
-        &nconfig.get_rsa_cert_path(),
-        &nconfig.get_rsa_private_key_path(),
+        &nconfig.get_noise_cert_path(),
         &nconfig.get_node_addr(),
         Some(vss_addr),
     )
