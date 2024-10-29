@@ -207,6 +207,7 @@ pub mod test {
 
     use super::*;
     use crate::config::TopologyConfig;
+    use crate::sys::ZprTun;
     use tokio::net::UdpSocket;
     use tokio::sync::mpsc;
 
@@ -258,7 +259,7 @@ pub mod test {
             BufferStack::new(buf_storage.leak::<'static>())
         });
         let agent_input = builder.agent_input.unwrap_or_else(|| {
-            let v: Vec<&tokio_tun::Tun> = Vec::new();
+            let v: Vec<&ZprTun> = Vec::new();
             AgentInput::new(v)
         });
         let substrate_egress = builder.substrate_egress.unwrap_or_else(|| {
