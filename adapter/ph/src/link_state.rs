@@ -239,21 +239,16 @@ impl LinkStateWrapper {
 
         match self.link_type {
             LinkType::AdapterToNode => {
-                if !asm.flags.disable_key_management {
-                    km_multiplexor::add_adapter_link(
-                        &asm,
-                        self.id,
-                        ZPIPair::new(zpr::ZPI_ENCRYPTED_HEADER_FLAG | 5, 6),
-                        asm.self_noise_keypair.clone().unwrap(),
-                        asm.peer_noise_keypair.clone().unwrap().public,
-                        asm.certx.clone().unwrap(),
-                    )
-                    .unwrap();
-                    Ok(())
-                } else {
-                    drop(locked_fsm);
-                    self.keying_done(asm)
-                }
+                km_multiplexor::add_adapter_link(
+                    &asm,
+                    self.id,
+                    ZPIPair::new(zpr::ZPI_ENCRYPTED_HEADER_FLAG | 5, 6),
+                    asm.self_noise_keypair.clone().unwrap(),
+                    asm.peer_noise_keypair.clone().unwrap().public,
+                    asm.certx.clone().unwrap(),
+                )
+                .unwrap();
+                Ok(())
             }
             LinkType::NodeToNode => {
                 warn!("Error: Node to node not supported yet");
@@ -261,20 +256,15 @@ impl LinkStateWrapper {
                 return Err(LinkStateError::OperationNotSupportedYet);
             }
             LinkType::NodeToAdapter => {
-                if !asm.flags.disable_key_management {
-                    km_multiplexor::add_node_link(
-                        &asm,
-                        self.id,
-                        ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 3, 4),
-                        asm.self_noise_keypair.clone().unwrap(),
-                        asm.certx.clone().unwrap(),
-                    )
-                    .unwrap();
-                    Ok(())
-                } else {
-                    drop(locked_fsm);
-                    self.keying_done(asm)
-                }
+                km_multiplexor::add_node_link(
+                    &asm,
+                    self.id,
+                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 3, 4),
+                    asm.self_noise_keypair.clone().unwrap(),
+                    asm.certx.clone().unwrap(),
+                )
+                .unwrap();
+                Ok(())
             }
         }
     }
