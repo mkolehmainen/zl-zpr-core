@@ -114,7 +114,10 @@ fn main() -> ExitCode {
     {
         Ok(key) => key,
         Err(e) => {
-            error!("failed to load private key file: {:?}", e);
+            error!(
+                "failed to load private key file: {:?}: {:?}",
+                &config.private_key_file, e
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -185,8 +188,10 @@ fn main() -> ExitCode {
             }
         })
         .unwrap();
-
-    let control_socket = Arc::new(UnixListener::bind(config.control_path).unwrap());
+    let control_socket = Arc::new(
+        UnixListener::bind(&config.control_path).expect("failed to bind to control socket"),
+    );
+    info!("control socket bound to {:?}", config.control_path);
 
     //
     // open TUN devices
@@ -228,7 +233,7 @@ fn main() -> ExitCode {
         socket.set_reuse_port(true).unwrap();
         socket
             .bind(&socket2::SockAddr::from(config.self_addr))
-            .expect("unable to bind to self addr");
+            .expect("unable to bind to self_addr");
         substrate_sockets.push(Arc::new(UdpSocket::from_std(socket.into()).unwrap()));
     }
 
@@ -335,6 +340,17 @@ fn main() -> ExitCode {
         ));
     }
 
+    if ph_mode == PhMode::Node {
+        if config.self_addr.port() == 0 {
+            // TODO: Should we force setting a port when configuring a node?
+            warn!("self_addr port is 0 which means dock listening port will be randomly assigned");
+        }
+        info!(
+            "node {} dock listening on {}",
+            asm.system_name,
+            substrate_sockets[0].local_addr().unwrap()
+        );
+    }
     for (worker_index, socket) in substrate_sockets.into_iter().enumerate() {
         js.spawn(substrate_ingress_worker::launch(
             substrate_ingress_worker::Config {
