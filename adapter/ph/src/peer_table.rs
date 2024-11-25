@@ -8,8 +8,9 @@ use crate::sync_req;
 use bytes::Bytes;
 use cslab::{RcuCslab, RcuCslabReader};
 use dashmap::DashMap;
-use enum_map::{enum_map, Enum, EnumMap};
-use enumset::{EnumSet, EnumSetType};
+use enum_map::{Enum, EnumMap};
+use enumset::{enum_set, EnumSet, EnumSetType};
+use std::default::Default;
 use std::future::Future;
 use std::sync::atomic::{self, Ordering};
 use std::sync::Mutex;
@@ -18,20 +19,31 @@ use tokio::sync::mpsc;
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zpr::{LinkId, SubstrateAddr, LINK_ID_UNKNOWN};
+use zpr::{self, LinkId, SubstrateAddr, LINK_ID_UNKNOWN};
 
 const PEER_TABLE_SIZE: usize = 1024;
 
 /// Some peers are "special", e.g. the visa service adapter attached to the initial node.
 /// These names let us identify them.
-#[derive(Debug, Enum, EnumSetType)]
+#[derive(Debug, Enum, EnumSetType /* implies Clone, Copy */)]
 pub enum SpecialPeerName {
     VisaServiceAdapter,
 }
 
+pub fn special_peer_names_from_x509_subject_name(
+    subject: &openssl::x509::X509NameRef,
+) -> EnumSet<SpecialPeerName> {
+    let Ok(dn_der) = subject.to_der() else {
+        return enum_set!();
+    };
+    match dn_der.as_slice() {
+        zpr::VISA_SERVICE_DN => enum_set!(SpecialPeerName::VisaServiceAdapter),
+        _ => enum_set!(),
+    }
+}
+
 pub struct PeerState {
     pub substrate_addr: SubstrateAddr,
-    pub special_names: EnumSet<SpecialPeerName>,
     pub link_state_machine: LinkStateWrapper,
     pub sync_req_state: sync_req::SyncReqState,
     pub pft: PeerForwardingTable,
@@ -86,7 +98,6 @@ impl PeerState {
 
         Self {
             substrate_addr,
-            special_names: EnumSet::<SpecialPeerName>::empty(),
             link_state_machine: LinkStateWrapper::new(link_id, link_type),
             pft: PeerForwardingTable::new(),
             sync_req_state: sync_req::SyncReqState::new(),
@@ -94,10 +105,6 @@ impl PeerState {
             mgmt_processor_worker,
             km_state: PeerKmState::new(),
         }
-    }
-
-    pub fn add_special_name(&mut self, name: SpecialPeerName) {
-        self.special_names |= name;
     }
 
     /// Return a reference to the transport SA if there is an SA on the link, and if it is established.
@@ -115,7 +122,8 @@ pub struct PeerTable {
     peer_slab: Mutex<RcuCslab<PeerState>>,
     peer_slab_reader: RcuBox<RcuCslabReader<PeerState>>,
     sa_to_link: DashMap<SubstrateAddr, LinkId>,
-    special_peers: EnumMap<SpecialPeerName, AtomicLinkId>,
+    // TODO: it would be nice if this lived in the same RCU as peer_slab_reader
+    special_peers: RcuBox<EnumMap<SpecialPeerName, LinkId>>,
 }
 
 pub type PeerTableEntryGuard<'a> = RcuCslabEntryGuard<'a, PeerState>;
@@ -126,7 +134,7 @@ pub enum PeerInsertError {
 }
 
 #[derive(Debug)]
-pub enum SecurityAssocaitionStateError {
+pub enum PeerUpdateError {
     NoAssociationForLink,
 }
 
@@ -138,7 +146,7 @@ impl PeerTable {
             peer_slab: Mutex::new(peer_slab),
             peer_slab_reader,
             sa_to_link: DashMap::with_capacity(PEER_TABLE_SIZE),
-            special_peers: enum_map! { _ => LINK_ID_UNKNOWN.into() },
+            special_peers: RcuBox::default(),
         }
     }
 
@@ -156,7 +164,6 @@ impl PeerTable {
         Ok(VacantPeerTableEntry {
             peer_slab_guard,
             sa_to_link_ref: &self.sa_to_link,
-            special_peers_ref: &self.special_peers,
         })
     }
 
@@ -166,9 +173,19 @@ impl PeerTable {
             return;
         };
         self.sa_to_link.remove(&peer_state.substrate_addr);
-        for name in peer_state.special_names {
-            self.special_peers[name].store(LINK_ID_UNKNOWN, Ordering::Relaxed); // note; no useful ordering possible here
-        }
+
+        self.special_peers
+            .update(|sp_ref| {
+                let mut new_sp = *sp_ref;
+                for (_name, peer_id_ref) in new_sp.iter_mut() {
+                    if *peer_id_ref == link_id {
+                        *peer_id_ref = LINK_ID_UNKNOWN;
+                    }
+                }
+                Some(new_sp)
+            })
+            .unwrap();
+
         let new_reader = peer_slab.remove((link_id as usize).wrapping_sub(1));
         std::mem::drop(peer_slab);
         self.peer_slab_reader.write(new_reader);
@@ -201,7 +218,7 @@ impl PeerTable {
         // synchronizes with the Release in VacantPeerTableEntry::insert();
         // ensures anyone who reads from the slab following this sees the peer
         // (assuming of course it hasn't been removed!)
-        let id = self.special_peers[name].load(Ordering::Acquire);
+        let id = self.special_peers.get()[name];
 
         if id == LINK_ID_UNKNOWN {
             None
@@ -229,10 +246,10 @@ impl PeerTable {
         &self,
         link_id: LinkId,
         sa: KmTransportSA,
-    ) -> Result<(), SecurityAssocaitionStateError> {
+    ) -> Result<(), PeerUpdateError> {
         let entry = self
             .get(link_id)
-            .ok_or(SecurityAssocaitionStateError::NoAssociationForLink)?;
+            .ok_or(PeerUpdateError::NoAssociationForLink)?;
         entry.km_state.transport_sa.write(Some(sa));
         Ok(())
     }
@@ -241,27 +258,20 @@ impl PeerTable {
     /// stash its handle in here.
     ///
     /// Only possible error is if there is no entry in the table under the `link_id`.
-    pub fn set_km_handle(
-        &self,
-        link_id: LinkId,
-        handle: KmHandle,
-    ) -> Result<(), SecurityAssocaitionStateError> {
+    pub fn set_km_handle(&self, link_id: LinkId, handle: KmHandle) -> Result<(), PeerUpdateError> {
         let entry = self
             .get(link_id)
-            .ok_or(SecurityAssocaitionStateError::NoAssociationForLink)?;
+            .ok_or(PeerUpdateError::NoAssociationForLink)?;
         entry.km_state.handle.lock().unwrap().replace(handle);
         Ok(())
     }
 
     /// After this, [PeerTable::is_security_assocaition_established] will return false for the link until
     /// a call to [PeerTable::set_security_association].
-    pub fn clear_security_association(
-        &self,
-        link_id: LinkId,
-    ) -> Result<(), SecurityAssocaitionStateError> {
+    pub fn clear_security_association(&self, link_id: LinkId) -> Result<(), PeerUpdateError> {
         let entry = self
             .get(link_id)
-            .ok_or(SecurityAssocaitionStateError::NoAssociationForLink)?;
+            .ok_or(PeerUpdateError::NoAssociationForLink)?;
         entry.km_state.transport_sa.write(None);
         Ok(())
     }
@@ -308,12 +318,31 @@ impl PeerTable {
         }
         handle.take()
     }
+
+    pub fn assign_special_name(
+        &self,
+        name: SpecialPeerName,
+        link_id: LinkId,
+    ) -> Result<(), PeerUpdateError> {
+        // FIXME: This can race peer removal; we ought to place
+        // `special_peers` and `peer_slab_reader` in the same RcuBox
+        self.special_peers
+            .update(|sp_ref| {
+                if sp_ref[name] == LINK_ID_UNKNOWN {
+                    let mut new_sp = *sp_ref;
+                    new_sp[name] = link_id;
+                    Some(new_sp)
+                } else {
+                    None
+                }
+            })
+            .map_err(|()| PeerUpdateError::NoAssociationForLink)
+    }
 }
 
 pub struct VacantPeerTableEntry<'a> {
     peer_slab_guard: MutexGuard<'a, RcuCslab<PeerState>>,
     sa_to_link_ref: &'a DashMap<SubstrateAddr, LinkId>,
-    special_peers_ref: &'a EnumMap<SpecialPeerName, AtomicLinkId>,
 }
 
 impl VacantPeerTableEntry<'_> {
@@ -328,8 +357,8 @@ impl VacantPeerTableEntry<'_> {
         let link_id = (id + 1) as LinkId;
 
         // synchronizes with the Acquire in PeerTable::lookup_*();
-        // ensures the peer slab entry is visible to anyone who first reads from one of the
-        // below "reverse" tables with Acquire ordering
+        // ensures the peer slab entry is visible to anyone who first reads from
+        // the "reverse" table with Acquire ordering
         atomic::fence(Ordering::Release);
 
         if let Some(other) = self
@@ -340,16 +369,6 @@ impl VacantPeerTableEntry<'_> {
                 "duplicate peer substrate address: {link_id} and {other} share {}",
                 peer_state_ref.substrate_addr
             );
-        }
-
-        for name in peer_state_ref.special_names {
-            let other = self.special_peers_ref[name].swap(link_id, Ordering::Relaxed);
-            if other != LINK_ID_UNKNOWN {
-                panic!(
-                    "duplicate special peer name: {link_id} and {other} share {:?}",
-                    name
-                );
-            }
         }
 
         link_id
