@@ -4,14 +4,15 @@ use crate::km::{KeyManager, KmTransportSA};
 use crate::link_state::{LinkStateWrapper, LinkType};
 use crate::queues;
 use crate::rcu::{RcuBox, RcuCslabEntryGuard, RcuOptionGuard};
+use crate::special_peers::*;
 use crate::sync_req;
 use bytes::Bytes;
 use cslab::{RcuCslab, RcuCslabReader};
 use dashmap::DashMap;
-use enum_map::{Enum, EnumMap};
-use enumset::{enum_set, EnumSet, EnumSetType};
+use enum_map::EnumMap;
 use std::default::Default;
 use std::future::Future;
+use std::num::NonZero;
 use std::sync::atomic::{self, Ordering};
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -22,25 +23,6 @@ use tokio_util::sync::CancellationToken;
 use zpr::{self, LinkId, SubstrateAddr, LINK_ID_UNKNOWN};
 
 const PEER_TABLE_SIZE: usize = 1024;
-
-/// Some peers are "special", e.g. the visa service adapter attached to the initial node.
-/// These names let us identify them.
-#[derive(Debug, Enum, EnumSetType /* implies Clone, Copy */)]
-pub enum SpecialPeerName {
-    VisaServiceAdapter,
-}
-
-pub fn special_peer_names_from_x509_subject_name(
-    subject: &openssl::x509::X509NameRef,
-) -> EnumSet<SpecialPeerName> {
-    let Ok(dn_der) = subject.to_der() else {
-        return enum_set!();
-    };
-    match dn_der.as_slice() {
-        zpr::VISA_SERVICE_DN => enum_set!(SpecialPeerName::VisaServiceAdapter),
-        _ => enum_set!(),
-    }
-}
 
 pub struct PeerState {
     pub substrate_addr: SubstrateAddr,
@@ -81,7 +63,7 @@ const MGMT_PROCESSOR_QUEUE_SIZE: usize = 16;
 
 impl PeerState {
     pub fn new<Worker>(
-        link_id: LinkId,
+        link_id: NonZero<LinkId>,
         link_type: LinkType,
         substrate_addr: SubstrateAddr,
         launch_mgmt_processor_worker: impl FnOnce(
@@ -98,7 +80,7 @@ impl PeerState {
 
         Self {
             substrate_addr,
-            link_state_machine: LinkStateWrapper::new(link_id, link_type),
+            link_state_machine: LinkStateWrapper::new(link_id.get(), link_type),
             pft: PeerForwardingTable::new(),
             sync_req_state: sync_req::SyncReqState::new(),
             mgmt_processor,
@@ -121,7 +103,7 @@ const _: () = assert!(std::mem::size_of::<AtomicLinkId>() == std::mem::size_of::
 pub struct PeerTable {
     peer_slab: Mutex<RcuCslab<PeerState>>,
     peer_slab_reader: RcuBox<RcuCslabReader<PeerState>>,
-    sa_to_link: DashMap<SubstrateAddr, LinkId>,
+    sa_to_link: DashMap<SubstrateAddr, NonZero<LinkId>>,
     // TODO: it would be nice if this lived in the same RCU as peer_slab_reader
     special_peers: RcuBox<EnumMap<SpecialPeerName, LinkId>>,
 }
@@ -150,7 +132,7 @@ impl PeerTable {
         }
     }
 
-    pub fn insert(&self, peer_state: PeerState) -> Result<LinkId, PeerInsertError> {
+    pub fn insert(&self, peer_state: PeerState) -> Result<NonZero<LinkId>, PeerInsertError> {
         Ok(self.vacant_entry()?.insert(peer_state))
     }
 
@@ -203,7 +185,7 @@ impl PeerTable {
             .map(inspector)
     }
 
-    pub fn lookup_peer(&self, substrate_addr: &SubstrateAddr) -> Option<LinkId> {
+    pub fn lookup_peer(&self, substrate_addr: &SubstrateAddr) -> Option<NonZero<LinkId>> {
         let id = self.sa_to_link.get(substrate_addr).map(|id| *id);
 
         // synchronizes with the Release in VacantPeerTableEntry::insert();
@@ -214,17 +196,11 @@ impl PeerTable {
         id
     }
 
-    pub fn lookup_special_peer(&self, name: SpecialPeerName) -> Option<LinkId> {
+    pub fn lookup_special_peer(&self, name: SpecialPeerName) -> Option<NonZero<LinkId>> {
         // synchronizes with the Release in VacantPeerTableEntry::insert();
         // ensures anyone who reads from the slab following this sees the peer
         // (assuming of course it hasn't been removed!)
-        let id = self.special_peers.get()[name];
-
-        if id == LINK_ID_UNKNOWN {
-            None
-        } else {
-            Some(id)
-        }
+        NonZero::new(self.special_peers.get()[name])
     }
 
     pub fn inspect<T>(
@@ -342,19 +318,19 @@ impl PeerTable {
 
 pub struct VacantPeerTableEntry<'a> {
     peer_slab_guard: MutexGuard<'a, RcuCslab<PeerState>>,
-    sa_to_link_ref: &'a DashMap<SubstrateAddr, LinkId>,
+    sa_to_link_ref: &'a DashMap<SubstrateAddr, NonZero<LinkId>>,
 }
 
 impl VacantPeerTableEntry<'_> {
-    pub fn key(&self) -> LinkId {
-        (self.peer_slab_guard.vacant_key().unwrap() + 1) as LinkId
+    pub fn key(&self) -> NonZero<LinkId> {
+        NonZero::new((self.peer_slab_guard.vacant_key().unwrap() + 1) as LinkId).unwrap()
     }
 
-    pub fn insert(mut self, peer_state: PeerState) -> LinkId {
+    pub fn insert(mut self, peer_state: PeerState) -> NonZero<LinkId> {
         let id = self.peer_slab_guard.insert(peer_state).unwrap();
         let peer_state_ref = self.peer_slab_guard.get(id).unwrap();
 
-        let link_id = (id + 1) as LinkId;
+        let link_id = NonZero::new((id + 1) as LinkId).unwrap();
 
         // synchronizes with the Acquire in PeerTable::lookup_*();
         // ensures the peer slab entry is visible to anyone who first reads from
