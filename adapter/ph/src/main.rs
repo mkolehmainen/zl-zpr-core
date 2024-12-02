@@ -210,8 +210,8 @@ fn main() -> ExitCode {
         tun_addr,
     ) {
         Ok(devs) => devs.into_iter().map(Arc::new).collect(),
-        Err(e) => {
-            panic!("unable to create TUN device: {:?}", e);
+        Err(err) => {
+            panic!("unable to create TUN device: {err}");
         }
     };
     let tun_ctl = Box::new(tun_ctl::TunCtlImpl::new(tun_devs[0].clone()));
@@ -394,6 +394,22 @@ fn main() -> ExitCode {
                 asm.system_name, dsid
             );
         });
+    }
+
+    //
+    // start Visa Support Service if we're a node
+    //
+
+    if ph_mode == PhMode::Node {
+        let (vss_inq, _vss_outq) = mpsc::channel(asm.topology_config.vss_queue_size);
+
+        let vss_addr = std::net::SocketAddr::new(
+            asm.agent_address
+                .expect("Node must have agent address assigned"),
+            libnode::vss::DEFAULT_VSS_PORT,
+        );
+
+        js.spawn_blocking(move || libnode::vss::start_vss_server(vss_inq, vss_addr));
     }
 
     //
