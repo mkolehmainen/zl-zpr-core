@@ -3,11 +3,14 @@ use crate::buffer_stack::BufferStack;
 use crate::capture_worker::CaptureWorker;
 use crate::config;
 use crate::counters::*;
+use crate::defs;
 use crate::flow_control::FlowControl;
+use crate::forwarding_tables;
 use crate::km_cert_exchange::KmCertExchange;
 use crate::km_multiplexor::KmState;
 use crate::km_noise;
 use crate::link_state::{LinkEvent, LinkStateError, LinkType};
+use crate::mgmt;
 use crate::mgmt_processor_worker;
 use crate::peer_table;
 use crate::peer_table::PeerInsertError;
@@ -20,6 +23,7 @@ use std::net::IpAddr;
 use std::num::NonZero;
 use std::result::Result;
 use std::sync::Arc;
+use thiserror::Error;
 use tracing::{error, info};
 use zpr::{self, LinkId, SubstrateAddr};
 use zpr_ext::std::num::NonZeroExt;
@@ -72,7 +76,6 @@ pub struct Assembly {
     pub peer_ids: std::sync::Mutex<Vec<zpr::LinkId>>, // HACK until peer_table is enumerable
 
     // Adapter tables
-    // NOTE: only adapter_manager_worker should modify these tables!
     pub alt: adapter_tables::AgentLookupTable,
     pub dlt: adapter_tables::DockLookupTable,
 
@@ -83,6 +86,16 @@ pub struct Assembly {
     pub self_noise_keypair: Option<NoiseKeypair>,
     pub peer_noise_keypair: Option<NoiseKeypair>,
     pub certx: Option<KmCertExchange>,
+}
+
+#[derive(Debug, Error)]
+pub enum AddRouteError {
+    #[error("bind failed: {0}")]
+    BindFailed(mgmt::requests::BindAgentAddressError),
+    #[error("peer gone")]
+    PeerGone,
+    #[error("PFT full")]
+    PftFull,
 }
 
 impl Assembly {
@@ -191,21 +204,84 @@ impl Assembly {
         return Ok(peer_id);
     }
 
-    pub fn hack_default_policy(&self, ingress_link_id: LinkId) -> Option<NonZero<LinkId>> {
-        if ingress_link_id == zpr::LINK_ID_UNKNOWN {
-            None
-        } else if ingress_link_id == zpr::LOCAL_AGENT_LINK_ID {
+    pub async fn add_route(
+        &self,
+        ingress_link_id: NonZero<LinkId>,
+        five_tuple: defs::FiveTuple,
+        egress_link_id: NonZero<LinkId>,
+        compression_mode: zpr::CompressionMode,
+    ) -> Result<zpr::StreamId, AddRouteError> {
+        let egress_tether_id;
+        if egress_link_id.get() == zpr::LOCAL_AGENT_LINK_ID {
+            egress_tether_id = self
+                .dlt
+                .insert(adapter_tables::DltPep {
+                    compression_mode,
+                    five_tuple,
+                })
+                .map_err(|()| {
+                    AddRouteError::BindFailed(
+                        mgmt::requests::BindAgentAddressError::BindAgentAddressError(
+                            "DLT full".into(),
+                        ),
+                    )
+                })?;
+        } else {
+            egress_tether_id = mgmt::requests::send_bind_agent_address_request(
+                self,
+                egress_link_id.get(),
+                compression_mode,
+                five_tuple,
+            )
+            .await
+            .map_err(|e| AddRouteError::BindFailed(e))?;
+        }
+
+        // form PEP
+        let pep = forwarding_tables::PftPep {
+            next_hop: forwarding_tables::PftNextHop(egress_link_id.get(), egress_tether_id),
+        };
+
+        let Some(ingress_peer_state) = self.peer_table.get(ingress_link_id.get()) else {
+            return Err(AddRouteError::PeerGone);
+        };
+
+        let ingress_tether_id = ingress_peer_state
+            .pft
+            .insert(pep)
+            .map_err(|()| AddRouteError::PftFull)?;
+
+        Ok(ingress_tether_id)
+    }
+
+    /// "Default" policy used by the node, in lieu of obtaining forwarding instructions
+    /// from the Visa Service.  Consulted after resolving special-peer policy.
+    pub fn hack_default_policy(&self, ingress_link_id: NonZero<LinkId>) -> Option<NonZero<LinkId>> {
+        if ingress_link_id.get() == zpr::LOCAL_AGENT_LINK_ID {
+            // Reject packets from the local agent.
+            // (Packets destined to the Visa Service Adapter fall under special-peer policy.)
             None
         } else {
-            let peer_ids = self.peer_ids.lock().unwrap();
-
-            let peer_id_idx = peer_ids.iter().position(|id| *id == ingress_link_id)?;
-
             let visa_server_id = self
                 .peer_table
                 .lookup_special_peer(crate::special_peers::SpecialPeerName::VisaServiceAdapter)
                 .unwrap_or_zero();
 
+            // Unconditionally accept traffic from the Visa Service Adapter;
+            // forward it to our local agent.
+            if ingress_link_id.get() == visa_server_id {
+                return std::num::NonZero::new(zpr::LOCAL_AGENT_LINK_ID);
+            }
+
+            let peer_ids = self.peer_ids.lock().unwrap();
+
+            let peer_id_idx = peer_ids
+                .iter()
+                .position(|id| *id == ingress_link_id.get())?;
+
+            // Unconditionally accept traffice from non-special adapters;
+            // forward to the "next" such adapter in a cycle.  (So e.g.
+            // two adapters forward between each other.)
             for i in 1..peer_ids.len() {
                 let peer_id = peer_ids[(peer_id_idx + i) % peer_ids.len()];
                 if peer_id != visa_server_id {

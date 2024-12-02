@@ -2,6 +2,7 @@ use crate::defs::FiveTuple;
 use crate::net_defs::IpAddress;
 use enum_map::Enum;
 use enumset::{enum_set, EnumSet, EnumSetType};
+use std::num::NonZero;
 
 /// Some peers are "special", e.g. the visa service adapter attached to the initial node.
 /// These names let us identify them.
@@ -29,16 +30,21 @@ const VISA_SERVICE_IP_ADDRESS: IpAddress = IpAddress::new_from_std(&zpr::VISA_SE
 /// is a default policy to allow such traffic to a special peer.  If so,
 /// returns the special peer's name, otherwise returns None.
 pub fn default_policy_lookup(
-    ingress_link_id: zpr::LinkId,
+    ingress_link_id: NonZero<zpr::LinkId>,
     five_tuple: &FiveTuple,
 ) -> Option<SpecialPeerName> {
-    match (ingress_link_id, five_tuple) {
+    match (ingress_link_id.get(), five_tuple) {
         (
             zpr::LOCAL_AGENT_LINK_ID,
             FiveTuple {
                 dst_address: VISA_SERVICE_IP_ADDRESS,
                 l4_protocol: zpr::VISA_SERVICE_PROTO,
                 dst_port: zpr::VISA_SERVICE_PORT,
+                ..
+            } |
+            FiveTuple {
+                dst_address: VISA_SERVICE_IP_ADDRESS,
+                l4_protocol: 1 /* ICMP */ | 58 /* ICMPv6 */,
                 ..
             },
         ) => Some(SpecialPeerName::VisaServiceAdapter),

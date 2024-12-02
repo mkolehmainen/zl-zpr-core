@@ -1,19 +1,18 @@
 //! Handlers for management requests.
 
 use crate::adapter_tables;
-use crate::assembly::{Assembly, PhMode};
+use crate::assembly::{self, Assembly, PhMode};
 use crate::config;
 use crate::counters;
 use crate::defs::*;
-use crate::forwarding_tables;
 use crate::link_state::LinkEvent;
 use crate::net_defs::IpAddress;
 use crate::packet::{BufferPacket, Packet};
-use crate::special_peers;
 use crate::zdp;
 use bytes::{Buf, BufMut};
+use std::num::NonZero;
 use std::sync::Arc;
-use tracing::info;
+use tracing::*;
 use zpr;
 use zpr_ext::zerocopy::{FromBytesExt, IntoBytesExt};
 
@@ -305,7 +304,14 @@ pub async fn handle_bind_agent_address_request(
         dst_port,
     );
 
-    let ingress_link_id = pkt.metadata().ingress_link_id;
+    let Some(ingress_link_id) = NonZero::new(pkt.metadata().ingress_link_id) else {
+        // who sent this??
+        error!(
+            "{}: coding error: stray packet from unknown source; dropping",
+            asm.system_name
+        );
+        return Ok(());
+    };
 
     // recycle request buffer for response
     let mut rsp_pkt = Packet::new(pkt.destroy(), config::DEFAULT_MESSAGE_HEADROOM);
@@ -314,97 +320,73 @@ pub async fn handle_bind_agent_address_request(
 
     match asm.ph_mode {
         PhMode::Node => {
-            let Some(egress_link_id) =
-                special_peers::default_policy_lookup(ingress_link_id, &five_tuple)
-                    .and_then(|id| asm.peer_table.lookup_special_peer(id))
-                    .or_else(|| {
-                        // HACK: for now, we assume a visa which forwards through to the other adapter
-                        // AND ALSO we manually issue a bind request out to that adapter
-
-                        // TODO: request visa
-
-                        asm.hack_default_policy(ingress_link_id)
-                    })
-            else {
-                // send error to requestor
-                super::core::send_per_flow_mgmt_response(
-                    asm,
-                    ingress_link_id,
-                    zdp::ZdpPacketType::BindAgentAddressResponse,
-                    0,
-                    seq_num,
-                    rsp_pkt,
-                )
-                .await;
-
-                return Ok(());
-            };
-
-            match super::requests::send_bind_agent_address_request(
+            // TODO: errors need more consideration here
+            match super::dock::bind_agent_address(
                 asm,
-                egress_link_id.get(),
+                ingress_link_id,
                 compression_mode,
                 five_tuple,
             )
             .await
             {
-                Ok(egress_tether_id) => {
-                    // form PEP
-                    let pep = forwarding_tables::PftPep {
-                        next_hop: forwarding_tables::PftNextHop(
-                            egress_link_id.get(),
-                            egress_tether_id,
-                        ),
-                    };
-
-                    match asm.peer_table.inspect(ingress_link_id, |peer_state| {
-                        match peer_state.pft.insert(pep) {
-                            Ok(tid) => {
-                                // success; respond with tether ID
-                                // TODO: maybe tick a counter somewhere?
-                                zdp::ZdpBindAgentAddressResponseHeader {
-                                    status_code:
-                                        zdp::ZdpBindAgentAddressResponseHeader::STATUS_CODE_SUCCESS,
-                                    info_len: 0,
-                                }
-                                .write_to_buf(&mut rsp_pkt)
-                                .unwrap();
-
-                                tid
-                            }
-
-                            Err(()) => {
-                                // PFT full; respond with error message
-                                // TODO: maybe tick a counter somewhere?
-                                let message = "PFT full";
-
-                                zdp::ZdpBindAgentAddressResponseHeader {
-                                    status_code:
-                                        zdp::ZdpBindAgentAddressResponseHeader::STATUS_CODE_OTHER,
-                                    info_len: message.len() as u8,
-                                }
-                                .write_to_buf(&mut rsp_pkt)
-                                .unwrap();
-
-                                rsp_pkt.put(message.as_bytes());
-
-                                0
-                            }
-                        }
-                    }) {
-                        Some(tid) => ingress_tether_id = tid,
-
-                        None => {
-                            // peer went away; don't bother responding
-                            asm.buffer_stack.put_buffer(rsp_pkt.destroy());
-                            return Ok(());
-                        }
+                Ok(ingress_tid) => {
+                    // success; respond with ingress tether ID
+                    // TODO: maybe tick a counter somewhere?
+                    zdp::ZdpBindAgentAddressResponseHeader {
+                        status_code: zdp::ZdpBindAgentAddressResponseHeader::STATUS_CODE_SUCCESS,
+                        info_len: 0,
                     }
+                    .write_to_buf(&mut rsp_pkt)
+                    .unwrap();
 
-                    // TODO: factor out message generation using Result<StreamId, Box<str>>
+                    ingress_tether_id = ingress_tid;
                 }
 
-                Err(err) => {
+                Err(super::dock::BindAgentAddressError::PolicyError) => {
+                    // send error to requestor
+                    super::core::send_per_flow_mgmt_response(
+                        asm,
+                        ingress_link_id.get(),
+                        zdp::ZdpPacketType::BindAgentAddressResponse,
+                        0,
+                        seq_num,
+                        rsp_pkt,
+                    )
+                    .await;
+
+                    return Ok(());
+                }
+
+                Err(super::dock::BindAgentAddressError::AddRouteError(
+                    assembly::AddRouteError::PftFull,
+                )) => {
+                    // PFT full; respond with error message
+                    // TODO: maybe tick a counter somewhere?
+                    let message = "PFT full";
+
+                    zdp::ZdpBindAgentAddressResponseHeader {
+                        status_code: zdp::ZdpBindAgentAddressResponseHeader::STATUS_CODE_OTHER,
+                        info_len: message.len() as u8,
+                    }
+                    .write_to_buf(&mut rsp_pkt)
+                    .unwrap();
+
+                    rsp_pkt.put(message.as_bytes());
+
+                    ingress_tether_id = 0;
+                }
+
+                Err(super::dock::BindAgentAddressError::AddRouteError(
+                    assembly::AddRouteError::PeerGone,
+                )) => {
+                    // peer went away; don't bother responding
+                    asm.buffer_stack.put_buffer(rsp_pkt.destroy());
+                    return Ok(());
+                }
+
+                Err(super::dock::BindAgentAddressError::AddRouteError(
+                    assembly::AddRouteError::BindFailed(err),
+                )) => {
                     // unable to bind next-hop; respond with error message
                     // TODO: maybe tick a counter somewhere?
                     let message = format!("unable to bind next-hop: {}", err);
@@ -429,6 +411,8 @@ pub async fn handle_bind_agent_address_request(
                 compression_mode,
                 five_tuple,
             };
+
+            // TODO: reverse path
 
             // attempt to insert into DLT
             match asm.dlt.insert(pep) {
@@ -468,7 +452,7 @@ pub async fn handle_bind_agent_address_request(
     // respond to requestor
     super::core::send_per_flow_mgmt_response(
         asm,
-        ingress_link_id,
+        ingress_link_id.get(),
         zdp::ZdpPacketType::BindAgentAddressResponse,
         ingress_tether_id,
         seq_num,
