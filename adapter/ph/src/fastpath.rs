@@ -437,6 +437,20 @@ pub fn substrate_ingress(
 
     pkt.metadata_mut().ingress_link_id = asm.peer_table.lookup_peer(peer_sa).unwrap_or_zero();
 
+    if pkt.metadata().ingress_link_id == 0 {
+        warn!(
+            "{}: got packet from {peer_sa} which isn't in the peer table; peer table contains:",
+            asm.system_name
+        );
+        let ids = asm.peer_ids.lock().unwrap().clone();
+        for id in ids {
+            if let Some(peer) = asm.peer_table.get(id) {
+                warn!("{id}: {}", peer.substrate_addr);
+            }
+        }
+        warn!("[end of peer table]");
+    }
+
     // Read, but do not remove the ZPI header
     let Ok((zpi_hdr, _)) = zdp::ZdpZpiHeader::read_from_prefix(&pkt.body()) else {
         drop_and_count(asm, pkt, CounterType::BadStructure);
