@@ -109,7 +109,7 @@ sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$PH_BIN" \
   --node-public-key-file node.pubkey \
   --agent-addr "$VS_ZPR_ADDR6" 2>&1 |tee adapter-vs.log &
 
-sleep 2  # TODO: remove?
+sleep 20  # TODO: remove?
 
 sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" "$PH_BIN" \
   adapter \

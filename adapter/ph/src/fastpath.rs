@@ -781,6 +781,14 @@ pub fn forward(asm: &Assembly, mut pkt: BufferPacket) {
 
             egress_link_id = pep.next_hop.0;
             egress_stream_id = pep.next_hop.1;
+
+            info!(
+                "NODE forwarding {}:{} to {}:{}",
+                pkt.metadata().ingress_link_id,
+                pkt.metadata().ingress_stream_id,
+                egress_link_id,
+                egress_stream_id
+            );
         }
     }
 

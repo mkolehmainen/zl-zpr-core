@@ -101,10 +101,6 @@ pub enum AddRouteError {
 }
 
 impl Assembly {
-    pub fn is_node(&self) -> bool {
-        self.ph_mode == PhMode::Node
-    }
-
     pub fn process_link_state_event(
         self: &Arc<Self>,
         id: LinkId,
