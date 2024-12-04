@@ -347,17 +347,18 @@ pub async fn handle_bind_agent_address_request(
 
                 Err(super::dock::BindAgentAddressError::PolicyError) => {
                     // send error to requestor
-                    super::core::send_per_flow_mgmt_response(
-                        asm,
-                        ingress_link_id.get(),
-                        zdp::ZdpPacketType::BindAgentAddressResponse,
-                        0,
-                        seq_num,
-                        rsp_pkt,
-                    )
-                    .await;
+                    let message = "policy error";
 
-                    return Ok(());
+                    zdp::ZdpBindAgentAddressResponseHeader {
+                        status_code: zdp::ZdpBindAgentAddressResponseHeader::STATUS_CODE_OTHER,
+                        info_len: message.len() as u8,
+                    }
+                    .write_to_buf(&mut rsp_pkt)
+                    .unwrap();
+
+                    rsp_pkt.put(message.as_bytes());
+
+                    ingress_tether_id = 0;
                 }
 
                 Err(super::dock::BindAgentAddressError::AddRouteError(
