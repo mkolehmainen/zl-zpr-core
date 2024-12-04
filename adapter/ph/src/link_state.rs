@@ -544,8 +544,7 @@ impl LinkStateWrapper {
                         connection_id: Some(123), // unused
                         dock_addr: Some(
                             IpAddress::new_from_std(&asm.agent_address.unwrap())
-                                .v6
-                                .into(),
+                                .into_v4_or_v6_octets(),
                         ),
                         claims: Some(
                             [
