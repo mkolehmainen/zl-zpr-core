@@ -509,7 +509,9 @@ impl LinkStateWrapper {
                         "register agent address when SA not established".to_owned(),
                     ));
                 };
-                drop(locked_fsm);
+
+                // TODO: validate that DN *only* has CN, since this is what VS expects
+                // (or, teach VS about DNs)
 
                 let cn: String;
 
@@ -526,90 +528,102 @@ impl LinkStateWrapper {
 
                 info!("{}: Link {} CN is {cn}", asm.system_name, self.id);
 
-                // issue a Connect Request to the visa service for this adapter
-                let connect_req = libnode::vsapi::ConnectRequest {
-                    connection_id: Some(123), // unused
-                    dock_addr: Some(
-                        IpAddress::new_from_std(&asm.agent_address.unwrap())
-                            .v6
+                if cn == zpr::VISA_SERVICE_CN {
+                    locked_fsm.state = LinkState::Active;
+                    debug!(
+                        "{}: Link {} (Visa Service) received agent address.  Becoming active, no authorization required",
+                        asm.system_name, self.id
+                    );
+                    drop(locked_fsm);
+                    self.run_active(asm)
+                } else {
+                    drop(locked_fsm);
+
+                    // issue an Authorize Connect Request to the visa service for this adapter
+                    let connect_req = libnode::vsapi::ConnectRequest {
+                        connection_id: Some(123), // unused
+                        dock_addr: Some(
+                            IpAddress::new_from_std(&asm.agent_address.unwrap())
+                                .v6
+                                .into(),
+                        ),
+                        claims: Some(
+                            [
+                                ("zpr.addr".to_owned(), addr.to_string()),
+                                ("zpr.adapter.cn".to_owned(), cn),
+                            ]
                             .into(),
-                    ),
-                    claims: Some(
-                        [
-                            ("zpr.addr".to_owned(), addr.to_string()),
-                            ("zpr.adapter.cn".to_owned(), cn),
-                        ]
-                        .into(),
-                    ),
-                    challenge: None,           // unused
-                    challenge_responses: None, // unused
-                };
+                        ),
+                        challenge: None,           // unused
+                        challenge_responses: None, // unused
+                    };
 
-                let link_id = self.id;
-                let task_asm = asm.clone();
-                tokio::task::spawn_local(async move {
-                    match task_asm
-                        .vsconn
-                        .as_ref()
-                        .unwrap()
-                        .authorize_connect(connect_req)
-                        .await
-                    {
-                        Ok(libnode::vsapi::ConnectResponse {
-                            status: Some(libnode::vsapi::StatusCode::SUCCESS),
-                            ..
-                        }) => {
-                            info!("{}: link {link_id} authorized", task_asm.system_name);
+                    let link_id = self.id;
+                    let task_asm = asm.clone();
+                    tokio::task::spawn_local(async move {
+                        match task_asm
+                            .vsconn
+                            .as_ref()
+                            .unwrap()
+                            .authorize_connect(connect_req)
+                            .await
+                        {
+                            Ok(libnode::vsapi::ConnectResponse {
+                                status: Some(libnode::vsapi::StatusCode::SUCCESS),
+                                ..
+                            }) => {
+                                info!("{}: link {link_id} authorized", task_asm.system_name);
 
-                            if task_asm
-                                .process_link_state_event(
-                                    link_id,
-                                    LinkEvent::ReceivedAuthorizeResponse,
-                                )
-                                .is_err()
-                            {
-                                Err(())
-                            } else {
-                                Ok(())
+                                if task_asm
+                                    .process_link_state_event(
+                                        link_id,
+                                        LinkEvent::ReceivedAuthorizeResponse,
+                                    )
+                                    .is_err()
+                                {
+                                    Err(())
+                                } else {
+                                    Ok(())
+                                }
+                            }
+
+                            Ok(cr) => {
+                                warn!(
+                                    "{}: link {link_id} authorization rejected: {}",
+                                    task_asm.system_name,
+                                    cr.reason.unwrap_or("(no reason given)".to_owned())
+                                );
+
+                                if task_asm
+                                    .process_link_state_event(link_id, LinkEvent::Reset)
+                                    .is_err()
+                                {
+                                    Err(())
+                                } else {
+                                    Ok(())
+                                }
+                            }
+
+                            Err(err) => {
+                                warn!(
+                                    "{}: link {link_id} authorization failed: {err}",
+                                    task_asm.system_name
+                                );
+
+                                if task_asm
+                                    .process_link_state_event(link_id, LinkEvent::Reset)
+                                    .is_err()
+                                {
+                                    Err(())
+                                } else {
+                                    Ok(())
+                                }
                             }
                         }
+                    });
 
-                        Ok(cr) => {
-                            warn!(
-                                "{}: link {link_id} authorization rejected: {}",
-                                task_asm.system_name,
-                                cr.reason.unwrap_or("(no reason given)".to_owned())
-                            );
-
-                            if task_asm
-                                .process_link_state_event(link_id, LinkEvent::Reset)
-                                .is_err()
-                            {
-                                Err(())
-                            } else {
-                                Ok(())
-                            }
-                        }
-
-                        Err(err) => {
-                            warn!(
-                                "{}: link {link_id} authorization failed: {err}",
-                                task_asm.system_name
-                            );
-
-                            if task_asm
-                                .process_link_state_event(link_id, LinkEvent::Reset)
-                                .is_err()
-                            {
-                                Err(())
-                            } else {
-                                Ok(())
-                            }
-                        }
-                    }
-                });
-
-                Ok(())
+                    Ok(())
+                }
             }
             (_, _) => Err(LinkStateError::InvalidOperation(
                 "Discarded unsolicited register address request".to_string(),
