@@ -483,11 +483,21 @@ pub fn substrate_ingress(
             }
             None => {
                 // Either no security association on link, or it is not yet established.
+                warn!(
+                    "{}: INSECURE, no SA on link {}",
+                    asm.system_name,
+                    pkt.metadata().ingress_link_id
+                );
                 secure = false;
             }
         },
         None => {
             // No link in peer table
+            warn!(
+                "{}: INSECURE, no link in peer table for {}",
+                asm.system_name,
+                pkt.metadata().ingress_link_id
+            );
             secure = false;
         }
     };
@@ -504,6 +514,11 @@ pub fn substrate_ingress(
             drop_and_count(asm, pkt, CounterType::UnknownZpi);
             return;
         }
+        warn!(
+            "{}: INSECURE, decrypting null packet from {}",
+            asm.system_name,
+            pkt.metadata().ingress_link_id
+        );
         match decrypt_null(&mut pkt) {
             Ok(()) => (),
             Err(err) => {
