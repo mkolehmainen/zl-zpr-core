@@ -62,13 +62,13 @@ pub async fn send_hello_request(asm: &Assembly, link_id: zpr::LinkId) -> Result<
                 return Err(());
             };
             let status = hdr.status;
-            debug!("Received HelloResponse, status: {}", status);
+            debug!("Received HelloResponse, status: {status}");
             asm.buffer_stack.put_buffer(hello_res.destroy());
             Ok(())
         }
 
         Err(err) => {
-            warn!("{} error with HelloRequest", err);
+            warn!("{err} error with HelloRequest");
             Err(())
         }
     }
