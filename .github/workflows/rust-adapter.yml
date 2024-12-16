@@ -25,6 +25,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        cache-workspaces: |
+          adapter/ph
+          adapter/ph-debug
+          zpr-ext
+          cslab
+          cbpf-rs
 
     - name: Install Deps
       timeout-minutes: 2
@@ -62,6 +70,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        cache-workspaces: |
+          adapter/ph
+          adapter/ph-debug
+          zpr-ext
+          cslab
+          cbpf-rs
+
     - name: Build + test ph
       timeout-minutes: 5
       run: |
@@ -75,6 +92,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        cache-workspaces: |
+          adapter/ph
+          adapter/ph-debug
+          zpr-ext
+          cslab
+          cbpf-rs
     - name: Check format
       timeout-minutes: 5
       run: |
@@ -86,6 +111,14 @@ jobs:
     runs-on: ubuntu-latest
     steps: 
     - uses: actions/checkout@v4
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        cache-workspaces: |
+          adapter/ph
+          adapter/ph-debug
+          zpr-ext
+          cslab
+          cbpf-rs
     - name: Check warnings 
       timeout-minutes: 5
       run: |
@@ -98,6 +131,14 @@ jobs:
     runs-on: ubuntu-latest
     steps: 
     - uses: actions/checkout@v4
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        cache-workspaces: |
+          adapter/ph
+          adapter/ph-debug
+          zpr-ext
+          cslab
+          cbpf-rs
     - name: Check test warnings
       timeout-minutes: 5
       run: |
@@ -111,6 +152,14 @@ jobs:
     runs-on: ubuntu-latest
     steps: 
     - uses: actions/checkout@v4
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        cache-workspaces: |
+          adapter/ph
+          adapter/ph-debug
+          zpr-ext
+          cslab
+          cbpf-rs
     - name: Check test warnings
       timeout-minutes: 10
       run: |
@@ -125,8 +174,16 @@ jobs:
   capture-integration-test:
     needs: [ph-build, ph-debug-build]
     runs-on: ubuntu-latest
-    steps: 
+    steps:
     - uses: actions/checkout@v4
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        cache-workspaces: |
+          adapter/ph
+          adapter/ph-debug
+          zpr-ext
+          cslab
+          cbpf-rs
     - name: Check test warnings
       timeout-minutes: 10
       run: |
