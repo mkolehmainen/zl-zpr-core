@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Duration};
@@ -58,19 +57,11 @@ pub enum VSOutput {
     PingSuccess(u64, u64), // (CONFIG_ID, POLICY_VERSION)
 }
 
-#[derive(Clone)]
 pub struct VSConn {
-    shared: Arc<Shared>,
-}
-
-struct Shared {
-    state: Mutex<State>,
-}
-
-struct State {
     service_addr: String, // visa service address, format "HOST:PORT"
     node_cert_pem_data: String,
-    cmd_tx: Option<mpsc::Sender<VSCommand>>,
+    cmd_tx: mpsc::Sender<VSCommand>,
+    cmd_rx: mpsc::Receiver<VSCommand>,
     output_tx: mpsc::Sender<VSOutput>,
     client_fac: vscli::VSClientFactory,
     vss_service_addr: SocketAddr, // visa support service listen address
@@ -148,25 +139,25 @@ impl VSConn {
         let vss_service_addr =
             vss_service_addr.unwrap_or_else(|| SocketAddr::new(node_zpr_addr, DEFAULT_VSS_PORT));
 
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                service_addr: service_addr.to_string(),
-                node_cert_pem_data: cert_pem_data,
-                cmd_tx: None,
-                output_tx: output_tx,
-                client_fac: vscli::default_vsclient_factory,
-                vss_service_addr,
-                agent: node_agent,
-            }),
-        });
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
 
-        Ok(VSConn { shared })
+        let vs_conn = VSConn {
+            service_addr: service_addr.to_string(),
+            node_cert_pem_data: cert_pem_data,
+            cmd_tx,
+            cmd_rx,
+            output_tx,
+            client_fac: vscli::default_vsclient_factory,
+            vss_service_addr,
+            agent: node_agent,
+        };
+
+        Ok(vs_conn)
     }
 
     #[cfg(test)]
-    fn set_client_factory(&self, fac: vscli::VSClientFactory) {
-        let mut state = self.shared.state.lock().unwrap();
-        state.client_fac = fac;
+    fn set_client_factory(&mut self, fac: vscli::VSClientFactory) {
+        self.client_fac = fac;
     }
 
     /// Registers with visa service and obtains an API key.
@@ -174,20 +165,12 @@ impl VSConn {
     fn initialize(&self, client: &mut Box<dyn VSClientI>) -> Result<(), VSError> {
         debug!(target: VS_RPC, "VSConn::initialize starts");
 
-        let pem_data: String;
-        let vss_svc_addr;
-        let agnt: vsapi::Agent;
-        {
-            let state = self.shared.state.lock().unwrap();
-            pem_data = state.node_cert_pem_data.clone();
-            vss_svc_addr = state.vss_service_addr;
-            agnt = state.agent.clone();
-        }
-
-        let _apikey = match client.authenticate(agnt, &pem_data, vss_svc_addr) {
-            Ok(k) => k,
-            Err(e) => return Err(e.into()),
-        };
+        let _apikey =
+            match client.authenticate(&self.agent, &self.node_cert_pem_data, self.vss_service_addr)
+            {
+                Ok(k) => k,
+                Err(e) => return Err(e.into()),
+            };
 
         Ok(())
     }
@@ -197,23 +180,11 @@ impl VSConn {
     ///
     /// This little run loop is fairly basic: all requests of the visa service run one at a time and
     /// in order.
-    pub async fn run(&self, ctok: CancellationToken) -> Result<(), VSError> {
-        info!(target: VS_RPC, "run starts");
-
-        let (tx, mut rx) = mpsc::channel(16);
-        let fac: vscli::VSClientFactory;
-        let service_addr: String;
-        let output_tx: mpsc::Sender<VSOutput>;
-        {
-            let mut state = self.shared.state.lock().unwrap(); // TAKES LOCK (drops when state goes out of scope)
-            state.cmd_tx = Some(tx.clone());
-            output_tx = state.output_tx.clone();
-            fac = state.client_fac.clone();
-            service_addr = state.service_addr.clone();
-        }
+    pub async fn run(&mut self, ctok: CancellationToken) -> Result<(), VSError> {
+        info!(target: VS_RPC, "VSConn::run starts");
 
         // All use of the client is in our little loop. So we honor its non-multithreaded aspect.
-        let mut client = match (fac)(&service_addr) {
+        let mut client = match (self.client_fac)(&self.service_addr) {
             Ok(c) => c,
             Err(e) => return Err(e.into()),
         };
@@ -229,7 +200,7 @@ impl VSConn {
                     match client.ping_vs() {
                         Ok(ping_resp) => {
                             ping_errors = 0;
-                            match output_tx.send(VSOutput::PingSuccess(ping_resp.configuration.unwrap() as u64, ping_resp.policy_version.unwrap() as u64)).await {
+                            match self.output_tx.send(VSOutput::PingSuccess(ping_resp.configuration.unwrap() as u64, ping_resp.policy_version.unwrap() as u64)).await {
                                 Ok(_) => {}
                                 Err(e) => {
                                     error!(target: VS_RPC, "failed to send ping success message: {e}");
@@ -256,12 +227,12 @@ impl VSConn {
                 }
 
                 // Handle one of the "async" requests.
-                Some(cmd) = rx.recv() => {
+                Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
                         // send errors simply mean requestor ignored reply; ignore them
-                        VSCommand::RequestVisa(req, resp_chan) => { let _ = resp_chan.send(self.handle_request_visa(&mut client, req)); },
-                        VSCommand::AuthorizeConnect(cr, resp_chan) => { let _ = resp_chan.send(self.handle_authorize_connect(&mut client, cr)); },
-                        VSCommand::AgentDisconnect(ipa, resp_chan) => { let _ = resp_chan.send(self.handle_agent_disconnect(&mut client, ipa)); },
+                        VSCommand::RequestVisa(req, resp_chan) => { let _ = resp_chan.send(Self::handle_request_visa(&mut client, req)); },
+                        VSCommand::AuthorizeConnect(cr, resp_chan) => { let _ = resp_chan.send(Self::handle_authorize_connect(&mut client, cr)); },
+                        VSCommand::AgentDisconnect(ipa, resp_chan) => { let _ = resp_chan.send(Self::handle_agent_disconnect(&mut client, ipa)); },
                     }
                 }
             }
@@ -270,7 +241,6 @@ impl VSConn {
     }
 
     fn handle_request_visa(
-        &self,
         client: &mut Box<dyn VSClientI>,
         req: VisaRequest,
     ) -> VisaRequestResponse {
@@ -284,7 +254,6 @@ impl VSConn {
     }
 
     fn handle_authorize_connect(
-        &self,
         client: &mut Box<dyn VSClientI>,
         cr: vsapi::ConnectRequest,
     ) -> AuthorizeConnectResponse {
@@ -297,11 +266,7 @@ impl VSConn {
         }
     }
 
-    fn handle_agent_disconnect(
-        &self,
-        client: &mut Box<dyn VSClientI>,
-        ipa: IpAddr,
-    ) -> DisconnectStatus {
+    fn handle_agent_disconnect(client: &mut Box<dyn VSClientI>, ipa: IpAddr) -> DisconnectStatus {
         match client.agent_disconnect(ipa) {
             Ok(_) => Ok(()),
             Err(e) => {
@@ -311,22 +276,24 @@ impl VSConn {
         }
     }
 
+    /// Creates a handle which can be used to issue commands to this connection.
+    pub fn handle(&self) -> VSConnHandle {
+        VSConnHandle {
+            cmd_tx: self.cmd_tx.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct VSConnHandle {
+    cmd_tx: mpsc::Sender<VSCommand>,
+}
+
+impl VSConnHandle {
     /// Attempt to enqueue an async command to the runloop.
     /// Returns an error if the command could not be enqueued.
     async fn send_command(&self, cmd: VSCommand) -> Result<(), VSClientError> {
-        // Extract the tx channel from the state, but must do so without keeping lock across the await later.
-        let tx_chan: mpsc::Sender<VSCommand>;
-        {
-            let state = self.shared.state.lock().unwrap(); // TAKES LOCK (drops when state goes out of scope)
-            if let Some(tx) = &state.cmd_tx {
-                tx_chan = tx.clone();
-            } else {
-                error!(target: VS_RPC, "VSConn::send_command called but no command channel available");
-                return Err(VSClientError::ConnClosed);
-            }
-        }
-
-        if let Err(e) = tx_chan.send(cmd).await {
+        if let Err(e) = self.cmd_tx.send(cmd).await {
             error!(target: VS_RPC, "VSConn::send_command failed to queue: {e}");
             return Err(VSClientError::ConnClosed);
         }
@@ -505,7 +472,7 @@ s5JVZ48=
     impl VSClientI for TestVSCli {
         fn authenticate(
             &mut self,
-            _agent: vsapi::Agent,
+            _agent: &vsapi::Agent,
             _cert_pem_data: &str,
             _vss_service_addr: SocketAddr,
         ) -> Result<String, VSClientError> {
@@ -613,7 +580,7 @@ s5JVZ48=
         claims.insert(String::from("foo"), String::from("fee"));
         let agnt = new_node_agent(node_addr, "n0", &claims);
 
-        let conn = VSConn::new(
+        let mut conn = VSConn::new(
             agnt,
             tx,
             "127.0.0.1:0",
@@ -656,7 +623,7 @@ s5JVZ48=
         claims.insert(String::from("foo"), String::from("fee"));
         let agnt = new_node_agent(node_addr, "n0", &claims);
 
-        let conn = VSConn::new(
+        let mut conn = VSConn::new(
             agnt,
             tx,
             "127.0.0.1:0",
@@ -670,9 +637,9 @@ s5JVZ48=
 
         let ctoken = CancellationToken::new();
         let vs_tok = ctoken.clone();
-        let sp_conn = conn.clone();
+        let conn_handle = conn.handle();
         tokio::spawn(async move {
-            let _ = sp_conn.run(vs_tok).await;
+            let _ = conn.run(vs_tok).await;
         });
 
         // Should get a ping message
@@ -693,7 +660,7 @@ s5JVZ48=
             l3_type: zpr::L3Type::Ipv4,
             packet: vec![1, 2, 3, 4],
         };
-        let resp = conn.request_visa(req);
+        let resp = conn_handle.request_visa(req);
 
         match timeout(Duration::from_millis(100), resp).await {
             Ok(resp) => {
@@ -717,7 +684,7 @@ s5JVZ48=
                 packet: vec![1, 2, 3, 4],
             };
             set_next_error(VSClientError::NoAPIKey);
-            let resp = conn.request_visa(req);
+            let resp = conn_handle.request_visa(req);
             match timeout(Duration::from_millis(100), resp).await {
                 Ok(resp) => {
                     assert!(matches!(resp.unwrap_err(), VSClientError::NoAPIKey));
@@ -745,7 +712,7 @@ s5JVZ48=
         claims.insert(String::from("foo"), String::from("fee"));
         let agnt = new_node_agent(node_addr, "n0", &claims);
 
-        let conn = VSConn::new(
+        let mut conn = VSConn::new(
             agnt,
             tx,
             "127.0.0.1:0",
@@ -759,9 +726,9 @@ s5JVZ48=
 
         let ctoken = CancellationToken::new();
         let vs_tok = ctoken.clone();
-        let sp_conn = conn.clone();
+        let conn_handle = conn.handle();
         tokio::spawn(async move {
-            let _ = sp_conn.run(vs_tok).await;
+            let _ = conn.run(vs_tok).await;
         });
 
         // Should get a ping message
@@ -788,7 +755,7 @@ s5JVZ48=
             challenge: Some(vec![1, 2, 3, 4]),
             challenge_responses: Some(vec![vec![5, 6, 7, 8]]),
         };
-        let resp = conn.authorize_connect(req);
+        let resp = conn_handle.authorize_connect(req);
 
         match timeout(Duration::from_millis(100), resp).await {
             Ok(resp) => {
@@ -815,7 +782,7 @@ s5JVZ48=
                 challenge_responses: None,
             };
             set_next_error(VSClientError::NoAPIKey);
-            let resp = conn.authorize_connect(req);
+            let resp = conn_handle.authorize_connect(req);
             match timeout(Duration::from_millis(100), resp).await {
                 Ok(resp) => {
                     assert!(matches!(resp.unwrap_err(), VSClientError::NoAPIKey));
@@ -843,7 +810,7 @@ s5JVZ48=
         claims.insert(String::from("foo"), String::from("fee"));
         let agnt = new_node_agent(node_addr, "n0", &claims);
 
-        let conn = VSConn::new(
+        let mut conn = VSConn::new(
             agnt,
             tx,
             "127.0.0.1:0",
@@ -857,9 +824,9 @@ s5JVZ48=
 
         let ctoken = CancellationToken::new();
         let vs_tok = ctoken.clone();
-        let sp_conn = conn.clone();
+        let conn_handle = conn.handle();
         tokio::spawn(async move {
-            let _ = sp_conn.run(vs_tok).await;
+            let _ = conn.run(vs_tok).await;
         });
 
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -879,7 +846,7 @@ s5JVZ48=
 
         assert_eq!(get_counter(CounterT::AgentDisconnect), 0);
 
-        let resp = conn.agent_disconnect(node_addr);
+        let resp = conn_handle.agent_disconnect(node_addr);
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -895,7 +862,7 @@ s5JVZ48=
 
         // Run disconnect again check that we get the error:
         set_next_error(VSClientError::NoAPIKey);
-        let resp = conn.agent_disconnect(node_addr);
+        let resp = conn_handle.agent_disconnect(node_addr);
 
         match timeout(Duration::from_millis(100), resp).await {
             Ok(resp) => {
