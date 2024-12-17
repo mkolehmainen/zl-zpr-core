@@ -1,6 +1,5 @@
 #!/usr/bin/bash
 set -euo pipefail
-
 PH_BIN=$(realpath "$(dirname $0)/../adapter/ph/target/debug/ph")
 PH_DEBUG_BIN=$(realpath "$(dirname $0)/../adapter/ph-debug/target/debug/ph-debug")
 VS_BIN=$(realpath "$(dirname $0)/../visaservice/core/build/vservice")

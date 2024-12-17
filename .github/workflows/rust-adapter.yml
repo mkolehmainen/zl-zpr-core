@@ -25,6 +25,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          adapter/ph
+          adapter/ph-debug
+          zpr-ext
+          cslab
+          cbpf-rs
 
     - name: Install Deps
       timeout-minutes: 2
@@ -62,6 +70,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          adapter/ph
+          adapter/ph-debug
+          zpr-ext
+          cslab
+          cbpf-rs
+
     - name: Build + test ph
       timeout-minutes: 5
       run: |
@@ -111,7 +128,16 @@ jobs:
     runs-on: ubuntu-latest
     steps: 
     - uses: actions/checkout@v4
-    - name: Check test warnings
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          adapter/ph
+          adapter/ph-debug
+          zpr-ext
+          cslab
+          cbpf-rs
+
+    - name: Build
       timeout-minutes: 10
       run: |
         sudo apt update
@@ -120,14 +146,27 @@ jobs:
         make ph
         make visaservice
         cargo build --manifest-path adapter/ph-debug/Cargo.toml
+
+    - name: One Node v6 Test
+      timeout-minutes: 10
+      run: |
         ZPR_TEST_VERBOSE=1 integration-test/one-node-v6-test.sh
 
   capture-integration-test:
     needs: [ph-build, ph-debug-build]
     runs-on: ubuntu-latest
-    steps: 
+    steps:
     - uses: actions/checkout@v4
-    - name: Check test warnings
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          adapter/ph
+          adapter/ph-debug
+          zpr-ext
+          cslab
+          cbpf-rs
+
+    - name: Build
       timeout-minutes: 10
       run: |
         sudo apt update
@@ -136,4 +175,8 @@ jobs:
         make ph
         make visaservice
         cargo build --manifest-path adapter/ph-debug/Cargo.toml
+
+    - name: Capture Test
+      timeout-minutes: 10
+      run: |
         ZPR_TEST_VERBOSE=1 integration-test/capture-test.sh
