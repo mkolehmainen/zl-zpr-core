@@ -25,9 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - uses: actions-rust-lang/setup-rust-toolchain@v1
+    - uses: Swatinem/rust-cache@v2
       with:
-        cache-workspaces: |
+        workspaces: |
           adapter/ph
           adapter/ph-debug
           zpr-ext
@@ -70,9 +70,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - uses: actions-rust-lang/setup-rust-toolchain@v1
+    - uses: Swatinem/rust-cache@v2
       with:
-        cache-workspaces: |
+        workspaces: |
           adapter/ph
           adapter/ph-debug
           zpr-ext
@@ -92,14 +92,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        cache-workspaces: |
-          adapter/ph
-          adapter/ph-debug
-          zpr-ext
-          cslab
-          cbpf-rs
     - name: Check format
       timeout-minutes: 5
       run: |
@@ -111,14 +103,6 @@ jobs:
     runs-on: ubuntu-latest
     steps: 
     - uses: actions/checkout@v4
-    - uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        cache-workspaces: |
-          adapter/ph
-          adapter/ph-debug
-          zpr-ext
-          cslab
-          cbpf-rs
     - name: Check warnings 
       timeout-minutes: 5
       run: |
@@ -131,14 +115,6 @@ jobs:
     runs-on: ubuntu-latest
     steps: 
     - uses: actions/checkout@v4
-    - uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        cache-workspaces: |
-          adapter/ph
-          adapter/ph-debug
-          zpr-ext
-          cslab
-          cbpf-rs
     - name: Check test warnings
       timeout-minutes: 5
       run: |
@@ -152,15 +128,16 @@ jobs:
     runs-on: ubuntu-latest
     steps: 
     - uses: actions/checkout@v4
-    - uses: actions-rust-lang/setup-rust-toolchain@v1
+    - uses: Swatinem/rust-cache@v2
       with:
-        cache-workspaces: |
+        workspaces: |
           adapter/ph
           adapter/ph-debug
           zpr-ext
           cslab
           cbpf-rs
-    - name: Check test warnings
+
+    - name: Build
       timeout-minutes: 10
       run: |
         sudo apt update
@@ -169,6 +146,10 @@ jobs:
         make ph
         make visaservice
         cargo build --manifest-path adapter/ph-debug/Cargo.toml
+
+    - name: One Node v6 Test
+      timeout-minutes: 10
+      run: |
         ZPR_TEST_VERBOSE=1 integration-test/one-node-v6-test.sh
 
   capture-integration-test:
@@ -176,15 +157,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - uses: actions-rust-lang/setup-rust-toolchain@v1
+    - uses: Swatinem/rust-cache@v2
       with:
-        cache-workspaces: |
+        workspaces: |
           adapter/ph
           adapter/ph-debug
           zpr-ext
           cslab
           cbpf-rs
-    - name: Check test warnings
+
+    - name: Build
       timeout-minutes: 10
       run: |
         sudo apt update
@@ -193,4 +175,8 @@ jobs:
         make ph
         make visaservice
         cargo build --manifest-path adapter/ph-debug/Cargo.toml
+
+    - name: Capture Test
+      timeout-minutes: 10
+      run: |
         ZPR_TEST_VERBOSE=1 integration-test/capture-test.sh
