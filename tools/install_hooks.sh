@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Tool to install the git pre-commit hooks. Can be run from any directory.
 
 HOOKS="pre-commit"

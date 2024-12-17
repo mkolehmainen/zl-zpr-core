@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 # Git pre-commit hooks. Checks to ensure code is formatted and compiles without warnings
 # when a user tries to commit. Can be over-ruled by running git commit with --no-verify
