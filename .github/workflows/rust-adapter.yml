@@ -24,8 +24,8 @@ jobs:
   ph-build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: Swatinem/rust-cache@v2
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+    - uses: Swatinem/rust-cache@91863c7bb91512f5b1911a1095863bde3deb5670 # v2
       with:
         workspaces: |
           adapter/ph
@@ -69,8 +69,8 @@ jobs:
   ph-debug-build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: Swatinem/rust-cache@v2
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+    - uses: Swatinem/rust-cache@91863c7bb91512f5b1911a1095863bde3deb5670 # v2
       with:
         workspaces: |
           adapter/ph
@@ -91,7 +91,7 @@ jobs:
     needs: [ph-debug-build]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
     - name: Check format
       timeout-minutes: 5
       run: |
@@ -102,7 +102,7 @@ jobs:
     needs: [ph-debug-build]
     runs-on: ubuntu-latest
     steps: 
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
     - name: Check warnings 
       timeout-minutes: 5
       run: |
@@ -114,7 +114,7 @@ jobs:
     needs: [ph-debug-build]
     runs-on: ubuntu-latest
     steps: 
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
     - name: Check test warnings
       timeout-minutes: 5
       run: |
@@ -127,8 +127,8 @@ jobs:
     needs: [ph-build, ph-debug-build]
     runs-on: ubuntu-latest
     steps: 
-    - uses: actions/checkout@v4
-    - uses: Swatinem/rust-cache@v2
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+    - uses: Swatinem/rust-cache@91863c7bb91512f5b1911a1095863bde3deb5670 # v2
       with:
         workspaces: |
           adapter/ph
@@ -156,8 +156,8 @@ jobs:
     needs: [ph-build, ph-debug-build]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: Swatinem/rust-cache@v2
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+    - uses: Swatinem/rust-cache@91863c7bb91512f5b1911a1095863bde3deb5670 # v2
       with:
         workspaces: |
           adapter/ph

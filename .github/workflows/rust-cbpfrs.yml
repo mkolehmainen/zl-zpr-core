@@ -19,7 +19,7 @@ jobs:
   cbpf-build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
     - name: Build + test cbpf
       timeout-minutes: 5
       run: |
@@ -32,7 +32,7 @@ jobs:
     needs: [cbpf-build]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
     - name: Check format
       timeout-minutes: 5
       run: |
@@ -43,7 +43,7 @@ jobs:
     needs: [cbpf-build]
     runs-on: ubuntu-latest
     steps: 
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
     - name: Check warnings
       timeout-minutes: 5
       run: |
@@ -54,7 +54,7 @@ jobs:
     needs: [cbpf-build]
     runs-on: ubuntu-latest
     steps: 
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
     - name: Check test warnings
       timeout-minutes: 5
       run: |
