@@ -56,7 +56,7 @@ impl ArgError for str {
 ///    sudo ./ph adapter -c adapter_config.toml --node-addr 10.1.0.8:12345
 ///
 /// Eg, override the name of the node (which may or may not be also set in the config file):
-///    sudo ./ph node -c node_config.toml --name node0
+///    sudo ./ph node -c node_config.toml
 ///
 #[derive(Debug, Parser)]
 #[command(version, verbatim_doc_comment)]
@@ -67,10 +67,6 @@ struct Control {
 
 #[derive(Args, Debug)]
 pub struct CommonArgs {
-    /// Optional, identifying name for instance (defaults to "adapter" or "node" depending on mode)
-    #[arg(short = 'n', long)]
-    name: Option<String>,
-
     /// Unix domain socket path for the "control" interface
     #[arg(long, value_name = "DOMAIN_SOCKET_PATH")]
     control_path: Option<String>,
@@ -168,7 +164,6 @@ fn get_data_home() -> PathBuf {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            name: "".to_string(),
             control_path: get_data_home().join("control.sock"),
             self_addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0),
             ca_file: PathBuf::from(""),
@@ -204,7 +199,6 @@ impl Config {
         common: &CommonArgs,
     ) -> Result<Self, ArgsError> {
         let mut config = Config::default();
-        config.name = "adapter".to_string();
         // fold in anything from the config file:
         if let Some(config_file) = config_file {
             let base_dir = config_file.config_path.parent().unwrap();
@@ -220,7 +214,6 @@ impl Config {
         common: &CommonArgs,
     ) -> Result<Self, ArgsError> {
         let mut config = Config::default();
-        config.name = "node".to_string();
         // fold in anything from the config file:
         if let Some(config_file) = config_file {
             let base_dir = config_file.config_path.parent().unwrap();
@@ -233,10 +226,6 @@ impl Config {
     // Check that the required bits are present based on mode.
     // Also checks that the various files exist.
     fn check_valid(&self, mode: PhMode) -> Result<(), ArgsError> {
-        if self.name.is_empty() {
-            // return Err(MissingArgError("name"));
-            return Err("name".arg_missing());
-        }
         if self.control_path.to_str().unwrap().is_empty() {
             return Err("control_path".arg_missing());
         }
@@ -289,9 +278,6 @@ impl Config {
         config: &GlobalConfigSection,
         base_dir: &Path,
     ) -> Result<(), ArgsError> {
-        if let Some(name) = &config.name {
-            self.name = name.clone();
-        }
         if let Some(control_path) = &config.control_path {
             if control_path.is_relative() {
                 self.control_path = base_dir.join(control_path);
@@ -359,9 +345,6 @@ impl Config {
 
     // Overwrite our internal state with the values present in the CommonArgs (from command line)
     fn set_from_common(&mut self, common: &CommonArgs) -> Result<(), ArgsError> {
-        if let Some(name) = &common.name {
-            self.name = name.clone();
-        }
         if let Some(control_path) = &common.control_path {
             let cp = PathBuf::from(control_path);
             if cp.is_relative() {
@@ -451,7 +434,6 @@ struct NodeConfig {
 // Global section is shared by nodes and adapters.
 #[derive(Deserialize, Debug, Clone)]
 struct GlobalConfigSection {
-    name: Option<String>,
     control_path: Option<PathBuf>,
     self_addr: Option<SocketAddr>,
     ca_file: Option<PathBuf>,
@@ -637,7 +619,6 @@ mod test {
     fn test_main_args_load_config_adapter() {
         let tomltxt = r#"
         [global]
-        name = "adapter0"
         control_path = "/var/run/zpr/control.sock"
         self_addr = "192.168.0.1:12345"
         ca_file = "tests/ca.pem"
@@ -657,7 +638,6 @@ mod test {
 
         let config: AdapterConfig = load_config(tmpfile.get_path()).unwrap();
 
-        assert_eq!(config.global.name, Some("adapter0".to_string()));
         assert_eq!(
             config.global.control_path,
             Some(PathBuf::from("/var/run/zpr/control.sock"))
@@ -705,7 +685,6 @@ mod test {
     fn test_main_args_load_config_node() {
         let tomltxt = r#"
         [global]
-        name = "node0"
         control_path = "/var/run/zpr/control.sock"
         self_addr = "192.168.0.1:12345"
         ca_file = "tests/ca.pem"
@@ -720,7 +699,6 @@ mod test {
 
         let config: NodeConfig = load_config(tmpfile.get_path()).unwrap();
 
-        assert_eq!(config.global.name, Some("node0".to_string()));
         assert_eq!(
             config.global.control_path,
             Some(PathBuf::from("/var/run/zpr/control.sock"))
@@ -750,7 +728,6 @@ mod test {
     fn test_main_args_argparse_adapter_config() {
         let mut tomltxt = r#"
         [global]
-        name = "adapter0"
         control_path = "$CONTROLFILE"
         self_addr = "192.168.0.1:12345"
         ca_file = "$CAFILE"
@@ -782,20 +759,12 @@ mod test {
 
         let tmpfile = TempFile::new_toml(&tomltxt);
 
-        let args = vec![
-            "ph",
-            "adapter",
-            "-c",
-            tmpfile.get_path().to_str().unwrap(),
-            "-n",
-            "a0",
-        ];
+        let args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
 
         let (pmode, config) = argparse(Some(args)).unwrap();
 
         assert_eq!(pmode, PhMode::Adapter);
 
-        assert_eq!(config.name, "a0".to_string());
         assert_eq!(config.control_path, control_file.get_path());
         assert_eq!(
             config.self_addr,
@@ -829,7 +798,6 @@ mod test {
     fn test_main_args_adapter_config_requires_adapter_section() {
         let tomltxt = r#"
         [global]
-        name = "adapter0"
         control_path = "/var/run/zpr/control.sock"
         self_addr = "192.168.0.1:12345"
         ca_file = "tests/ca.pem"
@@ -840,14 +808,7 @@ mod test {
 
         let tmpfile = TempFile::new_toml(&tomltxt);
 
-        let args = vec![
-            "ph",
-            "adapter",
-            "-c",
-            tmpfile.get_path().to_str().unwrap(),
-            "-n",
-            "a0",
-        ];
+        let args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
         match argparse(Some(args)) {
             Err(ArgsError::ParseError(_)) => {}
             _ => panic!("Expected ParseError"),
@@ -860,7 +821,6 @@ mod test {
     fn test_main_args_adapter_config_blank_adapter() {
         let mut tomltxt = r#"
         [global]
-        name = "adapter0"
         control_path = "/tmp/control.sock"
         self_addr = "192.168.0.1:12345"
         ca_file = "$CAFILE"
@@ -971,7 +931,6 @@ mod test {
 
         assert_eq!(pmode, PhMode::Adapter);
 
-        assert_eq!(config.name, "adapter".to_string());
         assert_eq!(config.control_path, control_file.get_path());
         assert_eq!(
             config.self_addr,
@@ -1037,7 +996,6 @@ mod test {
 
         assert_eq!(pmode, PhMode::Adapter);
 
-        assert_eq!(config.name, "adapter".to_string());
         assert!(!config.control_path.to_string_lossy().is_empty());
         assert_eq!(
             config.self_addr,
@@ -1097,7 +1055,6 @@ mod test {
 
         assert_eq!(pmode, PhMode::Node);
 
-        assert_eq!(config.name, "node".to_string());
         assert!(!config.control_path.to_string_lossy().is_empty());
         assert_eq!(
             config.self_addr,
@@ -1140,7 +1097,6 @@ mod test {
 
         assert_eq!(pmode, PhMode::Node);
 
-        assert_eq!(config.name, "node".to_string());
         assert!(!config.control_path.to_string_lossy().is_empty());
         assert_eq!(
             config.self_addr,
