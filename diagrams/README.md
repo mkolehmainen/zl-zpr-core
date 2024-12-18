@@ -10,7 +10,7 @@ Then, set up a shell script wrapper to execute this jar file named
 `plantuml`.  The contents can be as simple as:
 
 ```sh
-#!/bin/sh
+#!/usr/bin/env bash
 exec java -jar /path/to/plantuml-xxx.jar "$@"
 ```
 
