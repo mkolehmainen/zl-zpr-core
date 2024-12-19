@@ -11,6 +11,7 @@ package doc
 import (
 	"fmt"
 	"math"
+	"net/netip"
 	"reflect"
 	"strconv"
 
@@ -462,6 +463,32 @@ func NewZplString(input interface{}) (ZplString, error) {
 // MustNewZplString is just like NewZplString but panics if construction fails.
 func MustNewZplString(input interface{}) ZplString {
 	z, err := NewZplString(input)
+	if err != nil {
+		panic(err)
+	}
+	return z
+}
+
+func NewIPv6Address(input interface{}) (ZplString, error) {
+	addr, err := NewZplString(input)
+	if err != nil {
+		return addr, err
+	}
+	// Special case for IPv4 addresses, reformat them as IPv4-in-IPv6.
+	if ipa, err := netip.ParseAddr(addr.String()); err != nil {
+		// Return possible error from ParseAddr if input is not an IP.
+		return ZplString{}, ZplScalarErrorf(addr, "invalid service address: %w", err)
+	} else {
+		if ipa.Is4() {
+			return NewZplString(fmt.Sprintf("::ffff:%s", addr.String()))
+		}
+	}
+
+	return addr, nil
+}
+
+func MustNewIPv6Address(input interface{}) ZplString {
+	z, err := NewIPv6Address(input)
 	if err != nil {
 		panic(err)
 	}

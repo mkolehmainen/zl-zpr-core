@@ -956,7 +956,7 @@ func parseDSEndpointGeneral(epPath []yt.Node, allServices map[string]*doc.Scopin
 				return nil, err
 			}
 		case "address": // optional
-			if ep.Address, err = doc.NewZplString(childPath); err != nil {
+			if ep.Address, err = doc.NewIPv6Address(childPath); err != nil {
 				return nil, err
 			}
 			if err = doc.AssertValidZPRAddress(ep.Address.String()); err != nil {
@@ -1385,7 +1385,7 @@ func (pps *PPState) makeVisaService(visaServiceAddress string) (*doc.Component, 
 		Desc:     doc.MustNewZplString("visa service"),
 		Provider: vs.Provider,
 		// Auth:
-		Address:      doc.MustNewZplString(visaServiceAddress),
+		Address:      doc.MustNewIPv6Address(visaServiceAddress),
 		SingleTenant: doc.MustNewZplBoolean(true),
 		Decorator:    doc.MustNewZplBoolean(false),
 	}
