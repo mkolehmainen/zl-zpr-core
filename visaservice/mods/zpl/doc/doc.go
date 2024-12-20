@@ -3,6 +3,7 @@ package doc
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"regexp"
 	"strings"
 	"time"
@@ -123,9 +124,9 @@ type Certificate struct {
 
 // Host is not currently used by ZPL parsing but is used elsewhere in the compiler.
 type Host struct {
-	Address  string // An IPv6 address or a hostname (may also be used in an "address" values below)
-	addrIP   net.IP // filled in by by parser
-	addrName string // filled in by parser
+	Address  string     // An IPv6 address or a hostname (may also be used in an "address" values below)
+	addrIP   netip.Addr // filled in by the parser
+	addrName string     // filled in by parser
 }
 
 type Communications struct {
@@ -233,12 +234,18 @@ type Constraint struct {
 // IP returns the IP address if an IP address was specified in the host entry, or
 // if resolution has already happened.  If host is just a name, then use h.Address
 func (h *Host) IP() net.IP {
-	return h.addrIP
+	return h.addrIP.AsSlice()
 }
 
-func (h *Host) SetAddrIP(ip net.IP) {
+// IPAsString Converts the IP into a string, preserving IPv4-in-IPv6 string notation (which net.IP drops).
+func (h *Host) IPAsString() string {
+	return h.addrIP.String()
+}
+
+func (h *Host) SetAddrIP(ip netip.Addr) {
 	h.addrIP = ip
 }
+
 func (h *Host) SetAddrName(name string) {
 	h.addrName = name
 }

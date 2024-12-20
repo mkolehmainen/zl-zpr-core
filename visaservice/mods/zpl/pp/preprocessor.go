@@ -1851,7 +1851,7 @@ func parseComponent(svcPath []yt.Node, allow *allowBlock, apply *applyBlock, fus
 			if len(svc.AddressSet) > 0 {
 				return nil, yt.PathErrorf(childPath, "cannot use both address and address_set")
 			}
-			if svc.Address, err = doc.NewZplString(childPath); err != nil {
+			if svc.Address, err = doc.NewIPv6Address(childPath); err != nil {
 				return nil, err
 			}
 			if err = doc.AssertValidZPRAddress(svc.Address.String()); err != nil {
@@ -1865,7 +1865,7 @@ func parseComponent(svcPath []yt.Node, allow *allowBlock, apply *applyBlock, fus
 				return nil, err
 			}
 			for _, addrPath := range childPathSeq(childPath) {
-				if addr, err := doc.NewZplString(addrPath); err != nil {
+				if addr, err := doc.NewIPv6Address(addrPath); err != nil {
 					return nil, err
 				} else if err = doc.AssertValidZPRAddress(addr.String()); err != nil {
 					return nil, doc.ZplScalarErrorf(addr, "invalid service address: %w", err)
