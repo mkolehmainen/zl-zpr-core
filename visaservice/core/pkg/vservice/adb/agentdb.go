@@ -66,7 +66,7 @@ func (db *AgentDB) Dump(out logr.Logger) {
 		if rec.node {
 			atype = "node"
 		}
-		out.Infof("  [ %s ]  =>  (%v)  agent: %v; providers: %#v", addr, atype, rec.Agent.String(), rec.Agent.GetProvides())
+		out.Infof("  [ %s ]  =>  (%v)  agent: %v; provides: %#v", addr, atype, rec.Agent.String(), rec.Agent.GetProvides())
 	}
 	out.Infof("===== dumping of agent database complete =====")
 }
@@ -112,9 +112,6 @@ func (db *AgentDB) AddNode(zprAddr, tetherAddr netip.Addr, agent *agent.Agent, a
 	rec.Peer.APIKey = apiKey
 	rec.Peer.VSSAddr = vssAddr
 
-	// TODO: Remove this.
-	fmt.Printf("Adding node record --> %#v", rec)
-
 	db.Lock()
 	db.agents[zprAddr] = &rec
 	db.Unlock()
@@ -133,9 +130,6 @@ func (db *AgentDB) AddAdapter(zprAddr, tetherAddr netip.Addr, agent *agent.Agent
 		ZPRAddr:    zprAddr,
 		TetherAddr: tetherAddr,
 	}
-
-	// TODO: Remove this.
-	fmt.Printf("Adding adapter record --> [%s] %#v", zprAddr.String(), rec.Agent.GetProvides())
 
 	db.Lock()
 	db.agents[zprAddr] = &rec

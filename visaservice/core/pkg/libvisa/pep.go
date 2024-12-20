@@ -53,6 +53,8 @@ func pepIdxForProto(p snip.Protocol) (uint32, error) {
 		return PEPDockTCP, nil
 	case snip.ProtocolUDP:
 		return PEPDockUDP, nil
+	case snip.ProtocolICMP4:
+		return PEPDockICMP, nil
 	case snip.ProtocolICMP6:
 		return PEPDockICMP, nil
 	default:

@@ -47,7 +47,7 @@ services:
   ping:
     icmp:
       type: request-response
-      type_codes: 0, 4
+      type_codes: 0, 8
 
 communications:
   systems:
