@@ -1928,10 +1928,15 @@ func parseComponent(svcPath []yt.Node, allow *allowBlock, apply *applyBlock, fus
 	if len(svc.Provider) > 0 && (len(svc.AddressSet) > 0 || !svc.Address.Empty()) {
 		for _, exp := range svc.Provider {
 			if exp.Key.AsString() == defs.KAttrEPID {
-				// Allow it only if the adress is the same as address setting.
+				// Allow it only if the address is the same as address setting.
 				if svc.Address.Empty() {
 					return nil, yt.PathErrorf(svcPath, "cannot use %v and address_set on %v", defs.KAttrEPID, svc.ID.AsString())
-				} else if exp.Value.String() != svc.Address.AsString() {
+				}
+				expValue, err := doc.NewIPv6Address(exp.Value.String())
+				if err != nil {
+					return nil, yt.PathErrorf(svcPath, "provider value %v must be an address %v", defs.KAttrEPID, svc.ID.AsString())
+				}
+				if expValue.String() != svc.Address.AsString() {
 					return nil, yt.PathErrorf(svcPath, "provider %v must match address for %v", defs.KAttrEPID, svc.ID.AsString())
 				}
 			}
