@@ -1851,7 +1851,7 @@ func parseComponent(svcPath []yt.Node, allow *allowBlock, apply *applyBlock, fus
 			if len(svc.AddressSet) > 0 {
 				return nil, yt.PathErrorf(childPath, "cannot use both address and address_set")
 			}
-			if svc.Address, err = doc.NewZplString(childPath); err != nil {
+			if svc.Address, err = doc.NewIPv6Address(childPath); err != nil {
 				return nil, err
 			}
 			if err = doc.AssertValidZPRAddress(svc.Address.String()); err != nil {
@@ -1865,7 +1865,7 @@ func parseComponent(svcPath []yt.Node, allow *allowBlock, apply *applyBlock, fus
 				return nil, err
 			}
 			for _, addrPath := range childPathSeq(childPath) {
-				if addr, err := doc.NewZplString(addrPath); err != nil {
+				if addr, err := doc.NewIPv6Address(addrPath); err != nil {
 					return nil, err
 				} else if err = doc.AssertValidZPRAddress(addr.String()); err != nil {
 					return nil, doc.ZplScalarErrorf(addr, "invalid service address: %w", err)
@@ -1928,10 +1928,15 @@ func parseComponent(svcPath []yt.Node, allow *allowBlock, apply *applyBlock, fus
 	if len(svc.Provider) > 0 && (len(svc.AddressSet) > 0 || !svc.Address.Empty()) {
 		for _, exp := range svc.Provider {
 			if exp.Key.AsString() == defs.KAttrEPID {
-				// Allow it only if the adress is the same as address setting.
+				// Allow it only if the address is the same as address setting.
 				if svc.Address.Empty() {
 					return nil, yt.PathErrorf(svcPath, "cannot use %v and address_set on %v", defs.KAttrEPID, svc.ID.AsString())
-				} else if exp.Value.String() != svc.Address.AsString() {
+				}
+				expValue, err := doc.NewIPv6Address(exp.Value.String())
+				if err != nil {
+					return nil, yt.PathErrorf(svcPath, "provider value %v must be an address %v", defs.KAttrEPID, svc.ID.AsString())
+				}
+				if expValue.String() != svc.Address.AsString() {
 					return nil, yt.PathErrorf(svcPath, "provider %v must match address for %v", defs.KAttrEPID, svc.ID.AsString())
 				}
 			}

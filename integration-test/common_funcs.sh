@@ -82,10 +82,6 @@ function create_network() {
   sudo ip -n zpr-a tuntap add name tun0 mode tun user "$ZPR_USER" multi_queue
   sudo ip -n zpr-b tuntap add name tun0 mode tun user "$ZPR_USER" multi_queue
 
-  # (no IPv4 ZPR address for the VS)
-  #sudo ip -n zpr-a addr add "$A_ZPR_ADDR" peer "$B_ZPR_ADDR" dev tun0
-  #sudo ip -n zpr-b addr add "$B_ZPR_ADDR" peer "$A_ZPR_ADDR" dev tun0
-
   sudo ip -n zpr-node link set tun0 up
   sudo ip -n zpr-vs link set tun0 up
   sudo ip -n zpr-a link set tun0 up
@@ -94,10 +90,10 @@ function create_network() {
   # Kernel bug: kernels older than 6.10 don't set peer route correctly
   # when interface is down.  I think <https://github.com/torvalds/linux/commit/d0098e4c6b83e502cc1cd96d67ca86bc79a6c559>
   # fixes this issue.  For now, add the addresses after we bring the link up.
-  sudo ip -n zpr-node addr add "$NODE_ZPR_ADDR6" peer "$VS_ZPR_ADDR6" dev tun0
-  sudo ip -n zpr-vs addr add "$VS_ZPR_ADDR6" peer "$NODE_ZPR_ADDR6" dev tun0
-  sudo ip -n zpr-a addr add "$A_ZPR_ADDR6" peer "$B_ZPR_ADDR6" dev tun0
-  sudo ip -n zpr-b addr add "$B_ZPR_ADDR6" peer "$A_ZPR_ADDR6" dev tun0
+  sudo ip -n zpr-node addr add "$NODE_ZPR_ADDR" peer "$VS_ZPR_ADDR" dev tun0
+  sudo ip -n zpr-vs addr add "$VS_ZPR_ADDR" peer "$NODE_ZPR_ADDR" dev tun0
+  sudo ip -n zpr-a addr add "$A_ZPR_ADDR" peer "$B_ZPR_ADDR" dev tun0
+  sudo ip -n zpr-b addr add "$B_ZPR_ADDR" peer "$A_ZPR_ADDR" dev tun0
 }
 
 function destroy_network() {
@@ -144,15 +140,10 @@ EOF
 }
 
 function ping_test() {
-  sudo ip netns exec zpr-node ping -q -c 5 -w 5 "$VS_ZPR_ADDR6" & wait -f $!
-  sudo ip netns exec zpr-vs ping -q -c 5 -w 5 "$NODE_ZPR_ADDR6" & wait -f $!
-
-  # V4 currently does not work
-  #sudo ip netns exec zpr-a ping -q -c 5 -w 5 "$B_ZPR_ADDR" & wait -f $!
-  #sudo ip netns exec zpr-b ping -q -c 5 -w 5 "$A_ZPR_ADDR" & wait -f $!
-
-  sudo ip netns exec zpr-a ping -q -c 5 -w 5 "$B_ZPR_ADDR6" & wait -f $!
-  sudo ip netns exec zpr-b ping -q -c 5 -w 5 "$A_ZPR_ADDR6" & wait -f $!
+  sudo ip netns exec zpr-node ping -q -c 5 -w 5 "$VS_ZPR_ADDR" & wait -f $!
+  sudo ip netns exec zpr-vs ping -q -c 5 -w 5 "$NODE_ZPR_ADDR" & wait -f $!
+  sudo ip netns exec zpr-a ping -q -c 5 -w 5 "$B_ZPR_ADDR" & wait -f $!
+  sudo ip netns exec zpr-b ping -q -c 5 -w 5 "$A_ZPR_ADDR" & wait -f $!
 }
 
 function check_carrier() {

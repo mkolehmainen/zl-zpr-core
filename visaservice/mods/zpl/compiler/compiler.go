@@ -301,9 +301,9 @@ func (c *Compilation) resolve(host string) (string, error) {
 		c.hostTable[host] = entry
 	}
 	if entry.IP() == nil || entry.IP().IsUnspecified() {
-		if ipt := net.ParseIP(entry.Address); ipt != nil {
+		if ip, err := netip.ParseAddr(entry.Address); err == nil {
 			// If already an IP, great.
-			entry.SetAddrIP(ipt)
+			entry.SetAddrIP(ip)
 		} else {
 			fmt.Fprintf(os.Stderr, "resolving: %v\n", entry.Address)
 			addrs, err := net.LookupHost(entry.Address)
@@ -323,10 +323,16 @@ func (c *Compilation) resolve(host string) (string, error) {
 			}
 			c.infof("resolved: %v -> %v", entry.Address, addrs[0])
 			entry.SetAddrName(entry.Address)
-			entry.SetAddrIP(net.ParseIP(addrs[0]))
+
+			if ip, err := netip.ParseAddr(addrs[0]); err == nil {
+				// If already an IP, great.
+				entry.SetAddrIP(ip)
+			} else {
+				return "", fmt.Errorf("address parsing from DNS lookup failed for '%v': %v", entry.Address, err)
+			}
 		}
 	}
-	return entry.IP().String(), nil
+	return entry.IPAsString(), nil
 }
 
 // checkAttrExprPrefixes checks that all attribute expressions have a prefix that is actually provided by an auth service.

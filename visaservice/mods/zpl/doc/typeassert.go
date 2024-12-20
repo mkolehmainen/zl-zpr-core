@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -200,19 +201,15 @@ func assertValidPortSpecType(p string, r PortRange) error {
 	return nil
 }
 
-// AssertValidZPRADdress checks for IPv6 address or a hostname.
+// AssertValidZPRADdress checks for IPv6 or IPv4 address or a hostname.
 func AssertValidZPRAddress(a string) error {
-	if strings.Index(a, ":") > 0 {
-		ip := net.ParseIP(a)
-		if ip == nil {
-			return fmt.Errorf("not an IPv6 address: '%v'", a)
+	if ipa, err := netip.ParseAddr(a); err == nil {
+		if ipa.Is6() || ipa.Is4() {
+			return nil
 		}
-		// If it is really an IPv6 address, it won't convert to 4 bytes.
-		if ip.To4() != nil {
-			return fmt.Errorf("not an IPv6 address: '%v'", a)
-		}
-		return nil
+		return fmt.Errorf("not an IPv4/IPv6 address: '%v'", a)
 	}
+	// Note that `HostnameRegex` also matches IPv4 addresses.
 	if HostnameRegex.MatchString(a) {
 		return nil
 	}
