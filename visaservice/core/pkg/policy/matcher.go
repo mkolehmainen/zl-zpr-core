@@ -286,8 +286,11 @@ func (m *Matcher) MatchConnect(state *ConnectState) ([]string, error) {
 	}
 
 	for i, p := range matchedPolicies {
-		pp := m.policy.GetPolicies()[p]
-		m.log.Debug(fmt.Sprintf("[MX] --> MatchConnect did match policy %d of %d", i+1, len(matchedPolicies)), "id", pp.GetId())
+		id := "unknown"
+		if pols := m.policy.GetPolicies(); len(pols) > int(p) {
+			id = pols[p].GetId()
+		}
+		m.log.Debug(fmt.Sprintf("[MX] --> MatchConnect did match policy %d of %d", i+1, len(matchedPolicies)), "id", id)
 	}
 
 	var procsRan []uint32 // Matching connect PROCS (already ran)
@@ -297,7 +300,7 @@ func (m *Matcher) MatchConnect(state *ConnectState) ([]string, error) {
 	// we will need to re-match the agent to the policy.
 	//
 	// TODO: Are we sure that the compiler or matcher will not allow matching of conflicting
-	//       procedures? I guess it is all additive, but I'm not sure this is prooved to be correct
+	//       procedures? I guess it is all additive, but I'm not sure this is proved to be correct
 	//       anywhere.
 	for attrChanges > 0 {
 		matchedProcs := m.getProcsIfNotIn(matchedPolicies, procsRan)

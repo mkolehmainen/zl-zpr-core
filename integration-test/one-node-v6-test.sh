@@ -20,8 +20,14 @@ B_SUBSTRATE_ADDR=10.0.2.2
 
 NODE_ZPR_ADDR6=fd5a:5052::2
 VS_ZPR_ADDR6=fd5a:5052::1
-A_ZPR_ADDR6=fd00:1:1::1
-B_ZPR_ADDR6=fd00:1:2::1
+# A_ZPR_ADDR6=fd00:1:1::1
+# B_ZPR_ADDR6=fd00:1:2::1
+
+A_ZPR_ADDR6=10.253.1.1
+B_ZPR_ADDR6=10.253.2.1
+
+POLICY_BIN=v4-1node-2agent-ping.bin
+#POLICY_BIN=v6-1node-2agent-ping.bin
 
 NODE_SOCK=node.sock
 VS_SOCK=vs.sock
@@ -76,7 +82,8 @@ echo "Launching Visa Service"
 
 sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$VS_BIN" \
     -c vs-config.yaml \
-    -p "$PREGEN/v6-1node-2agent-ping.bin" \
+    --verbose \
+    -p "$PREGEN/$POLICY_BIN" \
     --listen_addr "[$VS_ZPR_ADDR6]":5002 2>&1 | tee vs.log | prefix_log vs &
 
 sleep 2

@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -254,6 +255,11 @@ func (s *VisaService) InstallPolicy(cp *polio.ContainedPolicy) (string, uint64, 
 // doInstallPolicy actually install policy into all the visa service components, including
 // communicating with any nodes.
 func (s *VisaService) doInstallPolicy(cp *polio.ContainedPolicy) error {
+
+	// TODO: Remove this.
+	j, _ := json.Marshal(cp.Policy)
+	fmt.Printf("OG Policy --> %s", string(j))
+
 	pp := policy.NewPolicyFromContainer(cp, s.log)
 	if pp.Size() == 0 {
 		return errors.New("policy is empty")

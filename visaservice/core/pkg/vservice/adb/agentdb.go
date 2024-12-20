@@ -66,7 +66,7 @@ func (db *AgentDB) Dump(out logr.Logger) {
 		if rec.node {
 			atype = "node"
 		}
-		out.Infof("  [ %s ]  =>  (%v)  agent: %v", addr, atype, rec.Agent.String())
+		out.Infof("  [ %s ]  =>  (%v)  agent: %v; providers: %#v", addr, atype, rec.Agent.String(), rec.Agent.GetProvides())
 	}
 	out.Infof("===== dumping of agent database complete =====")
 }
@@ -111,6 +111,10 @@ func (db *AgentDB) AddNode(zprAddr, tetherAddr netip.Addr, agent *agent.Agent, a
 	}
 	rec.Peer.APIKey = apiKey
 	rec.Peer.VSSAddr = vssAddr
+
+	// TODO: Remove this.
+	fmt.Printf("Adding node record --> %#v", rec)
+
 	db.Lock()
 	db.agents[zprAddr] = &rec
 	db.Unlock()
@@ -129,6 +133,10 @@ func (db *AgentDB) AddAdapter(zprAddr, tetherAddr netip.Addr, agent *agent.Agent
 		ZPRAddr:    zprAddr,
 		TetherAddr: tetherAddr,
 	}
+
+	// TODO: Remove this.
+	fmt.Printf("Adding adapter record --> [%s] %#v", zprAddr.String(), rec.Agent.GetProvides())
+
 	db.Lock()
 	db.agents[zprAddr] = &rec
 	db.Unlock()
@@ -207,9 +215,14 @@ func (db *AgentDB) AgentAtContactAddr(addr netip.Addr) (*agent.Agent, error) {
 	db.RLock()
 	defer db.RUnlock()
 
+	// Upgrade all IPv4 addresses to IPv4-in-IPv6
+	if addr.Is4() {
+		addr = netip.AddrFrom16(addr.As16())
+	}
+
 	rec, ok := db.agents[addr]
 	if !ok {
-		return nil, fmt.Errorf("agent not found")
+		return nil, fmt.Errorf("agent %s not found", addr)
 	}
 	return rec.Agent, nil
 }

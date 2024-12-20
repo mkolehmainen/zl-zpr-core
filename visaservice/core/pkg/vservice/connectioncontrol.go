@@ -123,7 +123,7 @@ func (vs *VSInst) applyConnectPolicy(curpol *policy.Policy, matcher *policy.Matc
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create a FlowState: %w", err)
 	}
-	matchedAttrKeys, err := matcher.MatchConnect(fs) // sets claim zpr.role (amoung other things).
+	matchedAttrKeys, err := matcher.MatchConnect(fs) // sets claim zpr.role (among other things).
 	if err != nil {
 		return nil, nil, err
 	}
