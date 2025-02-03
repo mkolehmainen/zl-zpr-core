@@ -3,7 +3,6 @@
 //! Really doesn't do very much except for translate incoming visa service
 //! messages into enums on a channel.
 
-use std::fmt::{self, Formatter};
 use std::net::SocketAddr;
 use thrift::protocol::{TBinaryInputProtocolFactory, TBinaryOutputProtocolFactory};
 use thrift::protocol::{TInputProtocolFactory, TOutputProtocolFactory};
@@ -24,7 +23,6 @@ use vsapi::{
 pub const DEFAULT_VSS_PORT: u16 = 8183;
 
 /// Messages from the visa service. These wrap the thrift message types.
-#[derive(Debug)]
 #[allow(dead_code)]
 pub enum VSSMsg {
     /// Indicates a policy has been installed.
@@ -35,16 +33,6 @@ pub enum VSSMsg {
 
     /// Pushed visa revokcations from the visa service.
     PushedRevocation(VisaRevocation),
-}
-
-impl fmt::Display for VSSMsg {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            VSSMsg::PolicyInstall(pi) => write!(f, "PolicyInstall(policy_id: {:?})", pi.policy_id),
-            VSSMsg::PushedVisa(v) => write!(f, "Visa(issuer_id: {:?})", v.issuer_id),
-            VSSMsg::PushedRevocation(r) => write!(f, "Revocation(issuer_id: {:?})", r.issuer_id),
-        }
-    }
 }
 
 /// The VisaSupportHandlerImpl is a light wrapper around the thrift
