@@ -31,6 +31,7 @@ macro_rules! err_config {
 /// Configuration structure which is parsed from the TOML.
 #[allow(dead_code)]
 pub struct Config {
+    pub base_path: PathBuf,
     pub digest: Digest,
     pub resolver: Resolver,
     pub nodes: HashMap<String, Node>,
@@ -81,6 +82,7 @@ pub struct Interface {
 #[derive(Debug)]
 pub struct VisaService {
     pub dock_node_id: String,
+    pub admin_attrs: Vec<(String, String)>,
 }
 
 /// Trusted Service table ("trusted_services")
@@ -114,8 +116,39 @@ pub enum IcmpFlowType {
     OneShot(Vec<u8>),
 }
 
+impl Protocol {
+    pub fn to_endpoint_str(&self) -> String {
+        let mut s = String::new();
+        let protname = self.protocol.to_string().to_uppercase();
+        if self.protocol.is_icmp() {
+            if let Some(ref icmp) = self.icmp {
+                match icmp {
+                    IcmpFlowType::RequestResponse(req, resp) => {
+                        s.push_str(&format!("{}/{}", protname, req));
+                        s.push_str(&format!(",{}/{}", protname, resp));
+                    }
+                    IcmpFlowType::OneShot(ref codes) => {
+                        for c in codes {
+                            s.push_str(&format!("{}/{}", protname, c));
+                        }
+                    }
+                }
+            } else {
+                s.push_str(&format!("{}/0", protname));
+            }
+        } else {
+            s.push_str(&format!("{}/", protname));
+            if let Some(ref port) = self.port {
+                s.push_str(port);
+            } else {
+                s.push_str("0");
+            }
+        }
+        s
+    }
+}
+
 /// Service table
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Service {
     pub id: String,
@@ -169,16 +202,25 @@ impl Config {
 pub fn load_config(path: &Path) -> Result<Config, CompilationError> {
     let cstr = std::fs::read_to_string(path).map_err(|e| CompilationError::Io(e))?;
 
+    let abs_path = path.canonicalize().map_err(|e| CompilationError::Io(e))?;
+    let base_path = match abs_path.parent() {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::new(),
+    };
+
+    parse_config(&cstr, &base_path)
+}
+
+/// Parse config from the toml string `cstr`. The `base_path` is used to resolve relative paths.
+pub fn parse_config(cstr: &str, base_path: &Path) -> Result<Config, CompilationError> {
     let digest = sha256(&cstr);
 
     let ctoml = cstr
         .parse::<Table>()
         .map_err(|e| CompilationError::TomlError(e))?;
 
-    // println!("parsed something:\n{:#?}", ctoml);
-    // println!("=====================");
-
     let config = Config {
+        base_path: base_path.to_path_buf(),
         digest,
         resolver: parse_resolver(&ctoml)?,
         nodes: parse_nodes(&ctoml)?,
@@ -268,20 +310,30 @@ fn parse_nodes(ctoml: &Table) -> Result<HashMap<String, Node>, CompilationError>
     Ok(node_map)
 }
 
+fn require_key(ctx: &str, table: &Table, key: &str) -> Result<(), CompilationError> {
+    if !table.contains_key(key) {
+        return Err(err_config!("error in {}: missing entry for {}", ctx, key));
+    }
+    Ok(())
+}
+
 /// Parse a single node table.
 fn parse_node(node_id: &str, node: &Table) -> Result<Node, CompilationError> {
+    require_key(&format!("nodes.{}", node_id), node, "key")?;
     let key = node["key"]
         .as_str()
         .ok_or(err_config!("node {} missing key", node_id))?
         .to_string();
+    require_key(&format!("nodes.{}", node_id), node, "zpr_address")?;
     let zpr_address = node["zpr_address"]
         .as_str()
-        .ok_or(err_config!("node {} missing zpr_address", node_id))?
+        .ok_or(err_config!("node {} invalid zpr_address", node_id))?
         .to_string();
 
     let mut interfaces = Vec::new();
 
     // In order to parse the interfaces, we need the interface names.
+    require_key(&format!("node {}", node_id), node, "interfaces")?;
     let ifnames = node["interfaces"]
         .as_array()
         .ok_or(err_config!("node {} missing interfaces", node_id))?;
@@ -322,8 +374,6 @@ fn parse_node(node_id: &str, node: &Table) -> Result<Node, CompilationError> {
 }
 
 fn parse_provider(ctx: &str, table: &Table) -> Result<Vec<(String, String)>, CompilationError> {
-    let mut provider = Vec::new();
-
     // The provider is an array of tuples (array of arrays).
     if !table.contains_key("provider") {
         return Err(err_config!("{} missing provider", ctx));
@@ -331,28 +381,8 @@ fn parse_provider(ctx: &str, table: &Table) -> Result<Vec<(String, String)>, Com
     let provider_tuples = table["provider"]
         .as_array()
         .ok_or(err_config!("{} provider is not an array", ctx))?;
-    for pt in provider_tuples {
-        let pt = pt.as_array().ok_or(err_config!(
-            "{} has provider entry that is not an array",
-            ctx
-        ))?;
-        if pt.len() != 2 {
-            return Err(err_config!("{} has provider entry is not a 2-tuple", ctx));
-        }
-        // TOML has other valid types but we just convert the provider attributes to strings.
-        // Maybe later we will introduce a richer attribute type since we are probably going to have to parse this again later.
-        let p0 = if pt[0].is_str() {
-            pt[0].as_str().unwrap().to_string()
-        } else {
-            pt[0].to_string()
-        };
-        let p1 = if pt[1].is_str() {
-            pt[1].as_str().unwrap().to_string()
-        } else {
-            pt[1].to_string()
-        };
-        provider.push((p0, p1));
-    }
+
+    let provider = tuples_to_tuple_str_vec(ctx, provider_tuples)?;
     Ok(provider)
 }
 
@@ -383,7 +413,49 @@ fn parse_visa_service(ctoml: &Table) -> Result<VisaService, CompilationError> {
         .as_str()
         .ok_or(err_config!("visa_service missing dock_node"))?
         .to_string();
-    Ok(VisaService { dock_node_id })
+
+    let admin_attrs = if vs.contains_key("admin_attrs") {
+        let tuples = vs["admin_attrs"]
+            .as_array()
+            .ok_or(err_config!("visa_service missing admin_attrs list"))?;
+        tuples_to_tuple_str_vec("visa_service", tuples)?
+    } else {
+        println!("warning: visa service has no admin_attrs");
+        Vec::new()
+    };
+    Ok(VisaService {
+        dock_node_id,
+        admin_attrs,
+    })
+}
+
+fn tuples_to_tuple_str_vec(
+    ctx: &str,
+    tuples: &Vec<toml::Value>,
+) -> Result<Vec<(String, String)>, CompilationError> {
+    let mut svec = Vec::new();
+    for pt in tuples {
+        let pt = pt
+            .as_array()
+            .ok_or(err_config!("{} has entry that is not an array", ctx))?;
+        if pt.len() != 2 {
+            return Err(err_config!("{} has entry is not a 2-tuple", ctx));
+        }
+        // TOML has other valid types but we just convert the provider attributes to strings.
+        // Maybe later we will introduce a richer attribute type since we are probably going to have to parse this again later.
+        let p0 = if pt[0].is_str() {
+            pt[0].as_str().unwrap().to_string()
+        } else {
+            pt[0].to_string()
+        };
+        let p1 = if pt[1].is_str() {
+            pt[1].as_str().unwrap().to_string()
+        } else {
+            pt[1].to_string()
+        };
+        svec.push((p0, p1));
+    }
+    Ok(svec)
 }
 
 /// Parse the trusted_services.<ID> tables.  Currently I am reserving the ID of "default" for the
@@ -812,6 +884,27 @@ mod test {
         assert!(vs.is_ok());
         let vs = vs.unwrap();
         assert_eq!(vs.dock_node_id, "n0");
+    }
+
+    #[test]
+    fn test_parse_visa_service_with_admin() {
+        let tstr = r#"
+        [visa_service]
+        dock_node = "n0"
+        admin_attrs = [["cn", "foo"], ["bar", "baz"]]
+        "#;
+        let ctoml = parse_toml(tstr);
+        let vs = parse_visa_service(&ctoml);
+        assert!(vs.is_ok());
+        let vs = vs.unwrap();
+        assert_eq!(vs.dock_node_id, "n0");
+        assert_eq!(vs.admin_attrs.len(), 2);
+        assert!(vs
+            .admin_attrs
+            .contains(&("cn".to_string(), "foo".to_string())));
+        assert!(vs
+            .admin_attrs
+            .contains(&("bar".to_string(), "baz".to_string())));
     }
 
     #[test]

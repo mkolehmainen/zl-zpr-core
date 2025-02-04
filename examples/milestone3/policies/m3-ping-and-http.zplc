@@ -6,7 +6,7 @@ order = ["hosts", "dns"]
 
 [resolver.hosts]
 "node0.zpr" = "fd5a:5052:90de::1"
-"node0.overlay" = "192.168.0.55"
+"node0.overlay" = "192.168.4.69"
 "my.service" = "fd5a:5052:1::8080"
 
 # [nodes]
@@ -37,12 +37,17 @@ protocol = "iana.ICMP6"
 icmp_type = "request-response"
 icmp_codes = [ 128, 129 ]
 
+[protocols.http]
+protocol = "iana.TCP"
+port = 80
+
 # [services]
 
 [services.ZServicePingable]
 protocol = "ping"
-# Could have a provider here too I think
 
+[services.ZWebService]
+protocol = "http"
 
 
 
