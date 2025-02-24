@@ -24,27 +24,15 @@ pub fn configure_env(config: &Path, dry_run: bool) -> Result<(), LaunchErr> {
         }
     };
 
-    // The control_path parent directories must exist. This can be set in the
-    // config, or there is a default.
-    let ctrl_path =
-        match rdr.get_config_str_value_for_section_and_key("global", zpr::CONTROL_PATH_KEY) {
-            Ok(Some(path)) => PathBuf::from(path),
-            Ok(None) => sys::get_data_home(),
-            Err(e) => return Err(LaunchErr::PCError(e)),
-        };
-    if dry_run {
-        println!("mkdir -p {}", ctrl_path.display());
-    } else {
-        fs::create_dir_all(&ctrl_path)?;
-    }
-    sys::get_platform().set_control_dir_owner_and_perms(&ctrl_path, &run_as_user, dry_run)?;
+    let tun_addr_str = rdr.must_get_config_str_value_for_key(zpr::AGENT_ADDR_KEY)?;
+    let tun_addr = tun_addr_str
+        .parse::<IpAddr>()
+        .or(Err(PCErr::KeyError(format!(
+            "{} not valid IP address",
+            zpr::AGENT_ADDR_KEY
+        ))))?;
 
-    let node_addr_str = rdr.must_get_config_str_value_for_key(zpr::AGENT_ADDR_KEY)?;
-    let node_addr = node_addr_str.parse::<IpAddr>().or(Err(PCErr::KeyError(
-        "node_addr not valid IP address".to_string(),
-    )))?;
-
-    let mask = match node_addr {
+    let mask = match tun_addr {
         IpAddr::V4(_ipv4) => zpr::IPV4_MASK,
         IpAddr::V6(_ipv6) => zpr::IPV6_MASK,
     };
@@ -53,6 +41,23 @@ pub fn configure_env(config: &Path, dry_run: bool) -> Result<(), LaunchErr> {
         Some(name) => name,
         None => sys::get_platform().get_tun_ifname().to_string(),
     };
+
+    #[cfg(target_os = "macos")]
+    {
+        if !tun_name.is_empty() {
+            println!(
+                "warning: on macos it is recommended to not set a tun name (found {})",
+                tun_name
+            );
+        }
+        // The ph will fail anyway, but might as well warn here too.
+        match tun_addr {
+            IpAddr::V4(_ipv4) => (),
+            IpAddr::V6(_ipv6) => {
+                println!("warning: IPv6 for agent_addr tunnel address is not supported on macos");
+            }
+        }
+    }
 
     // TODO: We could check self_addr setting and make sure that we have the
     //       address there on an interface.
@@ -66,7 +71,7 @@ pub fn configure_env(config: &Path, dry_run: bool) -> Result<(), LaunchErr> {
         );
     } else {
         // Create the tun interface, assign addresses etc.
-        sys::get_platform().create_tun(&tun_name, node_addr, mask, zpr::TUN_MTU, dry_run)?;
+        sys::get_platform().create_tun(&tun_name, tun_addr, mask, zpr::TUN_MTU, dry_run)?;
     }
 
     // Now drop root permissions.
@@ -74,7 +79,37 @@ pub fn configure_env(config: &Path, dry_run: bool) -> Result<(), LaunchErr> {
         "dropping root permissions, switching to user {}",
         run_as_user
     );
-    sys::get_platform().drop_privledges(&run_as_user, dry_run)?;
+
+    // We always drop privs, even in dry run mode.
+    sys::get_platform().drop_privileges(&run_as_user, false)?;
+
+    // The control_path parent directories must exist. This can be set in the
+    // config, or there is a default.  We do this after dropping privs since the
+    // path depends on the user. This means that sometimes user will need to manually
+    // step in here and create the directories.
+    let ctrl_path =
+        match rdr.get_config_str_value_for_section_and_key("global", zpr::CONTROL_PATH_KEY) {
+            Ok(Some(path)) => PathBuf::from(path),
+            Ok(None) => sys::get_data_home(),
+            Err(e) => return Err(LaunchErr::PCError(e)),
+        };
+    if dry_run {
+        println!("mkdir -p {}", ctrl_path.display());
+    } else {
+        fs::create_dir_all(&ctrl_path).or_else(|e| {
+            println!(
+                "tip: create {} manually or set a different value of {} in your config",
+                ctrl_path.display(),
+                zpr::CONTROL_PATH_KEY
+            );
+            Err(LaunchErr::FileError(format!(
+                "unable to create control path: {}: {}",
+                ctrl_path.display(),
+                e
+            )))
+        })?;
+    }
+    sys::get_platform().set_control_dir_owner_and_perms(&ctrl_path, &run_as_user, dry_run)?;
 
     Ok(())
 }
