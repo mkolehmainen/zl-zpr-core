@@ -54,6 +54,7 @@ mod sys;
 mod test_packet;
 mod tun_ctl;
 mod two_way_queue;
+mod visa_table;
 mod vs_worker;
 mod vss_worker;
 mod zdp;
@@ -318,6 +319,7 @@ fn main() -> ExitCode {
         substrate_egress: SubstrateEgress::new(substrate_sockets.iter().cloned()),
         agent_output_requeue: AgentOutputRequeue::new(agent_requeue_inqs),
         vsconn: vsconn.as_ref().map(|c| c.handle()),
+        visa_table: std::sync::Mutex::new(visa_table::VisaTable::new()),
         capture_queue: Capture::new(cap_inq),
         capture_worker: CaptureWorker::new(),
         flow_control: FlowControl::new(),
