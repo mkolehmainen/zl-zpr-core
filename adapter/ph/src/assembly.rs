@@ -56,7 +56,7 @@ pub struct Assembly {
     pub topology_config: config::TopologyConfig,
 
     // Shared resources.  These may be accessed by any part of the system.
-    pub agent_addresses: Vec<IpAddr>,
+    pub local_zpr_addresses: Vec<IpAddr>,
 
     pub substrate_egress: SubstrateEgress,
     pub agent_output_requeue: AgentOutputRequeue,
@@ -226,7 +226,7 @@ impl Assembly {
     /// Temporary? function to find a link based on the agent address
     pub fn find_egress_link(&self, agent_addr: IpAddress) -> Option<NonZero<LinkId>> {
         // Fist check the local agent addresses to see if it's a locally-destined packet
-        for addr in &self.agent_addresses {
+        for addr in &self.local_zpr_addresses {
             if agent_addr == (*addr).into() {
                 return Some(NonZero::new(zpr::LOCAL_AGENT_LINK_ID).unwrap());
             }
@@ -334,7 +334,7 @@ pub mod test {
     pub struct TestAssemblyBuilder {
         pub ph_mode: Option<PhMode>,
         pub topology_config: Option<TopologyConfig>,
-        pub agent_addresses: Option<Vec<IpAddr>>,
+        pub local_zpr_addresses: Option<Vec<IpAddr>>,
         pub substrate_egress: Option<SubstrateEgress>,
         pub agent_output_requeue: Option<AgentOutputRequeue>,
         pub vsconn: Option<Option<libnode::vsconn::VSConnHandle>>,
@@ -371,8 +371,8 @@ pub mod test {
     pub fn create_assembly(builder: TestAssemblyBuilder) -> Assembly {
         let ph_mode = builder.ph_mode.unwrap_or(PhMode::Adapter);
         let topology_config = builder.topology_config.unwrap_or_default();
-        let agent_addresses = builder
-            .agent_addresses
+        let local_zpr_addresses = builder
+            .local_zpr_addresses
             .unwrap_or(Vec::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]));
         let substrate_egress = builder
             .substrate_egress
@@ -423,7 +423,7 @@ pub mod test {
         Assembly {
             ph_mode,
             topology_config,
-            agent_addresses,
+            local_zpr_addresses,
             substrate_egress,
             agent_output_requeue,
             vsconn,

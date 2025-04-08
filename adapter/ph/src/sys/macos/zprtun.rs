@@ -53,7 +53,7 @@ impl ZprTun {
 
     #[allow(dead_code)]
     pub fn set_address(&mut self, addr: IpAddr) -> Result<(), ZprTunError> {
-        let idev = &mut *(self.0);
+        let idev = &mut self.0;
         match idev.set_address(addr) {
             Ok(_) => Ok(()),
             Err(e) => Err(ZprTunError::PlatformError(e.to_string())),

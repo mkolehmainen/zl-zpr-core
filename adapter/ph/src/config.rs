@@ -91,8 +91,8 @@ pub struct Config {
     /// Required for adapter - the node dock address on substrate.
     pub node_addr: Option<SocketAddr>,
 
-    /// Required for adapter - the adapters ZPR agent address.
-    pub agent_addr: Vec<IpAddr>,
+    /// Required for node and adapter - the local ZPR actor address(s).
+    pub zpr_addr: Vec<IpAddr>,
 
     /// Required for adapter - the path to the PEM file containing the nodes noise public key (not a certificate).
     pub node_public_key_file: Option<PathBuf>,
@@ -193,8 +193,8 @@ impl Config {
         } else {
             return Err("private_key_file or noise_private_key".arg_missing());
         }
-        if self.agent_addr.is_empty() {
-            return Err("agent_addr".arg_missing());
+        if self.zpr_addr.is_empty() {
+            return Err("zpr_addr".arg_missing());
         }
         match mode {
             PhMode::Adapter => {
@@ -258,7 +258,7 @@ impl Config {
             self.tun_if = Some(tun_if.clone());
         }
         if let Some(agent_addr) = &config.agent_addr {
-            self.agent_addr.extend(&*agent_addr);
+            self.zpr_addr.extend(&*agent_addr);
         }
         if let Some(debug) = &config.debug {
             self.debug.extend(debug.into_iter().cloned());
@@ -359,7 +359,7 @@ impl Config {
         if let Some(tun_if) = &common.tun_if {
             self.tun_if = Some(tun_if.clone());
         }
-        self.agent_addr.extend(&common.agent_addr);
+        self.zpr_addr.extend(&common.zpr_addr);
 
         self.debug.extend(common.debug.iter().cloned());
         self.quiet.extend(common.quiet.iter().cloned());
@@ -381,7 +381,7 @@ impl Default for Config {
             debug: Vec::new(),
             quiet: Vec::new(),
             node_addr: None,
-            agent_addr: Vec::new(),
+            zpr_addr: Vec::new(),
             node_public_key_file: None,
         }
     }

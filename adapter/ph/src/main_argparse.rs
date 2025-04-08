@@ -359,7 +359,7 @@ mod test {
             ))
         );
         assert_eq!(
-            config.agent_addr,
+            config.zpr_addr,
             Vec::from([IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))])
         );
         assert_eq!(
@@ -427,7 +427,7 @@ mod test {
             tmpfile.get_path().to_str().unwrap(),
             "--node-addr",
             "192.168.0.2:5000",
-            "--agent-addr",
+            "--zpr-addr",
             "10.0.0.1",
             "--node-public-key-file",
             &node_pk_fname,
@@ -445,7 +445,7 @@ mod test {
             ))
         );
         assert_eq!(
-            config.agent_addr,
+            config.zpr_addr,
             Vec::from([IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))])
         );
         assert_eq!(
@@ -528,7 +528,7 @@ mod test {
             ))
         );
         assert_eq!(
-            config.agent_addr,
+            config.zpr_addr,
             Vec::from([IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))])
         );
         assert_eq!(
@@ -596,7 +596,7 @@ mod test {
             ))
         );
         assert_eq!(
-            config.agent_addr,
+            config.zpr_addr,
             Vec::from([IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))])
         );
         assert_eq!(
@@ -672,7 +672,7 @@ mod test {
             &pk_file_fname,
             "--control-path",
             "/tmp/control.sock",
-            "--agent-addr",
+            "--zpr-addr",
             "10.0.0.1",
         ];
 
