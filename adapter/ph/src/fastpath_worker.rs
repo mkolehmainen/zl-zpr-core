@@ -1,11 +1,12 @@
 use crate::assembly::Assembly;
+use crate::config;
 use crate::fastpath::{FastpathWorker, FastpathWorkerConfig};
 use crate::fastpath_io::FastpathIo;
+use crate::packet_queue;
 use crate::sys::ZprTun;
 use enum_map::{enum_map, Enum};
 use nix::poll;
 use std::net::UdpSocket;
-use std::os::unix::net::UnixDatagram;
 use std::sync::Arc;
 
 #[derive(Enum)]
@@ -23,8 +24,8 @@ pub fn launch(
     asm: Arc<Assembly>,
     substrate_socket: UdpSocket,
     actor_input_tun: Arc<ZprTun>,
-    requeue_outq: UnixDatagram,
-    mgmt_substrate_outq: Option<UnixDatagram>,
+    requeue_outq: packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+    mgmt_substrate_outq: Option<packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>>,
 ) -> impl FnOnce() {
     move || {
         let worker = FastpathWorker::new(config, worker_index, asm.clone());

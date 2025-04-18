@@ -1,23 +1,24 @@
 use crate::batch_io::BatchIo;
+use crate::config;
 use crate::counters::*;
 use crate::fastpath::{FastpathWorker, FastpathWorkerConfig};
 use crate::net_defs;
 use crate::packet::{self, Packet};
+use crate::packet_queue;
 use crate::sys::{TunPi, ZprTun};
 use crate::zprtun;
 use bytes::Buf;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::net::UnixDatagram;
 use std::sync::Arc;
 
 pub struct FastpathIo {
     batch_io: BatchIo,
     actor_tun: Arc<ZprTun>,
     substrate_socket: UdpSocket,
-    pub requeue_outq: UnixDatagram,
-    pub mgmt_substrate_outq: UnixDatagram,
+    pub requeue_outq: packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+    pub mgmt_substrate_outq: packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
 }
 
 impl FastpathIo {
@@ -25,8 +26,8 @@ impl FastpathIo {
         config: FastpathWorkerConfig,
         substrate_socket: UdpSocket,
         actor_tun: Arc<ZprTun>,
-        requeue_outq: UnixDatagram,
-        maybe_mgmt_substrate_outq: Option<UnixDatagram>,
+        requeue_outq: packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+        maybe_mgmt_substrate_outq: Option<packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>>,
     ) -> Self {
         // HACK: nix does not support disabling an FD, so instead, make a dummy mgmt_substrate_outq socket
         // if we weren't given one
@@ -34,7 +35,7 @@ impl FastpathIo {
         match maybe_mgmt_substrate_outq {
             Some(outq) => mgmt_substrate_outq = outq,
             None => {
-                let (_, outq) = UnixDatagram::pair().unwrap();
+                let (_, outq) = packet_queue::packet_queue(1);
                 mgmt_substrate_outq = outq;
             }
         }
@@ -60,12 +61,12 @@ impl FastpathIo {
 
     /// Requeue socket FD for polling.
     pub fn requeue_fd(&self) -> BorrowedFd<'_> {
-        self.requeue_outq.as_fd()
+        self.requeue_outq.poll_fd()
     }
 
     /// Mgmt substrate FD for polling.
     pub fn mgmt_substrate_fd(&self) -> BorrowedFd<'_> {
-        self.mgmt_substrate_outq.as_fd()
+        self.mgmt_substrate_outq.poll_fd()
     }
 
     /// Process an input-ready notification on the substrate socket (substrate ingress).
@@ -178,50 +179,18 @@ impl FastpathIo {
 
     /// Process an input-ready notification on the requeue socket.
     pub fn process_requeue_in(&mut self, worker: &mut FastpathWorker) {
-        // TODO: batch receive
-        while let Some(mut buf) = worker.buffers.pop() {
-            if let Err(err) = self.requeue_outq.recv(buf.as_mut()) {
-                match err.kind() {
-                    ErrorKind::WouldBlock | ErrorKind::ResourceBusy => {
-                        worker.buffers.push(buf);
-                        break;
-                    }
-
-                    _ => {
-                        // FIXME: detect packet-too-large
-                        panic!("unrecoverable I/O error {err}");
-                    }
-                }
-            }
-
+        batch_process_packet_queue(worker, &mut self.requeue_outq, |worker, pkt| {
             worker.asm.counters[CounterType::RequeuedPacketsReceived].increment();
-            let pkt = Packet::new_with_existing_metadata(buf);
             worker.actor_output_post_classify(pkt, /* allow_bind_request */ false);
-        }
+        });
     }
 
     /// Process an input-ready notification on the mgmt substrate socket.
     pub fn process_mgmt_substrate_in(&mut self, worker: &mut FastpathWorker) {
-        // TODO: batch receive
-        while let Some(mut buf) = worker.buffers.pop() {
-            if let Err(err) = self.mgmt_substrate_outq.recv(buf.as_mut()) {
-                match err.kind() {
-                    ErrorKind::WouldBlock | ErrorKind::ResourceBusy => {
-                        worker.buffers.push(buf);
-                        break;
-                    }
-
-                    _ => {
-                        // FIXME: detect packet-too-large
-                        panic!("unrecoverable I/O error {err}");
-                    }
-                }
-            }
-
+        batch_process_packet_queue(worker, &mut self.mgmt_substrate_outq, |worker, pkt| {
             worker.asm.counters[CounterType::MgmtPacketsSent].increment();
-            let pkt = Packet::new_with_existing_metadata(buf);
             worker.substrate_egress(pkt);
-        }
+        });
     }
 
     /// Egress any queued packets, or drop if there is no space in the system queues.
@@ -352,5 +321,37 @@ fn clear_flowinfo(addr: &mut SocketAddr) {
     match addr {
         SocketAddr::V4(_) => (),
         SocketAddr::V6(addr) => addr.set_flowinfo(0),
+    }
+}
+
+fn batch_process_packet_queue(
+    worker: &mut FastpathWorker,
+    queue: &mut packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+    mut process_fn: impl FnMut(&mut FastpathWorker, Packet),
+) {
+    // Do not receive more than is currently in the queue;
+    // avoids racing with a fast sender and getting stuck here
+    // indefinitely.
+    let limit = queue.len();
+
+    for _i in 0..limit {
+        let Some(buf) = worker.buffers.pop() else {
+            break;
+        };
+
+        match queue.try_recv(buf) {
+            Ok(pkt) => {
+                process_fn(worker, pkt);
+            }
+
+            Err(packet_queue::TryRecvError::Empty(buf)) => {
+                worker.buffers.push(buf);
+                break;
+            }
+
+            Err(err) => {
+                panic!("unrecoverable I/O error {err:?}");
+            }
+        }
     }
 }
