@@ -19,7 +19,7 @@ dashmap = { version = "6.0.1" }
 enum-map = { version = "2.7.3" }
 enumset = "1.1.5"
 hdrhistogram = { version = "7.5.4" }
-libc = { version = "0.2.155" }
+libc = { version = "0.2.171" }
 libnode = { path = "../../libnode" }
 itertools = "0.14"
 nix = { version = "0.29.0", features = ["fs", "ioctl", "net", "poll"] }
@@ -42,13 +42,6 @@ zpr-ext = { path = "../../zpr-ext", features = ["bytes", "tokio", "zerocopy"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-tun = { version = "0.11.5" }
 io-uring = { version = "0.7.4", optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# This is used for its ability to manage a TUN device on mac.
-# Locked at 0.7.1 just so we are sure to track what is happening
-# in this project. There were some features in v0.6.1 that we
-# may need going forward.
-tun = { version = "=0.7.1", features = ["async"] }
 
 [dev-dependencies]
 rand = "0.8.5"
