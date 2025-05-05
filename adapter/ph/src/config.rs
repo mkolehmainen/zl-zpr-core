@@ -9,7 +9,9 @@ use base64::prelude::*;
 use serde::Deserialize;
 
 use crate::assembly::PhMode;
-use crate::pki::{load_noise_private_key, NOISE_KEY_LEN};
+use crate::auth::RsaBootstrapAuth;
+use crate::pki;
+use crate::pki::{load_cert, load_noise_private_key, NOISE_KEY_LEN};
 
 use crate::main_args::{ArgsError, CommonArgs};
 
@@ -72,11 +74,11 @@ pub struct Config {
     pub certificate_file: PathBuf,
 
     /// Path to a PEM file containing the noise private key, if specified.
-    /// One of either [private_key_file] or [private_key_data] must be specified.
+    /// One of either `private_key_file` or `private_key_data` must be specified.
     private_key_file: Option<PathBuf>,
 
     /// The noise private key data, base64 encoded. User has option to set this through an environment variable.
-    /// One of either [private_key_file] or [private_key_data] must be specified.
+    /// One of either `private_key_file` or `private_key_data` must be specified.
     private_key_data: Option<String>,
 
     /// Optionally specify the name of the TUN interface to use. In most cases this
@@ -97,6 +99,9 @@ pub struct Config {
 
     /// Required for adapter - the path to the PEM file containing the nodes noise public key (not a certificate).
     pub node_public_key_file: Option<PathBuf>,
+
+    /// Ignored for node, optional for adapter - Only set if the adapter is configured for bootstrap authentication.
+    pub bootstrap: Option<RsaBootstrapAuth>,
 }
 
 impl Config {
@@ -132,18 +137,22 @@ impl Config {
         return "".to_string();
     }
 
+    /// Create the [Config] struct using an optional configuration file plus
+    /// any passed "common" command line arguments.
+    ///
+    /// Note that additional, adapter specific command line arguments may get
+    /// folded into the returned object later.
     pub fn new_for_adapter(
         config_file: Option<AdapterConfig>,
         common: &CommonArgs,
     ) -> Result<Self, ArgsError> {
         let mut config = Config::default();
-        // fold in anything from the config file:
+        config.set_from_common(common)?;
         if let Some(config_file) = config_file {
             let base_dir = config_file.config_path.parent().unwrap();
             config.set_from_globals(&config_file.global, base_dir)?;
             config.set_from_adapter(&config_file.adapter, base_dir)?;
         }
-        config.set_from_common(common)?;
         Ok(config)
     }
 
@@ -152,13 +161,17 @@ impl Config {
         common: &CommonArgs,
     ) -> Result<Self, ArgsError> {
         let mut config = Config::default();
-        // fold in anything from the config file:
+        config.set_from_common(common)?;
         if let Some(config_file) = config_file {
             let base_dir = config_file.config_path.parent().unwrap();
             config.set_from_globals(&config_file.global, base_dir)?;
         }
-        config.set_from_common(common)?;
         Ok(config)
+    }
+
+    /// Parse the `certificate_file` (a noise certificate) and return the CN value found within.
+    pub fn get_noise_cn(&self) -> Result<String, ArgsError> {
+        return get_noise_cn(&self.certificate_file);
     }
 
     // Check that the required bits are present based on mode.
@@ -270,7 +283,8 @@ impl Config {
         Ok(())
     }
 
-    // Overwrite our internal state with the values present in the adapter section.
+    // Overwrite our internal state with the values present in the adapter section
+    // of TOML config.
     fn set_from_adapter(
         &mut self,
         config: &AdapterConfigSection,
@@ -284,6 +298,22 @@ impl Config {
                 self.node_public_key_file = Some(base_dir.join(node_public_key_file));
             } else {
                 self.node_public_key_file = Some(node_public_key_file.clone());
+            }
+        }
+
+        if let Some(bootstrap_key_file) = &config.bootstrap_key {
+            // In order to set the bootstrap object, we need to know the CN which means we need
+            // the certificate_file arg to be valid.
+
+            let cn = self.get_noise_cn()?;
+
+            if bootstrap_key_file.is_relative() {
+                self.bootstrap = Some(RsaBootstrapAuth::new(
+                    &cn,
+                    &base_dir.join(bootstrap_key_file),
+                )?);
+            } else {
+                self.bootstrap = Some(RsaBootstrapAuth::new(&cn, bootstrap_key_file)?);
             }
         }
         Ok(())
@@ -386,6 +416,7 @@ impl Default for Config {
             node_addr: None,
             zpr_addr: Vec::new(),
             node_public_key_file: None,
+            bootstrap: None,
         }
     }
 }
@@ -428,6 +459,7 @@ pub struct GlobalConfigSection {
 pub struct AdapterConfigSection {
     pub node_addr: Option<SocketAddr>,
     pub node_public_key_file: Option<PathBuf>,
+    pub bootstrap_key: Option<PathBuf>,
 }
 
 /// Configuration of data path & control plane topology.
@@ -510,5 +542,31 @@ fn check_file_exists(desc: &str, path: &Path) -> Result<(), ArgsError> {
             "{} path error: {:?}",
             desc, e
         ))),
+    }
+}
+
+/// Parse the `certificate_file` (a noise certificate) and return the CN value found within.
+///
+/// TODO: This has nothing to do with noise.  And nothing to do with km_cert_exchange.  Move to a pki util file.
+pub fn get_noise_cn(certificate_file: &Path) -> Result<String, ArgsError> {
+    let cert = load_cert(certificate_file)
+        .map_err(|e| ArgsError::ParseError(format!("failed to load noise certificate: {e:?}")))?;
+    pki::get_cn_from_cert(&cert).ok_or(ArgsError::ParseError(
+        "failed to get CN from certificate".to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_adapter_config() {
+        let toml_str = r#"
+            node_addr = "10.0.0.1:5000"
+            node_public_key_file = "node_pubkey.pem"
+            bootstrap_key = "rsa_key.pem"
+            "#;
+        let _config: AdapterConfigSection = toml::from_str(toml_str).unwrap();
     }
 }

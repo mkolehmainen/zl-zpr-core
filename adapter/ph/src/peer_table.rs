@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::auth::AUTH_KEY_SIZE_BYTES;
 use crate::forwarding_tables::PeerForwardingTable;
 use crate::km::{KeyManager, KmTransportSA};
 use crate::link_state::{LinkStateWrapper, LinkType};
@@ -25,8 +26,6 @@ use tokio_util::sync::CancellationToken;
 use zpr::{self, LinkId, SubstrateAddr, LINK_ID_UNKNOWN};
 
 const PEER_TABLE_SIZE: usize = 1024;
-
-pub const AUTH_KEY_SIZE_BYTES: usize = 32; // blake3 256bit key
 
 pub struct PeerState {
     pub substrate_addr: SubstrateAddr,
@@ -243,7 +242,7 @@ impl PeerTable {
         Ok(())
     }
 
-    /// At some point shortly after the link security assocaition is initialized, the [km_multiplexor] will
+    /// At some point shortly after the link security assocaition is initialized, the [crate::km_multiplexor] will
     /// stash its handle in here.
     ///
     /// Only possible error is if there is no entry in the table under the `link_id`.

@@ -1,4 +1,5 @@
 use crate::assembly::Assembly;
+use crate::auth::{self, DecodedBlob, ZdpAuthCodeBlob, ZdpSelfSignedBlob, AUTH_KEY_SIZE_BYTES};
 use crate::config;
 use crate::counters::CounterType;
 use crate::km::ZPIPair;
@@ -14,6 +15,7 @@ use crate::visa_mgmt;
 use crate::zdp::{ResponseCode, TerminateReason};
 
 use std::fmt::{Display, Formatter};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -126,7 +128,8 @@ pub enum LinkState {
     Closing,
     Resetting,
     Active,
-    RegisterAA,
+    RegisterAA, // aka acquiring ZPR address
+    WaitForInitAuth,
     Error,
 }
 
@@ -137,9 +140,16 @@ pub enum LinkEvent {
     KeyingDone,
     ReceivedHelloRequest,
     ReceivedHelloResponse(ResponseCode),
-    ReceivedRegisterRequest(IpAddress),
-    ReceivedRegisterResponse(ResponseCode),
-    ReceivedAuthorizeResponse,
+
+    ReceivedInitAuth((bool, Option<auth::ZdpInitAuthenticationPayload>)), // (bootstrap_flag, challenge)
+
+    ReceivedAcquireZprAddressRequest(Option<Vec<IpAddress>>, String), // (requested_addrs, auth_blob)
+    ReceivedAcquireResponse(ResponseCode),
+
+    ReceivedGrantZprAddressRequest(Option<Vec<IpAddress>>), // granted_addrs, None means failure.
+    ReceivedGrantResponse(ResponseCode),
+
+    ReceivedAuthorizeResponse, // from visa service
     ReceivedKeepAliveResponse,
     ReceivedTerminateRequest(TerminateReason),
     ReceivedTerminateResponse(ResponseCode),
@@ -198,6 +208,7 @@ impl LinkData {
 }
 
 pub struct LinkStateMachine {
+    id: LinkId,
     state: LinkState,
     status: LinkStatus,
     silent: bool,
@@ -206,8 +217,9 @@ pub struct LinkStateMachine {
 }
 
 impl LinkStateMachine {
-    pub fn new() -> Self {
+    pub fn new(link_id: LinkId) -> Self {
         Self {
+            id: link_id,
             state: LinkState::Inactive,
             status: LinkStatus::Down,
             silent: false,
@@ -217,13 +229,16 @@ impl LinkStateMachine {
     }
 
     pub fn set_state(&mut self, new_state: LinkState) {
+        if new_state != self.state {
+            debug!(target: LINK_STATE, "Link {} state transition {:?} => {:?}", self.id, self.state, new_state);
+        }
         self.state = new_state;
         self.last_state_change = std::time::Instant::now();
     }
 }
 
 pub struct LinkStateWrapper {
-    id: LinkId,
+    id: LinkId, // set at constructor, never changes.
     link_type: LinkType,
     locked_fsm: Mutex<LinkStateMachine>,
     pub locked_data: Mutex<LinkData>,
@@ -234,7 +249,7 @@ impl LinkStateWrapper {
         Self {
             id: new_id,
             link_type: new_link_type,
-            locked_fsm: Mutex::new(LinkStateMachine::new()),
+            locked_fsm: Mutex::new(LinkStateMachine::new(new_id)),
             locked_data: Mutex::new(LinkData::new()),
         }
     }
@@ -249,6 +264,8 @@ impl LinkStateWrapper {
         locked_fsm.status == LinkStatus::Up && locked_fsm.state == LinkState::Active
     }
 
+    /// Takes lock, returns copy of addresses.
+    /// Will hang if you already have fsm lock!
     pub fn get_actor_addresses(&self) -> Vec<IpAddress> {
         let locked_fsm = self.locked_fsm.lock().unwrap();
         locked_fsm.actor_addresses.clone()
@@ -276,18 +293,29 @@ impl LinkStateWrapper {
         asm: &Arc<Assembly>,
         event: LinkEvent,
     ) -> Result<(), LinkStateError> {
+        debug!(target: LINK_STATE, "Link {}: *EVENT* {event:?}", self.id);
         match event {
             LinkEvent::Start => self.start(asm),
             LinkEvent::KeyingDone => self.keying_done(asm),
             LinkEvent::ReceivedHelloRequest => self.process_hello_request(asm),
             LinkEvent::ReceivedHelloResponse(code) => self.process_hello_response(asm, code),
-            LinkEvent::ReceivedRegisterRequest(addr) => {
-                self.process_register_actor_address_request(asm, addr)
+
+            LinkEvent::ReceivedAcquireZprAddressRequest(addrs, blob) => {
+                self.process_acquire_zpr_address_request(asm, addrs, blob)
             }
-            LinkEvent::ReceivedRegisterResponse(code) => {
-                self.process_register_actor_address_response(asm, code)
+            LinkEvent::ReceivedAcquireResponse(code) => self.process_acquire_response(asm, code),
+
+            LinkEvent::ReceivedInitAuth((bootstrap_flag, challenge)) => {
+                self.process_init_auth(asm, bootstrap_flag, challenge)
             }
+
+            LinkEvent::ReceivedGrantZprAddressRequest(addrs) => {
+                self.process_grant_zpr_address_request(asm, addrs)
+            }
+            LinkEvent::ReceivedGrantResponse(code) => self.process_grant_response(asm, code),
+
             LinkEvent::ReceivedAuthorizeResponse => self.process_authorize_repsonse(asm),
+
             LinkEvent::ReceivedTerminateRequest(code) => self.process_terminate_request(asm, code),
             LinkEvent::ReceivedTerminateResponse(_) => self.process_terminate_response(asm),
             LinkEvent::ReceivedTerminateIndication(code) => {
@@ -382,7 +410,6 @@ impl LinkStateWrapper {
 
         if let Some(ref peer_cert) = sa.peer_cert {
             info!(target: LINK_STATE, "Link {link_id} has name {:?}", peer_cert.subject_name());
-
             // assign special-peer name if this peer is special
             for name in
                 special_peers::special_peer_names_from_x509_subject_name(peer_cert.subject_name())
@@ -425,7 +452,7 @@ impl LinkStateWrapper {
     /// Update link state based on received hello request
     /// Transitions from Helloing to Registering Actor Address
     /// Does not generate any packets
-    fn process_hello_request(&self, _asm: &Assembly) -> Result<(), LinkStateError> {
+    fn process_hello_request(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
         let link_id = self.id;
         match (self.link_type, locked_fsm.state) {
@@ -435,11 +462,15 @@ impl LinkStateWrapper {
                 Ok(())
             }
             (LinkType::NodeToAdapter, LinkState::Helloing) => {
+                // Note that the node goes into RegisterAA while the adapter will go into WaitForInitAuth.
+                // Node is really waiting now for an Acquire Call.
                 locked_fsm.set_state(LinkState::RegisterAA);
                 debug!(
                     target: LINK_STATE,
-                    "Link {link_id} finished helloing.  Waiting on register actor address"
+                    "Link {link_id} finished helloing.  Waiting for other side to respond to init-auth"
                 );
+                drop(locked_fsm);
+                self.send_init_authentication_request(asm);
                 Ok(())
             }
             (LinkType::AdapterToNode, _) => {
@@ -455,6 +486,10 @@ impl LinkStateWrapper {
         }
     }
 
+    /// This is kicked off by [LinkEvent::ReceivedHelloResponse].
+    /// That event may be generated when we have sent hello
+    /// message ourselves [LinkStateWrapper::maybe_send_hello]
+    ///
     /// Update link state based on received hello response
     /// Transitions from Helloing to Registering Actor Address
     /// Sends a Register Actor Address request if this is an adapter
@@ -473,13 +508,12 @@ impl LinkStateWrapper {
 
         match (self.link_type, locked_fsm.state) {
             (LinkType::AdapterToNode, LinkState::Helloing) => {
-                locked_fsm.set_state(LinkState::RegisterAA);
+                locked_fsm.set_state(LinkState::WaitForInitAuth);
                 debug!(
                     target: LINK_STATE,
-                    "Link {link_id} finished helloing.  Sending register actor address"
+                    "Link {link_id} finished helloing.  Now waiting for init auth."
                 );
                 drop(locked_fsm);
-                self.send_register_address(asm);
                 Ok(())
             }
             (LinkType::NodeToNode, LinkState::Helloing) => {
@@ -500,83 +534,188 @@ impl LinkStateWrapper {
         }
     }
 
-    fn send_register_address(&self, asm: &Arc<Assembly>) {
-        let link_id = self.id;
-        let task_asm = asm.clone();
-        tokio::task::spawn_local(async move {
-            for actor_addr in &task_asm.local_zpr_addresses {
-                let result = mgmt::requests::send_register_actor_address_request(
-                    &task_asm,
-                    link_id,
-                    *actor_addr,
-                )
-                .await;
-
-                if result.is_err() || result.unwrap() == ResponseCode::Other {
-                    warn!(target: LINK_STATE, "Link {link_id} failed to register address {actor_addr}");
-                }
-            }
-
-            task_asm.process_link_state_event(
-                link_id,
-                LinkEvent::ReceivedRegisterResponse(ResponseCode::Success),
-            )
-        });
-    }
-
-    /// Update link state based on received register actor address request
-    /// Transitions from Registering Actor Address to Active
-    /// Does not generate any packets
+    /// The ZprAddressRequest is from adapter to node (furute: joining node to node).
+    /// Includes authentication blob from sender, as well as the requested addresses.
+    /// Inclusion of requested addresses is temporary.
     ///
-    /// The "Register Actor Address" is to become the "Acquire ZPR Address"
-    /// message soon.  In that version, the Acquire message will include a
-    /// BLOB showing evidence of authentication which we can evaluate and
-    /// pass to the visa service.  Visa service will grant access and an
-    /// address and call back down here to [process_authorize_response].
-    fn process_register_actor_address_request(
+    /// This will call off to visa service for checking.
+    /// Results comes back through a RecievedAuthorizeResponse event.
+    fn process_acquire_zpr_address_request(
         &self,
         asm: &Arc<Assembly>,
-        addr: IpAddress,
+        addrs: Option<Vec<IpAddress>>,
+        blob: String,
+    ) -> Result<(), LinkStateError> {
+        let link_id = self.id;
+        let mut locked_fsm = self.locked_fsm.lock().unwrap();
+
+        match (self.link_type, locked_fsm.state) {
+            (LinkType::NodeToAdapter, LinkState::RegisterAA) => {}
+
+            (_, _) => {
+                return Err(LinkStateError::InvalidOperation(
+                    "Discarded unsolicited register address request".to_string(),
+                ))
+            }
+        }
+
+        if addrs.is_none() {
+            warn!(target: LINK_STATE, "Link {link_id} received acquire request with no addresses");
+            drop(locked_fsm);
+            return self.process_error_response(asm);
+        }
+        let addrs = addrs.unwrap();
+
+        // TODO: For now there can be at most one address.
+        if addrs.len() > 1 {
+            warn!(target: LINK_STATE, "Link {link_id} received acquire request with multiple addresses");
+            drop(locked_fsm);
+            return self.process_error_response(asm);
+        }
+        let requested_addr = addrs[0];
+
+        locked_fsm.actor_addresses.push(requested_addr);
+        debug!(
+            target: LINK_STATE,
+            "Link {link_id} received acquire addr request for actor ({requested_addr})."
+        );
+
+        // A self-signed blob needs to be checked before we forward it on.
+
+        let Ok(d_blob) = auth::decode_blob(&blob) else {
+            warn!(target: LINK_STATE, "Link {link_id} received acquire request with invalid blob");
+            drop(locked_fsm);
+            return self.process_error_response(asm);
+        };
+
+        match d_blob {
+            DecodedBlob::AuthCode(_) => {}
+            DecodedBlob::SelfSigned(ss_blob) => {
+                if !self.check_self_signed_blob(asm, link_id, &ss_blob) {
+                    drop(locked_fsm);
+                    return self.process_error_response(asm);
+                }
+            }
+        }
+
+        // Now we have verified our part of the blob, we can send to the visa service for checking the signature.
+        // TODO: Send d_blob to visa service, check signature, etc.
+
+        info!(target: LINK_STATE, "TODO: not yet sending blob to vs");
+        match visa_mgmt::build_connect_request(asm, link_id, requested_addr) {
+            Ok(Some(conn_req)) => {
+                drop(locked_fsm);
+                Ok(visa_mgmt::authorize_connect(asm, link_id, conn_req))
+            }
+
+            Ok(None) => {
+                debug!(target: LINK_STATE, "skipping visa service authorize call, authorizing ourselves");
+
+                // Need to send a grant here anyway to "turn on" the adapter (and outselves)
+                // So pretend we are the visa service and handle our own authorization.
+                drop(locked_fsm);
+
+                let task_asm = asm.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(e) = task_asm
+                        .process_link_state_event(link_id, LinkEvent::ReceivedAuthorizeResponse)
+                    {
+                        error!(target: LINK_STATE, "Link {link_id} failed to process authorize response: {e}");
+                    }
+                });
+
+                Ok(())
+            }
+
+            Err(e) => Err(e),
+        }
+    }
+
+    fn check_self_signed_blob(
+        &self,
+        asm: &Arc<Assembly>,
+        link_id: LinkId,
+        ss_blob: &ZdpSelfSignedBlob,
+    ) -> bool {
+        // Now check that the CN in the presented blob matches the CN the peer used to establish link.
+        let Some(peer_state) = asm.peer_table.get(link_id) else {
+            warn!(target: LINK_STATE, "Link {link_id} blob check failed: cannot find peer state entry");
+            return false;
+        };
+        let Some(sa) = peer_state.get_established_transport_association() else {
+            warn!(target: LINK_STATE, "Link {link_id} blob check failed: cannot find SA");
+            return false;
+        };
+        let Some(ref peer_cert) = sa.peer_cert else {
+            warn!(target: LINK_STATE, "Link {link_id} no peer cert found, cannot validate blob");
+            return false;
+        };
+        let key = asm.peer_table.inspect(link_id, {
+            |peer| {
+                let mut key = [0u8; AUTH_KEY_SIZE_BYTES];
+                key[0..AUTH_KEY_SIZE_BYTES].copy_from_slice(&peer.auth_key[0..AUTH_KEY_SIZE_BYTES]);
+                key
+            }
+        });
+        if key.is_none() {
+            warn!(target: LINK_STATE, "Link {link_id} received acquire request but have no auth key");
+            return false;
+        }
+        let key = key.unwrap();
+
+        if let Err(e) = ss_blob.verify_blob_challenge(peer_cert, &key) {
+            warn!(target: LINK_STATE, "Link {link_id} challenge verification failed: {e}");
+            return false;
+        }
+        true
+    }
+
+    /// AcquireResponse is sent from a node to the adapter after adapter sends
+    /// in the acquire zpr address message (which is essentially an auth message).
+    /// The ACK of this means we are now waiting for a Grant message.
+    ///
+    /// No state change. No messages.
+    fn process_acquire_response(
+        &self,
+        _asm: &Arc<Assembly>,
+        code: ResponseCode,
+    ) -> Result<(), LinkStateError> {
+        let link_id = self.id;
+        let locked_fsm = self.locked_fsm.lock().unwrap();
+        match (self.link_type, locked_fsm.state) {
+            (LinkType::AdapterToNode, LinkState::RegisterAA) => {
+                debug!(target: LINK_STATE, "link {link_id} acquire ZDP address response (ACK) message recieved, code {:?}", code);
+                Ok(())
+            }
+            (_, _) => Err(LinkStateError::InvalidOperation(
+                "Discarded unsolicited acquire zpr adress response".to_string(),
+            )),
+        }
+    }
+
+    /// A grant response is just an ACK of a ZPR address grant message.
+    /// For now only expected from an adapter to a a node.
+    /// If status is OK means the link is addressed and up on sender side.
+    fn process_grant_response(
+        &self,
+        asm: &Arc<Assembly>,
+        code: ResponseCode,
     ) -> Result<(), LinkStateError> {
         let link_id = self.id;
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
         match (self.link_type, locked_fsm.state) {
             (LinkType::NodeToAdapter, LinkState::RegisterAA) => {
-                locked_fsm.actor_addresses.push(addr);
-                debug!(
-                    target: LINK_STATE,
-                    "Link {link_id} received actor address ({addr}).  Authorizing with visa service"
-                );
-
-                match visa_mgmt::build_connect_request(asm, link_id, addr) {
-                    Ok(Some(conn_req)) => Ok(visa_mgmt::authorize_connect(asm, link_id, conn_req)),
-                    Ok(None) => {
-                        locked_fsm.set_state(LinkState::Active);
-                        debug!(
-                            target: LINK_STATE,
-                            "Link {link_id} (Visa Service) received actor address.  Becoming active, no authorization required"
-                        );
-                        drop(locked_fsm);
-                        self.run_active(asm)
-                    }
-                    Err(e) => Err(e),
+                if code == ResponseCode::Success {
+                    locked_fsm.set_state(LinkState::Active);
+                    debug!(target: LINK_STATE, "Link {link_id} has ACKd the grant.  Becoming active");
+                    drop(locked_fsm);
+                    self.run_active(&asm)
+                } else {
+                    warn!(target: LINK_STATE, "Link {link_id} did not ACK the grant. Shutting down");
+                    locked_fsm.set_state(LinkState::Error);
+                    drop(locked_fsm);
+                    self.initiate_close(asm, TerminateReason::Other)
                 }
-            }
-            (_, _) => Err(LinkStateError::InvalidOperation(
-                "Discarded unsolicited register address request".to_string(),
-            )),
-        }
-    }
-
-    fn process_authorize_repsonse(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
-        let link_id = self.id;
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::RegisterAA) => {
-                locked_fsm.set_state(LinkState::Active);
-                debug!(target: LINK_STATE, "Link {link_id} authorized.  Becoming active");
-                drop(locked_fsm);
-                self.run_active(&asm)
             }
             (_, _) => Err(LinkStateError::InvalidOperation(
                 "Discarded unsolicited authorize response".to_string(),
@@ -584,31 +723,239 @@ impl LinkStateWrapper {
         }
     }
 
-    /// Update link state based on received register actor address response
-    /// Transitions from Registering Actor Address to Active
-    /// Does not generate any packets
-    fn process_register_actor_address_response(
+    /// Grant ZPR Address message is from a node to an adapter and includes the
+    /// result of authentication verification.
+    ///
+    /// If this inidicates success it will include the ZPR addresses we are
+    /// supposed to use.  If this indicates failure we should tear down the link.
+    ///
+    /// Currently we tell the node what address we want so these should be no
+    /// suprise and are actually already set.
+    ///
+    /// `addrs` has granted address on success, None on failure.
+    fn process_grant_zpr_address_request(
         &self,
         asm: &Arc<Assembly>,
-        _code: ResponseCode,
+        addrs: Option<Vec<IpAddress>>,
     ) -> Result<(), LinkStateError> {
         let link_id = self.id;
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
         match (self.link_type, locked_fsm.state) {
             (LinkType::AdapterToNode, LinkState::RegisterAA) => {
-                locked_fsm.set_state(LinkState::Active);
-                asm.tun_ctl.set_carrier(true).unwrap();
-                debug!(
-                    target: LINK_STATE,
-                    "Link {link_id} finished registering actor address.  Becoming active"
-                );
-                drop(locked_fsm);
-                self.run_active(asm)
+                match addrs {
+                    Some(addrs) => {
+                        // TODO: In future we will take addresses from here and configure TUN.
+                        info!(target: LINK_STATE, "Link {link_id} granted ZPR addresses {:?}, becoming ACTIVE", addrs);
+                        locked_fsm.set_state(LinkState::Active);
+                        asm.tun_ctl.set_carrier(true).unwrap();
+                        debug!(
+                            target: LINK_STATE,
+                            "Link {link_id} finished registering actor address: becoming active"
+                        );
+                        drop(locked_fsm);
+                        self.run_active(asm)
+                    }
+                    None => {
+                        // Grant failed.
+                        warn!(target: LINK_STATE, "Link {link_id} failed to be granted ZPR address");
+                        locked_fsm.set_state(LinkState::Error);
+                        drop(locked_fsm);
+                        self.initiate_close(asm, TerminateReason::Other)
+                    }
+                }
             }
             (_, _) => Err(LinkStateError::InvalidOperation(
-                "Discarded unsolicited register address response".to_string(),
+                "Discarded unsolicited Grant Zpr Address request".to_string(),
             )),
         }
+    }
+
+    /// This is the event handler fro the return path from the visa service AUTHORIZE operation.
+    /// This needs to trigger sending of the Grant Address message.
+    ///
+    /// TODO: At some point this will need the ZPR address returned to it also.  For now we
+    /// use the address we saved in our state (from the original request).
+    ///
+    fn process_authorize_repsonse(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
+        let addrs = self.get_actor_addresses();
+        let locked_fsm = self.locked_fsm.lock().unwrap();
+
+        match (self.link_type, locked_fsm.state) {
+            (LinkType::NodeToAdapter, LinkState::RegisterAA) => {} // ok
+            (_, _) => {
+                return Err(LinkStateError::InvalidOperation(
+                    "Discarded unsolicited authorize response".to_string(),
+                ))
+            }
+        }
+
+        // Send a Grant message, consume the response and then send in an event
+        // indicating we got it (ReceivedGrantResponse).
+        drop(locked_fsm);
+
+        // Will call back via ReceivedGrantResponse event if successful.
+        self.send_grant_zpr_address_request(asm, addrs);
+        Ok(())
+    }
+
+    /// Handle an init-auth message from sender.
+    ///
+    /// If this is bootstrap and we are configured for bootstrap we can self-authenticate
+    /// and send in an AcquireZprAddressRequest.
+    ///
+    /// TODO: If we are not configured for bootstrap then we need to kick off actor
+    /// authentication somehow.  FOR NOW in this case we just proceed, sending in a
+    /// "fake" address request.
+    ///
+    /// For now we must be in WaitForInitAuth to accept this message.
+    /// We transition to RegisterAA if we successfully self-auth, otherwise we go to
+    /// error and shutdown the link.
+    fn process_init_auth(
+        &self,
+        asm: &Arc<Assembly>,
+        bootstrap: bool,
+        challenge: Option<auth::ZdpInitAuthenticationPayload>,
+    ) -> Result<(), LinkStateError> {
+        let link_id = self.id;
+
+        let mut locked_fsm = self.locked_fsm.lock().unwrap();
+        match (self.link_type, locked_fsm.state) {
+            // NOTE: This is not exactly right, in general we can get an InitAuth at any time, though we
+            // may not want to act on it and sometimes may be a protocol error.
+            (LinkType::AdapterToNode, LinkState::WaitForInitAuth) => {
+                debug!(target: LINK_STATE, "Link {link_id} received init auth.");
+
+                // If we can do bootstrap and it is allowed, then do that.
+                if bootstrap && asm.bsauth.is_some() {
+                    if challenge.is_none() {
+                        error!(target: LINK_STATE, "Link {link_id} received init auth with no challenge");
+                        locked_fsm.set_state(LinkState::Error);
+                        drop(locked_fsm);
+                        return self.initiate_close(asm, TerminateReason::Other);
+                    }
+                    let challenge = challenge.unwrap();
+                    if let Some(bs) = asm.bsauth.as_ref() {
+                        match bs.authenticate(&challenge) {
+                            Ok(blobstr) => {
+                                locked_fsm.set_state(LinkState::RegisterAA);
+                                drop(locked_fsm);
+                                // The send function below will invoke a state event callback.
+                                // We staty in RegisterAA state until we get a grant.
+                                self.send_acquire_zpr_address_request(asm, &blobstr);
+                            }
+                            Err(e) => {
+                                error!(target: LINK_STATE, "Link {link_id} failed to self-authenticate: {e:?}");
+                                // Shutdown the link
+                                locked_fsm.set_state(LinkState::Error);
+                                drop(locked_fsm);
+                                return self.initiate_close(asm, TerminateReason::Other);
+                            }
+                        }
+                    }
+                } else {
+                    // Bootstrap not allowed or not configured. (TODO: Real actor auth)
+                    locked_fsm.set_state(LinkState::RegisterAA);
+                    drop(locked_fsm);
+                    let blob = ZdpAuthCodeBlob::new_fake().encode();
+                    self.send_acquire_zpr_address_request(asm, &blob);
+                }
+            }
+            (_, _) => {
+                return Err(LinkStateError::UnexpectedTransition(
+                    locked_fsm.state,
+                    "Discard unexpected init authentication".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Send off the Inti-Authentication message with a blob that the receiver could
+    /// use for authentication.
+    fn send_init_authentication_request(&self, asm: &Arc<Assembly>) {
+        let link_id = self.id;
+        let task_asm = asm.clone();
+
+        tokio::task::spawn_local(async move {
+            let result = mgmt::requests::send_init_authentication_request(&task_asm, link_id).await;
+            if result.is_err() {
+                error!(target: LINK_STATE, "Link {link_id} failed to send init-auth request");
+                if let Err(e) = task_asm.process_link_state_event(link_id, LinkEvent::Error) {
+                    error!(target: LINK_STATE, "event handling error: {e}");
+                }
+            }
+        });
+    }
+
+    /// Send the Grant message, if all goes well then fire off a ReceivedGrantResponse event.
+    fn send_grant_zpr_address_request(&self, asm: &Arc<Assembly>, addrs: Vec<IpAddress>) {
+        let link_id = self.id;
+        let task_asm = asm.clone();
+
+        // Convert the IpAddresses into IpAddrs
+        let ipaddrs = addrs
+            .iter()
+            .map(|addr| IpAddr::from(addr))
+            .collect::<Vec<_>>();
+
+        tokio::task::spawn_local(async move {
+            let result = mgmt::requests::send_grant_zpr_address_request(
+                &task_asm,
+                link_id,
+                ResponseCode::Success,
+                &ipaddrs,
+            )
+            .await;
+
+            if result.is_err() {
+                error!(target: LINK_STATE, "Link {link_id} failed to send grant zpr address");
+                if let Err(e) = task_asm.process_link_state_event(link_id, LinkEvent::Error) {
+                    error!(target: LINK_STATE, "event handling error: {e}");
+                }
+            } else {
+                // Did send and got response.
+                if let Err(e) = task_asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantResponse(result.unwrap()),
+                ) {
+                    error!(target: LINK_STATE, "event handling error: {e}");
+                }
+            }
+        });
+    }
+
+    /// Send Acquire message, and if all goes well fire off a ReceivedAcquireResponse event.
+    fn send_acquire_zpr_address_request(&self, asm: &Arc<Assembly>, blob: &str) {
+        let link_id = self.id;
+        let task_asm = asm.clone();
+
+        let blob_opt = Some(blob.as_bytes().to_vec());
+
+        tokio::task::spawn_local(async move {
+            let result = mgmt::requests::send_acquire_zpr_address_request(
+                &task_asm,
+                link_id,
+                &task_asm.local_zpr_addresses,
+                blob_opt,
+            )
+            .await;
+
+            if result.is_err() {
+                error!(target: LINK_STATE, "Link {link_id} failed to send acquire zpr address");
+                if let Err(e) = task_asm.process_link_state_event(link_id, LinkEvent::Error) {
+                    error!(target: LINK_STATE, "event handlinhg error {e}");
+                }
+            } else {
+                // Did send and got response.
+                if let Err(e) = task_asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedAcquireResponse(result.unwrap()),
+                ) {
+                    error!(target: LINK_STATE, "event handling error {e}");
+                }
+            }
+        });
     }
 
     fn process_error_response(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {

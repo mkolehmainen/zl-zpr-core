@@ -6,11 +6,12 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use clap::Parser;
 
 use crate::assembly::PhMode;
+use crate::auth;
 use crate::main_args::{ArgsError, Command, Control};
 
 use crate::config::{AdapterConfig, Config, NodeConfig};
@@ -40,6 +41,7 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
             common,
             node_addr,
             node_public_key_file,
+            bootstrap_key,
         } => {
             ph_mode = PhMode::Adapter;
             let config_file: Option<AdapterConfig> = match config_file {
@@ -61,8 +63,7 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
             if let Some(node_addr) = node_addr {
                 config.node_addr = Some(node_addr);
             }
-            if let Some(node_public_key_file) = node_public_key_file {
-                let npkf = PathBuf::from(node_public_key_file);
+            if let Some(npkf) = node_public_key_file {
                 if npkf.is_relative() {
                     let npkf = fs::canonicalize(npkf).or_else(|e| {
                         Err(ArgsError::PathError(format!(
@@ -74,6 +75,20 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
                 } else {
                     config.node_public_key_file = Some(npkf);
                 }
+            }
+            if let Some(mut bootstrap_key) = bootstrap_key {
+                if bootstrap_key.is_relative() {
+                    bootstrap_key = fs::canonicalize(bootstrap_key).or_else(|e| {
+                        Err(ArgsError::PathError(format!(
+                            "path error for bootstrap key: {:?}",
+                            e
+                        )))
+                    })?;
+                }
+                config.bootstrap = Some(auth::RsaBootstrapAuth::new(
+                    &config.get_noise_cn()?,
+                    &bootstrap_key,
+                )?);
             }
         }
 
@@ -139,6 +154,7 @@ mod test {
     use std::env;
     use std::fs;
     use std::net::{IpAddr, SocketAddr};
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempFile {

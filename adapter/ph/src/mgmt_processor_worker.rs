@@ -50,7 +50,7 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
 
     debug!(
         target: ZDP,
-        "handling mgmt message from {} type {:?} seq_num {}",
+        "Link {}: handling mgmt message type {:?} seq_num {}",
         pkt.metadata().ingress_link_id,
         base_hdr.packet_type,
         base_hdr.sequence_number
@@ -97,23 +97,22 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
 
             ZdpPacketType::HelloRequest => handlers::handle_hello_request(asm, seq_num, pkt).await,
 
-            ZdpPacketType::HelloResponse => {
-                handlers::handle_hello_response(asm, seq_num, pkt).await
+            ZdpPacketType::InitAuthenticationRequest => {
+                handlers::handle_init_authentication_request(asm, seq_num, pkt).await
             }
 
-            ZdpPacketType::InitAuthentication => {
-                handlers::handle_init_authentication(asm, pkt).await
+            ZdpPacketType::AcquireZprAddressRequest => {
+                handlers::handle_acquire_zpr_address_request(asm, seq_num, pkt).await
             }
 
-            ZdpPacketType::RegisterActorAddressRequest => {
-                handlers::handle_register_actor_address_request(asm, seq_num, pkt).await
+            ZdpPacketType::GrantZprAddressRequest => {
+                handlers::handle_grant_zpr_address_request(asm, seq_num, pkt).await
             }
 
-            ZdpPacketType::RegisterActorAddressResponse => {
-                handlers::handle_register_actor_address_response(asm, seq_num, pkt).await
+            packet_type => {
+                warn!("unhandled mgmt packet type {:?}", packet_type);
+                Err((HandleMgmtError::UnknownType(packet_type.0), pkt))
             }
-
-            packet_type => Err((HandleMgmtError::UnknownType(packet_type.0), pkt)),
         }
     }
 }

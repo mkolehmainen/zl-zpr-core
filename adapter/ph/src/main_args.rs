@@ -3,6 +3,7 @@
 //! The main entry point is [crate::main_argparse::argparse] which will parse the command line arguments
 //! and any config file, returning a PH configuration.
 
+use crate::auth::AuthError;
 use crate::logging::targets::*;
 use clap::{Args, Parser, Subcommand};
 use std::net::{IpAddr, SocketAddr};
@@ -23,6 +24,9 @@ pub enum ArgsError {
 
     #[error("{0}")]
     PathError(String),
+
+    #[error("bootstrap config error: {0}")]
+    AuthError(#[from] AuthError),
 }
 
 /// ZPR Packet Handler
@@ -112,7 +116,11 @@ pub enum Command {
 
         /// PEM file holding the nodes noise public key
         #[arg(long, short = 'b', value_name = "PATH")]
-        node_public_key_file: Option<String>, // noise public key for node (only specified when starting an adapter)
+        node_public_key_file: Option<PathBuf>, // noise public key for node (only specified when starting an adapter)
+
+        /// PEM file holding the boostrap RSA private key
+        #[arg(long, value_name = "PATH")]
+        bootstrap_key: Option<PathBuf>,
     },
     /// Start the handler in node mode
     #[command(verbatim_doc_comment)]

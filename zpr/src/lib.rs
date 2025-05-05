@@ -88,6 +88,22 @@ impl std::fmt::Display for L3Type {
     }
 }
 
+/// Trait for that from which an L3Type can be derived.
+#[allow(dead_code)]
+pub trait L3TypeDeriveable {
+    fn l3_type(&self) -> L3Type;
+}
+
+/// Derive L3Type from an IP address.
+impl L3TypeDeriveable for IpAddr {
+    fn l3_type(&self) -> L3Type {
+        match self {
+            IpAddr::V4(_) => L3Type::Ipv4,
+            IpAddr::V6(_) => L3Type::Ipv6,
+        }
+    }
+}
+
 /// Bitmask indicating how an actor packet is compressed.
 pub type CompressionMode = u8;
 

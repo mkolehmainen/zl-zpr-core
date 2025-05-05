@@ -19,6 +19,7 @@ mod adapter_manager_worker;
 mod adapter_tables;
 mod admin_worker;
 mod assembly;
+mod auth;
 mod batch_io;
 mod capture_worker;
 mod classifier;
@@ -77,7 +78,7 @@ use flow_control::FlowControl;
 use km_multiplexor::KmState;
 use km_noise::NoiseKeypair;
 use logging::targets::STARTUP;
-use pki::{load_cert, load_noise_public_key};
+use pki::load_noise_public_key;
 use queues::*;
 use sys::ZprTun;
 use tun_ctl::TunCtl;
@@ -301,16 +302,8 @@ fn main() -> ExitCode {
     let vs_outq;
 
     if ph_mode == PhMode::Node {
-        let node_cert = load_cert(&config.certificate_file).expect("unable to read certificate");
-
-        let node_name = node_cert
-            .subject_name()
-            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
-            .next()
-            .expect("unable to locate CN in certificate subject name")
-            .data()
-            .as_utf8()
-            .expect("CN must be UTF-8 string");
+        let node_name = config::get_noise_cn(&config.certificate_file)
+            .expect("unable to determine node name: cannot parse CN");
         info!(target: STARTUP, "node name is \"{node_name}\"");
 
         let node_actor =
@@ -363,6 +356,7 @@ fn main() -> ExitCode {
         peer_noise_keypair,
         certx,
         system_start_time,
+        bsauth: config.bootstrap,
     });
 
     //

@@ -158,6 +158,12 @@ impl From<IpAddress> for IpAddr {
     }
 }
 
+impl From<&IpAddress> for IpAddr {
+    fn from(addr: &IpAddress) -> Self {
+        IpAddr::from(*addr)
+    }
+}
+
 impl std::fmt::Display for IpAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         Ipv6Addr::from(*self).fmt(f)
