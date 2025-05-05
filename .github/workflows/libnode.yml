@@ -1,0 +1,28 @@
+name: Rust-node
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'libnode/**'
+      - '.github/workflows/rust-libnode.yml'
+  pull_request:
+    paths:
+      - 'libnode/**'
+      - '.github/workflows/rust-libnode.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  libnode-build:
+    name: Libnode
+    uses: ./.github/workflows/rust-containerized-build-test.yml
+    with:
+      name: Libnode
+      path: ./libnode
+    secrets: inherit

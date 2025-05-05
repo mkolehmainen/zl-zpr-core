@@ -1,0 +1,28 @@
+name: Rust-zprext
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'zpr-ext/**'
+      - '.github/workflows/rust-zprext.yml'
+  pull_request:
+    paths:
+      - 'zpr-ext/**'
+      - '.github/workflows/rust-zprext.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  zpr-ext:
+    name: ZPR Ext
+    uses: ./.github/workflows/rust-build-test.yml
+    with:
+      name: 'ZPR-Ext'
+      path: './zpr-ext'
+    secrets: inherit

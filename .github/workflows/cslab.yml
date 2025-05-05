@@ -1,0 +1,28 @@
+name: Rust-cslab
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'cslab/**'
+      - '.github/workflows/rust-cslab.yml'
+  pull_request:
+    paths:
+      - 'cslab/**'
+      - '.github/workflows/rust-cslab.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cslab-build:
+    name: Cslab
+    uses: ./.github/workflows/rust-build-test.yml
+    with:
+      name: 'Cslab'
+      path: './cslab'
+    secrets: inherit
