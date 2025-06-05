@@ -49,16 +49,38 @@ pub async fn send_echo_request(asm: &Assembly, link_id: zpr::LinkId) -> zpr::Seq
 }
 
 /// send a Hello Request and wait for the Response (RFC 6.5 § 6.3.4)
+///
+/// Augmented temporarily with an actors local ZPR addresses.  In future these
+/// will be handed out to the adapter by the dock (first an AAA then a real one).
+///
+/// Note we only use the first address in the list.
+///
+/// ## Panics
+/// - If address list is empty.
 pub async fn send_hello_request(
     asm: &Assembly,
     link_id: zpr::LinkId,
+    actor_addrs: &[IpAddr],
 ) -> Result<zdp::ResponseCode, ()> {
+    if actor_addrs.is_empty() {
+        panic!("send_hello_request requires at least one local ZPR address");
+    }
+    let actor_addr = actor_addrs[0].to_owned();
     let response = core::send_sync_non_flow_req(
         asm,
         link_id,
         zdp::ZdpPacketType::HelloRequest,
         zdp::ZdpPacketType::HelloResponse,
-        move |_packet| {},
+        move |mut req| {
+            let hdr = zdp::ZdpHelloRequestHeader {
+                ip_version: actor_addr.l3_type(),
+            };
+            hdr.write_to_buf(&mut req).unwrap();
+            match actor_addr {
+                IpAddr::V4(addr) => req.put(&addr.octets()[..]),
+                IpAddr::V6(addr) => req.put(&addr.octets()[..]),
+            }
+        },
     )
     .await;
 
