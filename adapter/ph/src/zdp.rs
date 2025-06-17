@@ -232,6 +232,9 @@ pub struct ZdpTerminateLinkResponseHeader {
 pub struct ZdpBindActorAddressRequestHeader {
     pub ip_version: zpr::L3Type,
     pub compression_mode: zpr::CompressionMode,
+    // Followed in memory by:
+    // - <PACKET BODY starting with IP header>
+    // (source/dest addresses and layer4 protocol must be extracted from the IP header in the packet)
 }
 
 /// Bind Actor Address response (§ 6.3.11)

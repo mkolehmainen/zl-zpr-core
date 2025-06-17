@@ -8,7 +8,7 @@ use crate::counters;
 use crate::defs::*;
 use crate::link_state::LinkEvent;
 use crate::logging::targets::{FLOW_MGMT, REPORTING, ZDP};
-use crate::net_defs::IpAddress;
+use crate::net_defs::{ip_number, IpAddress};
 use crate::packet::Packet;
 use crate::zdp;
 use bytes::{Buf, BufMut};
@@ -619,67 +619,104 @@ pub async fn handle_bind_actor_address_request(
         return Err((HandleMgmtError::BadStructure, pkt));
     };
 
-    // TODO: disallow bind requests between nodes
-
-    // read addresses (always present)
-    let src_address;
-    let dst_address;
-    match hdr.ip_version {
+    // The packet body now immediately follows the header
+    // Extract source/dest addresses and protocol from the IP header in the packet body.
+    // Does not advance the packet buffer position.
+    // TODO: Could our own classifier.rs do this for us?
+    let body = pkt.body();
+    let (src_address, dst_address, ip_protocol) = match hdr.ip_version {
         zpr::L3Type::Ipv4 => {
-            let Ok(src_addr) = <[u8; 4]>::read_from_buf(&mut pkt) else {
+            if body.len() < 20 {
                 return Err((HandleMgmtError::BadStructure, pkt));
-            };
-            src_address = src_addr.into();
-
-            let Ok(dst_addr) = <[u8; 4]>::read_from_buf(&mut pkt) else {
-                return Err((HandleMgmtError::BadStructure, pkt));
-            };
-            dst_address = dst_addr.into();
+            }
+            // IPv4 header: src @ 12..16, dst @ 16..20, protocol @ 9
+            let src_address = IpAddress::new_from_v4([body[12], body[13], body[14], body[15]]);
+            let dst_address = IpAddress::new_from_v4([body[16], body[17], body[18], body[19]]);
+            let ip_protocol = body[9];
+            (src_address, dst_address, ip_protocol)
         }
-
         zpr::L3Type::Ipv6 => {
-            let Ok(src_addr) = <[u8; 16]>::read_from_buf(&mut pkt) else {
+            if body.len() < 40 {
                 return Err((HandleMgmtError::BadStructure, pkt));
+            }
+            // IPv6 header: src @ 8..24, dst @ 24..40, next_header @ 6
+            let src_address = IpAddress {
+                v6: body[8..24].try_into().unwrap(),
             };
-            src_address = src_addr.into();
-
-            let Ok(dst_addr) = <[u8; 16]>::read_from_buf(&mut pkt) else {
-                return Err((HandleMgmtError::BadStructure, pkt));
+            let dst_address = IpAddress {
+                v6: body[24..40].try_into().unwrap(),
             };
-            dst_address = dst_addr.into();
+            let ip_protocol = body[6];
+            (src_address, dst_address, ip_protocol)
         }
-
         _ => {
             return Err((HandleMgmtError::BadStructure, pkt));
         }
     };
 
-    // read IP Protocol (always present)
-    if pkt.remaining() < 1 {
-        return Err((HandleMgmtError::BadStructure, pkt));
-    }
-    let ip_protocol = pkt.get_u8();
+    // TODO: How do bind requests work between nodes?
 
-    // read source port (optional)
-    let src_port;
-    if hdr.compression_mode & zpr::compression_mode::SOURCE_PORT_PRESENT != 0 {
-        if pkt.remaining() < 2 {
+    // Next in we have the entire packet that is triggering this bind request (well, up to
+    // what will fit in our buffer).
+    // So it will be a IPv6 or IPv4 header, and then the l4 header, etc.
+
+    let packet_body: Vec<u8> = pkt.body().to_vec(); // copy to send to visa service
+
+    let src_port: u16;
+    let dst_port: u16;
+
+    match hdr.ip_version {
+        zpr::L3Type::Ipv4 => {
+            if pkt.remaining() < 20 {
+                // minimum IPv4 header size
+                return Err((HandleMgmtError::BadStructure, pkt));
+            }
+            let ihl = pkt.body()[0] & 0x0f; // Internet Header Length
+            if ihl < 5 {
+                return Err((HandleMgmtError::BadStructure, pkt));
+            }
+            let hdrlen = (ihl as usize) * 4; // header length in bytes
+            if pkt.remaining() < hdrlen {
+                return Err((HandleMgmtError::BadStructure, pkt));
+            }
+            pkt.advance(hdrlen); // skip IPv4 header
+        }
+        zpr::L3Type::Ipv6 => {
+            if pkt.remaining() < 40 {
+                // IPv6 header size
+                return Err((HandleMgmtError::BadStructure, pkt));
+            }
+            pkt.advance(40); // skip IPv6 header
+        }
+        _ => {
+            warn!(target: ZDP, "Link {}: unsupported ip_version value {}", pkt.metadata().ingress_link_id, hdr.ip_version);
             return Err((HandleMgmtError::BadStructure, pkt));
         }
-        src_port = pkt.get_u16();
-    } else {
-        src_port = 0;
     }
-
-    // read destination port (optional)
-    let dst_port;
-    if hdr.compression_mode & zpr::compression_mode::DESTINATION_PORT_PRESENT != 0 {
-        if pkt.remaining() < 2 {
+    // At this point our packet buffer is set to the start of whatever is after the
+    // IP header.
+    match ip_protocol {
+        ip_number::TCP | ip_number::UDP => {
+            // read TCP/UDP header
+            if pkt.remaining() < 4 {
+                return Err((HandleMgmtError::BadStructure, pkt));
+            }
+            src_port = pkt.get_u16();
+            dst_port = pkt.get_u16();
+        }
+        ip_number::ICMP | ip_number::IPV6_ICMP => {
+            // Just stuff the TYPE value into both source and dest.
+            if pkt.remaining() < 2 {
+                return Err((HandleMgmtError::BadStructure, pkt));
+            }
+            let icmp_type = pkt.get_u8();
+            src_port = icmp_type.into();
+            dst_port = icmp_type.into();
+        }
+        _ => {
+            warn!(target: ZDP, "Link {}: unsupported IP protocol {}", pkt.metadata().ingress_link_id, ip_protocol);
             return Err((HandleMgmtError::BadStructure, pkt));
         }
-        dst_port = pkt.get_u16();
-    } else {
-        dst_port = 0;
     }
 
     let compression_mode = hdr.compression_mode;
@@ -699,8 +736,10 @@ pub async fn handle_bind_actor_address_request(
         return Ok(());
     };
 
-    // read triggering-packet body
-    let packet_body: Vec<u8> = pkt.body().into();
+    debug!(
+        target: ZDP,
+        "Link {}: handlers.handle_bind_actor_address_request -- five_tuple {five_tuple}", ingress_link_id.get(),
+    );
 
     // recycle request buffer for response
     let mut rsp_pkt = Packet::new(pkt.destroy(), config::DEFAULT_MESSAGE_HEADROOM);

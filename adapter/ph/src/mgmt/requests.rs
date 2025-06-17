@@ -348,6 +348,7 @@ pub async fn send_bind_actor_address_request(
     five_tuple: FiveTuple,
     packet_body: Vec<u8>,
 ) -> Result<zpr::StreamId, BindActorAddressError> {
+    info!(target: ZDP, "Link {link_id}: sending BindActorAddressRequest for {five_tuple} with compression mode {compression_mode} packet_body size {}", packet_body.len());
     let response = core::send_sync_per_flow_req(
         asm,
         link_id,
@@ -362,26 +363,7 @@ pub async fn send_bind_actor_address_request(
             .write_to_buf(&mut req)
             .unwrap();
 
-            match five_tuple.l3_type {
-                zpr::L3Type::Ipv4 => {
-                    req.put(five_tuple.src_address.read_as_v4().as_slice());
-                    req.put(five_tuple.dst_address.read_as_v4().as_slice());
-                }
-
-                zpr::L3Type::Ipv6 => {
-                    req.put(five_tuple.src_address.v6.as_slice());
-                    req.put(five_tuple.dst_address.v6.as_slice());
-                }
-
-                other => panic!("Link {link_id}: bad L3 type: {}", other.0),
-            }
-
-            req.put_u8(five_tuple.l4_protocol);
-
-            if compression_mode != 0 {
-                todo!("L4 compression");
-            }
-
+            // No longer append source/dest addresses or layer4 protocol; just append the packet body
             req.put_slice(&packet_body);
         },
     )
