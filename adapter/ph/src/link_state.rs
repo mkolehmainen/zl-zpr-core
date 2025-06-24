@@ -15,53 +15,14 @@ use crate::zdp::{self, ResponseCode, TerminateReason};
 
 use openssl::x509::X509;
 use std::fmt::{Display, Formatter};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::time::MissedTickBehavior;
 use tracing::*;
-use zpr::LinkId;
-use zpr::ZPI_ENCRYPTED_HEADER_FLAG;
-
-// "fd5a:5052:1::10" TODO: needs to come from dock (which gets it from VS)
-const HARD_CODED_BAS_ADDR: Ipv6Addr = Ipv6Addr::new(0xfd5a, 0x5052, 0x1, 0, 0, 0, 0, 0x10);
-
-// TODO: Not sure how we get these out or if we need them.
-const HARD_CODED_BAS_TLS_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
-MIIFmzCCA4OgAwIBAgIUJSg4OHOfPqY+lD7ymZy6akX/ZZ8wDQYJKoZIhvcNAQEL
-BQAwXTELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAktZMRMwEQYDVQQHDApMb3Vpc3Zp
-bGxlMQswCQYDVQQKDAJBSTEMMAoGA1UECwwDWlBSMREwDwYDVQQDDAhhdXRoLnpw
-cjAeFw0yNTA0MTYxOTQ4MjRaFw0yNjA0MTYxOTQ4MjRaMF0xCzAJBgNVBAYTAlVT
-MQswCQYDVQQIDAJLWTETMBEGA1UEBwwKTG91aXN2aWxsZTELMAkGA1UECgwCQUkx
-DDAKBgNVBAsMA1pQUjERMA8GA1UEAwwIYXV0aC56cHIwggIiMA0GCSqGSIb3DQEB
-AQUAA4ICDwAwggIKAoICAQDl6DwVoQJsWAOTK4JWZYp3YL7b647ypIadVioKaGAk
-1Fk4FwogcZG/tBqsxCCW+pv7FXfjbwp6ChrxUGaTZUGzF5ft5L7q4oqSKOHvL1i9
-DiyU3xwk/biMiPTyuB8YYIiwQDiHAtYncJVMGMJPefDTl8OPNsjGQyJI+xuoBP/n
-PhbNIgn6E8YxrNl0/u+xWHjM6iOe5bZhXH1nkJQ+hviTxAtRDfayGM0nXrkEzdkC
-Aav95Kgp91cIa2lgoPpHm+HwQANp8jEPvsTVFMbwlPuFx9nopyXLzAdkgv9Z3+S3
-W9ISFWdaAQ4TJDrWfAQyPgPy8UPLOzoK/TC9qbRx2QLQaY3v6+hurnWUm0cHAZ5n
-zs8KflWXfRR+DA3Vc4aDF5vhT0IBDxs5rGu3/gtlJKwfwzMGDtprtuAXpXyZ48yM
-f17WymXsamWDIN58cHjPWgLYoUsr87HtRFGVmlqvCBzaQf4zGCOoW5LWSlkzD2da
-6ak3xBbogGExSk7RAhi9XLCl0LKfjTRsEGuAKpbGvt4h8i2Bq5YLmrzrqzI5XDYt
-u3W1hWwSwwAzK6SHvYLyOMTI75UMy9Zsh4VoUJUNkYm4XgO0WFaA9bs5Cq73d1zY
-i70s8jccheYhoAVXOWLDBQxCu2beHR7tkNXwyZ/RBhL/4/tyc+FKzF6C9sE9f6hv
-EQIDAQABo1MwUTAdBgNVHQ4EFgQU+bscgkfPxWQLdX4AypBqXnzmvxwwHwYDVR0j
-BBgwFoAU+bscgkfPxWQLdX4AypBqXnzmvxwwDwYDVR0TAQH/BAUwAwEB/zANBgkq
-hkiG9w0BAQsFAAOCAgEASZvKIbzeXKd1WuMmZT7kCywYqmWfgo7O51VNWni3FLdQ
-5De44BGIOVUFn+0vC0xQQbQ4iM9yTMb27AQJGm9Aor92w9G7LvR6Mp5py16eJb+F
-MSMZwN7PqK/QdnbIwiUGplDkKndd1dA/ZcHg5oJdE1areX0Zw8ZZ5yZoO12xnhc4
-AK2Mop897EGSYHyrxidYbocPj5Bn7m3mVC7U2quh1HwnZzbWfpx9g8Ry4T8kUco3
-dwZa2RHWhy2yrky2t3pg5tqaw79f/pXoTkcxvRSwZU3EcY23rq5OYQc7SLBIMm/a
-n8ZSJIduRRTLNE7T6Y7o43jDU8u+tcfB5ZE9ytuJA/NgtIYeEiNHMRepYNI2pffj
-MGELMS4xR3NIEyA6ZGVRBnI4dDr/3AmliOKKSt77iueSYCaPDBaxbbwcvEBBJtB0
-TPzKFsY5IH5ve5pZu7IhHIbE/yrAicbNtfX487WQTZfY+Qo8bf+XbdQIcRzkD+Q4
-VAvgJld9s5RI6x8CocU/PQvtQcWPFj//SbnnaMv2TTMLYgP+XWFwD1K1WQFpx2PK
-YM6AGtFc6p9klbags4r80QK+yEwYiBaNjDKmiNfQ1J38HCmd9lnMbzt9p7T838fP
-FiCJxns37RAqhGyryo9L0cryIEPwerjtNoLxmg94rfdovRmY+pm+HokRbD4Vycw=
------END CERTIFICATE-----
-"#;
+use zpr::{LinkId, ZPI_ENCRYPTED_HEADER_FLAG};
 
 /// State machine for links and docking sessions
 
@@ -178,7 +139,7 @@ pub enum LinkEvent {
     Start,
     KeyingDone,
     ReceivedHelloRequest(IpAddress), // Actors ZPR address - TODO: implement AAAs
-    ReceivedHelloResponse(ResponseCode),
+    ReceivedHelloResponse(ResponseCode, Option<Vec<SocketAddr>>), // (response code, ASA addresses)
 
     ReceivedInitAuth((bool, Option<auth::ZdpInitAuthenticationPayload>)), // (bootstrap_flag, challenge)
 
@@ -237,6 +198,7 @@ pub struct LinkData {
     // For now, keep-alives are attempted every 3 seconds
     // Assuming no loss, 100 samples will store 5 minutes of latency data
     latency_data: SampleRing<Duration, 100>,
+    asa_addresses: Option<Vec<SocketAddr>>, // Addresses of ASA servers told to us by our peer, if any
 }
 
 impl LinkData {
@@ -245,6 +207,7 @@ impl LinkData {
             echo_success: 0,
             echo_timeout: 0,
             latency_data: SampleRing::new(Duration::ZERO),
+            asa_addresses: None,
         }
     }
 }
@@ -445,7 +408,9 @@ impl LinkStateWrapper {
             LinkEvent::ReceivedHelloRequest(peer_zpr_addr) => {
                 self.process_hello_request(asm, peer_zpr_addr)
             }
-            LinkEvent::ReceivedHelloResponse(code) => self.process_hello_response(asm, code),
+            LinkEvent::ReceivedHelloResponse(code, maybe_asa_addrs) => {
+                self.process_hello_response(asm, code, maybe_asa_addrs)
+            }
 
             LinkEvent::ReceivedAcquireZprAddressRequest(addrs, blob) => {
                 self.process_acquire_zpr_address_request(asm, addrs, blob)
@@ -672,6 +637,7 @@ impl LinkStateWrapper {
         &self,
         asm: &Arc<Assembly>,
         code: ResponseCode,
+        maybe_asa_addrs: Option<Vec<SocketAddr>>,
     ) -> Result<(), LinkStateError> {
         if code == ResponseCode::Other {
             // Received an error response.
@@ -683,6 +649,9 @@ impl LinkStateWrapper {
 
         match (self.link_type, locked_fsm.state) {
             (LinkType::AdapterToNode, LinkState::Helloing) => {
+                let mut link_data = self.locked_data.lock().unwrap();
+                link_data.asa_addresses = maybe_asa_addrs.clone();
+                drop(link_data);
                 locked_fsm.set_state(LinkState::WaitForInitAuth);
                 debug!(
                     target: LINK_STATE,
@@ -692,6 +661,9 @@ impl LinkStateWrapper {
                 Ok(())
             }
             (LinkType::NodeToNode, LinkState::Helloing) => {
+                let mut link_data = self.locked_data.lock().unwrap();
+                link_data.asa_addresses = maybe_asa_addrs.clone();
+                drop(link_data);
                 locked_fsm.set_state(LinkState::Active);
                 debug!(target: LINK_STATE, "Link {link_id} finished helloing.  Becoming active");
                 Ok(())
@@ -995,6 +967,9 @@ impl LinkStateWrapper {
     ) -> Result<(), LinkStateError> {
         let link_id = self.id;
 
+        // Grab a copy of our ASA addresses.
+        let asa_addrs = self.locked_data.lock().unwrap().asa_addresses.clone();
+
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
         match (self.link_type, locked_fsm.state) {
             // NOTE: This is not exactly right, in general we can get an InitAuth at any time, though we
@@ -1039,11 +1014,10 @@ impl LinkStateWrapper {
                     locked_fsm.set_state(LinkState::RegisterAA);
                     info!(target: LINK_STATE, "Link {link_id} received init auth, time to talk to authentication service");
 
-                    // TODO: Presumably we would get the ZPR address of the auth service
-                    //       from our node somehow. What about the cert?
-                    if asm.rsauth.is_some() {
+                    // TODO: We get the ZPR address of the auth services from our node. What about the cert?
+                    if asm.rsauth.is_some() && asa_addrs.is_some() {
                         drop(locked_fsm);
-                        self.do_https_authenticate(asm);
+                        self.do_https_authenticate(asm, asa_addrs.unwrap());
                     } else {
                         error!(target: LINK_STATE, "Link {link_id} no auth service configured");
                         locked_fsm.set_state(LinkState::Error);
@@ -1135,14 +1109,23 @@ impl LinkStateWrapper {
     /// Run the HTTPS authentication process in a tokio task.
     /// - [LinkEvent::AuthenticationSuccess] on success
     /// - [LinkEvent::AuthenticationFailure] on failure
-    fn do_https_authenticate(&self, asm: &Arc<Assembly>) {
+    ///
+    /// TODO: Figure out what it means if there are multiple ASA addresses.
+    /// For now this uses the first address in the list.
+    fn do_https_authenticate(&self, asm: &Arc<Assembly>, asa_addrs: Vec<SocketAddr>) {
         let link_id = self.id;
 
-        let service_addr = SocketAddr::new(
-            IpAddr::V6(HARD_CODED_BAS_ADDR),
-            auth::DEFAULT_ZPR_OAUTH_RSA_PORT,
-        );
-        let tls_cert = X509::from_pem(HARD_CODED_BAS_TLS_CERT_PEM.as_bytes()).unwrap();
+        if asa_addrs.is_empty() {
+            error!(target: LINK_STATE, "Link {link_id}: no ASA addresses provided for authentication");
+            if let Err(e) = asm.process_link_state_event(link_id, LinkEvent::AuthenticationFailure)
+            {
+                error!(target: LINK_STATE, "Link {link_id}: event handling error {e}");
+            }
+            return;
+        }
+        let service_addr = asa_addrs[0];
+
+        let tls_cert = X509::from_pem(auth::HARD_CODED_BAS_TLS_CERT_PEM.as_bytes()).unwrap();
         let task_asm = asm.clone();
 
         tokio::task::spawn_local(async move {
