@@ -64,6 +64,7 @@ mod tun_ctl;
 mod two_way_queue;
 mod visa_mgmt;
 mod visa_table;
+mod vs_types;
 mod vs_worker;
 mod vss_worker;
 mod zdp;
@@ -85,6 +86,8 @@ use pki::load_noise_public_key;
 use queues::*;
 use sys::ZprTun;
 use tun_ctl::TunCtl;
+
+use crate::vs_types::AuthServicesList;
 
 /// Creates a nonblocking local socket pair suitable for transferring
 /// PACKET_BUFFER_SIZE-sized messages.
@@ -413,6 +416,7 @@ fn main() -> ExitCode {
         visa_table: tokio::sync::RwLock::new(visa_table::VisaTable::new_with_vs_visas(
             &node_zpr_addr,
         )),
+        vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
         capture_queue: Capture::new(cap_inq),
         capture_worker: CaptureWorker::new(),
         flow_control: FlowControl::new(),
