@@ -17,6 +17,9 @@ use crate::pki::{load_cert, load_noise_private_key, NOISE_KEY_LEN};
 
 use crate::main_args::{ArgsError, CommonArgs};
 
+/// Upper bound on number of active links (peers) that the PH can manage.
+pub const MAX_ACTIVE_LINKS: usize = 1024;
+
 /// Size of a packet buffer.
 pub const PACKET_BUFFER_SIZE: usize = 4096 * 3;
 
@@ -26,6 +29,9 @@ pub const DEFAULT_MESSAGE_HEADROOM: usize = 256;
 pub const DEFAULT_REQUEST_RETRY_COUNT: usize = 3;
 pub const DEFAULT_REQUEST_RETRY_TIMER: std::time::Duration = std::time::Duration::from_secs(1);
 pub const DEFAULT_TERMINATE_RESPONSE_TIMER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long to wait for an actor to finish out of band authentication.
+pub const ACTOR_AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub const ANCILLARY_BUFFER_SIZE: usize = 128;
 

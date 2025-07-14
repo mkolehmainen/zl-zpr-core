@@ -10,6 +10,7 @@ use crate::link_state::LinkEvent;
 use crate::logging::targets::{FLOW_MGMT, REPORTING, ZDP};
 use crate::net_defs::{ip_number, IpAddress};
 use crate::packet::Packet;
+use crate::special_peers::SpecialPeerName;
 use crate::tlv::{self, TlvEncoding};
 use crate::zdp;
 use bytes::{Buf, BufMut};
@@ -29,6 +30,10 @@ use zpr_ext::zerocopy::{FromBytesExt, IntoBytesExt};
 pub enum HandleMgmtError {
     #[error("unknown packet type: {0}")]
     UnknownType(u8),
+
+    #[error("message not permitted")]
+    MessageNotPermitted,
+
     #[error("bad packet structure")]
     BadStructure,
 }
@@ -38,6 +43,7 @@ impl From<HandleMgmtError> for counters::CounterType {
         match err {
             HandleMgmtError::UnknownType(_type) => Self::UnknownType,
             HandleMgmtError::BadStructure => Self::BadStructure,
+            HandleMgmtError::MessageNotPermitted => Self::OtherError,
         }
     }
 }
@@ -114,7 +120,7 @@ pub async fn handle_echo_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Handl
 /// TODO: Not yet in RFC 6
 ///
 /// Message from node requesting authentication.
-///
+/// Sends a [zdp::ZdpInitAuthenticationResponse] back.
 ///
 pub async fn handle_init_authentication_request(
     asm: &Arc<Assembly>,
@@ -173,8 +179,10 @@ pub async fn handle_init_authentication_request(
     Ok(())
 }
 
+/// Process the InitAuthenticationResponse message.
+/// Just inform the link_state that we got this.
 pub async fn handle_init_authentication_response(
-    _asm: &Arc<Assembly>,
+    asm: &Arc<Assembly>,
     mut pkt: Packet,
 ) -> HandleMgmtResult {
     let Ok(hdr) = zdp::ZdpInitAuthenticationResponse::read_from_buf(&mut pkt) else {
@@ -184,7 +192,7 @@ pub async fn handle_init_authentication_response(
     let link_id = pkt.metadata().ingress_link_id;
     let status = hdr.status_code;
     debug!(target: ZDP, "Link {link_id}: Received InitAuthenticationResponse, status: {status:?}");
-
+    let _ = asm.process_link_state_event(link_id, LinkEvent::ReceivedInitAuthResponse(status));
     Ok(())
 }
 
@@ -263,13 +271,17 @@ pub async fn handle_terminate_indication(
 
 /// handle a Hello Request (RFC 6.5 § 6.3.4)
 /// Reads the hello, fire a ReceivedHelloRequest event, and then sends a response.
+///
 pub async fn handle_hello_request(
     asm: &Arc<Assembly>,
     _seq_num: zpr::SeqNum,
     mut pkt: Packet,
 ) -> HandleMgmtResult {
     let ingress_link_id = pkt.metadata().ingress_link_id;
-
+    if asm.ph_mode != PhMode::Node {
+        warn!(target: ZDP, "Link {ingress_link_id} received Hello Request but not in node mode");
+        return Err((HandleMgmtError::MessageNotPermitted, pkt));
+    }
     debug!(target: ZDP, "Received Hello Request for link {ingress_link_id}");
 
     let Ok(hdr) = zdp::ZdpHelloRequestHeader::read_from_buf(&mut pkt) else {
@@ -306,18 +318,57 @@ pub async fn handle_hello_request(
     let mut rsp_pkt = Packet::new(pkt.destroy(), config::DEFAULT_MESSAGE_HEADROOM);
     let hdr = rsp_pkt.alloc_zeroed_header::<zdp::ZdpHelloResponseHeader>();
 
-    hdr.status = match asm
+    let response_status = match asm
         .process_link_state_event(ingress_link_id, LinkEvent::ReceivedHelloRequest(actor_addr))
     {
         Err(_) => zdp::ResponseCode::Other,
         Ok(()) => zdp::ResponseCode::Success,
     };
 
+    let mut aaa_address: Option<IpAddress> = None;
+
+    if response_status == zdp::ResponseCode::Success {
+        // We need an AAA address if an authentication service is available and the connecting adapter
+        // is not fronting the visa service.
+
+        let is_visa_service = asm
+            .peer_table
+            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter)
+            .map_or(false, |id| id.get() == ingress_link_id);
+
+        let auth_service_avaialable = asm.rsauth.is_some();
+
+        if !is_visa_service && auth_service_avaialable {
+            // Then we need an AAA.
+            if let Some(pool) = asm.address_pool.lock().unwrap().as_mut() {
+                let addr = pool.get_aaa_address();
+                debug!(target: ZDP, "Link {ingress_link_id}: HelloResponse - allocated AAA address: {addr} (active pool size: {})",
+                    pool.len());
+                aaa_address = Some(addr);
+
+                // Store the AAA in the link memory so we can free it later.
+                match asm.process_link_state_event(ingress_link_id, LinkEvent::AssignedAAA(addr)) {
+                    Err(e) => {
+                        // Highly improbable
+                        panic!("Link {ingress_link_id}: failed to process AssignedAAA event: {e}");
+                    }
+                    Ok(()) => (),
+                }
+            } else {
+                // Programming error: if we are a node, we must have a pool.
+                panic!("adapter (node) handling a hello-request missing address pool");
+            }
+        }
+    }
+
+    hdr.status = response_status;
+
+    // Policy ID and version are always included, even if not SUCCESS.
     let policy_id: i64 = 0; // TODO: We get policy ID from visa service. Record that somewhere, access it here.
     TlvEncoding::new_policy_id(policy_id).put(&mut rsp_pkt);
     TlvEncoding::new_version(VERSION).put(&mut rsp_pkt);
 
-    {
+    if response_status == zdp::ResponseCode::Success {
         let svclist = asm.vs_auth_services.read().unwrap();
         if svclist.is_valid() {
             // If we have a list of services, include them in the response.
@@ -333,7 +384,11 @@ pub async fn handle_hello_request(
         } else {
             warn!(target: ZDP, "Link {ingress_link_id}: HelloResponse - no valid auth services available");
         }
+        if let Some(aaa_addr) = aaa_address {
+            TlvEncoding::new_aaa(aaa_addr).put(&mut rsp_pkt);
+        }
     }
+
     super::core::send_non_flow_mgmt(
         asm,
         ingress_link_id,
@@ -341,11 +396,28 @@ pub async fn handle_hello_request(
         rsp_pkt,
     );
 
-    match asm.process_link_state_event(ingress_link_id, LinkEvent::SentHelloResponse) {
-        Err(e) => {
-            error!(target: ZDP, "Link {ingress_link_id}: Failed to process SentHelloResponse event: {:?}", e);
+    let close_link = if response_status == zdp::ResponseCode::Success {
+        match asm.process_link_state_event(ingress_link_id, LinkEvent::SentHelloResponse) {
+            Err(e) => {
+                error!(target: ZDP, "Link {ingress_link_id}: Failed to process SentHelloResponse event: {:?}", e);
+                true
+            }
+            Ok(()) => false,
         }
-        Ok(()) => (),
+    } else {
+        // TODO: The framework within which this function is called does not allow us to
+        // return an error back which would trigger a link shutdown.  So we do it manually
+        // and just return Ok() though things are not in fact OK.
+        info!(target: ZDP, "Link {ingress_link_id}: HelloRequest processing failed, shutting down link");
+        true
+    };
+    if close_link {
+        match asm.process_link_state_event(ingress_link_id, LinkEvent::Error) {
+            Err(e) => {
+                error!(target: ZDP, "Link {ingress_link_id}: failed to process Error event: {e}");
+            }
+            Ok(()) => (),
+        }
     }
 
     Ok(())
@@ -364,36 +436,38 @@ pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Hand
     // A tlv has a type (number) and a value.
     let tlv_data =
         tlv::parse_from_buf(&mut pkt).map_err(|_| (HandleMgmtError::BadStructure, pkt))?;
-    if let Some(ver) = tlv_data.get(&tlv::DataType::VERSION) {
-        info!(target: ZDP, "Link {link_id}: HelloResponse - peer version is : {}", ver[0]);
-    } else {
-        warn!(target: ZDP, "Link {link_id}: HelloResponse did not include version");
-    }
-    if let Some(policy_id) = tlv_data.get(&tlv::DataType::POLICY_ID) {
-        info!(target: ZDP, "Link {link_id}: HelloResponse - peer policy ID is : {}", policy_id[0]);
-    } else {
-        warn!(target: ZDP, "Link {link_id}: HelloResponse did not include policy ID");
-    }
 
     let mut asa_addresses = Vec::<SocketAddr>::new();
 
-    if let Some(asa_entries) = tlv_data.get(&tlv::DataType::ASA) {
-        for asa_entry in asa_entries {
-            match asa_entry {
-                tlv::TlvValue::SocketAddr(sa) => {
-                    info!(target: ZDP, "Link {link_id}: HelloResponse includes ASA address:{sa}");
-                    asa_addresses.push(sa.clone());
-                }
-                _ => {
-                    warn!(target: ZDP, "Link {link_id}: HelloResponse ASA value type is wrong: {asa_entry:?}");
+    for (tlv_type, tlv_value) in &tlv_data {
+        match tlv_type {
+            &tlv::DataType::VERSION => {
+                info!(target: ZDP, "Link {link_id}: HelloResponse - peer version is : {}", tlv_value[0]);
+            }
+            &tlv::DataType::POLICY_ID => {
+                info!(target: ZDP, "Link {link_id}: HelloResponse - peer policy ID is : {}", tlv_value[0]);
+            }
+            &tlv::DataType::ASA => {
+                for asa_entry in tlv_value {
+                    match asa_entry {
+                        tlv::TlvValue::SocketAddr(sa) => {
+                            info!(target: ZDP, "Link {link_id}: HelloResponse includes ASA address:{sa}");
+                            asa_addresses.push(sa.clone());
+                        }
+                        _ => {
+                            warn!(target: ZDP, "Link {link_id}: HelloResponse ASA value type is wrong: {asa_entry:?}");
+                        }
+                    }
                 }
             }
+            _ => {
+                info!(target: ZDP, "Link {link_id}: HelloResponse includes ignored TLV type: {tlv_type}");
+            }
         }
-    } else {
-        warn!(target: ZDP, "Link {link_id}: HelloResponse did not include ASA TLV");
     }
 
     let maybe_asa_addrs = if asa_addresses.is_empty() {
+        warn!(target: ZDP, "Link {link_id}: HelloResponse did not include ASA TLV");
         None
     } else {
         Some(asa_addresses)
