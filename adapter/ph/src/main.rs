@@ -60,6 +60,7 @@ mod special_peers;
 mod sync_req;
 mod sys;
 mod test_packet;
+mod timer_wheel;
 mod tlv;
 mod tun_ctl;
 mod two_way_queue;
