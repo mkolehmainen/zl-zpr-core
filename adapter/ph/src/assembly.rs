@@ -24,8 +24,6 @@ use crate::tun_ctl::TunCtl;
 use crate::visa_table;
 use crate::vs_types::AuthServicesList;
 use crate::zdp::TerminateReason;
-
-use enum_map::EnumMap;
 use km_noise::NoiseKeypair;
 use std::net::IpAddr;
 use std::num::NonZero;
@@ -82,7 +80,7 @@ pub struct Assembly {
     pub capture_worker: CaptureWorker,
     pub flow_control: FlowControl,
 
-    pub counters: EnumMap<CounterType, Counter>,
+    pub counters: Counters,
 
     pub tun_ctl: Box<dyn TunCtl + Send>,
 
@@ -481,7 +479,7 @@ pub mod test {
         pub capture_queue: Option<Capture>,
         pub capture_worker: Option<CaptureWorker>,
         pub flow_control: Option<FlowControl>,
-        pub counters: Option<EnumMap<CounterType, Counter>>,
+        pub counters: Option<Counters>,
         pub tun_ctl: Option<Box<dyn TunCtl + Send>>,
         pub peer_table: Option<peer_table::PeerTable>,
         pub peer_ids: Option<Vec<zpr::LinkId>>,

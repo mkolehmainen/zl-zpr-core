@@ -241,8 +241,16 @@ async fn echo(_asm: &Assembly) -> String {
 
 async fn counters(asm: &Assembly) -> String {
     let mut counts: String = String::new();
-    for (key, &ref value) in &asm.counters {
+    let _ = write!(&mut counts, "Management counts:\n");
+    for (key, &ref value) in &asm.counters.management {
         let _ = write!(&mut counts, "{}: {}\n", key, value.get_count());
+    }
+
+    for (i, fastpath) in asm.counters.fastpaths.lock().unwrap().iter().enumerate() {
+        let _ = write!(&mut counts, "Fastpath #{} counts:\n", i);
+        for (key, &ref value) in fastpath {
+            let _ = write!(&mut counts, "{}: {}\n", key, value.get_count());
+        }
     }
 
     let _ = write!(&mut counts, "Uptime: {:?}\n", asm.get_uptime());
@@ -251,8 +259,14 @@ async fn counters(asm: &Assembly) -> String {
 }
 
 async fn counters_reset(asm: &Assembly) -> String {
-    for value in asm.counters.values() {
+    for value in asm.counters.management.values() {
         value.reset();
+    }
+
+    for fastpath in asm.counters.fastpaths.lock().unwrap().iter() {
+        for value in fastpath.values() {
+            value.reset();
+        }
     }
 
     String::from("counters_reset\n")
