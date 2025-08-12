@@ -245,7 +245,12 @@ fn main() -> ExitCode {
             None
         }
     } else {
-        Some(zpr::ZPR_TEMP_LOCAL_ADDRESS.into())
+        // HACK -- if linux just don't add an address.
+        if cfg!(target_os = "linux") {
+            None
+        } else {
+            Some(zpr::ZPR_TEMP_LOCAL_ADDRESS.into())
+        }
     };
 
     let tun_devs: Vec<_> = match ZprTun::new_mq(
