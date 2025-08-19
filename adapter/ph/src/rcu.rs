@@ -167,13 +167,15 @@ mod rcu_impl {
 #[cfg(all(feature = "rcu-crossbeam-epoch", not(doc)))]
 mod rcu_impl {
     use crossbeam_epoch as epoch;
+    use std::marker::PhantomData;
     use std::sync::atomic::Ordering;
 
     pub struct RcuBox<T>(epoch::Atomic<T>);
 
     pub struct RcuGuard<'a, T> {
         guard: epoch::Guard,
-        atomic: &'a epoch::Atomic<T>,
+        ptr: *const T,
+        phantom: PhantomData<&'a T>,
     }
 
     impl<T> Drop for RcuGuard<'_, T> {
@@ -185,9 +187,9 @@ mod rcu_impl {
         type Target = T;
 
         fn deref(&self) -> &Self::Target {
-            let ptr = self.atomic.load(Ordering::Acquire, &self.guard);
+            // SAFETY: we know we have the associated guard for the lifetime of the returned ref
             // SAFETY: we only allow readers to access "live" values
-            unsafe { ptr.deref() }
+            unsafe { self.ptr.as_ref().unwrap_unchecked() }
         }
     }
 
@@ -205,9 +207,12 @@ mod rcu_impl {
         }
 
         pub fn get(&self) -> RcuGuard<'_, T> {
+            let guard = epoch::pin();
+            let ptr = self.0.load(Ordering::Acquire, &guard).as_raw();
             RcuGuard {
-                guard: epoch::pin(),
-                atomic: &self.0,
+                guard,
+                ptr,
+                phantom: PhantomData,
             }
         }
 
@@ -218,6 +223,17 @@ mod rcu_impl {
                 .swap(epoch::Owned::new(new_value), Ordering::AcqRel, &guard);
             // SAFETY: `old_value` is now unreachable
             unsafe {
+                // Note on ordering:
+                //
+                // We assume/hope `defer_destroy()` synchronizes-with
+                // `pin()`.  (They are not documented to do so, but I think
+                // it is a safe assumption.) So, in the case that the
+                // `pin()` of a `get()` occurs _after_ this step, but
+                // _before_ we implicitly unpin (and thus execute the
+                // destructor), the above swap is visible to the load in
+                // `get()`.  (Else, the load would see the pre-swap value,
+                // and a subsequent dereference thereof might occur after we
+                // have unpinned and thus triggered the destructor.)
                 guard.defer_destroy(old_value);
             }
         }
@@ -234,6 +250,7 @@ mod rcu_impl {
             };
             // SAFETY: `old_value` is now unreachable
             unsafe {
+                // See note on ordering in write().
                 guard.defer_destroy(old_value);
             }
             Ok(())
@@ -398,5 +415,25 @@ impl<T> RcuBox<cslab::RcuCslabReader<T>> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RcuBox;
+
+    #[test]
+    fn guard_pins_value() {
+        let rcu = RcuBox::new(true);
+        std::thread::scope(|s| {
+            let guard = rcu.get();
+            // this unsynchronized spawn+sleep is very silly but needed
+            // because some RCU impls deadlock if a write is issued
+            // while a guard is held (hence making this test vacuously true
+            // by disallowing this scheduling)
+            s.spawn(|| rcu.write(false));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(*guard);
+        });
     }
 }
