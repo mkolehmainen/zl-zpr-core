@@ -5,12 +5,11 @@
 
 use cbpf_rs;
 use clap::{Args, CommandFactory, Parser, Subcommand};
-use clap_complete::{generate, shells::Bash};
+use clap_complete::{generate, shells::Shell};
 use ctrlc;
 use pcap::{Capture, Linktype};
 use std::borrow::Borrow;
-use std::fs::File;
-use std::fs::OpenOptions;
+use std::fs::{create_dir_all, File, OpenOptions};
 use std::io;
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter, Error, IoSlice};
@@ -153,10 +152,10 @@ fn main() -> std::io::Result<()> {
     let args = CmdlineArgs::parse();
     let socket = args.socket.clone();
 
-    if let Some(file_name) = args.generate.clone() {
-        let file = File::create(file_name)?;
-        let writer = BufWriter::new(file);
-        generate_completion(writer);
+    if let Some(path) = args.generate {
+        if path != "NO_INPUT".to_string() {
+            return generate_completion(path);
+        }
     }
 
     if let Some(command) = args.command {
@@ -479,13 +478,30 @@ fn serialize(program: &str) -> String {
     serialized_program
 }
 
-fn generate_completion<W: std::io::Write>(mut writer: BufWriter<W>) {
-    generate(
-        Bash,
-        &mut CmdlineArgs::command(),
-        CmdlineArgs::command().get_name().to_string(),
-        &mut writer,
-    );
+fn generate_completion(path: String) -> std::io::Result<()> {
+    let shells_exts: Vec<(Shell, &str)> = Vec::from([
+        (Shell::Bash, "sh"),
+        (Shell::Elvish, "elv"),
+        (Shell::Fish, "fish"),
+        (Shell::PowerShell, "ps1"),
+        (Shell::Zsh, "zsh"),
+    ]);
+
+    create_dir_all(&path)?;
+
+    for (shell, extension) in shells_exts {
+        let formatted_path = format!("{path}/ph-cli.{extension}");
+        let file = File::create(formatted_path)?;
+        let mut writer = BufWriter::new(file);
+        generate(
+            shell,
+            &mut CmdlineArgs::command(),
+            CmdlineArgs::command().get_name().to_string(),
+            &mut writer,
+        );
+    }
+
+    Ok(())
 }
 
 struct CtrlcHandle {
