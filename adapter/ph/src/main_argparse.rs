@@ -4,11 +4,10 @@
 //! and any config file, returning a PH configuration. See [crate::config::Config] for
 //! more details on the configuration.
 
+use clap::Parser;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-
-use clap::Parser;
 
 use crate::assembly::PhMode;
 use crate::auth;
@@ -35,6 +34,7 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
         Some(args) => Control::parse_from(args),
         None => Control::parse(),
     };
+
     match control.command {
         Command::Adapter {
             config_file,
