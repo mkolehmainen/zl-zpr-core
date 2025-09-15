@@ -711,7 +711,11 @@ fn decrypt_with_sa(
         return decrypt_hmac(transport_sa.recv_hmac_key, pkt);
     } else if zpi_hdr.zpi == transport_sa.recv_zpis.encr {
         // TODO: Put padlen in state somewhere too
-        return decrypt_full(asm, &*transport_sa.codec, NOISE_PADLEN, pkt);
+        if asm.config.get().km_impl == zpr::KM_ID_NOISE {
+            return decrypt_full(asm, &*transport_sa.codec, NOISE_PADLEN, pkt);
+        } else {
+            return decrypt_full(asm, &*transport_sa.codec, 0, pkt);
+        }
     } else {
         // We have an SA and ZPI does not match.
         warn!(

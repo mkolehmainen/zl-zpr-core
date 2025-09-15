@@ -126,10 +126,12 @@ fn handle_key_management(asm: &Arc<Assembly>, pkt: &mut Packet) {
         return;
     };
 
-    if !km_hdr.is_noise() {
+    if (km_hdr.is_noise() && asm.config.get().km_impl != zpr::KM_ID_NOISE)
+        || (km_hdr.is_null() && asm.config.get().km_impl != zpr::KM_ID_NULL)
+    {
         error!(
             target: KEY_MGMT,
-            "KeyManagement packet not using NOISE - type is {}",
+            "KeyManagement packet type does not match KM implementation - type is {}",
             km_hdr.message_type
         );
         core::count_event(asm, pkt, ManagementCounterType::OtherError);
@@ -159,4 +161,5 @@ fn handle_key_management(asm: &Arc<Assembly>, pkt: &mut Packet) {
             return;
         }
     };
+    return;
 }

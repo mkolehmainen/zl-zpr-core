@@ -31,6 +31,7 @@ pub enum KmMsgProcessingError {
 pub enum KmSetupError {
     InitializationError(KmError),
     LinkNotFound,
+    UnknownKmType,
 }
 
 /// Global state for the KM system.
@@ -183,7 +184,12 @@ pub async fn launch_message_worker(
     mut msg_queue: mpsc::Receiver<KmLinkMsg<Bytes>>,
 ) {
     while let Some(km_buf_msg) = msg_queue.recv().await {
-        requests::send_key_management(&*asm, km_buf_msg.link_id, zpr::KM_ID_NOISE, &km_buf_msg.msg);
+        requests::send_key_management(
+            &*asm,
+            km_buf_msg.link_id,
+            asm.config.get().km_impl,
+            &km_buf_msg.msg,
+        );
     }
 }
 
@@ -195,6 +201,9 @@ pub async fn launch_message_worker(
 /// - `peer_noise_key` is the public noise key for the node/dock.
 ///
 /// Note that the link must already have a peer_table entry.
+///
+/// TODO the functionr requires local_noise_key and peer_noise_key
+/// even if the system is running with the null km
 pub fn add_adapter_link(
     asm: &Assembly,
     link_id: zpr::LinkId,
@@ -277,10 +286,10 @@ fn add_noise_link(
     let spawn_sig_tx = asm.km_state.km_sig_tx.clone();
 
     let (km_tx, km_rx) = mpsc::channel(asm.topology_config.km_link_queue_size);
-
+    let km_impl = asm.config.get().km_impl;
     let sph = tokio::spawn(async move {
         match spawn_mgr
-            .start(spawn_ctok, spawn_km_tx, spawn_sig_tx, km_rx)
+            .start(spawn_ctok, spawn_km_tx, spawn_sig_tx, km_rx, km_impl)
             .await
         {
             Ok(_) => (),
@@ -466,15 +475,16 @@ mod test {
                 };
 
                 // Since we have a "raw" responder, we can just pass the payload (no ZDP headers have been added).
-                let handshake_reply = match responder.handle_message(&handshake_req) {
-                    Ok(Some(m)) => m,
-                    Ok(None) => {
-                        panic!("expected handshake-1 message, got nothing!");
-                    }
-                    Err(e) => {
-                        panic!("responder handle_message failed on handshake-req: {:?}", e);
-                    }
-                };
+                let handshake_reply =
+                    match responder.handle_message(&handshake_req, zpr::KM_ID_NOISE) {
+                        Ok(Some(m)) => m,
+                        Ok(None) => {
+                            panic!("expected handshake-1 message, got nothing!");
+                        }
+                        Err(e) => {
+                            panic!("responder handle_message failed on handshake-req: {:?}", e);
+                        }
+                    };
 
                 // Now send the reply back into our link.
                 handle_inbound_km_msg(&asm, adapter_link_id, &handshake_reply).unwrap();
