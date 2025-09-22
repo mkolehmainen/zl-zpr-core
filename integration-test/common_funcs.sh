@@ -196,7 +196,6 @@ function get_descendants() {
     echo $(pstree -pT "$$" | egrep -o "$regex" | sed -E "s/$regex/\2/")
 }
 
-
 # Takes one arg- filepath relative to TMPDIR
 function emitlog() {
     echo -e "\n\n==== $1 ====\n"

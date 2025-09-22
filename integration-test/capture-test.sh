@@ -250,9 +250,10 @@ do
 	echo
 	echo "Terminating $pid"
 	sleep 1
-	sudo kill -SIGTERM "$pid"
+	sudo kill -SIGINT "$pid"
 	sleep 1
 done
+
 stty sane || true
 
 #
