@@ -43,6 +43,7 @@ if [ ! -e "$VS_ADMIN_BIN" ]; then
 fi
 
 NODE_SOCK=node.sock
+CAP_SOCK=cap.sock
 VS_SOCK=vs.sock
 ADAPTER1_SOCK=adapter1.sock
 ADAPTER2_SOCK=adapter2.sock
@@ -114,6 +115,7 @@ sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
   node \
   --logging "$DEBUG_TARGETS" \
   --control-path "$NODE_SOCK" \
+  --capture-path "$CAP_SOCK" \
   --ca-file ca.crt \
   --certificate-file node.crt \
   --private-key-file node.key \
@@ -129,6 +131,7 @@ sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$VS_SOCK" \
+  --capture-path "$CAP_SOCK" \
   --self-addr "$VS_SUBSTRATE_ADDR" \
   --ca-file ca.crt \
   --certificate-file vs.zpr.crt \
@@ -147,6 +150,7 @@ sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER1_SOCK" \
+  --capture-path "$CAP_SOCK" \
   --self-addr "$A_SUBSTRATE_ADDR" \
   --ca-file ca.crt \
   --certificate-file adapter1.crt \
@@ -163,6 +167,7 @@ sudo -E ip netns exec zpr-b sudo -E -u "$ZPR_USER" "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER2_SOCK" \
+  --capture-path "$CAP_SOCK" \
   --self-addr "$B_SUBSTRATE_ADDR" \
   --ca-file ca.crt \
   --certificate-file adapter2.crt \
@@ -182,6 +187,7 @@ if [[ "$NUM_ACTORS" -ge 3 ]]; then
     adapter \
     --logging "$DEBUG_TARGETS" \
     --control-path "$ADAPTER3_SOCK" \
+    --capture-path "$CAP_SOCK" \
     --self-addr "$C_SUBSTRATE_ADDR" \
     --ca-file ca.crt \
     --certificate-file adapter3.crt \
