@@ -52,6 +52,7 @@ VS_SOCK=vs.sock
 ADAPTER1_SOCK=adapter1.sock
 ADAPTER2_SOCK=adapter2.sock
 ADAPTER3_SOCK=adapter3.sock
+NODE_CAP_SOCK=node_cap.sock
 
 function counters() {
   SOCKET=$1
@@ -122,7 +123,7 @@ sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
   node \
   --logging "$DEBUG_TARGETS" \
   --control-path "$NODE_SOCK" \
-  --capture-path "$CAP_SOCK" \
+  --capture-path "$NODE_CAP_SOCK" \
   --ca-file ca.crt \
   --certificate-file node.crt \
   --private-key-file node.key \
