@@ -6,7 +6,6 @@ use crate::km::{PeerCertificate, ZPIPair};
 use crate::km_multiplexor;
 use crate::logging::targets::LINK_STATE;
 use crate::mgmt;
-use crate::net_defs::IpAddress;
 use crate::sample_ring::SampleRing;
 use crate::special_peers;
 use crate::special_peers::SpecialPeerName;
@@ -23,6 +22,7 @@ use thiserror::Error;
 use tokio::time::MissedTickBehavior;
 use tracing::*;
 use zpr::{LinkId, ZPI_ENCRYPTED_HEADER_FLAG};
+use zpr_utils::net_defs::IpAddress;
 
 /// State machine for links and docking sessions
 

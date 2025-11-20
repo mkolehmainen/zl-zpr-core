@@ -9,7 +9,6 @@ use crate::config;
 use crate::counters;
 use crate::link_state::{LinkEvent, LinkStateError};
 use crate::logging::targets::{FLOW_MGMT, REPORTING, ZDP};
-use crate::net_defs::IpAddress;
 use crate::packet::Packet;
 use crate::tc;
 use crate::tlv::{self, TlvEncoding};
@@ -22,6 +21,7 @@ use thiserror::Error;
 use tracing::*;
 use zpr;
 use zpr_ext::zerocopy::{FromBytesExt, IntoBytesExt};
+use zpr_utils::net_defs::IpAddress;
 
 /// Indicates whether the mgmt message was handled successfully.
 /// (It may be the case that the mgmt message itself indicates

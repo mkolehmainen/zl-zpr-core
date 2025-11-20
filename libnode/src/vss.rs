@@ -14,9 +14,10 @@ use tracing::{debug, error, info};
 
 use crate::logging::targets::VSS_RPC;
 use vsapi::{
-    self, PolicyInfo, ServicesList, VisaHop, VisaRevocation, VisaSupportSyncHandler,
+    self, PolicyInfo, ServicesList, VisaRevocation, VisaSupportSyncHandler,
     VisaSupportSyncProcessor,
 };
+use zpr::vsapi_types::Visa;
 
 /// Default port for the visa support service. Note that the visa support service
 /// should only listen on the ZPR interface (not substrate interface!).
@@ -30,7 +31,7 @@ pub enum VSSMsg {
     PolicyInstall(PolicyInfo),
 
     /// Pushed visas from the visa service.
-    PushedVisa(VisaHop),
+    PushedVisa(Visa),
 
     /// Pushed visa revokcations from the visa service.
     PushedRevocation(VisaRevocation),
@@ -99,8 +100,16 @@ impl VisaSupportSyncHandler for VisaSupportHandlerImpl {
     fn handle_install_visas(&self, vh: Vec<vsapi::VisaHop>) -> thrift::Result<()> {
         debug!(target: VSS_RPC, "handle_install_visas, count={}", vh.len());
         for v in vh {
+            let visa = match Visa::try_from(v) {
+                Ok(visa) => visa,
+                Err(e) => {
+                    error!(target: VSS_RPC, "Visa could not be created: {e}");
+                    return Err(thrift::Error::from("enqueue failed"));
+                }
+            };
+
             self.msg_chan_out
-                .blocking_send(VSSMsg::PushedVisa(v))
+                .blocking_send(VSSMsg::PushedVisa(visa))
                 .or_else(|e| {
                     error!(target: VSS_RPC, "failed to enqueue visa message to node: {e}");
                     Err(thrift::Error::from("enqueue failed"))

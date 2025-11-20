@@ -1,6 +1,7 @@
 //! ZPR concepts, excluding the ZDP protocol.
 
 pub mod rpc_commands;
+pub mod vsapi_types;
 
 capnp::generated_code!(pub mod cli_capnp);
 pub mod admin_api {

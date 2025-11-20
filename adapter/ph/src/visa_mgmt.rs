@@ -2,7 +2,6 @@ use crate::assembly::Assembly;
 use crate::counters::ManagementCounterType;
 use crate::link_state::{LinkEvent, LinkStateError};
 use crate::logging::targets::VISA_MGMT;
-use crate::net_defs::{IPV6_ADDRESS_SIZE, IpAddress};
 use crate::visa_table;
 use crate::vs_types;
 use libnode::{claims, vsapi};
@@ -12,7 +11,9 @@ use std::num::NonZero;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tracing::*;
+use zpr::vsapi_types;
 use zpr::{LinkId, VisaId};
+use zpr_utils::net_defs::{IPV6_ADDRESS_SIZE, IpAddress};
 
 pub fn authorize_connect(
     asm: &Arc<Assembly>,
@@ -178,32 +179,14 @@ pub async fn actor_disconnect(asm: Arc<Assembly>, addr: IpAddress) {
 }
 
 /// Figure out egress link and insert visa into table.
-pub fn parse_visa(
+pub fn insert_visa(
     asm: &Arc<Assembly>,
-    visa: vsapi::VisaHop,
+    visa: vsapi_types::Visa,
 ) -> Result<(VisaId, NonZero<LinkId>), visa_table::VisaTableError> {
-    let Some(visa) = visa.visa else {
+    let addr = visa.dst_addr.clone();
+    let Some(link_id) = asm.find_egress_link(addr.into()) else {
         asm.counters.management[ManagementCounterType::VisaRequestError].increment();
-        error!(target: VISA_MGMT, "visa request error: Could not parse visa");
-        return Err(visa_table::VisaTableError::ParseError("all".into()));
-    };
-    // for now, just pull the destination address tether to set up forwarding
-    let Some(octets) = visa.dest.clone() else {
-        asm.counters.management[ManagementCounterType::VisaRequestError].increment();
-        error!(target: VISA_MGMT, "visa request error: Could not parse visa");
-        return Err(visa_table::VisaTableError::ParseError(
-            "destination address".into(),
-        ));
-    };
-    let Ok(addr) = IpAddress::try_from(octets) else {
-        asm.counters.management[ManagementCounterType::VisaRequestError].increment();
-        return Err(visa_table::VisaTableError::ParseError(
-            "destination address".into(),
-        ));
-    };
-    let Some(link_id) = asm.find_egress_link(addr) else {
-        asm.counters.management[ManagementCounterType::VisaRequestError].increment();
-        return Err(visa_table::VisaTableError::DestNotFound(addr));
+        return Err(visa_table::VisaTableError::DestNotFound(addr.into()));
     };
     let visa_id = asm.visa_table.write().unwrap().insert_visa(visa)?;
     Ok((visa_id, link_id))

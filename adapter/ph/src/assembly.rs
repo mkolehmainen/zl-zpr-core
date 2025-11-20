@@ -12,7 +12,6 @@ use crate::link_state::{LinkEvent, LinkStateError, LinkType};
 use crate::logging::targets::PEER_MGMT;
 use crate::mgmt;
 use crate::mgmt_processor_worker;
-use crate::net_defs::{IpAddress, ScopedIpAddr};
 use crate::peer_table;
 use crate::peer_table::PeerInsertError;
 use crate::queues::*;
@@ -36,6 +35,7 @@ use tracing_subscriber::filter::targets::Targets;
 #[allow(unused_imports)]
 use tracing_subscriber::{Layer, Registry, filter, fmt, reload};
 use zpr::{self, LinkId, SubstrateAddr, VisaId};
+use zpr_utils::net_defs::{IpAddress, ScopedIpAddr};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PhMode {

@@ -5,10 +5,10 @@
 //! For now, it's all here together.
 
 use crate::defs;
-use crate::net_defs;
 use crate::zdp;
 use bytes::{Buf, BufMut};
 use zpr_ext::zerocopy::{FromBytesExt, IntoBytesExt};
+use zpr_utils::net_defs;
 
 /// IP 5-Tuple Traffic Classifier
 #[derive(Clone)]

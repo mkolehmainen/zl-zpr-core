@@ -2,9 +2,9 @@ use openssl::rand::rand_bytes;
 use std::collections::HashSet;
 use std::net::Ipv6Addr;
 use thiserror::Error;
+use zpr_utils::net_defs::IpAddress;
 
 use crate::config;
-use crate::net_defs::IpAddress;
 
 /// Maximum allowed AAA ID value (40 bits)
 ///

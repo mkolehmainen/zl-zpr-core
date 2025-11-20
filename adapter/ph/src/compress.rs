@@ -2,13 +2,13 @@
 
 use crate::classifier;
 use crate::defs::FiveTuple;
-use crate::net_defs;
 use crate::packet::Packet;
 use bytes::Buf;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use zerocopy::*;
 use zpr::{CompressionMode, L3Type};
 use zpr_ext::bytes::BufExt;
+use zpr_utils::net_defs;
 
 const ZDP_V4_FRAG_INFO_PRESENT: u8 = 0b00001000;
 

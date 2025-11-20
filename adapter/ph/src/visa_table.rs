@@ -5,18 +5,19 @@
 use crate::defs::FiveTuple;
 use crate::five_tuple_lookup_table::FiveTupleLookupTable;
 use crate::logging::targets::VISA_MGMT;
-use crate::net_defs::{IpAddress, ip_number};
 use crate::peer_table;
 
 use chrono::{DateTime, Utc};
-use libnode::vsapi;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::net::{IpAddr, Ipv6Addr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::*;
-use zpr::{ForwardingEntry, L3Type, VisaId};
+use zpr::vsapi_types;
+use zpr::vsapi_types::VsapiFiveTuple;
+use zpr::{ForwardingEntry, VisaId};
+use zpr_utils::net_defs::{IpAddress, ip_number};
 
 // TODO: Figure out correct value for this visa expiration
 const VS_VISAS_DURATION: Duration = Duration::from_secs(60 * 60 * 24); // 24 hours
@@ -41,9 +42,9 @@ pub enum VisaTableError {
 #[derive(Default, Clone)]
 pub struct Visa {
     // TODO add methods so that these don't have to be made pub
-    pub visa: Option<vsapi::Visa>,
+    pub visa: Option<vsapi_types::Visa>,
     streams: Vec<ForwardingEntry>,
-    pub ftuple: Option<FiveTuple>,
+    pub ftuple: Option<VsapiFiveTuple>,
 }
 
 /// Struct for the visa timeout queue
@@ -77,8 +78,8 @@ impl PartialEq for VisaTimeout {
 impl Eq for VisaTimeout {}
 
 impl Visa {
-    pub fn new(visa: vsapi::Visa) -> Self {
-        let ftuple = Self::extract_five_tuple(&visa);
+    pub fn new(visa: vsapi_types::Visa) -> Self {
+        let ftuple = visa.get_five_tuple();
         Self {
             visa: Some(visa),
             streams: Vec::new(),
@@ -98,80 +99,6 @@ impl Visa {
         self.streams.push(forwarding_entry);
     }
 
-    pub fn extract_five_tuple(visa: &vsapi::Visa) -> FiveTuple {
-        let src_addr = match &visa.source_contact {
-            Some(src) => match IpAddress::try_from(src.clone()) {
-                Ok(addr) => addr,
-                Err(_) => IpAddress::UNSPECIFIED,
-            },
-            None => IpAddress::UNSPECIFIED,
-        };
-
-        let dst_addr = match &visa.dest_contact {
-            Some(dst) => match IpAddress::try_from(dst.clone()) {
-                Ok(addr) => addr,
-                Err(_) => IpAddress::UNSPECIFIED,
-            },
-            None => IpAddress::UNSPECIFIED,
-        };
-
-        let l3_protocol = if src_addr.is_v4() {
-            L3Type::Ipv4
-        } else {
-            L3Type::Ipv6
-        };
-
-        let l4_protocol = match visa.dock_pep {
-            Some(pep) => match pep {
-                vsapi::PEPIndex::TCP => ip_number::TCP,
-                vsapi::PEPIndex::UDP => ip_number::UDP,
-                vsapi::PEPIndex::ICMP => {
-                    if l3_protocol == zpr::L3Type::Ipv4 {
-                        ip_number::ICMP
-                    } else {
-                        ip_number::IPV6_ICMP
-                    }
-                }
-                _ => 0,
-            },
-            None => 0,
-        };
-
-        let (src_port, dst_port) = match visa.dock_pep {
-            Some(pep) if pep == vsapi::PEPIndex::TCP || pep == vsapi::PEPIndex::UDP => {
-                if let Some(pargs) = &visa.tcpudp_pep_args {
-                    (
-                        pargs.source_port.unwrap_or_default() as u16,
-                        pargs.dest_port.unwrap_or_default() as u16,
-                    )
-                } else {
-                    (0, 0)
-                }
-            }
-            Some(pep) if pep == vsapi::PEPIndex::ICMP => {
-                if let Some(pargs) = &visa.icmp_pep_args {
-                    (
-                        pargs.icmp_type_code.unwrap_or_default() as u16,
-                        pargs.icmp_antecedent.unwrap_or_default() as u16,
-                    )
-                } else {
-                    (0, 0)
-                }
-            }
-            Some(_) => (0, 0),
-            None => (0, 0),
-        };
-
-        return FiveTuple {
-            src_address: src_addr,
-            dst_address: dst_addr,
-            l3_type: l3_protocol,
-            l4_protocol,
-            src_port,
-            dst_port,
-        };
-    }
-
     // Return true if the visa matches the given traffic description (given in the
     // form of a FiveTuple).
     //
@@ -183,14 +110,10 @@ impl Visa {
         }
 
         let visa_tuple = self.ftuple.as_ref().unwrap();
-        if visa_tuple.src_address != IpAddress::UNSPECIFIED
-            && visa_tuple.src_address != five_tuple.src_address
-        {
+        if visa_tuple.src_address != IpAddr::from(five_tuple.src_address) {
             return false;
         }
-        if visa_tuple.dst_address != IpAddress::UNSPECIFIED
-            && visa_tuple.dst_address != five_tuple.dst_address
-        {
+        if visa_tuple.dst_address != IpAddr::from(five_tuple.dst_address) {
             return false;
         }
         // TODO: Explicitly set this (l3_type) in visa and also allow it to be set to 0?
@@ -305,16 +228,10 @@ impl VisaTable {
     }
 
     /// Insert a visa from the Visa Service into the Visa Table
-    pub fn insert_visa(&mut self, visa: vsapi::Visa) -> Result<VisaId, VisaTableError> {
-        let Some(visa_id) = visa.issuer_id else {
-            return Err(VisaTableError::ParseError("issuer_id"));
-        };
-        let Some(timestamp) = visa.expires else {
-            return Err(VisaTableError::ParseError("expiration"));
-        };
-        let Some(expiration) = DateTime::from_timestamp_millis(timestamp) else {
-            return Err(VisaTableError::ParseError("expiration"));
-        };
+    pub fn insert_visa(&mut self, visa: vsapi_types::Visa) -> Result<VisaId, VisaTableError> {
+        let visa_id = visa.issuer_id as i32;
+
+        let expiration = DateTime::from(visa.expires);
 
         info!(target: VISA_MGMT,
             "Visa inserted into VisaTable ID: {visa_id}, Expiration: {}",
@@ -336,7 +253,8 @@ impl VisaTable {
 
     /// Match traffic to a visa. Returns all matching visa IDs.
     pub fn match_traffic(&self, five_tuple: &FiveTuple) -> Option<VisaId> {
-        self.lookup_table.find_match(*five_tuple)
+        self.lookup_table
+            .find_match(VsapiFiveTuple::from(*five_tuple))
     }
 
     /// Link a forwarding entry to a given visa
@@ -405,7 +323,7 @@ impl VisaTable {
         match visa_query {
             Ok(visa) => {
                 if let Some(ftuple) = &visa.ftuple {
-                    Ok(ftuple.dst_address.clone())
+                    Ok(IpAddress::from(ftuple.dst_address.clone()))
                 } else {
                     Err(VisaTableError::ParseError(
                         "visa missing destination address",
@@ -425,29 +343,24 @@ fn make_tcp_visa(
     dest_port: u16,
     configuration: i64,
     expiration_ms: i64,
-) -> vsapi::Visa {
-    let pepargs = vsapi::PEPArgsTCPUDP {
-        source_contact_addr: Some(source.octets().to_vec()),
-        dest_contact_addr: Some(dest.octets().to_vec()),
-        source_port: Some(source_port as i32),
-        dest_port: Some(dest_port as i32),
-        server: Some(true),
-        icmp_allowed: None,
+) -> vsapi_types::Visa {
+    let pepargs = vsapi_types::TcpUdpPep {
+        source_port: source_port,
+        dest_port: dest_port,
     };
-    vsapi::Visa {
-        issuer_id: Some(visa_id),
-        configuration: Some(configuration),
-        expires: Some(expiration_ms),
-        source: Some(source.octets().to_vec()),
-        dest: Some(dest.octets().to_vec()),
-        source_contact: Some(source.octets().to_vec()),
-        dest_contact: Some(dest.octets().to_vec()),
-        dock_pep: Some(vsapi::PEPIndex::TCP),
-        tcpudp_pep_args: Some(pepargs),
-        icmp_pep_args: None,
-        session_key: None,
-        cons: None,
-        sig: None,
+    let dur = Duration::from_millis(expiration_ms as u64);
+
+    vsapi_types::Visa {
+        issuer_id: visa_id as u64,
+        config: configuration,
+        expires: UNIX_EPOCH + dur,
+        src_addr: (*source).into(),
+        dst_addr: (*dest).into(),
+        dock_pep: ip_number::TCP,
+        tcp_udp_pep: Some(pepargs),
+        icmp_pep: None,
+        session_key: vsapi_types::KeySet::default(),
+        cons: vsapi_types::Constraints::default(),
     }
 }
 
@@ -458,10 +371,10 @@ mod tests {
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
     use crate::forwarding_tables::PftPep;
     use crate::link_state::LinkType;
-    use crate::net_defs;
     use crate::peer_table::test::create_dummy_peer_state;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
+    use zpr_utils::net_defs;
 
     #[test]
     fn test_timeouts() {
