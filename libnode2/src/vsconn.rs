@@ -14,6 +14,7 @@ use tracing::*;
 
 use crate::error::VSApiError;
 use crate::logging::targets::VS_RPC;
+use crate::vsapi_types::{PacketDesc, Visa, VisaDenialReason};
 
 const PARAM_ZPR_ADDR: &str = "zpr_addr";
 const PARAM_AAA_PREFIX: &str = "aaa_prefix";
@@ -25,8 +26,21 @@ pub struct VSConnectRequest {
     pub aaa_prefix: IpNet,
 }
 
+#[derive(Debug)]
+pub struct VSVisaRequest {
+    pub pdesc: PacketDesc,
+    pub previous_id: Option<u64>,
+}
+
+#[derive(Debug)]
+pub enum VSVisaDecision {
+    Allowed(Visa),
+    Denied(VisaDenialReason),
+}
+
 /// Returns no error if call to VSAPI authenticate was successful.
 type VSConnectResponse = Result<(), VSApiError>;
+type VSVisaResponse = Result<VSVisaDecision, VSApiError>;
 
 // The async "commands" that can be sent into the running visa service client.
 #[derive(Debug)]
@@ -36,6 +50,9 @@ enum VS2Command {
 
     /// Run through the connect sequence. If connect succeeds the VSHandle is kept internally.
     Connect(VSConnectRequest, oneshot::Sender<VSConnectResponse>),
+
+    // TODO: rest of the vsapi commands
+    VisaRequest(VSVisaRequest, oneshot::Sender<VSVisaResponse>),
 }
 
 pub struct VSConn {
@@ -159,6 +176,20 @@ impl VSConn {
                                 error!(target: VS_RPC, "failed to send connect response: {:?}", e);
                             }
                         }
+
+                        VS2Command::VisaRequest(req, resp_tx) => {
+                            debug!(target: VS_RPC, "VSConn: visa_request");
+                            let resp = if vs_handle.is_none() {
+                                Err(VSApiError::CommandFailed(
+                                    "not connected to VS-API".to_string(),
+                                ))
+                            } else {
+                                self.do_visa_request(vs_handle.as_ref().unwrap(), req).await
+                            };
+                            if let Err(e) = resp_tx.send(resp) {
+                                error!(target: VS_RPC, "failed to send visa_request response: {:?}", e);
+                            }
+                        }
                     }
                 }
                 info!(target: VS_RPC, "VSConn: exiting run loop");
@@ -268,6 +299,37 @@ impl VSConn {
         // Ok we now have an authenticated handle to the VS.
         Ok(vs_handle_svc)
     }
+
+    async fn do_visa_request(
+        &self,
+        vs_h: &vsapi2::v_s_handle::Client,
+        req: VSVisaRequest, // TODO: VSVisaRequest should use a PacketDesc from vs-dt, then implement write_to on it.
+    ) -> Result<VSVisaDecision, VSApiError> {
+        let mut vr_request = vs_h.visa_request_request();
+        let mut vrr_bldr = vr_request.get().init_req();
+        vrr_bldr.set_previous_id(0);
+        let mut pd_bldr = vrr_bldr.init_packet();
+        req.pdesc.write_to(&mut pd_bldr);
+        let vr_response = vr_request.send().promise.await?;
+        let allow_deny_error = vr_response.get()?.get_resp()?;
+
+        match allow_deny_error.which()? {
+            vsapi2::visa_response::Which::Allow(v) => {
+                let cp_visa = v?;
+                let visa = Visa::try_from(cp_visa)?;
+                Ok(VSVisaDecision::Allowed(visa))
+            }
+            vsapi2::visa_response::Which::Deny(dcode) => {
+                let dcode = dcode?;
+                let deny_code = VisaDenialReason::from(dcode);
+                Ok(VSVisaDecision::Denied(deny_code))
+            }
+            vsapi2::visa_response::Which::Error(err_obj) => {
+                let err_obj = err_obj?;
+                Err(new_coded_error(err_obj))
+            }
+        }
+    }
 }
 
 impl VSConnHandle {
@@ -289,6 +351,13 @@ impl VSConnHandle {
     pub async fn stop(&self, deregister: bool) -> Result<(), VSApiError> {
         let cmd = VS2Command::Stop(deregister);
         self.send_command(cmd).await
+    }
+
+    pub async fn visa_request(&self, req: VSVisaRequest) -> Result<VSVisaDecision, VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = VS2Command::VisaRequest(req, resp_tx);
+        self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
     }
 }
 
