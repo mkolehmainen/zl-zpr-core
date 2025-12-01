@@ -3,22 +3,20 @@ use crate::counters::ManagementCounterType;
 use crate::link_state::{LinkEvent, LinkStateError};
 use crate::logging::targets::VISA_MGMT;
 use crate::visa_table;
-use crate::vs_types;
-use libnode::{claims, vsapi};
-use std::collections::BTreeMap;
+use libnode::claims;
 use std::net::IpAddr;
 use std::num::NonZero;
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 use tracing::*;
-use zpr::vsapi_types;
+use zpr::vsapi_types::{self, AuthServicesList};
 use zpr::{LinkId, VisaId};
-use zpr_utils::net_defs::{IPV6_ADDRESS_SIZE, IpAddress};
+use zpr_utils::net_defs::IpAddress;
 
 pub fn authorize_connect(
     asm: &Arc<Assembly>,
     link_id: LinkId,
-    connect_req: libnode::vsapi::ConnectRequest,
+    connect_req: vsapi_types::ConnectRequest,
 ) {
     let task_asm = asm.clone();
     tokio::task::spawn_local(async move {
@@ -29,59 +27,25 @@ pub fn authorize_connect(
             .authorize_connect(connect_req)
             .await
         {
-            Ok(cr) => match cr.status {
-                Some(vsapi::StatusCode::SUCCESS) => {
-                    if let Some(actor) = cr.actor {
-                        info!(target: VISA_MGMT, "link {link_id}: VS authorize_connect returns SUCCESS");
-                        if actor.zpr_addr.is_none() {
-                            // Really this is a bug in visa service I think.
-                            error!(target: VISA_MGMT, "link {link_id} authorized, but no zpr address present in actor");
-                            let _ignore_error =
-                                task_asm.process_link_state_event(link_id, LinkEvent::Error);
-                            return;
-                        }
-                        let addr_bytes = actor.zpr_addr.unwrap();
-                        if addr_bytes.len() != IPV6_ADDRESS_SIZE {
-                            // Our ZPR addresses should be IPv6 -- at least for now.
-                            error!(target: VISA_MGMT, "link {link_id} authorized, but zpr address is not 16 bytes long: {} bytes", addr_bytes.len());
-                            let _ignore_error =
-                                task_asm.process_link_state_event(link_id, LinkEvent::Error);
-                            return;
-                        }
-                        let addr_buf: [u8; IPV6_ADDRESS_SIZE] = addr_bytes
-                            .try_into()
-                            .expect("actor.zpr_addr should be exactly 16 bytes");
-                        let zpr_addr = IpAddress::new_from_std(&IpAddr::from(addr_buf));
+            Ok(cr) => {
+                info!(target: VISA_MGMT, "link {link_id}: VS authorize_connect returned successfully");
+                match cr.zpr_addr {
+                    IpAddr::V4(_) => {
+                        // Our ZPR addresses should be IPv6 -- at least for now.
+                        error!(target: VISA_MGMT, "link {link_id} authorized, but zpr address is not IPv6");
+                        let _ignore_error =
+                            task_asm.process_link_state_event(link_id, LinkEvent::Error);
+                        return;
+                    }
+                    IpAddr::V6(_) => {
+                        let zpr_addr = IpAddress::new_from_std(&cr.zpr_addr);
                         let _ignore_error = task_asm.process_link_state_event(
                             link_id,
                             LinkEvent::ReceivedAuthorizeResponse(zpr_addr),
                         );
-                    } else {
-                        // This is also a bug in visa service. It must set an access if status == success.
-                        error!(target: VISA_MGMT, "link {link_id} authorized, but no actor present");
-                        let _ignore_error =
-                            task_asm.process_link_state_event(link_id, LinkEvent::Error);
                     }
                 }
-                Some(vsapi::StatusCode::FAIL) => {
-                    warn!(
-                        target: VISA_MGMT,
-                        "link {link_id}: VS authorize_connect FAILED: {}",
-                        cr.reason.unwrap_or("(no reason given)".to_owned())
-                    );
-                    let _ignore_error =
-                        task_asm.process_link_state_event(link_id, LinkEvent::Error);
-                }
-                _ => {
-                    warn!(
-                        target: VISA_MGMT,
-                        "link {link_id}: VS authorize_connect failed with unexpected status: {:?}",
-                        cr.status
-                    );
-                    let _ignore_error =
-                        task_asm.process_link_state_event(link_id, LinkEvent::Error);
-                }
-            },
+            }
 
             Err(err) => {
                 warn!(target: VISA_MGMT, "link {link_id}: VS authorize_connect failed with error: {err}");
@@ -101,7 +65,7 @@ pub fn build_connect_request(
     id: LinkId,
     addr: IpAddress,
     blob: &str,
-) -> Result<Option<libnode::vsapi::ConnectRequest>, LinkStateError> {
+) -> Result<Option<vsapi_types::ConnectRequest>, LinkStateError> {
     let cn = get_common_name(asm, id)?;
 
     if cn == zpr::VISA_SERVICE_CN {
@@ -109,25 +73,28 @@ pub fn build_connect_request(
     }
 
     // The visa service expects to find the BLOBs in the challenge response buffers.
-    let crbufs: Vec<Vec<u8>> = vec![blob.as_bytes().to_vec()];
+    let mut ss = vsapi_types::ZprSelfSignedBlob::default();
+    ss.challenge = blob.as_bytes().to_vec();
+    let crbufs: Vec<vsapi_types::AuthBlob> = vec![vsapi_types::AuthBlob::SS(ss)];
 
-    let mut claims = BTreeMap::new();
+    let mut claims = Vec::new();
     if addr != IpAddress::UNSPECIFIED {
-        claims.insert(claims::KATTR_EPID.into(), addr.to_string());
+        claims.push(vsapi_types::Claim {
+            key: claims::KATTR_EPID.into(),
+            value: addr.to_string(),
+        });
     }
-    claims.insert(claims::KATTR_CN.into(), cn);
+    claims.push(vsapi_types::Claim {
+        key: claims::KATTR_CN.into(),
+        value: cn,
+    });
 
     // issue an Authorize Connect Request to the visa service for this adapter
-    let connect_req = libnode::vsapi::ConnectRequest {
-        connection_id: Some(123), // unused
-        dock_addr: Some(
-            IpAddress::new_from_std(&asm.get_local_dock_addr())
-                .v6
-                .to_vec(),
-        ),
-        claims: Some(claims),
-        challenge: None, // unused
-        challenge_responses: Some(crbufs),
+    let connect_req = vsapi_types::ConnectRequest {
+        substrate_addr: asm.get_local_dock_addr(),
+        claims: claims,
+        blobs: crbufs,
+        dock_interface: 0,
     };
     Ok(Some(connect_req))
 }
@@ -207,13 +174,8 @@ pub fn get_egress_link_for_visa(
 
 pub fn handle_revocation(
     asm: &Arc<Assembly>,
-    revocation: vsapi::VisaRevocation,
+    visa_id: VisaId,
 ) -> Result<(), visa_table::VisaTableError> {
-    let Some(visa_id) = revocation.issuer_id else {
-        error!(target: VISA_MGMT, "Visa revocation with no ID");
-        return Err(visa_table::VisaTableError::ParseError("issuer_id".into()));
-    };
-
     asm.visa_table
         .write()
         .unwrap()
@@ -222,45 +184,22 @@ pub fn handle_revocation(
 
 pub fn handle_services_update(
     asm: &Arc<Assembly>,
-    services: vsapi::ServicesList,
+    services: AuthServicesList,
 ) -> Result<(), visa_table::VisaTableError> {
-    let expiration = if let Some(unixts) = services.expiration {
-        if unixts == 0 {
-            // 0 is a special case, meaning "no expiration"
-            None
-        } else {
-            Some(UNIX_EPOCH + Duration::from_secs(unixts as u64))
+    let expiration = match services.expiration {
+        Some(exp) => Some(exp),
+        None => {
+            error!(target: VISA_MGMT, "visa service sends services list with no expiration set");
+            Some(UNIX_EPOCH)
         }
-    } else {
-        error!(target: VISA_MGMT, "visa service sends services list with no expiration set");
-        Some(UNIX_EPOCH) // not present? Already expired then.
     };
 
     let mut vs_auth_services = Vec::new();
 
-    if let Some(services) = services.services {
-        debug!(target: VISA_MGMT, "received services update with {} entries", services.len());
-        for service in services {
-            if service.type_ != vsapi::ServiceType::ACTOR_AUTHENTICATION {
-                continue;
-            }
-            if service.address.is_none() {
-                error!(target: VISA_MGMT, "service descriptor with no address (id={})", service.service_id.unwrap_or_default());
-                continue;
-            }
-            match vs_types::ServiceDescriptor::try_from(service) {
-                Ok(sd) => {
-                    vs_auth_services.push(sd);
-                }
-                Err(e) => {
-                    error!(target: VISA_MGMT, "failed to parse vsapi service descriptor: {e}");
-                    continue;
-                }
-            }
-        }
-    } else {
-        // Got update with nothing.
-        debug!(target: VISA_MGMT, "received empty services update, clearing vs_auth_services");
+    let services = services.services;
+    debug!(target: VISA_MGMT, "received services update with {} entries", services.len());
+    for service in services {
+        vs_auth_services.push(service);
     }
     debug!(target: VISA_MGMT, "updating auth services with {} entries, expires at {expiration:?}", vs_auth_services.len());
     // The update is always a complete replacement of the list of services, and may be empty.
