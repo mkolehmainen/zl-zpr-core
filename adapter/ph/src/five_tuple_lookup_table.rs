@@ -5,6 +5,7 @@ use ip_network_table_deps_treebitmap::IpLookupTable;
 use range_set_blaze::RangeMapBlaze;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use zpr::VisaId;
 use zpr::vsapi_types::{VsapiFiveTuple, VsapiIpProtocol};
@@ -17,18 +18,18 @@ pub struct FiveTupleLookupTable {
     table: RcuBox<Arc<FiveTupleLookup>>,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub struct ProtoLookup {
-    proto_vec: Arc<Vec<ProtoAndId>>,
+    proto_vec: Arc<Vec<Arc<ProtoAndId>>>,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub struct ProtoAndId {
     proto: VsapiIpProtocol,
     id: VisaId,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub enum PortLookup<T: Clone + Eq + PartialEq> {
     Wildcard(T),
     MultiVal(Arc<RangeMapBlaze<u16, T>>),
@@ -76,7 +77,7 @@ impl FiveTupleLookupTable {
         };
         // Create array for protocol
         let mut arr = Vec::new();
-        arr.push(ProtoAndId::new(five_tuple.l4_protocol, visa_id));
+        arr.push(Arc::new(ProtoAndId::new(five_tuple.l4_protocol, visa_id)));
 
         // Determine which enum to use for src level
         let src_level: SrcPortLookup = match five_tuple.src_port {
@@ -208,10 +209,10 @@ impl<T: Combinable + Clone + Eq + PartialEq> Combinable for PortLookup<T> {
             | (PortLookup::MultiVal(curr_level), PortLookup::Wildcard(level_below)) => {
                 let mut curr_level_intersection = RangeMapBlaze::new();
                 curr_level_intersection.ranges_insert(0..=65535, level_below.clone());
-                for (port, lvl_below) in curr_level.iter() {
+                for (range, lvl_below) in curr_level.range_values() {
                     // We know there will be a collision, so we pre-emptively make the intersection and then insert it
                     let level_below_intersection = level_below.combine(lvl_below);
-                    curr_level_intersection.insert(port, level_below_intersection);
+                    curr_level_intersection.ranges_insert(range, level_below_intersection);
                 }
                 PortLookup::MultiVal(Arc::new(curr_level_intersection))
             }
@@ -235,8 +236,8 @@ impl<T: Combinable + Clone + Eq + PartialEq> Combinable for PortLookup<T> {
                 let port = tuple_val.0;
                 let level_below = tuple_val.1.clone();
                 let mut curr_level_intersection = RangeMapBlaze::new();
-                for (key, val) in curr_level.iter() {
-                    curr_level_intersection.insert(key, val.clone());
+                for (key, val) in curr_level.range_values() {
+                    curr_level_intersection.ranges_insert(key, val.clone());
                 }
                 match curr_level_intersection.insert(port, level_below.clone()) {
                     None => (),
@@ -249,18 +250,55 @@ impl<T: Combinable + Clone + Eq + PartialEq> Combinable for PortLookup<T> {
             }
             (PortLookup::MultiVal(curr_level1), PortLookup::MultiVal(curr_level2)) => {
                 let mut curr_level_intersection = RangeMapBlaze::new();
-                for (key, val) in curr_level1.iter() {
-                    curr_level_intersection.insert(key, val.clone());
+                for (key, val) in curr_level1.range_values() {
+                    curr_level_intersection.ranges_insert(key, val.clone());
                 }
-                for (port, level_below2) in curr_level2.iter() {
-                    match curr_level_intersection.insert(port, level_below2.clone()) {
-                        None => (),
-                        Some(level_below1) => {
-                            let level_below_intersection = level_below1.combine(&level_below2);
-                            curr_level_intersection.insert(port, level_below_intersection);
+                let mut existing_ranges = curr_level1.ranges();
+                let mut curr_existing_range = existing_ranges.next();
+                let mut inserting_iterator = curr_level2.range_values();
+                let mut curr_inserting_range = inserting_iterator.next();
+                while curr_inserting_range.is_some() {
+                    let (inserting_range, level_below2) = curr_inserting_range.clone().unwrap();
+                    if let Some(ref curr) = curr_existing_range {
+                        // check if the ranges overlap, if they do, insert element by element
+                        if overlap(&curr, &inserting_range) {
+                            for port in inserting_range.into_iter() {
+                                match curr_level_intersection.insert(port, level_below2.clone()) {
+                                    None => (),
+                                    Some(level_below1) => {
+                                        let level_below_intersection =
+                                            level_below1.combine(&level_below2);
+                                        curr_level_intersection
+                                            .insert(port, level_below_intersection);
+                                    }
+                                }
+                            }
+                            // We only increment the inserting value becuase it is possible that the next inserting range
+                            // also overlaps the same existing range
+                            curr_inserting_range = inserting_iterator.next();
+                        } else {
+                            // Don't overlap and the inserting range comes before the first existing range, meaning it
+                            // couldn't overlap with a later already existing range
+                            if inserting_range.end() < curr.start() {
+                                // Don't need to look at return value, know there will be no overlap
+                                curr_level_intersection
+                                    .ranges_insert(inserting_range, level_below2.clone());
+                                // Since the inserted range somes entirely before the current existing range, we only increment the inserting range
+                                curr_inserting_range = inserting_iterator.next();
+                            } else {
+                                // If there was no overlap and the inserting range comes after the existing range, we need to make sure there is
+                                // not a later existing range that would overlap the inserting range, so we increase only the existing range
+                                curr_existing_range = existing_ranges.next();
+                            }
                         }
+                    } else {
+                        // If the existing range is none, we have passed the end of the existing values and we know we will have no more overlap
+                        curr_level_intersection
+                            .ranges_insert(inserting_range, level_below2.clone());
+                        curr_inserting_range = inserting_iterator.next();
                     }
                 }
+
                 PortLookup::MultiVal(Arc::new(curr_level_intersection))
             }
         }
@@ -268,11 +306,15 @@ impl<T: Combinable + Clone + Eq + PartialEq> Combinable for PortLookup<T> {
 }
 
 impl ProtoLookup {
-    pub fn new(v: Vec<ProtoAndId>) -> Self {
+    pub fn new(v: Vec<Arc<ProtoAndId>>) -> Self {
         Self {
             proto_vec: Arc::new(v),
         }
     }
+}
+
+pub fn overlap<T: PartialOrd>(range1: &RangeInclusive<T>, range2: &RangeInclusive<T>) -> bool {
+    range1.start() <= range2.end() && range1.end() >= range2.start()
 }
 
 impl Combinable for ProtoLookup {
@@ -1538,5 +1580,329 @@ mod tests {
         assert_eq!(table.find_match(ft_diff_src_addr), Some(18));
         assert_eq!(table.find_match(ft_diff_dst_addr), Some(19));
         assert_eq!(table.find_match(ft), None);
+    }
+
+    #[test]
+    pub fn multival_combine_no_overlap() {
+        // Map 1: |-----|            |-----|
+        // Map 2:          |-----|
+        let mut map1 = RangeMapBlaze::new();
+        map1.ranges_insert(
+            54u16..=75u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map1.ranges_insert(
+            100u16..=101u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        let port_lookup1: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map1));
+
+        let mut map2 = RangeMapBlaze::new();
+        map2.ranges_insert(
+            80u16..=90u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        let port_lookup2: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map2));
+
+        let intersection = port_lookup1.combine(&port_lookup2);
+
+        let mut map3 = RangeMapBlaze::new();
+        map3.ranges_insert(
+            54u16..=75u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map3.ranges_insert(
+            100u16..=101u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map3.ranges_insert(
+            80u16..=90u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        let port_lookup3: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map3));
+
+        assert_eq!(port_lookup3, intersection);
+    }
+
+    #[test]
+    pub fn multival_combine_no_overlap_flipped() {
+        // Map 1:           |-----|
+        // Map 2: |-----|            |-----|
+        let mut map2 = RangeMapBlaze::new();
+        map2.ranges_insert(
+            54u16..=75u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map2.ranges_insert(
+            100u16..=101u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        let port_lookup2: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map2));
+
+        let mut map1 = RangeMapBlaze::new();
+        map1.ranges_insert(
+            80u16..=90u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        let port_lookup1: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map1));
+
+        let intersection = port_lookup1.combine(&port_lookup2);
+
+        let mut map3 = RangeMapBlaze::new();
+        map3.ranges_insert(
+            54u16..=75u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map3.ranges_insert(
+            100u16..=101u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map3.ranges_insert(
+            80u16..=90u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        let port_lookup3: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map3));
+
+        assert_eq!(port_lookup3, intersection);
+    }
+
+    #[test]
+    pub fn multival_combine_no_overlap_flipped_multiple() {
+        // Map 1:           |-----|
+        // Map 2: |-----|            |-----| |-----|
+        let mut map2 = RangeMapBlaze::new();
+        map2.ranges_insert(
+            54u16..=75u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map2.ranges_insert(
+            100u16..=101u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map2.ranges_insert(
+            104u16..=107u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        let port_lookup2: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map2));
+
+        let mut map1 = RangeMapBlaze::new();
+        map1.ranges_insert(
+            80u16..=90u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        let port_lookup1: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map1));
+
+        let intersection = port_lookup1.combine(&port_lookup2);
+
+        let mut map3 = RangeMapBlaze::new();
+        map3.ranges_insert(
+            54u16..=75u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map3.ranges_insert(
+            100u16..=101u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map3.ranges_insert(
+            104u16..=107u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map3.ranges_insert(
+            80u16..=90u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        let port_lookup3: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map3));
+
+        assert_eq!(port_lookup3, intersection);
+    }
+
+    #[test]
+    pub fn multival_combine_first_overlap() {
+        // Map 1: |-----|            |-----|
+        // Map 2:     |-----|
+        let mut map1 = RangeMapBlaze::new();
+        map1.ranges_insert(
+            54u16..=75u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map1.ranges_insert(
+            100u16..=101u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        let port_lookup1: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map1));
+
+        let mut map2 = RangeMapBlaze::new();
+        map2.ranges_insert(
+            60u16..=90u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        let port_lookup2: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map2));
+
+        let intersection = port_lookup1.combine(&port_lookup2);
+
+        let mut map3 = RangeMapBlaze::new();
+        map3.ranges_insert(
+            54u16..=59u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map3.ranges_insert(
+            60u16..=75u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![
+                    Arc::new(ProtoAndId { proto: 2, id: 2 }),
+                    Arc::new(ProtoAndId { proto: 1, id: 1 }),
+                ]),
+            },
+        );
+        map3.ranges_insert(
+            76u16..=90u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        map3.ranges_insert(
+            100u16..=101u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        let port_lookup3: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map3));
+
+        assert_eq!(port_lookup3, intersection);
+    }
+
+    #[test]
+    pub fn multival_combine_second_overlap() {
+        // Map 1: |-----|        |-----|          |-----|
+        // Map 2:             |-----|      |-----|
+        let mut map1 = RangeMapBlaze::new();
+        map1.ranges_insert(
+            54u16..=75u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map1.ranges_insert(
+            95u16..=105u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map1.ranges_insert(
+            110u16..=111u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        let port_lookup1: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map1));
+
+        let mut map2 = RangeMapBlaze::new();
+        map2.ranges_insert(
+            90u16..=100u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        map2.ranges_insert(
+            112u16..=113u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        let port_lookup2: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map2));
+
+        let intersection = port_lookup1.combine(&port_lookup2);
+
+        let mut map3 = RangeMapBlaze::new();
+        map3.ranges_insert(
+            54u16..=75u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map3.ranges_insert(
+            90u16..=94u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        map3.ranges_insert(
+            95u16..=100u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![
+                    Arc::new(ProtoAndId { proto: 2, id: 2 }),
+                    Arc::new(ProtoAndId { proto: 1, id: 1 }),
+                ]),
+            },
+        );
+        map3.ranges_insert(
+            101u16..=105u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map3.ranges_insert(
+            110u16..=111u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 1, id: 1 })]),
+            },
+        );
+        map3.ranges_insert(
+            112u16..=113u16,
+            ProtoLookup {
+                proto_vec: Arc::new(vec![Arc::new(ProtoAndId { proto: 2, id: 2 })]),
+            },
+        );
+        let port_lookup3: PortLookup<ProtoLookup> = PortLookup::MultiVal(Arc::new(map3));
+
+        assert_eq!(port_lookup3, intersection);
     }
 }
