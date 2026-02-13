@@ -418,7 +418,9 @@ impl KeyManagerStateMachine for KmNoise {
             let rpk = self.peer_pub_key.as_ref().unwrap();
             let mut initiator = match snow::Builder::new(np)
                 .local_private_key(self.local_keypair.private.as_ref())
+                .unwrap()
                 .remote_public_key(rpk)
+                .unwrap()
                 .build_initiator()
             {
                 Ok(i) => i,
@@ -444,6 +446,7 @@ impl KeyManagerStateMachine for KmNoise {
         } else {
             let responder = match snow::Builder::new(np)
                 .local_private_key(self.local_keypair.private.as_ref())
+                .unwrap()
                 .build_responder()
             {
                 Ok(r) => r,
