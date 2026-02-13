@@ -49,7 +49,7 @@ pub fn send_discard(asm: &Assembly, link_id: LinkId) -> Sent<'_> {
 pub fn send_echo_request(asm: &Assembly, link_id: LinkId) -> Sent<'_> {
     let mut pkt = core::new_heap_packet();
     pkt.alloc_zeroed_header::<zdp::ZdpEchoHeader>();
-    core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::EchoRequest, pkt)
+    core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::Echo, pkt)
 }
 
 /// send a Hello Request (RFC 6.5 § 6.3.4)
@@ -154,7 +154,7 @@ pub fn send_acquire_zpr_address_request<'a>(
     } else {
         actor_addrs[0].l3_type()
     };
-    let hdr = zdp::ZdpAcquireZprAddressRequestHeader {
+    let hdr = zdp::ZdpAcquireZprAddressHeader {
         blob_len: (blob.len() as u16).into(),
         ip_version,
         addr_count: actor_addrs.len() as u8,
@@ -182,12 +182,7 @@ pub fn send_acquire_zpr_address_request<'a>(
         }
     }
 
-    core::send_non_flow_mgmt(
-        asm,
-        link_id,
-        zdp::ZdpPacketType::AcquireZprAddressRequest,
-        req,
-    )
+    core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::AcquireZprAddress, req)
 }
 
 /// Send an GrantZprAddressRequest (TODO: not yet in RFC 6)
@@ -214,7 +209,7 @@ pub fn send_grant_zpr_address_request<'a>(
     } else {
         actor_addrs[0].l3_type()
     };
-    let hdr = zdp::ZdpGrantZprAddressRequestHeader {
+    let hdr = zdp::ZdpGrantZprAddressHeader {
         status_code,
         ip_version,
         addr_count: actor_addrs.len() as u8,
@@ -241,12 +236,7 @@ pub fn send_grant_zpr_address_request<'a>(
         }
     }
 
-    core::send_non_flow_mgmt(
-        asm,
-        link_id,
-        zdp::ZdpPacketType::GrantZprAddressRequest,
-        req,
-    )
+    core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::GrantZprAddress, req)
 }
 
 /// send a Terminate Link or Docking Session message (TODO: document)

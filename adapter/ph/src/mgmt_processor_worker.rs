@@ -63,7 +63,7 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
     let seq_num = pkt.metadata().seq_num;
 
     match base_hdr.packet_type {
-        ZdpPacketType::EchoRequest => {
+        ZdpPacketType::Echo => {
             trace!(
                 target: ZDP,
                 "Link {}: handling mgmt message type {:?} seq_num {seq_num}",
@@ -140,7 +140,7 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
 
             ZdpPacketType::Discard => handlers::handle_discard(asm, pkt).await,
 
-            ZdpPacketType::EchoRequest => handlers::handle_echo_request(asm, pkt).await,
+            ZdpPacketType::Echo => handlers::handle_echo_request(asm, pkt).await,
 
             ZdpPacketType::KeyManagement => {
                 panic!("unexpected Key Management message in mgmt processor")
@@ -158,11 +158,11 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
                 handlers::handle_init_authentication_request(asm, pkt).await
             }
 
-            ZdpPacketType::AcquireZprAddressRequest => {
+            ZdpPacketType::AcquireZprAddress => {
                 handlers::handle_acquire_zpr_address_request(asm, pkt).await
             }
 
-            ZdpPacketType::GrantZprAddressRequest => {
+            ZdpPacketType::GrantZprAddress => {
                 handlers::handle_grant_zpr_address_request(asm, pkt).await
             }
 

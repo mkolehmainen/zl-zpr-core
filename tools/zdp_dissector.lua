@@ -3,79 +3,88 @@
 zdp_proto = Proto("zdp", "ZDP Header Dissector")
 
 -- ZDP Headers 
-zpi_val = ProtoField.uint8("zdp.zpi", "ZPI", base.DEC)
-zdp_type = ProtoField.uint8("zdp.type", "Type", base.DEC)
-excess_len = ProtoField.uint8("zdp.excess_len", "Excess Length", base.DEC)
-seq_num = ProtoField.uint64("zdp.seq_num", "Sequence Number", base.DEC)
-stream_id = ProtoField.uint32("zdp.streamid", "Stream ID", base.DEC)
-pad = ProtoField.bytes("zdp.pad", "Pad")
-hmac = ProtoField.bytes("zdp.mac", "HMAC")
+a2a_mac = ProtoField.uint64("zdp.a2a_mac", "A2A MAC", base.HEX)
 a2a_said = ProtoField.uint8("zdp.a2a_said", "A2A SAID", base.HEX)
 agent_packet = ProtoField.bytes("zdp.agent_packet", "Agent Packet")
-a2a_mac = ProtoField.uint64("zdp.a2a_mac", "A2A MAC", base.HEX)
+excess_len = ProtoField.uint8("zdp.excess_len", "Excess Length", base.DEC)
+hmac = ProtoField.bytes("zdp.mac", "HMAC")
 management_packet = ProtoField.bytes("zdp.management", "Management Packet")
+pad = ProtoField.bytes("zdp.pad", "Pad")
+seq_num = ProtoField.uint64("zdp.seq_num", "Sequence Number", base.DEC)
+stream_id = ProtoField.uint32("zdp.streamid", "Stream ID", base.DEC)
+zdp_type = ProtoField.uint8("zdp.type", "Type", base.DEC)
+zpi_val = ProtoField.uint8("zdp.zpi", "ZPI", base.DEC)
 
 -- Agent Packet Headers
-ip_version = ProtoField.uint8("zdp.ip_version", "IP Version", base.DEC)
-ihl = ProtoField.uint8("zdp.ihl", "Internet Header Length", base.DEC)
+fl = ProtoField.uint32("zdp.fl", "Flow Label", base.DEC)
 frag_id = ProtoField.uint16("zdp.frag_id", "Fragment ID", base.DEC)
 frag_offset = ProtoField.uint16("zdp.frag_offset", "Fragment Offset", base.DEC)
-ttl = ProtoField.uint8("zdp.ttl", "Time to Live", base.DEC)
-tc = ProtoField.uint8("zdp.tc", "Traffic Class", base.DEC)
-fl = ProtoField.uint32("zdp.fl", "Flow Label", base.DEC)
 hop_limit = ProtoField.uint8("zdp.hop_limit", "Hop Limit", base.DEC)
+ihl = ProtoField.uint8("zdp.ihl", "Internet Header Length", base.DEC)
+ip_version = ProtoField.uint8("zdp.ip_version", "IP Version", base.DEC)
+tc = ProtoField.uint8("zdp.tc", "Traffic Class", base.DEC)
+ttl = ProtoField.uint8("zdp.ttl", "Time to Live", base.DEC)
 -- dscp = ProtoField.uint8("zdp.dscp", "Differentiated Services Code Point", base.DEC)
 -- ip_options = ProtoField.bytes("zdp.ip_options", "IP Options")
 
 -- Management Data
-trans_id = ProtoField.uint16("zdp.trans_id", "Transaction ID", base.DEC)
+additional_data = ProtoField.bytes("zdp.additional", "Optional Additional Data")
+addr_count = ProtoField.uint8("zdp.addr_count", "Address Count", base.DEC)
 adl = ProtoField.uint16("zdp.adl", "Additional Data Length", base.DEC)
-reason_code = ProtoField.uint8("zdp.reason_code", "Reason Code", base.DEC)
-response_code = ProtoField.uint8("zdp.response_code", "Response Code", base.DEC)
+blob = ProtoField.bytes("zdp.blob", "Blob")
+blob_len = ProtoField.uint16("zdp.blob_len", "Blob Length", base.DEC)
+bootstrap_support = ProtoField.uint8("zdp.bootstrap", "Bootstrap Support Flag")
+comp_mode = ProtoField.uint8("zdp.comp_mode", "Compression Mode", base.HEX)
+ctime = ProtoField.uint64("zdp.ctime", "CTime", base.DEC)
 data_length_u8 = ProtoField.uint8("zdp.data_len_t", "Data Length", base.DEC)
 data_length_u16 = ProtoField.uint16("zdp.data_len_i", "Data Length", base.DEC)
-additional_data = ProtoField.bytes("zdp.additional", "Optional Additional Data")
-source_port_present = ProtoField.uint8("zdp.source_port_present", "Source Port Information Present", base.DEC)
-dest_port_present = ProtoField.uint8("zdp.dest_port_present", "Destination Port Information Present", base.DEC)
-source_addr_v4 = ProtoField.ipv4("zdp.source_addr_v4", "Source IP Address")
 dest_addr_v4 = ProtoField.ipv4("zdp.dest_addr_v4", "Destination IP Address")
-source_addr_v6 = ProtoField.ipv6("zdp.source_addr_v6", "Source IP Address")
 dest_addr_v6 = ProtoField.ipv6("zdp.dest_addr_v6", "Destination IP Address")
+dest_info = ProtoField.uint16("zdp.dest_info", "Destination Port Information", base.DEC)
+info_len = ProtoField.uint8("zdp.info_len", "Information Length", base.DEC)
+ip_protocol = ProtoField.uint8("zdp.ip_protocol", "IP Protocol", base.DEC)
 ipv4_addr = ProtoField.ipv4("zdp.ipv4", "IP Address")
 ipv6_addr = ProtoField.ipv6("zdp.ipv6", "IP Address")
+nonce = ProtoField.uint64("zdp.nonce", "Nonce", base.HEX)
+pkt_len = ProtoField.uint16("zdp.pkt_len", "Endpoint Packet Length", base.DEC)
+reason_code = ProtoField.uint8("zdp.reason_code", "Reason Code", base.DEC)
+response_code = ProtoField.uint8("zdp.response_code", "Response Code", base.DEC)
+source_addr_v4 = ProtoField.ipv4("zdp.source_addr_v4", "Source IP Address")
+source_addr_v6 = ProtoField.ipv6("zdp.source_addr_v6", "Source IP Address")
 source_info = ProtoField.uint16("zdp.source_info", "Source Port Information", base.DEC)
-dest_info = ProtoField.uint16("zdp.dest_info", "Destination Port Information", base.DEC)
 status_code = ProtoField.uint8("zdp.status_code", "Status Code", base.DEC)
-info_len = ProtoField.uint8("zdp.info_len", "Information Length", base.DEC)
 status_info = ProtoField.bytes("zdp.status_info", "Optional Additional Status Information")
-comp_mode = ProtoField.uint8("zdp.comp_mode", "Compression Mode", base.HEX)
-tlv_type = ProtoField.uint8("zdp.tlv_type", "TLV Type", base.DEC)
+tcst = ProtoField.uint8("zdp.tcst", "TCST", base.DEC)
 tlv_len = ProtoField.uint8("zdp.tlv_length", "TLV Length", base.DEC)
-tlv_val_u16 = ProtoField.uint16("zdp.tlv_u16", "TLV Value", base.DEC)
+tlv_type = ProtoField.uint8("zdp.tlv_type", "TLV Type", base.DEC)
+tlv_val_bytes = ProtoField.bytes("zdp.tlv_bytes", "TLV Value")
 tlv_val_i64 = ProtoField.int64("zdp.tlv_u64", "TLV Value", base.DEC)
-tlv_val_str = ProtoField.string("zdp.tlv_string", "TLV Value", base.ASCII)
 tlv_val_ipv4 = ProtoField.ipv4("zdp.tlv_ipv4", "TLV Value", base.DEC)
 tlv_val_ipv6 = ProtoField.ipv6("zdp.tlv_ipv6", "TLV Value", base.DEC)
-tlv_val_bytes = ProtoField.bytes("zdp.tlv_bytes", "TLV Value")
-bootstrap_support = ProtoField.uint8("zdp.bootstrap", "Bootstrap Support Flag")
-blob_len = ProtoField.uint16("zdp.blob_len", "Blob Length", base.DEC)
-addr_count = ProtoField.uint8("zdp.addr_count", "Address Count", base.DEC)
-blob = ProtoField.bytes("zdp.blob", "Blob")
-nonce = ProtoField.uint64("zdp.nonce", "Nonce", base.HEX)
-ctime = ProtoField.uint64("zdp.ctime", "CTime", base.DEC)
--- ip_protocol = ProtoField.uint8("zdp.ip_protocol", "IP Protocol", base.DEC)
--- req_seq_num = ProtoField.uint16("zdp.req_seq_num", "Request Sequence Number", base.DEC)
+tlv_val_str = ProtoField.string("zdp.tlv_string", "TLV Value", base.ASCII)
+tlv_val_u16 = ProtoField.uint16("zdp.tlv_u16", "TLV Value", base.DEC)
+trans_id = ProtoField.uint16("zdp.trans_id", "Transaction ID", base.DEC)
+-- dest_port_present = ProtoField.uint8("zdp.dest_port_present", "Destination Port Information Present", base.DEC)
 -- ip_protocol_present = ProtoField.uint8("zdp.protocol_present", "IP Protocol Present", base.DEC)
+-- req_seq_num = ProtoField.uint16("zdp.req_seq_num", "Request Sequence Number", base.DEC)
+-- source_port_present = ProtoField.uint8("zdp.source_port_present", "Source Port Information Present", base.DEC)
 
-zdp_proto.fields = { zpi_val, zdp_type, excess_len, seq_num, stream_id, pad, 
-                     hmac, a2a_said, agent_packet, a2a_mac, management_packet, ip_version,
-                     ihl, frag_id, frag_offset, ttl, tc, fl, hop_limit, trans_id,
-                     adl, additional_data, source_port_present, nonce, ctime,
-                     dest_port_present, source_addr_v4, source_addr_v6, dest_addr_v4, dest_addr_v6, source_info, 
-                     dest_info, status_code, info_len, status_info, reason_code, response_code, data_length_u8, data_length_u16,
-                     comp_mode, tlv_type, tlv_len, tlv_val_u16, tlv_val_i64, tlv_val_str, tlv_val_ipv4, 
-                     tlv_val_ipv6, tlv_val_bytes, bootstrap_support, blob_len, addr_count, blob, ipv4_addr, ipv6_addr, }
-                     --  dscp, ip_options, req_seq_num, ip_protocol_present, ip_protocol
+
+
+zdp_proto.fields = { 
+    -- ZDP Headers
+    a2a_mac, a2a_said, agent_packet, excess_len, hmac, management_packet, pad,
+    seq_num, stream_id, zdp_type, zpi_val,
+    -- Agent Packet Headers
+    fl, frag_id, frag_offset, hop_limit, ihl, ip_version, tc, ttl,
+    -- Management Data
+    additional_data, addr_count, adl, blob, blob_len, bootstrap_support, comp_mode,
+    ctime, data_length_u8, data_length_u16, dest_addr_v4, dest_addr_v6, dest_info, 
+    ip_protocol, info_len, ipv4_addr, ipv6_addr, nonce, pkt_len, 
+    reason_code,  response_code, source_addr_v4, source_addr_v6, source_info, 
+    status_code, status_info, tcst, tlv_len, tlv_type, tlv_val_bytes, 
+    tlv_val_i64, tlv_val_ipv4, tlv_val_ipv6, tlv_val_str, tlv_val_u16, trans_id,
+}
 
 -- Lengths of fields when using Noise Encryption
 A2A_SAID = 1
@@ -88,9 +97,12 @@ EXCESS_LEN = 1
 FLAGS = 1
 HOP_LIMIT = 1
 IP_VERSION = 1
+IP_PROTOCOL = 1
 INFO_LEN = 1
 REASON_CODE = 1
 RESPONSE_CODE = 1
+TC = 1
+TCST = 1
 TLV_LEN = 1
 TLV_TYPE = 1
 TTL = 1
@@ -98,7 +110,7 @@ TYPE = 1
 ZPI = 1
 
 ADL = 2
-BIND_TRANS_ID = 2
+PKT_LEN = 2
 BLOB_LEN = 2
 DL_INIT = 2
 FRAG_ID = 2
@@ -135,7 +147,7 @@ function zdp_proto.dissector(buffer, pinfo, tree)
     -- TODO shorten main    
     local zdp_header_subtree = tree:add(zdp_proto, buffer(), "ZDP Header Data")
 
-    local zdp_header = Dissector(zdp_header_subtree, buffer)
+    local zdp_header = TreeBuilder(buffer, pinfo, zdp_header_subtree)
     zdp_header:add_field(zpi_val, ZPI)
 
     local type = zdp_header:get_curr_buffer_section(TYPE):uint()
@@ -166,7 +178,7 @@ function zdp_proto.dissector(buffer, pinfo, tree)
         
         local v4_v6 = get_first_four(buffer(PKT_START, 1):uint())
         agent_header_subtree:add(ip_version, v4_v6)
-        local agent_header = Dissector(agent_header_subtree, buffer)
+        local agent_header = TreeBuilder(buffer, pinfo, agent_header_subtree)
         agent_header:set_pos(PKT_START)
 
         -- NOTE No updates to this section RE size/position of values, assuming they stayed the same for now
@@ -212,7 +224,7 @@ function zdp_proto.dissector(buffer, pinfo, tree)
         if real_len > PER_FLOW_NON_AGENT_DATA then
             local mgmt_start = zdp_header:get_pos()
             zdp_header:add_field(management_packet, real_len - PER_FLOW_NON_AGENT_DATA)
-            decode_management(type, buffer(mgmt_start, real_len - PER_FLOW_NON_AGENT_DATA), tree)
+            decode_management(type, buffer(mgmt_start, real_len - PER_FLOW_NON_AGENT_DATA), pinfo, tree)
         end
         -- NOTE I believe that both the Pad and the MAC are removed before the packets are captured
     else -- Non-per-flow management message
@@ -224,7 +236,7 @@ function zdp_proto.dissector(buffer, pinfo, tree)
         if real_len > NON_FLOW_NON_AGENT_DATA then
             local mgmt_start = zdp_header:get_pos()
             zdp_header:add_field(management_packet, real_len - NON_FLOW_NON_AGENT_DATA)
-            decode_management(type, buffer(mgmt_start, real_len - NON_FLOW_NON_AGENT_DATA), tree)
+            decode_management(type, buffer(mgmt_start, real_len - NON_FLOW_NON_AGENT_DATA), pinfo, tree)
         end
     end
 end
@@ -232,9 +244,9 @@ end
 -- Idiomatic way of doing this may be to actually create a whole new dissector, although that might be challenging
 -- becuase we couldn't just forward the managament packet, the type would also have to be forwarded, meaning we would either
 -- have to forward basically the whole packet, or create a new tvb with the type and the management packet and forward that
-function decode_management(type, buffer, tree)
+function decode_management(type, buffer, pinfo, tree)
     local management_subtree = tree:add(zdp_proto, buffer(), "Management Packet Data")
-    local management = Dissector(management_subtree, buffer)
+    local management = TreeBuilder(buffer, pinfo, management_subtree)
     local func = management_table[type]
     if(func) then
         func(management)
@@ -329,43 +341,36 @@ function get_tlv_val_type(type, len)
     return tlv_val_bytes
 end
 
-function handle_bind_agent_addr_req(management)
-    management:add_field(trans_id, BIND_TRANS_ID)
+function handle_bind_actor_addr_req(management)
+    -- I think there are 2 bytes at the beginning of the packet, but I am not sure what is supposed to be there
+    -- The format is supposed to be l3type (1 byte) then pkt len (2 bytes), but they are two bytes after they should be
+    management:increase_pos(2)
     local version = management:add_field_and_return(ip_version, IP_VERSION)
-    local compression_mode = management:add_field_and_return(comp_mode, COMP_MODE)
+    local length = management:add_field_and_return(pkt_len, PKT_LEN)
 
-    local source_present = get_second_bit(compression_mode)
-    local dest_present = get_third_bit(compression_mode)
-    management:add_field_with_text_no_buffer(source_port_present, source_present, presence_value[source_present])
-    management:add_field_with_text_no_buffer(dest_port_present, dest_present, presence_value[dest_present])
-
-    -- TODO Here we just dissect the src addr and dest addr, do we want other parts of the IP header?
-    if version == 4 then
-        management:increase_pos(12)
-        management:add_field(source_addr_v4, IPV4_LEN)
-        management:add_field(dest_addr_v4, IPV4_LEN)
-    elseif version == 6 then
-        management:increase_pos(8)
-        management:add_field(source_addr_v6, IPV6_LEN)
-        management:add_field(dest_addr_v6, IPV6_LEN)
-    end
-    
-    if source_present == 1 then
-        management:add_field(source_info, PORT_LEN)
-    end
-
-    if dest_present == 1 then 
-        management:add_field(dest_info, PORT_LEN)
-    end
+    -- Full IP packet inside, can just hand off to IP dissector
+    local ip_dissector = Dissector.get("ip")
+    ip_dissector:call(management:get_curr_buffer_section(length):tvb(), management:get_pinfo(), management:get_tree())
 end
 
-function handle_bind_agent_addr_res(management)
-    management:add_field(trans_id, BIND_TRANS_ID)
+function handle_bind_actor_addr_res(management)
     management:add_field_with_text_table(response_code, RESPONSE_CODE, response_code_table)
     local info = management:add_field_and_return(info_len, INFO_LEN)
     if info > 0 then 
         management:add_field(status_info, info)
     end
+    management:add_field(tcst, TCST)
+    management:add_field(tc, TC)
+end
+
+function handle_bind_egress_stream_req(management)
+    management:add_field(tcst, TCST)
+    management:add_field(tc, TC)
+end
+
+function handle_bind_egress_stream_res(management)
+    management:add_field_with_text_table(response_code, RESPONSE_CODE, response_code_table)
+    management:add_field(info_len, INFO_LEN)
 end
 
 function handle_init_authentication_req(management) 
@@ -413,13 +418,16 @@ function handle_grant_zpr_addr_req(management)
 end
 
 -- "Class" that contains the tree, buffer, and current position
-function Dissector(init_tree, init_buffer) 
-    local dissector = { tree = init_tree, buffer = init_buffer, pos = 0, real_len = 0 }
+function TreeBuilder(init_buffer, init_pinfo, init_tree) 
+    local dissector = { buffer = init_buffer, pinfo = init_pinfo, tree = init_tree, pos = 0, real_len = 0 }
 
     local methods = {
         add_field = function(self, field, len)
             self.tree:add(field, self.buffer(self.pos, len))
             self.pos = self.pos + len
+        end,
+        add_field_no_buffer = function(self, field, val)
+            self.tree:add(field, val)
         end,
         add_field_and_return = function(self, field, len)
             local val = self.buffer(self.pos, len)
@@ -456,6 +464,12 @@ function Dissector(init_tree, init_buffer)
         end,
         get_buffer_len = function(self) 
             return self.buffer:len()
+        end,
+        get_pinfo = function(self)
+            return self.pinfo
+        end,
+        get_tree = function(self)
+            return self.tree
         end
     }
 
@@ -470,18 +484,20 @@ end
 
 management_table = 
 {
-    [11] = handle_bind_agent_addr_req,
-    [12] = handle_bind_agent_addr_res,
+    [6] = handle_bind_actor_addr_req,
+    [7] = handle_bind_actor_addr_res,
+    [8] = handle_bind_egress_stream_req,
+    [9] = handle_bind_egress_stream_res,
     [131] = handle_echo,
     [133] = handle_terminate_ind_req,
-    [134] = handle_terminate_res,
-    [135] = handle_terminate_ind_req,
-    [136] = handle_hello_req,
-    [137] = handle_hello_res,
-    [140] = handle_acquire_zpr_addr_req,
-    [145] = handle_report,
-    [146] = handle_init_authentication_req,
-    [148] = handle_grant_zpr_addr_req,
+    [142] = handle_terminate_res,
+    [143] = handle_terminate_ind_req,
+    [134] = handle_hello_req,
+    [135] = handle_hello_res,
+    [138] = handle_acquire_zpr_addr_req,
+    [132] = handle_report,
+    [141] = handle_init_authentication_req,
+    [139] = handle_grant_zpr_addr_req,
 }
 
 presence_value = 
@@ -496,10 +512,10 @@ function get_type_name(type)
     local type_name = type_name_table[type]
 
     if type_name ~= nil then return type_name
-    elseif type >= 19 and type <= 95 then type_name = "Unallocated"
-    elseif type >= 96 and type <= 126 then type_name = "Reserved for private use and experimentation"
-    elseif type >= 150 and type <= 223 then type_name = "Unallocated"
-    elseif type >= 224 and type <= 254 then type_name = "Experimental and Private Use" end
+    elseif type >= 10 and type <= 95 then type_name = "Unallocated"
+    elseif type >= 96 and type <= 126 then type_name = "Reserved: Experimental and Private Use"
+    elseif type >= 142 and type <= 223 then type_name = "Unallocated"
+    elseif type >= 224 and type <= 253 then type_name = "Reserved: Experimental and Private Use" end
 
     return type_name
 end 
@@ -507,49 +523,36 @@ end
 type_name_table =
 {
     [0] = "Transit Packet",
-    [1] = "Unused",
-    [2] = "Destination Unreachable",
-    [3] = "Visa Herald Request",
-    [4] = "Visa Herald Response",
-    [5] = "Visa Update Request", -- not in rfc
-    [6] = "Visa Update Response", -- not in rfc
-    [7] = "Visa Retract Request",
-    [8] = "Visa Retract Response",
-    [9] = "Visa Deaccept Indication", -- differs from rfc
-    [10] = "Visa Deaccept Acknowledgement", -- differs from rfc
+    [1] = "Destination Unreachable",
+    [2] = "Set Path MTU",
+    [3] = "Stream ID Request",
+    [4] = "Stream ID Response",
+    [5] = "Stream ID Withdrawal",
+    [6] = "Bind Actor Address Request",
+    [7] = "Bind Actor Address Response",
+    [8] = "Bind Egress Stream Request",
+    [9] = "Bind Egress Stream Response",
+    [10] = "Visa Deaccept Acknowledgement",
     [11] = "Bind Actor Address Request",
-    [12] = "Bind Actor Address Response",
-    [13] = "Unbind Actor Address Request",
-    [14] = "Unbind Actor Address Response",
-    [15] = "Unused",
-    [16] = "Unused",
-    [17] = "Set Path MTU",
-    [18] = "Unused",
-    [127] = "Reserved, Discard", -- not in zdp.rs
+    [127] = "Reserved: Must not be used",
     [128] = "ZPR ARP",
     [129] = "Key Management",
     [130] = "Discard",
-    [131] = "Echo Request",
-    [132] = "Unused", -- not in rfc
-    [133] = "Terminate Link Request", -- rfcs also include docking in terminate
-    [134] = "Terminate Link Response",
-    [135] = "Terminate Link Indication",
-    [136] = "Hello Request",
-    [137] = "Hello Response",
-    [138] = "Configuration Request",
-    [139] = "Configuration Response",
-    [140] = "Acquire ZPR Address Request",
-    [141] = "Unused",
-    [142] = "Unused", -- differs from rfc
-    [143] = "Unregister Actor Address Request", -- differs from rfc
-    [144] = "Unregister Actor Address Response", -- differs from rfc
-    [145] = "Report",
-    [146] = "Init Authentication Request",
-    [147] = "Unused", -- differs from rfc
-    [148] = "Grant ZPR Address Request",
-    [149] = "Unused", -- differs from rfc
+    [131] = "Echo",
+    [132] = "Report",
+    [133] = "Terminate Link or Docking Session",
+    [134] = "Hello Request",
+    [135] = "Hello Response",
+    [136] = "Configuration Request",
+    [137] = "Configuration Response",
+    [138] = "Acquire ZPR Address",
+    [139] = "Grant ZPR Address",
+    [140] = "Revoke ZPR Address",
+    [141] = "Init Authentication Request",
+    [142] = "Terminate Link Response", -- not in rfc
+    [143] = "Terminate Link Indication", -- not in rfc
     [254] = "Acknowledgement",
-    [255] = "Reserved, must not be used",
+    [255] = "Reserved: Must not be used",
 }
 
 terminate_reason_table =
