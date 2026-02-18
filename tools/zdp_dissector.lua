@@ -115,6 +115,7 @@ BLOB_LEN = 2
 DL_INIT = 2
 FRAG_ID = 2
 FRAG_OFFSET = 2
+TRANS_ID = 2
 
 IPV4_LEN = 4
 STREAM_ID = 4
@@ -130,10 +131,9 @@ INIT_AUTH_HMAC = 32
 
 HMAC = 0
 KEY_NOISE_PAD = 0
-TRANS_ID = 0
 
 EXCESS_LEN_START = ZPI + TYPE
-TRANSIT_NON_AGENT_DATA = ZPI + TYPE + EXCESS_LEN + SEQ_NUM + STREAM_ID + KEY_NOISE_PAD + HMAC + A2A_SAID + A2A_MAC
+TRANSIT_NON_AGENT_DATA = ZPI + TYPE + EXCESS_LEN + STREAM_ID + KEY_NOISE_PAD + HMAC + A2A_SAID + A2A_MAC
 PKT_START = TRANSIT_NON_AGENT_DATA - A2A_MAC
 PER_FLOW_NON_AGENT_DATA = ZPI + TYPE + EXCESS_LEN + SEQ_NUM + STREAM_ID
 NON_FLOW_NON_AGENT_DATA = ZPI + TYPE + EXCESS_LEN + SEQ_NUM
@@ -175,18 +175,17 @@ function zdp_proto.dissector(buffer, pinfo, tree)
         -- zdp_header_subtree:add(compressed_pkt, buffer(curr_pos, 5))
 
         local agent_header_subtree = tree:add(zdp_proto, buffer(), "Compressed Agent Packet Header Data")
-        
-        local v4_v6 = get_first_four(buffer(PKT_START, 1):uint())
-        agent_header_subtree:add(ip_version, v4_v6)
         local agent_header = TreeBuilder(buffer, pinfo, agent_header_subtree)
         agent_header:set_pos(PKT_START)
+        local v4_v6 = get_first_four(buffer(PKT_START, 1):uint())
+        agent_header:add_field_no_buffer(ip_version, v4_v6)
 
-        -- NOTE No updates to this section RE size/position of values, assuming they stayed the same for now
+        -- NOTE/TODO No updates to this section RE size/position of values, assuming they stayed the same for now
         -- Just want to get this somewhat working first
         if v4_v6 == 4 then
             -- TODO since the curr_pos always has to get incremented, perhaps make a func that both adds to tree and increments curr_pos
             local ihl_val = get_back_four(buffer(PKT_START, 1):uint())
-            agent_header_subtree:add(ihl, ihl_val)
+            agent_header:add_field_no_buffer(ihl, ihl_val)
             agent_header:increase_pos(1)
             agent_header:add_field(frag_id, FRAG_ID)
             agent_header:add_field(frag_offset, FRAG_OFFSET)
@@ -209,12 +208,12 @@ function zdp_proto.dissector(buffer, pinfo, tree)
             -- still use hardcoded values here because since the values are bitpacked, if something was changed 
             -- within this section, these lines would need to be changed anyway
             local tc_value = get_middle_eight(buffer(curr_pos, 2):uint())
-            agent_header_subtree:add(tc, tc_value)
+            agent_header:add_field_no_buffer(tc, tc_value)
             curr_pos = curr_pos + 1
             local fl_value = get_back_twelve(buffer(curr_pos, 3):uint())
-            agent_header_subtree:add(fl, fl_value)
+            agent_header:add_field_no_buffer(fl, fl_value)
             curr_pos = curr_pos + 2
-            agent_header_subtree:add(hop_limit, buffer(curr_pos, HOP_LIMIT))
+            agent_header:add_field_no_buffer(hop_limit, buffer(curr_pos, HOP_LIMIT):uint())
             -- Dissector.get("tcp"):call(buffer(15, real_len - IP_NON_AGENT_DATA):tvb(), pinfo, tree)
         end
     elseif type <= 127 then -- Per-Flow Management Message
@@ -257,9 +256,6 @@ end
 
 -- Function definitions must come before table
 function handle_echo(management)
-    if TRANS_ID > 0 then
-        management:add_field(trans_id, TRANS_ID)
-    end
     local add_data_len = management:add_field_and_return(adl, ADL)
     if add_data_len > 0 then 
         management:add_field(additional_data, add_data_len)
@@ -267,9 +263,6 @@ function handle_echo(management)
 end
 
 function handle_terminate_ind_req(management)
-    if TRANS_ID > 0 then
-        management:add_field(trans_id, TRANS_ID)
-    end
     management:add_field_with_text_table(reason_code, REASON_CODE, terminate_reason_table)
     local data_len = management:add_field_and_return(data_length_u8, DL_TERMINATE)
     if data_len > 0 then 
@@ -278,9 +271,6 @@ function handle_terminate_ind_req(management)
 end
 
 function handle_terminate_res(management)
-    if TRANS_ID > 0 then
-        management:add_field(trans_id, TRANS_ID)
-    end
     management:add_field_with_text_table(response_code, RESPONSE_CODE, response_code_table)
     local data_len = management:add_field_and_return(data_length_u8, DL_TERMINATE)
     if data_len > 0 then 
@@ -342,9 +332,7 @@ function get_tlv_val_type(type, len)
 end
 
 function handle_bind_actor_addr_req(management)
-    -- I think there are 2 bytes at the beginning of the packet, but I am not sure what is supposed to be there
-    -- The format is supposed to be l3type (1 byte) then pkt len (2 bytes), but they are two bytes after they should be
-    management:increase_pos(2)
+    management:add_field(trans_id, TRANS_ID)
     local version = management:add_field_and_return(ip_version, IP_VERSION)
     local length = management:add_field_and_return(pkt_len, PKT_LEN)
 
@@ -354,6 +342,7 @@ function handle_bind_actor_addr_req(management)
 end
 
 function handle_bind_actor_addr_res(management)
+    management:add_field(trans_id, TRANS_ID)
     management:add_field_with_text_table(response_code, RESPONSE_CODE, response_code_table)
     local info = management:add_field_and_return(info_len, INFO_LEN)
     if info > 0 then 
@@ -364,11 +353,13 @@ function handle_bind_actor_addr_res(management)
 end
 
 function handle_bind_egress_stream_req(management)
+    management:add_field(trans_id, TRANS_ID)
     management:add_field(tcst, TCST)
     management:add_field(tc, TC)
 end
 
 function handle_bind_egress_stream_res(management)
+    management:add_field(trans_id, TRANS_ID)
     management:add_field_with_text_table(response_code, RESPONSE_CODE, response_code_table)
     management:add_field(info_len, INFO_LEN)
 end
