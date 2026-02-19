@@ -5,17 +5,21 @@ export RUST_BACKTRACE=1
 DEBUG_TARGETS=${DEBUG_TARGETS:-all=INFO}
 KM_IMPL=${KM_IMPL:-noise}
 
-PH_BIN=$(realpath "$(dirname $0)/../adapter/ph/target/debug/ph")
-PH_DEBUG_BIN=$(realpath "$(dirname $0)/../adapter/cli/target/debug/ph-cli")
-VS_BIN=$(realpath "$(dirname $0)/vservice")
-VS_ADMIN_BIN=$(realpath "$(dirname $0)/vs-admin")
+
+PH_BIN="${PH_BIN:-$(realpath "$(dirname "$0")/../adapter/ph/target/debug/ph")}"
+PH_DEBUG_BIN="${PH_DEBUG_BIN:-$(realpath "$(dirname "$0")/../adapter/cli/target/debug/ph-cli")}"
+VS_BIN="${VS_BIN:-$(realpath "$(dirname "$0")/vs")}"
+VS_ADMIN_BIN="${VS_ADMIN_BIN:-$(realpath "$(dirname "$0")/vs-admin")}"
+VALKEY_SERVER_BIN="${VALKEY_SERVER_BIN:-$(realpath "$(dirname "$0")/valkey-server")}"
+
 PREGEN=$(realpath "$(dirname $0)/pregen")
+NODE_AUTH_PRIVATE_KEY="${NODE_AUTH_PRIVATE_KEY:-$PREGEN/node-rsa-key.pem}"
 
 # netem parameters to configure on all links; e.g. "loss random 10%"
 # blank for no netem
 NETEM_PARAMS=${NETEM_PARAMS:-}
 
-source "$(dirname $0)/common_funcs.sh"
+source "$(dirname $0)/lib/common_funcs.sh"
 
 ZPR_USER=$USER
 
@@ -34,15 +38,46 @@ C_SUBSTRATE_ADDR=10.0.3.2
 ACTOR_PROTOCOL="ipv6"
 NUM_ACTORS=3
 # Note: POLICY_BIN, NODE_ZPR_ADDR, VS_ZPR_ADDR, A_ZPR_ADDR, and B_ZPR_ADDR are defined by parsing the input arguments.
-source "$(dirname $0)/parse_arguments.sh"
+source "$(dirname $0)/lib/parse_arguments.sh"
 
 if [ ! -e "$VS_BIN" ]; then
-  echo "vservice binary not found, expected it at $VS_BIN"
+  echo "vs binary not found, expected it at $VS_BIN"
   exit 1
 fi
 
 if [ ! -e "$VS_ADMIN_BIN" ]; then
   echo "vs-admin binary not found, expected it at $VS_ADMIN_BIN"
+  exit 1
+fi
+
+if systemctl is-active --quiet valkey-server 2>/dev/null; then
+  echo "valkey-server system service is running. Please stop it before running this test:"
+  echo "  sudo systemctl stop valkey-server"
+  exit 1
+fi
+
+if [ ! -e "$VALKEY_SERVER_BIN" ]; then
+  echo "valkey-server binary not found, expected it at $VALKEY_SERVER_BIN"
+  exit 1
+fi
+
+if [ ! -e "$PREGEN/$POLICY_BIN" ]; then
+  echo "policy file not found (expected .bin2): $PREGEN/$POLICY_BIN"
+  exit 1
+fi
+
+if [ ! -x "$PH_BIN" ]; then
+  echo "ph binary not found or not executable: $PH_BIN"
+  exit 1
+fi
+
+if [ ! -x "$PH_DEBUG_BIN" ]; then
+  echo "ph-cli binary not found or not executable: $PH_DEBUG_BIN"
+  exit 1
+fi
+
+if [ ! -e "$NODE_AUTH_PRIVATE_KEY" ]; then
+  echo "node auth private key not found: $NODE_AUTH_PRIVATE_KEY"
   exit 1
 fi
 
@@ -61,6 +96,7 @@ function counters() {
   SOCKET=$1
   "$PH_DEBUG_BIN" -p "$SOCKET" counters
 }
+
 
 #
 # Set up automatic cleanup
@@ -101,19 +137,25 @@ cp "$PREGEN/actor2-rsa.key" actor2-rsa.key
 cp "$PREGEN/actor3-rsa.key" actor3-rsa.key
 cp "$PREGEN/actorvs-rsa.key" actorvs-rsa.key
 
-emit_vs_config ca vs.zpr > vs-config.yaml
+emit_vs_config ca vs.zpr > vs-config.toml
 
 #
-# Launch Visa Service
+# Launch ValKey + Visa Service
 #
+
+echo "Launching ValKey"
+
+sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$VALKEY_SERVER_BIN" \
+    --save "" \
+    --appendonly no 2>&1 | tee valkey.log | prefix_log valkey &
+
+wait_for 15 check_vs_valkey_port
 
 echo "Launching Visa Service"
 
 sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$VS_BIN" \
-    -c vs-config.yaml \
-    -p "$PREGEN/$POLICY_BIN" \
-    -pp "tmp.pid" \
-    --listen_addr "[$VS_ZPR_ADDR]":5002 2>&1 | tee vs.log | prefix_log vs &
+    -c vs-config.toml \
+    "$PREGEN/$POLICY_BIN" 2>&1 | tee vs.log | prefix_log vs &
 
 sleep 2
 
@@ -131,6 +173,7 @@ sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
   --ca-file ca.crt \
   --certificate-file node.crt \
   --private-key-file node.key \
+  --auth-private-key "$NODE_AUTH_PRIVATE_KEY" \
   --km-impl "$KM_IMPL" \
   --tun-if tun0 \
   --zpr-addr "$NODE_ZPR_ADDR" 2>&1 | tee node.log | prefix_log zpr-node &
@@ -256,7 +299,7 @@ sleep 1
 sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$VS_ADMIN_BIN" \
 	--ca-cert ca.crt \
 	--svc-url "https://[$VS_ZPR_ADDR]:8182" \
-	revoke --actor-cn adapter2
+	actors --cn adapter2 --revoke
 
 if ! ping_a_b
 then PASS=0

@@ -1,20 +1,113 @@
-use crate::assembly::Assembly;
-use libnode::logging::targets::VS_RPC;
-use libnode::vsconn::VSOutput;
+use ipnet::IpNet;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::*;
+use tokio::sync::broadcast;
+use tracing::{error, info};
 
-// TODO: It might be nice to get a message here when we establish a a node connection to
-// the VS API.  Then we could send a request for the services list.  Not a big deal until
-// we have more than one node. With one node, we are always going to get a push
-// update via the VSS API as we are the only way the VS can talk to the ZPRnet.
+use crate::assembly::Assembly;
+use crate::config;
+use crate::logging::targets::STARTUP;
+use crate::vss_worker;
 
-pub async fn launch(_asm: Arc<Assembly>, mut queue: mpsc::Receiver<VSOutput>) {
-    while let Some(msg) = queue.recv().await {
-        match msg {
-            VSOutput::PingSuccess(config_id, policy_version) => {
-                trace!(target: VS_RPC, "visa service is alive (config_id: {config_id}, policy_version: {policy_version})");
+use libnode::vsconn::{VSConnHandle, VSConnLifecycleEvent, VSDisconnectNotice};
+use zpr::vsapi_types::DisconnectReason;
+
+pub async fn launch(
+    asm: Arc<Assembly>,
+    node_zpr_addr: IpAddr,
+    aaa_prefix: IpNet,
+    vss_addr: SocketAddr,
+    vs_handle: VSConnHandle,
+    mut lifecycle_rx: broadcast::Receiver<VSConnLifecycleEvent>,
+) {
+    // TODO: The new visa service supports a "reconnect" signal. That is not yet exposed by libnode2
+    loop {
+        // This acts as a gate -- waiting for runloop to start.
+        wait_for_runloop_start(&mut lifecycle_rx).await;
+
+        loop {
+            // Kick off a connect request to the VS, if it succeeds, notify the VS about our VSS endpoint.
+            let req = libnode::vsconn::VSConnectRequest {
+                zpr_addr: node_zpr_addr,
+                aaa_prefix,
+            };
+
+            tokio::select! {
+                res = vs_handle.connect(req) => {
+                    if let Err(e) = res {
+                        error!(target: STARTUP, "failed to get access to visa service: {e:?}");
+                    } else {
+                        info!(target: STARTUP, "node access granted to visa service");
+
+                        match vs_handle.register_vss(vss_addr).await {
+                            Ok(ops) => {
+                                info!(target: STARTUP, "registered VSS, received {} pending visa ops", ops.len());
+                                for op in ops {
+                                    if let Err(e) = vss_worker::process_visaop(&asm, op) {
+                                        error!(target: STARTUP, "failed to process initial visa op from VS: {e:?}");
+                                    }
+                                }
+                                break; // Exit inner loop; go back to waiting for a state change.
+                            }
+                            Err(e) => {
+                                error!(target: STARTUP, "failed to register VSS: {e:?}");
+
+                                let dreq = VSDisconnectNotice {
+                                    zpr_addr: None,
+                                    reason: DisconnectReason::LinkError,
+                                };
+                                if let Err(e) = vs_handle.notify_disconnect(dreq).await {
+                                    error!(target: STARTUP, "error disconnecting from VS after failed registration: {e:?}");
+                                    panic!("failed to establish connection to VS");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                evt = lifecycle_rx.recv() => {
+                    match evt {
+                        Ok(VSConnLifecycleEvent::RunLoopExits) => {
+                            info!(target: STARTUP, "VSConn runloop exited; aborting connect attempts and re-gating");
+                            break; // break inner connect loop, go re-gate on RunLoopStarts
+                        }
+                        Ok(VSConnLifecycleEvent::RunLoopStarts) => {
+                            // harmless duplicate start
+                        }
+                        Ok(VSConnLifecycleEvent::ConnectedToVsApi) => {
+                            // ignored but should not happen
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            error!(target: STARTUP, "lagged on VSConn lifecycle channel, skipped {skipped} events");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            error!(target: STARTUP, "VSConn lifecycle channel closed unexpectedly");
+                            panic!("VSConn lifecycle channel closed unexpectedly");
+                        }
+                    }
+                }
+            }
+
+            // wait a second and retry.
+            tokio::time::sleep(config::VSCONN_RETRY_WAIT).await;
+        }
+    }
+}
+
+async fn wait_for_runloop_start(lifecycle_rx: &mut broadcast::Receiver<VSConnLifecycleEvent>) {
+    loop {
+        match lifecycle_rx.recv().await {
+            Ok(VSConnLifecycleEvent::RunLoopStarts) => return,
+            Ok(_) => {
+                // ignored
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                error!(target: STARTUP, "lagged on VSConn lifecycle channel, skipped {skipped} events");
+                continue; // try again
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                error!(target: STARTUP, "VSConn lifecycle channel closed unexpectedly");
+                panic!("VSConn lifecycle channel closed unexpectedly"); // can't recover?
             }
         }
     }

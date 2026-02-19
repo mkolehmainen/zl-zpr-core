@@ -83,7 +83,6 @@ use fastpath::FastpathWorkerConfig;
 use flow_control::FlowControl;
 use km_multiplexor::KmState;
 use km_noise::NoiseKeypair;
-use libnode::claims;
 use logging::targets::STARTUP;
 use pki::{generate_self_signed_noise_cert, load_cert, load_noise_public_key};
 use queues::*;
@@ -487,8 +486,8 @@ fn main() -> ExitCode {
     //
 
     let mut vsconn;
-    let vs_outq;
     let mut maybe_aaa_pool = None;
+    let mut aaa_prefix = None;
 
     if ph_mode == PhMode::Node {
         // Note that config parsing code ensures that IF node THEN certificate_file is set.
@@ -504,37 +503,39 @@ fn main() -> ExitCode {
                 u32::from_be_bytes(addr.octets()[12..16].try_into().unwrap()) & 0x00FFFFFF
             }
         };
+
+        // TODO: In the near future the visa service will tell us the AAA network to use instead of the other way around.
         let aaa_pool = AddressPool::new(node_id);
         info!(target: STARTUP, "node ID is {node_id:#010x}, AAA net is {}", aaa_pool.get_prefix());
 
-        let mut node_actor =
-            libnode::vsconn::new_node_actor(config.zpr_addr[0], &Default::default());
-
-        node_actor
-            .attrs
-            .as_mut()
-            .unwrap()
-            .insert(claims::KATTR_AAA_NET.into(), aaa_pool.get_prefix());
+        aaa_prefix = Some(
+            aaa_pool
+                .get_prefix()
+                .parse::<ipnet::IpNet>()
+                .expect("invalid AAA prefix"),
+        );
 
         maybe_aaa_pool = Some(aaa_pool);
 
-        let (vs_inq, vs_outq_inner) = mpsc::channel(topology_config.vs_queue_size);
-        vs_outq = Some(vs_outq_inner);
+        // Load the node's RSA private key for VS "static" authentication. The public key is mapped to the
+        // node CN value in the policy.
+        let auth_key_path = config
+            .auth_private_key
+            .as_ref()
+            .expect("nodes require auth_private_key for visa service authentication");
+        let auth_key_pem = fs::read_to_string(auth_key_path)
+            .unwrap_or_else(|e| panic!("failed to read auth_private_key {auth_key_path:?}: {e}"));
+        let auth_private_key = openssl::pkey::PKey::private_key_from_pem(auth_key_pem.as_bytes())
+            .unwrap_or_else(|e| panic!("failed to parse auth_private_key {auth_key_path:?}: {e}"));
 
-        vsconn = Some(
-            libnode::vsconn::VSConn::new(
-                node_actor,
-                vs_inq,
-                &SocketAddr::new(VISA_SERVICE_ADDR, VISA_SERVICE_PORT).to_string(),
-                config.certificate_file.as_ref().unwrap(),
-                config.zpr_addr[0],
-                None,
-            )
-            .expect("error launching Visa Service connection manager"),
-        );
+        vsconn = Some(libnode::vsconn::VSConn::new(
+            topology_config.vs_queue_size,
+            SocketAddr::new(VISA_SERVICE_ADDR, VISA_SERVICE_PORT),
+            node_name,
+            auth_private_key,
+        ));
     } else {
         vsconn = None;
-        vs_outq = None;
     }
 
     //
@@ -722,36 +723,49 @@ fn main() -> ExitCode {
     //
     // start Visa Support Service, Visa Service connection manager, and their workers, if we're a node
     //
+    // TODO: More thought needed here about lifecycle. It's possible the connection to the visa service
+    // may fail (ie, the visa service may go down momentarily), and in that case we would normally want
+    // to restart it, which may also require restarting the vss -- both while the node (ph) remains up.
+    //
 
     if ph_mode == PhMode::Node {
         let (vss_inq, vss_outq) = mpsc::channel(asm.topology_config.vss_queue_size);
 
         let vss_addr =
-            std::net::SocketAddr::new(asm.get_local_dock_addr(), libnode::vss::DEFAULT_VSS_PORT);
+            std::net::SocketAddr::new(asm.get_local_dock_addr(), config::DEFAULT_VSS_PORT);
 
-        js.spawn_blocking(move || libnode::vss::start_vss_server(vss_inq, vss_addr));
-
-        // launch the VS conn mgr... this weird dance is necessary because
-        // although it is an async method, it calls blocking functions (namely Thrift functions)...
-        // once we switch to async Thrift we can simplify this
-        let rt_handle = runtime.handle().clone();
-        js.spawn_blocking(move || {
-            loop {
-                let res = rt_handle.block_on(
-                    vsconn
-                        .as_mut()
-                        .unwrap()
-                        .run(tokio_util::sync::CancellationToken::new()),
-                );
-
-                error!(target: STARTUP, "visa service connection manager terminated: {res:?}");
-
-                std::thread::sleep(std::time::Duration::from_secs(1));
+        // Launch VSS server (requires local set). This expects an inbound connection from the VS.
+        js.spawn_local(async move {
+            if let Err(e) = libnode::vss::launch_vss(&vss_addr, vss_inq).await {
+                error!(target: STARTUP, "VSS server terminated: {e:?}");
+                // TODO: If the VSS goes down we would normally want to restart it.
             }
         });
 
+        // Launch VSConn run loop (sets up its own local set). The VSConn handles reconnects.
+        // Send the "stop" command to cause it to exit cleanly.
+        let mut vsconn_instance = vsconn.take().unwrap();
+        let vsconn_lifecycle_rx = vsconn_instance.subscribe_lifecycle_events();
+        js.spawn_local(async move {
+            let res = vsconn_instance
+                .run_with_reconnect(config::VSCONN_RETRY_WAIT)
+                .await;
+            error!(target: STARTUP, "visa service connection manager terminated: {res:?}");
+        });
+
+        let vs_handle = asm.vsconn.as_ref().unwrap().clone();
+        let aaa_prefix = aaa_prefix.unwrap();
+
+        js.spawn_local(vs_worker::launch(
+            asm.clone(),
+            node_zpr_addr,
+            aaa_prefix,
+            vss_addr,
+            vs_handle,
+            vsconn_lifecycle_rx,
+        ));
+
         js.spawn_local(vss_worker::launch(asm.clone(), vss_outq));
-        js.spawn_local(vs_worker::launch(asm.clone(), vs_outq.unwrap()));
     }
 
     //

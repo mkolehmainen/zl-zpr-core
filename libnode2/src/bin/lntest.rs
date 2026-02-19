@@ -11,13 +11,15 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 use tracing::Level;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*};
 
-use libnode2::vsconn::{VSConn, VSConnectRequest, VSDisconnectNotice, VSVisaRequest};
+use libnode2::vsconn::{
+    VSConn, VSConnLifecycleEvent, VSConnectRequest, VSDisconnectNotice, VSVisaRequest,
+};
 use zpr::packet_info::L3Type;
 use zpr::vsapi_types::{
     AuthBlob, ChallengeAlg, Claim, CommFlag, ConnectRequest, DisconnectReason, PacketDesc,
@@ -227,7 +229,7 @@ async fn main() {
         args.node_cn,
         load_private_key(&args.private_key).expect("failed to load private key"),
     );
-
+    let mut life_rx = vsc.subscribe_lifecycle_events();
     let handle = vsc.handle();
 
     let local_set = tokio::task::LocalSet::new();
@@ -284,6 +286,29 @@ async fn main() {
         if connected {
             loop {
                 tokio::select! {
+                    event_res = life_rx.recv() => {
+                        match event_res {
+                            Ok(event) => {
+                                match event {
+                                    VSConnLifecycleEvent::RunLoopStarts =>
+                                        info!("lifecycle event: VSConn run loop starts"),
+
+                                    VSConnLifecycleEvent::ConnectedToVsApi =>
+                                        info!("lifecycle event: connected to VS API"),
+
+                                    VSConnLifecycleEvent::RunLoopExits =>
+                                        info!("lifecycle event: VSConn run loop exits"),
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!("lifecycle event receiver lagged, skipped {} messages", skipped);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                warn!("lifecycle event sender closed");
+                            }
+                        }
+                    }
+
                     Some(cmd) = cmd_rx.recv() => {
                         match cmd {
                             Cmd::Nop => {}
@@ -515,15 +540,12 @@ fn build_self_signed_blob(
     signer.update(&data)?;
     let raw_signature = signer.sign_to_vec()?;
 
-    // VS decodes base64 from the signature field before verifying.
-    let b64_signature = openssl::base64::encode_block(&raw_signature);
-
     Ok(SelfSignedBlob {
         alg: ChallengeAlg::RsaSha256Pkcs1v15,
         challenge,
         cn: cn.to_string(),
         timestamp,
-        signature: b64_signature.into_bytes(),
+        signature: raw_signature,
     })
 }
 

@@ -32,7 +32,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: true
-  VISA_SERVICE_RELEASE: v0.7.0
+  VISA_SERVICE_RELEASE: v0.8.0-rc.1
 
 jobs:
   # Build and upload ph
@@ -138,15 +138,20 @@ jobs:
         extract: true
         out-file-path: 'integration-test'
         token: ${{ secrets.ZPR_CICD_RO_TOKEN }}
-    
+
     - name: Set env
       run: |
         echo "DEBUG_TARGETS=all=DEBUG" >> $GITHUB_ENV
-    
+    - name: install valkey
+      run: |
+        sudo apt install -y valkey
+        sudo systemctl stop valkey-server
+        sudo systemctl disable valkey-server
+
     - name: One Node v6 Test
       timeout-minutes: 10
       run: |
-        ZPR_TEST_VERBOSE=1 integration-test/one-node-v6-test.sh
+        ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/one-node-v6-test.sh
 
   capture-integration-test:
     name: Run Capture Test
@@ -203,6 +208,12 @@ jobs:
         out-file-path: 'integration-test'
         token: ${{ secrets.ZPR_CICD_RO_TOKEN }}
 
+    - name: install valkey
+      run: |
+        sudo apt install -y valkey
+        sudo systemctl stop valkey-server
+        sudo systemctl disable valkey-server
+
     - name: Set env
       run: |
         echo "DEBUG_TARGETS=all=DEBUG" >> $GITHUB_ENV
@@ -210,4 +221,4 @@ jobs:
     - name: Capture Test
       timeout-minutes: 10
       run: |
-        ZPR_TEST_VERBOSE=1 integration-test/capture-test.sh
+        ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/capture-test.sh

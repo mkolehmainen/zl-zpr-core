@@ -4,7 +4,7 @@ use ipnet::IpNet;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Private};
@@ -12,7 +12,7 @@ use openssl::sign::Signer;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_rustls::TlsConnector;
 use tokio_util::compat::*;
 use tracing::*;
@@ -26,6 +26,8 @@ use zpr::write_to::WriteTo;
 
 const PARAM_ZPR_ADDR: &str = "zpr_addr";
 const PARAM_AAA_PREFIX: &str = "aaa_prefix";
+
+const LIFECYCLE_EVENT_BUFFER_SIZE: usize = 64;
 
 #[derive(Debug)]
 pub struct VSConnectRequest {
@@ -81,12 +83,25 @@ enum VS2Command {
     ),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum VSConnLifecycleEvent {
+    /// Means we have established a network connection to the Cap'n Proto service.
+    RunLoopStarts,
+
+    /// Means that the node connect-request was successful.
+    ConnectedToVsApi,
+
+    /// When run loop has stopped.
+    RunLoopExits,
+}
+
 pub struct VSConn {
     cmd_tx: mpsc::Sender<VS2Command>,
     cmd_rx: mpsc::Receiver<VS2Command>,
     vs_addr: SocketAddr,
     node_cn: String,
     node_private_key: PKey<Private>,
+    life_tx: broadcast::Sender<VSConnLifecycleEvent>,
 }
 
 #[derive(Clone)]
@@ -95,6 +110,13 @@ pub struct VSConnHandle {
 }
 
 impl VSConn {
+    /// Create a new VSConn.
+    ///
+    /// Use [VSConn::subscribe_lifecycle_events] to get a receiver for lifecycle events such as when
+    /// we connect to the VS API and when the run loop starts or exits.
+    ///
+    /// `buffer_size` determines how many commands can be buffered to send to the run loop before
+    /// [VSConnHandle] starts blocking.
     pub fn new(
         buffer_size: usize,
         vs_addr: SocketAddr,
@@ -102,13 +124,52 @@ impl VSConn {
         node_private_key: PKey<Private>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(buffer_size);
+        let (life_tx, _) = broadcast::channel(LIFECYCLE_EVENT_BUFFER_SIZE);
         VSConn {
             cmd_tx,
             cmd_rx,
             vs_addr,
             node_cn,
             node_private_key,
+            life_tx,
         }
+    }
+
+    /// Subscribe to broadcast lifecycle events from this VSConn.
+    pub fn subscribe_lifecycle_events(&self) -> broadcast::Receiver<VSConnLifecycleEvent> {
+        self.life_tx.subscribe()
+    }
+
+    /// Best-effort send a lifecycle event, just log if the send fails (no receivers).
+    fn send_lifecycle_event(&self, event: VSConnLifecycleEvent) {
+        match self.life_tx.send(event) {
+            Ok(_) => {}
+            Err(e) => {
+                info!(target: VS_RPC, "failed to send lifecycle event: {event:?}: {:?}", e);
+            }
+        }
+    }
+
+    /// Just like [VSConn::run] but will attempt to reconnect if the connection to the VS is lost, after
+    /// pausing for `reconnect_after`.
+    /// Sending a [VS2Command::Stop] will break the reconnect loop and cause this to return.
+    pub async fn run_with_reconnect(
+        &mut self,
+        reconnect_after: Duration,
+    ) -> Result<(), VSApiError> {
+        loop {
+            match self.run().await {
+                Ok(_) => {
+                    break;
+                }
+                Err(e) => {
+                    error!(target: VS_RPC, "VSConn: run loop exited with error: {:?}", e);
+                    info!(target: VS_RPC, "VSConn: reconnecting in {} seconds...", reconnect_after.as_secs());
+                    tokio::time::sleep(reconnect_after).await;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn run(&mut self) -> Result<(), VSApiError> {
@@ -140,6 +201,7 @@ impl VSConn {
                 tokio::task::spawn_local(rpc_system);
 
                 let mut vs_handle: Option<vsapi2::v_s_handle::Client> = None;
+                self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopStarts);
 
                 // Then loop over commands.
                 while let Some(cmd) = self.cmd_rx.recv().await {
@@ -176,6 +238,8 @@ impl VSConn {
                                 }
                             }
 
+                            // This is the only clean break from the run loop and the only way to get an
+                            // OK out of the run function.
                             break;
                         }
 
@@ -193,6 +257,7 @@ impl VSConn {
                                 Ok(handle) => {
                                     info!(target: VS_RPC, "VS API connect succeeded");
                                     vs_handle = Some(handle);
+                                    self.send_lifecycle_event(VSConnLifecycleEvent::ConnectedToVsApi);
                                     Ok(())
                                 }
                                 Err(e) => {
@@ -266,6 +331,7 @@ impl VSConn {
                     }
                 }
                 info!(target: VS_RPC, "VSConn: exiting run loop");
+                self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
                 Ok::<(), VSApiError>(())
             })
             .await
