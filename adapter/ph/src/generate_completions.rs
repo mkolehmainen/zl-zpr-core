@@ -1,9 +1,7 @@
 #![allow(dead_code)]
-mod auth;
 mod batch_io;
 mod logging;
 mod main_args;
-mod pki;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{generate, shells::Shell};
