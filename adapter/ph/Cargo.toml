@@ -22,7 +22,6 @@ dashmap = { version = "6.0.1" }
 enum-map = { version = "2.7.3" }
 enumset = "1.1.5"
 hdrhistogram = { version = "7.5.4" }
-ip_network_table-deps-treebitmap = { version = "0.5.0" }
 ipnet = { workspace = true }
 itertools = "0.14"
 libc = { version = "0.2.175" }
@@ -30,8 +29,6 @@ libnode = { package = "libnode2", path = "../../libnode2" }
 nix = { version =  "0.29.0", features = ["fs", "ioctl", "net", "poll", "uio"] }
 open-enum = { version = "0.5.1" }
 openssl = { workspace = true }
-openssl-sys = { version = "0.9.102" }
-range-set-blaze = { version = "0.5.0" }
 rcu = { path = "../../../utils/rcu", default-features = false }
 reqwest = { version = "0.13.1", features = ["json", "query"] }
 serde = { version = "1.0.214", features = ["derive"] }
@@ -45,7 +42,6 @@ tokio-util = { workspace = true }
 toml = "0.9.11"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-url = "2.5.4"
 zerocopy = { version = "0.8.3", features = ["derive", "std"] }
 zpr = { workspace = true }
 zpr-ext = { workspace = true, features = ["bytes", "tokio", "socket2", "zerocopy"] }
@@ -64,11 +60,11 @@ tokio = { workspace = true, features = ["test-util"] }
 [features]
 default = ["io-uring", "rcu-crossbeam-epoch"]
 ci = []
-rcu-aarc = ["rcu/rcu-aarc"]
-rcu-arc-swap = ["rcu/rcu-arc-swap"]
-rcu-crossbeam-epoch = ["rcu/rcu-crossbeam-epoch"]
-rcu-mutex-arc = ["rcu/rcu-mutex-arc"]
-rcu-rwlock = ["rcu/rcu-rwlock"]
+rcu-aarc = ["rcu/rcu-aarc", "zpr/rcu-aarc"]
+rcu-arc-swap = ["rcu/rcu-arc-swap", "zpr/rcu-arc-swap"]
+rcu-crossbeam-epoch = ["rcu/rcu-crossbeam-epoch", "zpr/rcu-crossbeam-epoch"]
+rcu-mutex-arc = ["rcu/rcu-mutex-arc", "zpr/rcu-mutex-arc"]
+rcu-rwlock = ["rcu/rcu-rwlock", "zpr/rcu-rwlock"]
 complete = ["clap_complete"]
 
 [[bin]]

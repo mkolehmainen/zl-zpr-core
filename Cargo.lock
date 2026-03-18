@@ -1877,7 +1877,6 @@ dependencies = [
  "capnp-rpc",
  "clap",
  "crossterm 0.28.1",
- "ipnet",
  "openssl",
  "ratatui 0.30.0",
  "rcgen",
@@ -1889,7 +1888,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-input",
- "zpr 0.9.0",
+ "zpr 0.10.1",
 ]
 
 [[package]]
@@ -2390,7 +2389,6 @@ dependencies = [
  "futures",
  "hdrhistogram",
  "io-uring",
- "ip_network_table-deps-treebitmap",
  "ipnet",
  "itertools 0.14.0",
  "libc",
@@ -2398,9 +2396,7 @@ dependencies = [
  "nix 0.29.0",
  "open-enum",
  "openssl",
- "openssl-sys",
  "rand 0.9.2",
- "range-set-blaze",
  "rcu",
  "reqwest",
  "serde",
@@ -2416,9 +2412,8 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "url",
  "zerocopy",
- "zpr 0.9.0",
+ "zpr 0.10.1",
  "zpr-ext",
  "zpr-utils",
 ]
@@ -2439,7 +2434,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "zpr 0.9.0",
  "zpr-ext",
 ]
 
@@ -4893,12 +4887,14 @@ dependencies = [
 
 [[package]]
 name = "zpr"
-version = "0.9.0"
-source = "git+https://github.com/org-zpr/zpr-common.git?tag=v0.9.0#1a2d224e01bdc08c3b0bf0106b6d8c3f28d12a74"
+version = "0.10.1"
 dependencies = [
  "capnp",
  "capnpc",
+ "ip_network_table-deps-treebitmap",
  "open-enum",
+ "range-set-blaze",
+ "rcu",
  "thiserror 1.0.69",
  "url",
  "zerocopy",
