@@ -2371,9 +2371,7 @@ dependencies = [
 name = "ph"
 version = "0.6.0"
 dependencies = [
- "aarc",
  "admin-api",
- "arc-swap",
  "arrayref",
  "base64 0.22.1",
  "blake3",
@@ -2384,7 +2382,6 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
- "crossbeam-epoch",
  "cslab",
  "curve25519-dalek",
  "dashmap",
@@ -2845,6 +2842,8 @@ dependencies = [
 name = "rcu"
 version = "0.1.0"
 dependencies = [
+ "aarc",
+ "arc-swap",
  "crossbeam-epoch",
  "cslab",
 ]
