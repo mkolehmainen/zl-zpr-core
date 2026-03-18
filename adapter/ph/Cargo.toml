@@ -14,12 +14,12 @@ blake3 = { version = "1.5.4" }
 bytes = { version = "1.11.1" }
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
-cbpf-rs = { path = "../../cbpf-rs" }
+cbpf-rs = { workspace = true }
 chrono = "0.4.39"
 clap = { workspace = true, features = ["env"] }
 clap_complete = { workspace = true, optional = true }
 crossbeam-epoch = { version = "0.9.18", optional = true }
-cslab = { path = "../../cslab" }
+cslab = { path = "../../../utils/cslab" }
 curve25519-dalek = "4.1.3"
 dashmap = { version = "6.0.1" }
 enum-map = { version = "2.7.3" }
@@ -50,8 +50,8 @@ tracing-subscriber = { workspace = true }
 url = "2.5.4"
 zerocopy = { version = "0.8.3", features = ["derive", "std"] }
 zpr = { workspace = true }
-zpr-ext = { path = "../../zpr-ext", features = ["bytes", "tokio", "socket2", "zerocopy"] }
-zpr-utils = { path = "../../zpr-utils" }
+zpr-ext = { workspace = true, features = ["bytes", "tokio", "socket2", "zerocopy"] }
+zpr-utils = { path = "../../../utils/zpr-utils" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.4", optional = true }

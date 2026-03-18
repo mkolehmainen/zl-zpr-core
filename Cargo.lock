@@ -142,15 +142,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
-
-[[package]]
 name = "arc-swap"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -416,16 +407,7 @@ dependencies = [
 name = "cbpf-rs"
 version = "0.2.0"
 dependencies = [
- "arbitrary",
  "pcap",
-]
-
-[[package]]
-name = "cbpf-rs-fuzz"
-version = "0.0.0"
-dependencies = [
- "cbpf-rs",
- "libfuzzer-sys",
 ]
 
 [[package]]
@@ -922,17 +904,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
-]
-
-[[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -1889,16 +1860,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
-name = "libfuzzer-sys"
-version = "0.4.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f12a681b7dd8ce12bff52488013ba614b869148d54dd79836ab85aafdd53f08d"
-dependencies = [
- "arbitrary",
- "cc",
-]
-
-[[package]]
 name = "libloading"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1928,7 +1889,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-input",
- "zpr",
+ "zpr 0.9.0",
 ]
 
 [[package]]
@@ -2459,7 +2420,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zerocopy",
- "zpr",
+ "zpr 0.9.0",
  "zpr-ext",
  "zpr-utils",
 ]
@@ -2480,7 +2441,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "zpr",
+ "zpr 0.9.0",
  "zpr-ext",
 ]
 
@@ -4911,6 +4872,19 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zpr"
+version = "0.8.1"
+source = "git+https://github.com/org-zpr/zpr-common.git?tag=v0.8.1#71ead993c6d21bdcd2f482513b53ebffec5f91fb"
+dependencies = [
+ "capnp",
+ "capnpc",
+ "open-enum",
+ "thiserror 1.0.69",
+ "url",
+ "zerocopy",
+]
+
+[[package]]
+name = "zpr"
 version = "0.9.0"
 source = "git+https://github.com/org-zpr/zpr-common.git?tag=v0.9.0#1a2d224e01bdc08c3b0bf0106b6d8c3f28d12a74"
 dependencies = [
@@ -4939,5 +4913,5 @@ name = "zpr-utils"
 version = "0.1.0"
 dependencies = [
  "zerocopy",
- "zpr",
+ "zpr 0.8.1",
 ]
