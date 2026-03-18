@@ -9,8 +9,8 @@
 use crate::defs::FiveTuple;
 use crate::mgmt::txn_mgr::TxnHandle;
 use crate::packet::Packet;
-use crate::rcu::{RcuBox, RcuCslabEntryGuard};
 use crate::tc;
+use rcu::{RcuBox, RcuCslabEntryGuard};
 use cslab::{RcuCslab, RcuCslabReader};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashMapEntry;

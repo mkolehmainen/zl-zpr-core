@@ -52,7 +52,6 @@ mod pcap_writer;
 mod peer_table;
 mod pki;
 mod queues;
-mod rcu;
 mod sample_ring;
 mod set_capture_file_worker;
 mod signal_worker;

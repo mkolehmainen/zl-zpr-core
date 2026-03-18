@@ -6,7 +6,7 @@ use crate::km::{KeyManager, KmTransportSA};
 use crate::link_state::{LinkStateWrapper, LinkType};
 use crate::mgmt::{self, txn_mgr};
 use crate::queues;
-use crate::rcu::{RcuBox, RcuCslabEntryGuard, RcuOptionGuard};
+use rcu::{RcuBox, RcuCslabEntryGuard, RcuOptionGuard};
 use crate::special_peers::*;
 use crate::zdpr;
 use bytes::Bytes;

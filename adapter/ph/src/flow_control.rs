@@ -1,7 +1,7 @@
 //! Controls whether a packet will be copied and captured in the packet
 //! capture framework
 
-use crate::rcu::RcuBox;
+use rcu::RcuBox;
 use cbpf_rs::BpfProgram;
 
 pub struct FlowControl {

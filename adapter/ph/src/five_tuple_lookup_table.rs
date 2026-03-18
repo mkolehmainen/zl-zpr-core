@@ -1,4 +1,4 @@
-use crate::rcu::RcuBox;
+use rcu::RcuBox;
 use crate::visa_table::Visa;
 
 use ip_network_table_deps_treebitmap::IpLookupTable;

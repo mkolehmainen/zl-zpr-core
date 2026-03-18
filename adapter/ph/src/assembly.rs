@@ -13,7 +13,7 @@ use crate::mgmt_processor_worker;
 use crate::peer_table;
 use crate::peer_table::PeerInsertError;
 use crate::queues::*;
-use crate::rcu;
+use rcu;
 use crate::special_peers::SpecialPeerName;
 use crate::tun_ctl::TunCtl;
 use crate::visa_table;
