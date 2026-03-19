@@ -70,7 +70,7 @@ async fn main() -> Result<(), CliError> {
     let cap_socket = args.cap_socket.clone();
 
     if let Some(command) = args.command {
-        process_command(command, &socket, cap_socket)
+        process_command(command, &socket, &cap_socket)
             .await
             .map(|_| {})
     } else {
@@ -78,7 +78,7 @@ async fn main() -> Result<(), CliError> {
     }
 }
 
-async fn run_cli(socket: PathBuf, cap_socket: Option<PathBuf>) -> Result<(), CliError> {
+async fn run_cli(socket: PathBuf, cap_socket: PathBuf) -> Result<(), CliError> {
     loop {
         print!("> ");
         io::stdout().flush()?;
@@ -98,7 +98,7 @@ async fn run_cli(socket: PathBuf, cap_socket: Option<PathBuf>) -> Result<(), Cli
                     continue;
                 }
 
-                match parse_and_exec(line, &socket, cap_socket.clone()).await {
+                match parse_and_exec(line, &socket, &cap_socket).await {
                     Ok(quit) => {
                         if quit {
                             return Ok(());
@@ -121,7 +121,7 @@ async fn run_cli(socket: PathBuf, cap_socket: Option<PathBuf>) -> Result<(), Cli
 async fn parse_and_exec(
     line: &str,
     socket: &PathBuf,
-    cap_socket: Option<PathBuf>,
+    cap_socket: &PathBuf,
 ) -> Result<bool, CliError> {
     let args = shlex::split(line).ok_or(Error::other("Invalid quoting"))?;
     let cli = CliCommand::try_parse_from(args).map_err(|e| Error::other(e.to_string()))?;
@@ -132,7 +132,7 @@ async fn parse_and_exec(
 async fn process_command(
     command: Commands,
     socket: &PathBuf,
-    cap_socket: Option<PathBuf>,
+    cap_socket: &PathBuf,
 ) -> Result<bool, CliError> {
     // Must quit immediately otherwise you get an error if the port is no longer open
     if matches!(command, Commands::Quit) {
@@ -362,7 +362,7 @@ async fn capture_sequence_task(
     file_path: String,
     time: u64,
     program: Option<String>,
-    cap_socket: Option<PathBuf>,
+    cap_socket: &PathBuf,
 ) -> Result<(), CliError> {
     let sleep_time = Duration::new(time, 0);
     handle_set_capture_file(file_path, cap_socket)?;
@@ -595,13 +595,7 @@ async fn get_node_addr_task(service: svc::Client) -> Result<(), CliError> {
 /// the file descriptor, upon receiving correct response, sends the fd as
 /// ancillary data, and awaits response again.
 #[allow(dead_code)]
-fn handle_set_capture_file(file_path: String, cap_socket: Option<PathBuf>) -> Result<(), CliError> {
-    if cap_socket.is_none() {
-        return Err(CliError::ParseError("No capture file socket".to_string()));
-    }
-
-    let socket: PathBuf = cap_socket.unwrap();
-
+fn handle_set_capture_file(file_path: String, cap_socket: &PathBuf) -> Result<(), CliError> {
     let file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -617,7 +611,7 @@ fn handle_set_capture_file(file_path: String, cap_socket: Option<PathBuf>) -> Re
     let bufs = &mut [IoSlice::new(&buf)];
 
     // Establish connection with RPC worker, send command
-    let stream = &mut UnixStream::connect(socket).unwrap();
+    let stream = &mut UnixStream::connect(cap_socket).unwrap();
     stream.write_all(format!("{}\n", RpcCommands::SetCaptureFile).as_bytes())?;
     stream.flush()?;
 

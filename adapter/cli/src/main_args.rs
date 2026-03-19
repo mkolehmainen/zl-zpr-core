@@ -14,8 +14,8 @@ pub struct CmdlineArgs {
     pub socket: PathBuf,
 
     /// Path to the Packet Handler's capture socket, only necessary when performing Capture commands
-    #[arg(long, short = 'c')]
-    pub cap_socket: Option<PathBuf>,
+    #[arg(long, short = 'c', default_value_os_t = get_data_home().join("capture.sock"))]
+    pub cap_socket: PathBuf,
 }
 
 #[derive(Parser, Debug)]
