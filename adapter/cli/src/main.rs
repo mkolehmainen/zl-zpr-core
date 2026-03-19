@@ -303,49 +303,39 @@ async fn flush_capture_file_task(service: svc::Client) -> Result<(), CliError> {
 /// need to use the pcap library, and can just have knowledge of the serialized
 /// format and use exclusively cbpf-rs
 // TODO change parameters of set cap prog to take the actual bpf vals instead of string
-async fn set_capture_program_task(
-    service: svc::Client,
-    program: Option<String>,
-) -> Result<(), CliError> {
-    // Ensures that a program has properly been provided before sending message because
-    // there is no default program
-    match program {
-        Some(program) => {
-            let capture = Capture::dead(Linktype::USER0)?;
-            let program = capture.compile(&program, true)?;
-            let instructions: &[pcap::BpfInstruction] = program.get_instructions();
+async fn set_capture_program_task(service: svc::Client, program: String) -> Result<(), CliError> {
+    let capture = Capture::dead(Linktype::USER0)?;
+    let program = capture.compile(&program, true)?;
+    let instructions: &[pcap::BpfInstruction] = program.get_instructions();
 
-            let mut request = service.set_capture_program_request();
-            let mut program_request = request
-                .get()
-                .init_program()
-                .init_bpf_prog(instructions.len() as u32);
+    let mut request = service.set_capture_program_request();
+    let mut program_request = request
+        .get()
+        .init_program()
+        .init_bpf_prog(instructions.len() as u32);
 
-            for (i, instruction) in instructions.iter().enumerate() {
-                let insn: &cbpf_rs::BpfInsn = instruction.borrow();
-                let mut insn_builder = program_request.reborrow().get(i as u32);
-                insn_builder.set_code(insn.code);
-                insn_builder.set_jt(insn.jt);
-                insn_builder.set_jf(insn.jf);
-                insn_builder.set_k(insn.k);
-            }
-
-            let response = request.send().promise.await?;
-            let results = response.get()?;
-            match results.get_result()?.which()? {
-                cli::success_or_error::Which::Success(_) => {
-                    println!("Capture program set")
-                }
-                cli::success_or_error::Which::Error(e) => {
-                    let result = e.unwrap().get_txt()?.to_string()?;
-                    println!("{result}");
-                    return Err(CliError::RpcError(result));
-                }
-            };
-            Ok(())
-        }
-        None => Err(CliError::ParseError("No capture program set".to_string())),
+    for (i, instruction) in instructions.iter().enumerate() {
+        let insn: &cbpf_rs::BpfInsn = instruction.borrow();
+        let mut insn_builder = program_request.reborrow().get(i as u32);
+        insn_builder.set_code(insn.code);
+        insn_builder.set_jt(insn.jt);
+        insn_builder.set_jf(insn.jf);
+        insn_builder.set_k(insn.k);
     }
+
+    let response = request.send().promise.await?;
+    let results = response.get()?;
+    match results.get_result()?.which()? {
+        cli::success_or_error::Which::Success(_) => {
+            println!("Capture program set")
+        }
+        cli::success_or_error::Which::Error(e) => {
+            let result = e.unwrap().get_txt()?.to_string()?;
+            println!("{result}");
+            return Err(CliError::RpcError(result));
+        }
+    };
+    Ok(())
 }
 
 async fn delete_capture_program_task(service: svc::Client) -> Result<(), CliError> {
@@ -361,7 +351,7 @@ async fn capture_sequence_task(
     service: svc::Client,
     file_path: String,
     time: u64,
-    program: Option<String>,
+    program: String,
     cap_socket: &PathBuf,
 ) -> Result<(), CliError> {
     let sleep_time = Duration::new(time, 0);
