@@ -93,7 +93,7 @@ pub enum CaptureCommands {
     CloseFile,
     /// Set a BPF to filter captured packets
     SetProgram {
-        #[arg(required = true, default_value = "link[0] == 1 | link[0] == 0")]
+        #[arg(required = true, default_value = "link[0] == 1 or link[0] == 0")]
         program: String,
     },
     /// Delete any set BPF
@@ -106,7 +106,7 @@ pub enum CaptureCommands {
         file_path: String,
         /// Duration in seconds
         duration: u64,
-        #[arg(default_value = "link[0] == 1 | link[0] == 0")]
+        #[arg(default_value = "link[0] == 1 or link[0] == 0")]
         program: String,
     },
 }

@@ -13,7 +13,9 @@ use cli::cmd_line_inter as svc;
 use pcap::{Capture, Linktype};
 use std::borrow::Borrow;
 use std::fs::OpenOptions;
-use std::io;
+// use std::io;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::io::prelude::*;
 use std::io::{BufReader, Error, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -47,6 +49,8 @@ enum CliError {
     CaptureError(#[from] pcap::Error),
     #[error("Deserialization Error")]
     DeserializationError(#[from] std::array::TryFromSliceError),
+    #[error("ReadLineError")]
+    ReadLineError(#[from] ReadlineError),
 }
 
 // thiserror does not propagate From implementations up
@@ -79,33 +83,31 @@ async fn main() -> Result<(), CliError> {
 }
 
 async fn run_cli(socket: PathBuf, cap_socket: PathBuf) -> Result<(), CliError> {
+    let mut rl = DefaultEditor::new()?;
+
+    // Optionally load history from a file, allows for cross sessioin history
+    let history_path = dirs::home_dir().map(|p| p.join(".ph_cli_history"));
+    if let Some(ref path) = history_path {
+        let _ = rl.load_history(path); // ignore error if file doesn't exist yet
+    }
+
     loop {
-        print!("> ");
-        io::stdout().flush()?;
-        let mut line = String::new();
-        match io::stdin().read_line(&mut line) {
-            Ok(0) => {
-                println!("Goodbye!");
-                return Ok(());
-            }
-            Err(e) => {
-                println!("{}", e);
-                return Err(CliError::ParseError("Failed to read line".to_string()));
-            }
-            Ok(_) => {
+        match rl.readline("> ") {
+            Ok(line) => {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
 
+                rl.add_history_entry(line)?;
+
                 match parse_and_exec(line, &socket, &cap_socket).await {
                     Ok(quit) => {
                         if quit {
-                            return Ok(());
+                            break;
                         }
                     }
                     Err(err) => match err {
-                        // Quits the program if the specified port is not open
                         CliError::OsError(err) => match err.kind() {
                             std::io::ErrorKind::NotFound => return Err(CliError::OsError(err)),
                             _ => println!("Failed to parse command \"{}\".  Error: {}", line, err),
@@ -114,8 +116,25 @@ async fn run_cli(socket: PathBuf, cap_socket: PathBuf) -> Result<(), CliError> {
                     },
                 }
             }
+            Err(ReadlineError::Interrupted) => {
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                break;
+            }
+            Err(err) => {
+                println!("Error: {}", err);
+                return Err(CliError::ParseError(err.to_string()));
+            }
         }
     }
+
+    // Save history on exit
+    if let Some(ref path) = history_path {
+        let _ = rl.save_history(path);
+    }
+
+    Ok(())
 }
 
 async fn parse_and_exec(
