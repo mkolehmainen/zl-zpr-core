@@ -1811,6 +1811,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "internet-checksum"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc6d6206008e25125b1f97fbe5d309eb7b85141cf9199d52dbd3729a1584dd16"
+
+[[package]]
 name = "io-uring"
 version = "0.7.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2529,6 +2535,7 @@ dependencies = [
  "enumset",
  "futures",
  "hdrhistogram",
+ "internet-checksum",
  "io-uring",
  "ip_network_table-deps-treebitmap",
  "ipnet",
@@ -5079,8 +5086,9 @@ dependencies = [
 
 [[package]]
 name = "zpr-utils"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "internet-checksum",
  "zerocopy",
  "zpr",
 ]
