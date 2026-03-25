@@ -10,7 +10,7 @@ license = "Apache-2.0"
 admin-api = { path = "../admin-api" }
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
-cbpf-rs = { workspace = true }
+cbpf-rs = { workspace = true, features = ["pcap"]}
 clap = { workspace = true }
 clap_complete = { workspace = true, optional = true }
 ctrlc = { version = "3.4.4" }

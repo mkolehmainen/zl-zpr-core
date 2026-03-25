@@ -10,11 +10,11 @@ use crate::defs::FiveTuple;
 use crate::mgmt::txn_mgr::TxnHandle;
 use crate::packet::Packet;
 use crate::tc;
-use rcu::{RcuBox, RcuCslabEntryGuard};
 use cslab::{RcuCslab, RcuCslabReader};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashMapEntry;
 use dashmap::mapref::one::Ref as DashMapRef;
+use rcu::{RcuBox, RcuCslabEntryGuard};
 use std::sync::Mutex;
 use zpr::packet_info::{CompressionMode, StreamId};
 

@@ -15,10 +15,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::*;
 use zpr::addrs::{VISA_SERVICE_ADDR, VISA_SERVICE_PORT};
+use zpr::five_tuple_lookup_table::FiveTupleLookupTable;
 use zpr::packet_info::{ForwardingEntry, VisaId};
 use zpr::vsapi_types;
-use zpr::vsapi_types::{DockPep, VsapiFiveTuple, HasFiveTuple};
-use zpr::five_tuple_lookup_table::FiveTupleLookupTable;
+use zpr::vsapi_types::{DockPep, HasFiveTuple, VsapiFiveTuple};
 use zpr_utils::net_defs::IpAddress;
 
 // TODO: Figure out correct value for this visa expiration
