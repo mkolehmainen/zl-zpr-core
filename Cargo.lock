@@ -2485,7 +2485,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "zpr 0.10.1",
  "zpr-ext",
 ]
 
