@@ -9,6 +9,7 @@ capnp-rpc = "0.25.0"
 cbpf-rs = { git = "https://github.com/org-zpr/zpr-utils.git", tag = "v0.1.0"}
 clap = { version = "4.5.23", features = ["derive"] }
 clap_complete = "4.5.57"
+internet-checksum = "0.2.1"
 ipnet = "2.11.0"
 openssl = "0.10.74"
 pcap = "2.0.0"
