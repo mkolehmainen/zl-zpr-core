@@ -6,7 +6,7 @@ members = ["adapter/admin-api", "adapter/ph", "adapter/cli", "libnode2"]
 [workspace.dependencies]
 capnp = { version = "0.25.0", features = ["sync_reader"] }
 capnp-rpc = "0.25.0"
-cbpf-rs = { git = "https://github.com/org-zpr/zpr-utils.git", tag = "v0.1.0"}
+cbpf-rs = { git = "https://github.com/org-zpr/zpr-utils.git", tag = "cbpf-rs-v0.2.0"}
 clap = { version = "4.5.23", features = ["derive"] }
 clap_complete = "4.5.57"
 internet-checksum = "0.2.1"
@@ -19,9 +19,8 @@ tokio = { version = "1.48.0", features = ["full"] }
 tokio-util = { version = "0.7.17", features = ["rt", "compat"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
-# zpr = { git = "https://github.com/org-zpr/zpr-common.git", tag = "v0.9.0", features = ["vsapi", "policy"] }
-zpr = { path = "../common", features = ["vsapi", "policy"], default-features = false }
-zpr-ext = { git = "https://github.com/org-zpr/zpr-utils.git", tag = "v0.1.0" }
+zpr = { git = "https://github.com/org-zpr/zpr-common.git", tag = "v0.10.1", features = ["vsapi", "policy"], default-features = false}
+zpr-ext = { git = "https://github.com/org-zpr/zpr-utils.git", tag = "zpr-ext-v0.5.3" }
 
 [profile.release]
 panic = "abort"
