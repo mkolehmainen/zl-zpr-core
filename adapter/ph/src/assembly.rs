@@ -176,6 +176,28 @@ impl Assembly {
         }
     }
 
+    /// Disconnect all non-internal, non-vs adapters.
+    /// Used in a node context when (for example) we loose all state with the visa service.
+    ///
+    /// Does not remove visas related to the adapter/peer.
+    pub async fn disconnect_adapters(self: &Arc<Self>) {
+        if matches!(self.ph_mode, PhMode::Node) {
+            let mut join_set = tokio::task::JoinSet::new();
+            let vs_peer = self
+                .peer_table
+                .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
+            self.peer_table.for_each(|(peer_id, peer)| {
+                if Some(peer_id) != vs_peer && !peer.is_internal() {
+                    // This should be a short block and must be blocked on,
+                    // otherwise the messages won't get sent
+                    let spawn_self = self.clone();
+                    join_set.spawn_local(async move { spawn_self.reset_peer(peer_id.get()).await });
+                }
+            });
+            join_set.join_all().await;
+        }
+    }
+
     #[allow(dead_code)]
     pub fn is_link_ready(&self, id: LinkId) -> bool {
         match self.peer_table.get(id) {
@@ -261,6 +283,7 @@ impl Assembly {
     }
 
     /// Caled from `LinkStateWrapper::complete_close`.`
+    /// Also drops visas related to the peer.
     pub fn drop_peer(self: &Arc<Self>, link_id: LinkId) {
         let vs_link_id = self
             .peer_table
@@ -269,6 +292,12 @@ impl Assembly {
             debug!(target: PEER_MGMT, "Removing peer {link_id} [VISA SERVICE]");
         } else {
             debug!(target: PEER_MGMT, "Removing peer {link_id}");
+        }
+        if self.ph_mode == PhMode::Node {
+            self.visa_table
+                .write()
+                .unwrap()
+                .revoke_for_link(link_id, &self.peer_table);
         }
         self.peer_table.remove(link_id);
         info!(target: PEER_MGMT, "Removed peer {link_id}");
