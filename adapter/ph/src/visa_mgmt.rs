@@ -9,13 +9,12 @@ use crate::visa_table;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use libnode::claims;
-use libnode::vsconn::VSDisconnectNotice;
 use std::net::IpAddr;
 use std::num::NonZero;
 use std::sync::Arc;
 use tracing::*;
 use zpr::packet_info::{LinkId, VisaId};
-use zpr::vsapi_types::{self, DisconnectReason};
+use zpr::vsapi_types::{self, DisconnectNotice, DisconnectReason};
 use zpr_utils::net_defs::IpAddress;
 
 pub fn authorize_connect(
@@ -162,7 +161,7 @@ fn get_common_name(asm: &Arc<Assembly>, id: LinkId) -> Result<String, LinkStateE
 
 /// This uses "RemoteDisconnect" as the reason passed to the visa service.
 pub async fn actor_disconnect(asm: Arc<Assembly>, addr: IpAddress) {
-    let notice = VSDisconnectNotice {
+    let notice = DisconnectNotice {
         zpr_addr: Some(addr.into()),
         reason: DisconnectReason::RemoteDisconnect,
     };
@@ -179,7 +178,10 @@ pub fn insert_visa(
     asm: &Arc<Assembly>,
     visa: vsapi_types::Visa,
 ) -> Result<VisaId, visa_table::VisaTableError> {
-    let addr = visa.dest_addr.clone();
+    if visa.visa_type != vsapi_types::VisaType::Full {
+        panic!("Forward only visas not yet supported")
+    }
+    let addr = visa.dock_pep.clone().unwrap().dest_addr;
     if asm.find_egress_link(addr.into()).is_none() {
         asm.counters.management[ManagementCounterType::VisaRequestError].increment();
         return Err(visa_table::VisaTableError::DestNotFound(addr.into()));

@@ -1,4 +1,5 @@
 use zpr::vsapi::v1 as vsapi2;
+use zpr::vsapi_types::ApiResponseError;
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -20,7 +21,8 @@ use tracing::*;
 use crate::error::VSApiError;
 use crate::logging::targets::VS_RPC;
 use zpr::vsapi_types::{
-    ConnectRequest, Connection, DenyCode, DisconnectReason, ErrorCode, PacketDesc, Visa, VisaOp,
+    ConnectRequest, Connection, DisconnectNotice, NodeConnect, StateFlag, Visa, VisaDecision,
+    VisaOp, VisaRequest, VisaResponse,
 };
 use zpr::write_to::WriteTo;
 
@@ -40,39 +42,15 @@ const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for connect/challenge/authenticate — longer due to crypto.
 const DEFAULT_CONNECT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug)]
-pub struct VSConnectRequest {
-    /// Connect will fail if this does not match policy.
-    pub zpr_addr: IpAddr,
-    pub state: StateFlag,
-}
-
-#[derive(Debug)]
-pub struct VSVisaRequest {
-    pub pdesc: PacketDesc,
-    pub previous_id: Option<u64>,
-}
-
-#[derive(Debug)]
-pub enum VSVisaDecision {
-    Allowed(Visa),
-    Denied(DenyCode),
-}
-
-#[derive(Debug)]
-pub struct VSDisconnectNotice {
-    /// None = node itself, Some = specific adapter
-    pub zpr_addr: Option<IpAddr>,
-    pub reason: DisconnectReason,
-}
-
-/// Returns no error if call to VSAPI authenticate was successful.
+/// 4 no error if call to VSAPI authenticate was successful.
+type VSVisaResponse = Result<VisaDecision, VSApiError>;
 type VSConnectResponse = Result<(), VSApiError>;
-type VSVisaResponse = Result<VSVisaDecision, VSApiError>;
 type VSRegisterVssResponse = Result<Vec<VisaOp>, VSApiError>;
 type VSAuthorizeConnectResponse = Result<Connection, VSApiError>;
 type VSNotifyDisconnectResponse = Result<(), VSApiError>;
 type VSPingResponse = Result<(), VSApiError>;
+type VSVisaIdsResponse = Result<Vec<u64>, VSApiError>;
+type VSVisaByIdResponse = Result<Vec<Visa>, VSApiError>;
 
 // The async "commands" that can be sent into the running visa service client.
 #[derive(Debug)]
@@ -81,20 +59,24 @@ enum VS2Command {
     Stop(bool),
 
     /// Run through the connect sequence. If connect succeeds the VSHandle is kept internally.
-    Connect(VSConnectRequest, oneshot::Sender<VSConnectResponse>),
+    Connect(NodeConnect, oneshot::Sender<VSConnectResponse>),
 
-    VisaRequest(VSVisaRequest, oneshot::Sender<VSVisaResponse>),
+    VisaRequest(VisaRequest, oneshot::Sender<VSVisaResponse>),
 
     RegisterVss(SocketAddr, oneshot::Sender<VSRegisterVssResponse>),
 
     AuthorizeConnect(ConnectRequest, oneshot::Sender<VSAuthorizeConnectResponse>),
 
     NotifyDisconnect(
-        VSDisconnectNotice,
+        DisconnectNotice,
         oneshot::Sender<VSNotifyDisconnectResponse>,
     ),
 
     Ping(oneshot::Sender<VSPingResponse>),
+
+    VisaIdsRequest(oneshot::Sender<VSVisaIdsResponse>),
+
+    VisaByIdsRequest(Vec<u64>, oneshot::Sender<VSVisaByIdResponse>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,16 +89,6 @@ pub enum VSConnLifecycleEvent {
 
     /// When run loop has stopped.
     RunLoopExits,
-}
-
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StateFlag {
-    /// Visa service / node has no state for this connection.
-    #[default]
-    NoState,
-
-    /// Visa service / node has existing state for this connection.
-    HasState,
 }
 
 pub struct VSConn {
@@ -351,7 +323,7 @@ impl VSConn {
                         }
                         vsapi2::ok_or_error::Which::Error(err_obj) => {
                             let err_obj = err_obj?;
-                            let err = new_coded_error(err_obj);
+                            let err = ApiResponseError::try_from(err_obj);
 
                             // There is no back channel for the Stop command so we just log the error.
                             error!(
@@ -475,13 +447,43 @@ impl VSConn {
                 }
                 Ok(())
             }
+            VS2Command::VisaIdsRequest(resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: visa_ids_request");
+                let resp = if !cmd_state.is_connected() {
+                    Err(VSApiError::CommandFailed(
+                        "not connected to VS-API".to_string(),
+                    ))
+                } else {
+                    self.do_visa_ids_request(cmd_state.vs_handle.as_ref().unwrap())
+                        .await
+                };
+                if let Err(e) = resp_tx.send(resp) {
+                    error!(target: VS_RPC, "failed to send visa_ids_request response: {:?}", e);
+                }
+                Ok(())
+            }
+            VS2Command::VisaByIdsRequest(req, resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: visa_by_ids_request");
+                let resp = if !cmd_state.is_connected() {
+                    Err(VSApiError::CommandFailed(
+                        "not connected to VS-API".to_string(),
+                    ))
+                } else {
+                    self.do_visa_by_ids_request(cmd_state.vs_handle.as_ref().unwrap(), req)
+                        .await
+                };
+                if let Err(e) = resp_tx.send(resp) {
+                    error!(target: VS_RPC, "failed to send visa_by_ids_request response: {:?}", e);
+                }
+                Ok(())
+            }
         }
     }
 
     async fn do_connect(
         &self,
         vs_service: &vsapi2::visa_service::Client,
-        req: VSConnectRequest,
+        req: NodeConnect,
     ) -> Result<vsapi2::v_s_handle::Client, VSApiError> {
         let mut vs_request = vs_service.connect_request();
 
@@ -525,7 +527,7 @@ impl VSConn {
             vsapi2::result::Which::Ok(vs_gate_obj) => vs_gate_obj?,
             vsapi2::result::Which::Error(err_obj) => {
                 let err_obj = err_obj?;
-                return Err(new_coded_error(err_obj));
+                return Err(ApiResponseError::try_from(err_obj)?.into());
             }
         };
 
@@ -580,7 +582,7 @@ impl VSConn {
             vsapi2::result::Which::Ok(handle_obj) => handle_obj?,
             vsapi2::result::Which::Error(err_obj) => {
                 let err_obj = err_obj?;
-                return Err(new_coded_error(err_obj));
+                return Err(ApiResponseError::try_from(err_obj)?.into());
             }
         };
 
@@ -591,8 +593,8 @@ impl VSConn {
     async fn do_visa_request(
         &self,
         vs_h: &vsapi2::v_s_handle::Client,
-        req: VSVisaRequest, // TODO: VSVisaRequest should use a PacketDesc from vs-dt, then implement write_to on it.
-    ) -> Result<VSVisaDecision, VSApiError> {
+        req: VisaRequest, // TODO: VisaRequest should use a PacketDesc from vs-dt, then implement write_to on it.
+    ) -> Result<VisaDecision, VSApiError> {
         let mut vr_request = vs_h.visa_request_request();
         let mut vrr_bldr = vr_request.get().init_req();
         vrr_bldr.set_previous_id(0);
@@ -604,24 +606,10 @@ impl VSConn {
             vr_request.send().promise,
         )
         .await?;
-        let allow_deny_error = vr_response.get()?.get_resp()?;
 
-        match allow_deny_error.which()? {
-            vsapi2::visa_response::Which::Allow(v) => {
-                let cp_visa = v?;
-                let visa = Visa::try_from(cp_visa)?;
-                Ok(VSVisaDecision::Allowed(visa))
-            }
-            vsapi2::visa_response::Which::Deny(dcode) => {
-                let dcode = dcode?;
-                let deny_code = DenyCode::from(dcode);
-                Ok(VSVisaDecision::Denied(deny_code))
-            }
-            vsapi2::visa_response::Which::Error(err_obj) => {
-                let err_obj = err_obj?;
-                Err(new_coded_error(err_obj))
-            }
-        }
+        let allow_deny_error: vsapi2::visa_response::Reader<'_> = vr_response.get()?.get_resp()?;
+        let vr = VisaResponse::try_from(allow_deny_error)?;
+        Ok(VisaDecision::try_from(vr)?)
     }
 
     async fn do_authorize_connect(
@@ -650,7 +638,7 @@ impl VSConn {
             }
             vsapi2::result::Which::Error(err_obj) => {
                 let err_obj = err_obj?;
-                Err(new_coded_error(err_obj))
+                Err(ApiResponseError::try_from(err_obj)?.into())
             }
         }
     }
@@ -658,7 +646,7 @@ impl VSConn {
     async fn do_notify_disconnect(
         &self,
         vs_h: &vsapi2::v_s_handle::Client,
-        req: VSDisconnectNotice,
+        req: DisconnectNotice,
     ) -> Result<(), VSApiError> {
         let mut nd_request = vs_h.notify_disconnect_request();
         let mut dn_bldr = nd_request.get().init_req();
@@ -682,7 +670,7 @@ impl VSConn {
             vsapi2::ok_or_error::Which::Ok(_) => Ok(()),
             vsapi2::ok_or_error::Which::Error(err_obj) => {
                 let err_obj = err_obj?;
-                Err(new_coded_error(err_obj))
+                Err(ApiResponseError::try_from(err_obj)?.into())
             }
         }
     }
@@ -720,7 +708,7 @@ impl VSConn {
             }
             vsapi2::result::Which::Error(err_obj) => {
                 let err_obj = err_obj?;
-                Err(new_coded_error(err_obj))
+                Err(ApiResponseError::try_from(err_obj)?.into())
             }
         }
     }
@@ -735,7 +723,69 @@ impl VSConn {
             rpc_with_timeout("ping", with_timeout, vs_h.ping_request().send().promise).await?;
         match ping_response_rdr.get()?.get_res()?.which()? {
             vsapi2::ok_or_error::Which::Ok(_) => Ok(()),
-            vsapi2::ok_or_error::Which::Error(err_rdr) => Err(new_coded_error(err_rdr?)),
+            vsapi2::ok_or_error::Which::Error(err_rdr) => {
+                Err(ApiResponseError::try_from(err_rdr?)?.into())
+            }
+        }
+    }
+
+    async fn do_visa_ids_request(
+        &self,
+        vs_h: &vsapi2::v_s_handle::Client,
+    ) -> Result<Vec<u64>, VSApiError> {
+        debug!(target: VS_RPC, "VS-API -> visa_ids_request");
+        let visa_ids_reqponse_rdr = rpc_with_timeout(
+            "visa_ids_request",
+            DEFAULT_RPC_TIMEOUT,
+            vs_h.visa_ids_request_request().send().promise,
+        )
+        .await?;
+        let ok_or_error = visa_ids_reqponse_rdr.get()?.get_res()?;
+        match ok_or_error.which()? {
+            vsapi2::result::Which::Ok(ids_list_rdr) => {
+                let ids: Vec<u64> = ids_list_rdr?.iter().collect();
+                Ok(ids)
+            }
+            vsapi2::result::Which::Error(err_obj) => {
+                let err_obj = err_obj?;
+                Err(ApiResponseError::try_from(err_obj)?.into())
+            }
+        }
+    }
+
+    async fn do_visa_by_ids_request(
+        &self,
+        vs_h: &vsapi2::v_s_handle::Client,
+        req: Vec<u64>,
+    ) -> Result<Vec<Visa>, VSApiError> {
+        debug!(target: VS_RPC, "VS-API -> visa_by_ids_request");
+        let mut visa_by_id_req = vs_h.visa_request_by_id_request();
+        let mut req_builder = visa_by_id_req.get().init_req(req.len() as u32);
+
+        for (i, id) in req.iter().enumerate() {
+            req_builder.set(i as u32, *id);
+        }
+
+        let visa_by_ids_reqponse_rdr = rpc_with_timeout(
+            "visa_by_ids_request",
+            DEFAULT_RPC_TIMEOUT,
+            visa_by_id_req.send().promise,
+        )
+        .await?;
+
+        let ok_or_error = visa_by_ids_reqponse_rdr.get()?.get_res()?;
+        match ok_or_error.which()? {
+            vsapi2::result::Which::Ok(visa_list_rdr) => {
+                let mut visas: Vec<Visa> = Vec::new();
+                for visa_rdr in visa_list_rdr?.iter() {
+                    visas.push(Visa::try_from(visa_rdr)?);
+                }
+                Ok(visas)
+            }
+            vsapi2::result::Which::Error(err_obj) => {
+                let err_obj = err_obj?;
+                Err(ApiResponseError::try_from(err_obj)?.into())
+            }
         }
     }
 }
@@ -749,7 +799,7 @@ impl VSConnHandle {
             .map_err(|_| VSApiError::ConnClosed)
     }
 
-    pub async fn connect(&self, req: VSConnectRequest) -> Result<(), VSApiError> {
+    pub async fn connect(&self, req: NodeConnect) -> Result<(), VSApiError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VS2Command::Connect(req, resp_tx);
         self.send_command(cmd).await?;
@@ -761,7 +811,7 @@ impl VSConnHandle {
         self.send_command(cmd).await
     }
 
-    pub async fn visa_request(&self, req: VSVisaRequest) -> Result<VSVisaDecision, VSApiError> {
+    pub async fn visa_request(&self, req: VisaRequest) -> Result<VisaDecision, VSApiError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VS2Command::VisaRequest(req, resp_tx);
         self.send_command(cmd).await?;
@@ -787,7 +837,7 @@ impl VSConnHandle {
         resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
     }
 
-    pub async fn notify_disconnect(&self, req: VSDisconnectNotice) -> Result<(), VSApiError> {
+    pub async fn notify_disconnect(&self, req: DisconnectNotice) -> Result<(), VSApiError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VS2Command::NotifyDisconnect(req, resp_tx);
         self.send_command(cmd).await?;
@@ -797,6 +847,20 @@ impl VSConnHandle {
     pub async fn ping(&self) -> Result<(), VSApiError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VS2Command::Ping(resp_tx);
+        self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+
+    pub async fn visa_id_request(&self) -> Result<Vec<u64>, VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = VS2Command::VisaIdsRequest(resp_tx);
+        self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+
+    pub async fn visa_by_id_request(&self, req: Vec<u64>) -> Result<Vec<Visa>, VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = VS2Command::VisaByIdsRequest(req, resp_tx);
         self.send_command(cmd).await?;
         resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
     }
@@ -840,20 +904,6 @@ where
         Ok(Err(capnp_err)) => Err(capnp_err.into()),
         Err(_elapsed) => Err(VSApiError::Timeout(name.to_string())),
     }
-}
-
-/// Create a VSApiError::CodedError from a capn proto vsapi2::error::Reader.
-fn new_coded_error(rdr: vsapi2::error::Reader) -> VSApiError {
-    let err_code: ErrorCode = match rdr.get_code() {
-        Ok(c) => c.into(),
-        Err(_) => ErrorCode::Internal,
-    };
-    let err_msg = match rdr.get_message() {
-        Ok(m) => m.to_string().unwrap(),
-        Err(_) => String::from("(no message)"),
-    };
-    let retry = rdr.get_retry_in();
-    VSApiError::CodedError(err_code, err_msg, retry)
 }
 
 #[derive(Debug)]

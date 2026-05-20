@@ -9,8 +9,8 @@ use crate::logging::targets::STARTUP;
 use crate::vss_worker;
 
 use libnode::error::VSApiError;
-use libnode::vsconn::{StateFlag, VSConnHandle, VSConnLifecycleEvent, VSDisconnectNotice};
-use zpr::vsapi_types::{DisconnectReason, ErrorCode};
+use libnode::vsconn::{VSConnHandle, VSConnLifecycleEvent};
+use zpr::vsapi_types::{DisconnectNotice, DisconnectReason, ErrorCode, NodeConnect, StateFlag};
 
 pub async fn launch(
     asm: Arc<Assembly>,
@@ -28,7 +28,7 @@ pub async fn launch(
 
         loop {
             // Kick off a connect request to the VS, if it succeeds, notify the VS about our VSS endpoint.
-            let req = libnode::vsconn::VSConnectRequest {
+            let req = NodeConnect {
                 zpr_addr: node_zpr_addr,
                 state,
             };
@@ -44,7 +44,7 @@ pub async fn launch(
                             info!(target: STARTUP, "node access granted to visa service");
                             true
                         }
-                        Err(VSApiError::CodedError(code, _msg, _)) if matches!(code, ErrorCode::OutOfSync) => {
+                        Err(VSApiError::CodedError(err)) if matches!(err.code, ErrorCode::OutOfSync) => {
                             state = StateFlag::NoState;
                             info!(target: STARTUP, "visa service reports out-of-sync; clearing adapters and visas");
                             asm.disconnect_adapters().await; // drops visas too
@@ -101,7 +101,7 @@ pub async fn launch(
                     Err(e) => {
                         error!(target: STARTUP, "failed to register VSS: {e:?}");
 
-                        let dreq = VSDisconnectNotice {
+                        let dreq = DisconnectNotice {
                             zpr_addr: None,
                             reason: DisconnectReason::LinkError,
                         };
