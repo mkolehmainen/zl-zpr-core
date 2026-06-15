@@ -352,6 +352,85 @@ pub fn send_bind_actor_address_error_response<'a>(
     )
 }
 
+pub fn send_stream_id_request<'a>(
+    asm: &'a Assembly,
+    link_id: LinkId,
+    txn_id: TxnId,
+    visa_id: VisaId,
+) -> Sent<'a> {
+    debug!(target: ZDP, "Link {link_id}: sending StreamIdRequest for {visa_id}");
+
+    let mut req = core::new_heap_packet();
+    let bind_req_hdr = req.alloc_zeroed_header::<zdp::ZdpStreamIdRequest>();
+    bind_req_hdr.visa_id = visa_id.into();
+
+    core::send_per_flow_txn_mgmt(
+        asm,
+        link_id,
+        zdp::ZdpPacketType::StreamIdRequest,
+        0,
+        txn_id,
+        req,
+    )
+}
+
+pub fn send_stream_id_success_response<'a>(
+    asm: &'a Assembly,
+    link_id: LinkId,
+    txn_id: TxnId,
+    tether_id: StreamId,
+) -> Sent<'a> {
+    debug!(target: ZDP, "Link {link_id}: sending StreamIdResponse [success] for {txn_id}");
+
+    let mut rsp_pkt = core::new_heap_packet();
+
+    zdp::ZdpStreamIdResponseHeader {
+        status_code: zdp::ResponseCode::Success,
+        info_len: 0,
+    }
+    .write_to_buf(&mut rsp_pkt)
+    .unwrap();
+
+    super::core::send_per_flow_txn_mgmt(
+        asm,
+        link_id,
+        zdp::ZdpPacketType::StreamIdResponse,
+        tether_id,
+        txn_id,
+        rsp_pkt,
+    )
+}
+
+pub fn send_stream_id_error_response<'a>(
+    asm: &'a Assembly,
+    link_id: LinkId,
+    txn_id: TxnId,
+    reason: &str,
+) -> Sent<'a> {
+    debug!(target: ZDP, "Link {link_id}: sending StreamIdResponse [error] for {txn_id}");
+
+    let mut rsp_pkt = core::new_heap_packet();
+    let max_sz = u8::MAX as usize;
+    let reason = &reason[..reason.len().min(max_sz)];
+    zdp::ZdpStreamIdResponseHeader {
+        status_code: zdp::ResponseCode::Other,
+        info_len: reason.len() as u8,
+    }
+    .write_to_buf(&mut rsp_pkt)
+    .unwrap();
+
+    rsp_pkt.put(reason.as_bytes());
+
+    super::core::send_per_flow_txn_mgmt(
+        asm,
+        link_id,
+        zdp::ZdpPacketType::StreamIdResponse,
+        0,
+        txn_id,
+        rsp_pkt,
+    )
+}
+
 pub fn send_bind_egress_stream_request<'a>(
     asm: &'a Assembly,
     link_id: LinkId,
