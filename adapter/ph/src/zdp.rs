@@ -222,6 +222,20 @@ pub struct ZdpBindActorAddressResponseHeader {
 
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(packed)]
+pub struct ZdpStreamIdRequest {
+    pub visa_id: U64,
+}
+
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(packed)]
+pub struct ZdpStreamIdResponseHeader {
+    pub status_code: ResponseCode,
+    pub info_len: u8,
+    // followed by `info_len` octets of Optional Additional Status Information
+}
+
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(packed)]
 pub struct ZdpBindEgressStreamRequestHeader {
     pub tcst: Tcst,
     // followed by traffic classifier
@@ -232,6 +246,7 @@ pub struct ZdpBindEgressStreamRequestHeader {
 pub struct ZdpBindEgressStreamResponseHeader {
     pub status_code: ResponseCode,
     pub info_len: u8,
+    // followed by `info_len` octets of Optional Additional Status Information
 }
 
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
