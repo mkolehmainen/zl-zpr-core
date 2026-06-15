@@ -394,6 +394,11 @@ impl RsaBootstrapAuth {
         };
         Ok(blob.encode())
     }
+
+    #[cfg(test)]
+    pub fn cn(&self) -> &str {
+        &self.cn
+    }
 }
 
 /// Response json object to initial auth request from an actor
