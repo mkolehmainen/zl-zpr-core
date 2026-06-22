@@ -105,7 +105,7 @@ Using the handy `zpr-pki` script:
 ./integration-test/lib/zpr-pki pubkey <node-noise.key >node-noise-pub.pem
 
 # Then sign the public key
-./zpr-pki gensignedcert authority/auth-ca.crt authority/auth-ca.key \
+./integration-test/zpr-pki gensignedcert authority/auth-ca.crt authority/auth-ca.key \
   /CN=node.zpr.org 365 < node-noise-pub.pem >node-noise.crt
 ```
 
@@ -136,7 +136,7 @@ Sample configuration, place in a file named `node-conf.toml`.
 [global]
 # ca_file is needed for the node to verify adapter certificates and recognize
 # the visa-service adapter as special.  Without it, VS routing will not work.
-ca_file = "auth-ca.crt"
+ca_file = "authority/auth-ca.crt"
 certificate_file = "node-noise.crt"
 private_key_file = "node-noise.key"
 self_addr = "129.6.7.1:5000"
@@ -165,11 +165,13 @@ matches against.  Generate and sign one:
 
 ### Create a configuration file for the visa service adapter
 
+Sample configuration, place in a file named `adapter-vs-conf.toml`.
+
 ```toml
 [global]
 # ca_file is optional for link establishment, but the VS adapter must present
 # a CA-signed certificate_file so the node can recognize it as the visa service.
-ca_file = "auth-ca.crt"
+ca_file = "authority/auth-ca.crt"
 certificate_file = "vs-noise.crt"   # CN must be "vs.zpr"
 private_key_file = "vs-noise.key"
 zpr_addr = [ "fd5a:5052::1" ]
@@ -285,7 +287,7 @@ here:
 # IP configuration for the node.
 sudo ip tuntap add name tun9 mode tun multi_queue
 sudo ip link set tun9 mtu 1400
-sudo addr add fd5a:5052:90de::1/32 dev tun9
+sudo ip addr add fd5a:5052:90de::1/32 dev tun9
 sudo ip link set tun9 up
 ```
 
@@ -304,7 +306,7 @@ need to configure its TUN interface similar to what we did for the node.
 # IP configuration for the visa service adapter.
 sudo ip tuntap add name tun9 mode tun multi_queue
 sudo ip link set tun9 mtu 1400
-sudo addr add fd5a:5052::1/32 dev tun9
+sudo ip addr add fd5a:5052::1/32 dev tun9
 sudo ip link set tun9 up
 ```
 
