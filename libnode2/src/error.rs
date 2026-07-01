@@ -1,6 +1,7 @@
 use thiserror::Error;
 use zpr::vsapi_types::{ApiResponseError, VsapiTypeError};
 
+
 #[derive(Debug, Error)]
 pub enum VSApiError {
     #[error("VS API connection is closed")]
