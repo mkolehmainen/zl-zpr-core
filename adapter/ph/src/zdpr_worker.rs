@@ -1,13 +1,10 @@
 //! Code which handles active aspects of ZDPR (namely, retries).
 
-use crate::assembly::Assembly;
-use crate::config;
 use crate::counters;
 use crate::mgmt;
-use std::sync::Arc;
+use crate::prelude::*;
 use tokio::select;
 use tokio::time;
-use zpr::packet_info::LinkId;
 
 pub async fn launch(asm: Arc<Assembly>, link_id: LinkId) {
     let mut retry_interval = time::interval(config::DEFAULT_ZDPR_RETRY_TIMER);
