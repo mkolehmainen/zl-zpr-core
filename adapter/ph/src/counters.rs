@@ -140,6 +140,7 @@ pub enum ManagementCounterType {
     OtherError,
 
     VisaRequested,
+    VisaByIdRequested,
     VisaRequestSuccess,
     VisaRequestDenied,
     VisaRequestError,
@@ -228,6 +229,7 @@ impl ManagementCounterType {
 
             // Visa counters (Node only)
             Self::VisaRequested => "Visa Requested",
+            Self::VisaByIdRequested => "Visa By Id Requested",
             Self::VisaRequestSuccess => "Visa Request Success",
             Self::VisaRequestDenied => "Visa Request Denied",
             Self::VisaRequestError => "Visa Request Error",

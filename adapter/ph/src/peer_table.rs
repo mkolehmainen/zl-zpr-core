@@ -5,6 +5,7 @@ use crate::forwarding_tables::PeerForwardingTable;
 use crate::km::{KeyManager, KmTransportSA};
 use crate::link_state::{LinkStateWrapper, LinkType};
 use crate::mgmt::{self, txn_mgr};
+use crate::prelude::*;
 use crate::queues;
 use crate::special_peers::*;
 use crate::zdpr;
@@ -67,6 +68,13 @@ impl PeerKmState {
             transport_sa: RcuBox::new(None),
         }
     }
+}
+
+pub enum PeerType {
+    Node,
+    Adapter,
+    Dock,
+    Unknown,
 }
 
 const MGMT_PROCESSOR_QUEUE_SIZE: usize = 16;
@@ -144,6 +152,22 @@ impl PeerState {
 
     pub fn is_internal(&self) -> bool {
         self.link_state_machine.is_internal()
+    }
+
+    /// What type of peer is this.  Accounts for well-known internal links
+    /// (local actor and dock).
+    pub fn peer_type(&self) -> PeerType {
+        match self.link_state_machine.get_link_type() {
+            LinkType::Internal => match self.link_state_machine.id {
+                LOCAL_ACTOR_LINK_ID => PeerType::Adapter,
+                DOCK_LINK_ID => PeerType::Dock,
+                _ => PeerType::Unknown,
+            },
+
+            LinkType::NodeToAdapter => PeerType::Adapter,
+            LinkType::AdapterToNode => PeerType::Dock,
+            LinkType::NodeToNode => PeerType::Node,
+        }
     }
 }
 
