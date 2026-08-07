@@ -624,6 +624,42 @@ pub async fn handle_bind_actor_address_request(
     Ok(())
 }
 
+pub async fn handle_stream_id_request(
+    asm: &Arc<Assembly>,
+    txn_id: TxnId,
+    mut pkt: Packet,
+) -> HandleMgmtResult {
+    // must only come from a node
+    if pkt.metadata().ingress_link_id == LOCAL_ACTOR_LINK_ID
+        || pkt.metadata().ingress_link_id == DOCK_LINK_ID
+    {
+        error!(target: ZDP, "Link {}: received StreamIdRequest message on non-node link", pkt.metadata().ingress_link_id);
+        return Err(HandleMgmtError::MessageNotPermitted);
+    }
+
+    let Ok(req) = zdp::ZdpStreamIdRequest::read_from_buf(&mut pkt) else {
+        return Err(HandleMgmtError::BadStructure);
+    };
+
+    let visa_id = req.visa_id.get();
+
+    let Some(ingress_link_id) = NonZero::new(pkt.metadata().ingress_link_id) else {
+        // who sent this??
+        error!(target: FLOW_MGMT, "coding error: stray packet from unknown source; dropping");
+        return Ok(());
+    };
+
+    debug!(
+        target: ZDP,
+        "Link {}: handlers.handle_stream_id_request -- visa_id {}",
+        ingress_link_id.get(), visa_id
+    );
+
+    dock::request_stream(asm, ingress_link_id, txn_id, visa_id);
+
+    Ok(())
+}
+
 pub async fn handle_bind_egress_stream_request(
     asm: &Arc<Assembly>,
     txn_id: TxnId,
@@ -715,6 +751,50 @@ pub async fn handle_bind_actor_address_response(
             };
 
             adapter::deny_tether(&asm, &txn, msg)?;
+            Ok(())
+        }
+
+        _ => Err(HandleMgmtError::BadStructure),
+    }
+}
+
+pub async fn handle_stream_id_response(
+    asm: &Arc<Assembly>,
+    txn_id: TxnId,
+    mut pkt: Packet,
+) -> HandleMgmtResult {
+    let link_id = pkt.metadata().ingress_link_id;
+
+    let Some(peer_state) = asm.peer_table.get(link_id) else {
+        return Err(HandleMgmtError::LinkClosed);
+    };
+
+    let Some(txn) = peer_state.txn_mgr.get(txn_id) else {
+        return Err(HandleMgmtError::UnknownTransaction);
+    };
+
+    let Ok(hdr) = zdp::ZdpStreamIdResponseHeader::read_from_buf(&mut pkt) else {
+        return Err(HandleMgmtError::BadStructure);
+    };
+
+    match hdr.status_code {
+        zdp::ResponseCode::Success => {
+            let stream_id = pkt.metadata().ingress_stream_id;
+
+            dock::install_tether(&asm, NonZero::new(link_id).unwrap(), &txn, stream_id)?;
+            Ok(())
+        }
+
+        zdp::ResponseCode::Other => {
+            if hdr.info_len as usize > pkt.remaining() {
+                return Err(HandleMgmtError::BadStructure);
+            }
+
+            let Ok(msg) = std::str::from_utf8(&pkt.body()[..hdr.info_len as usize]) else {
+                return Err(HandleMgmtError::BadStructure);
+            };
+
+            dock::deny_tether(&asm, NonZero::new(link_id).unwrap(), &txn, msg)?;
             Ok(())
         }
 

@@ -112,6 +112,20 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
                 .await
             }
 
+            ZdpPacketType::StreamIdRequest => {
+                let Ok(txn_hdr) = ZdpTransactionHeader::read_from_buf(&mut pkt) else {
+                    return Err(HandleMgmtError::BadStructure);
+                };
+                handlers::handle_stream_id_request(asm, txn_hdr.transaction_id.into(), pkt).await
+            }
+
+            ZdpPacketType::StreamIdResponse => {
+                let Ok(txn_hdr) = ZdpTransactionHeader::read_from_buf(&mut pkt) else {
+                    return Err(HandleMgmtError::BadStructure);
+                };
+                handlers::handle_stream_id_response(asm, txn_hdr.transaction_id.into(), pkt).await
+            }
+
             ZdpPacketType::BindEgressStreamRequest => {
                 let Ok(txn_hdr) = ZdpTransactionHeader::read_from_buf(&mut pkt) else {
                     return Err(HandleMgmtError::BadStructure);
@@ -131,9 +145,11 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
                 )
                 .await
             }
+
             ZdpPacketType::UnbindEgressStreamIndication => {
                 handlers::handle_unbind_indication(asm, pkt).await
             }
+
             packet_type => Err(HandleMgmtError::UnknownType(packet_type.0)),
         }
     } else {
