@@ -31,7 +31,7 @@ use std::num::NonZero;
 ///
 /// A success response (containing the tether ID) or error response (in
 /// the event that the DLT is full) is then issued to the dock, where these
-/// responses are handled by [`dock::install_tether()`] and [`dock::deny_tether()`]
+/// responses are handled by [`node::install_tether()`] and [`node::deny_tether()`]
 /// respectively.
 pub fn bind_egress_stream(
     asm: &Arc<Assembly>,
