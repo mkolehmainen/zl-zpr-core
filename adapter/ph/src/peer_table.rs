@@ -20,6 +20,7 @@ use std::future::Future;
 use std::num::NonZero;
 use std::sync::atomic::{self, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use strum;
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 use tokio::task;
@@ -71,6 +72,8 @@ impl PeerKmState {
     }
 }
 
+#[derive(Debug, strum::Display)]
+#[strum(serialize_all = "snake_case")]
 pub enum PeerType {
     Node,
     Adapter,

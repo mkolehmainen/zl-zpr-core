@@ -9,6 +9,7 @@ use super::{adapter, node};
 use crate::auth;
 use crate::counters;
 use crate::link_state::{LinkEvent, LinkStateError, LinkType};
+use crate::peer_table::PeerType;
 use crate::prelude::*;
 use crate::tc;
 use crate::tlv;
@@ -591,12 +592,6 @@ pub async fn handle_bind_actor_address_request(
     txn_id: TxnId,
     mut pkt: Packet,
 ) -> HandleMgmtResult {
-    // must not come from a dock
-    if pkt.metadata().ingress_link_id == DOCK_LINK_ID {
-        error!(target: ZDP, "{}: received BindActorAddress message on dock link", asm.formatted_link_id(pkt.metadata().ingress_link_id));
-        return Err(HandleMgmtError::MessageNotPermitted);
-    }
-
     let Ok(hdr) = zdp::ZdpBindActorAddressRequestHeader::read_from_buf(&mut pkt) else {
         return Err(HandleMgmtError::BadStructure);
     };
@@ -617,6 +612,13 @@ pub async fn handle_bind_actor_address_request(
         return Ok(());
     };
 
+    // must come from an adapter
+    let peer_type = peer_type_by_id(&asm, ingress_link_id);
+    if !matches!(peer_type, PeerType::Adapter) {
+        error!(target: ZDP, "{}: received BindActorAddress message on {peer_type} link", ingress_link_id);
+        return Err(HandleMgmtError::MessageNotPermitted);
+    }
+
     debug!(target: ZDP, "{}: handlers.handle_bind_actor_address_request", asm.formatted_link_id(ingress_link_id.get()));
 
     node::bind_actor_address(asm, ingress_link_id, txn_id, l3_type, pkt.body());
@@ -629,14 +631,6 @@ pub async fn handle_stream_id_request(
     txn_id: TxnId,
     mut pkt: Packet,
 ) -> HandleMgmtResult {
-    // must only come from a node
-    if pkt.metadata().ingress_link_id == LOCAL_ACTOR_LINK_ID
-        || pkt.metadata().ingress_link_id == DOCK_LINK_ID
-    {
-        error!(target: ZDP, "Link {}: received StreamIdRequest message on non-node link", pkt.metadata().ingress_link_id);
-        return Err(HandleMgmtError::MessageNotPermitted);
-    }
-
     let Ok(req) = zdp::ZdpStreamIdRequest::read_from_buf(&mut pkt) else {
         return Err(HandleMgmtError::BadStructure);
     };
@@ -648,6 +642,13 @@ pub async fn handle_stream_id_request(
         error!(target: FLOW_MGMT, "coding error: stray packet from unknown source; dropping");
         return Ok(());
     };
+
+    // must come from a node
+    let peer_type = peer_type_by_id(&asm, ingress_link_id);
+    if !matches!(peer_type, PeerType::Node) {
+        error!(target: ZDP, "{}: received StreamIdRequest message on {peer_type} link", ingress_link_id);
+        return Err(HandleMgmtError::MessageNotPermitted);
+    }
 
     debug!(
         target: ZDP,
@@ -665,12 +666,6 @@ pub async fn handle_bind_egress_stream_request(
     txn_id: TxnId,
     mut pkt: Packet,
 ) -> HandleMgmtResult {
-    // must come from an dock
-    if pkt.metadata().ingress_link_id != DOCK_LINK_ID {
-        error!(target: ZDP, "{}: received BindEgressStream message on non-dock link", asm.formatted_link_id(pkt.metadata().ingress_link_id));
-        return Err(HandleMgmtError::MessageNotPermitted);
-    }
-
     let Ok(hdr) = zdp::ZdpBindEgressStreamRequestHeader::read_from_buf(&mut pkt) else {
         return Err(HandleMgmtError::BadStructure);
     };
@@ -689,6 +684,13 @@ pub async fn handle_bind_egress_stream_request(
         error!(target: FLOW_MGMT, "coding error: stray packet from unknown source; dropping");
         return Ok(());
     };
+
+    // must come from a dock
+    let peer_type = peer_type_by_id(&asm, ingress_link_id);
+    if !matches!(peer_type, PeerType::Dock) {
+        error!(target: ZDP, "{}: received BindEgressStream message on {peer_type} link", ingress_link_id);
+        return Err(HandleMgmtError::MessageNotPermitted);
+    }
 
     debug!(
         target: ZDP,
@@ -896,4 +898,10 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
     }
 
     Ok(())
+}
+
+fn peer_type_by_id(asm: &Assembly, link_id: NonZero<LinkId>) -> PeerType {
+    asm.peer_table
+        .inspect(link_id.get(), |ps| ps.peer_type())
+        .unwrap_or(PeerType::Unknown)
 }
