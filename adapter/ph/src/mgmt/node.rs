@@ -1,6 +1,6 @@
-//! Dock API.
+//! Node/dock API.
 //!
-//! These functions operate the local dock state at a high level.
+//! These functions operate the local node and dock state at a high level.
 //!
 //! They are meant to be invoked either from [super::handlers] by a node in
 //! response to a message from an adapter, or directly by a node managing
@@ -55,7 +55,7 @@ enum BindRequestState {
 
 /// Per-peer state related to the docking session or node peer link and
 /// managed by the code in this module.
-pub struct DockingSessionPeerState {
+pub struct NodePeerState {
     /// In-progress inbound bind requests from this peer.  The key is the ID
     /// of a transaction opened by the peer; the value is the state of that
     /// bind request.
@@ -68,7 +68,7 @@ pub struct DockingSessionPeerState {
     awaiting_next_hop_bind_table: DashMap<TxnHandle, (NonZero<LinkId>, TxnId)>,
 }
 
-impl DockingSessionPeerState {
+impl NodePeerState {
     pub fn new() -> Self {
         Self {
             bind_request_state: DashMap::new(),
@@ -236,10 +236,7 @@ pub fn bind_actor_address(
     // add this entry.  Nonetheless, to ensure this behavior isn't broken should
     // the task be changed to spawn with `spawn()`, we begin instantiating the
     // bind request state machine entry (i.e., take a lock on it) up here.
-    let bind_st_entry = peer_state
-        .docking_session_state
-        .bind_request_state
-        .entry(txn_id);
+    let bind_st_entry = peer_state.node_state.bind_request_state.entry(txn_id);
 
     // Launch the visa-request task while holding a lock on its corresponding entry.
     let jh = tokio::task::spawn_local(visa_request_task(
@@ -335,10 +332,7 @@ pub fn request_stream(
     // add this entry.  Nonetheless, to ensure this behavior isn't broken should
     // the task be changed to spawn with `spawn()`, we begin instantiating the
     // bind request state machine entry (i.e., take a lock on it) up here.
-    let bind_st_entry = peer_state
-        .docking_session_state
-        .bind_request_state
-        .entry(txn_id);
+    let bind_st_entry = peer_state.node_state.bind_request_state.entry(txn_id);
 
     // Launch the visa-request task while holding a lock on its corresponding entry.
     let jh = tokio::task::spawn_local(visa_push_request_task(
@@ -472,17 +466,14 @@ fn requested_visa_granted(
         // requestor went away, bail!
         return;
     };
-    ingress_peer_state
-        .docking_session_state
-        .bind_request_state
-        .insert(
-            txn_id,
-            BindRequestState::AwaitingNextHopBind {
-                visa_id,
-                egress_link_id,
-                egress_bind_txn: egress_bind_txn.clone(),
-            },
-        );
+    ingress_peer_state.node_state.bind_request_state.insert(
+        txn_id,
+        BindRequestState::AwaitingNextHopBind {
+            visa_id,
+            egress_link_id,
+            egress_bind_txn: egress_bind_txn.clone(),
+        },
+    );
     drop(ingress_peer_state);
 
     // Issue a bind request on the next-hop link (first
@@ -491,7 +482,7 @@ fn requested_visa_granted(
 
     let egress_bind_txn_id = egress_bind_txn.id();
     egress_peer_state
-        .docking_session_state
+        .node_state
         .awaiting_next_hop_bind_table
         .insert(egress_bind_txn, (ingress_link_id, txn_id));
 
@@ -551,7 +542,7 @@ fn requested_tether_granted(
     // clean API on this state machine.)
 
     let dashmap::mapref::entry::Entry::Occupied(bind_st) = ingress_peer_state
-        .docking_session_state
+        .node_state
         .bind_request_state
         .entry(txn_id)
     else {
@@ -576,7 +567,7 @@ fn requested_tether_granted(
     if let Some(egress_peer_state) = asm.peer_table.get(egress_link_id.get()) {
         assert!(
             !egress_peer_state
-                .docking_session_state
+                .node_state
                 .awaiting_next_hop_bind_table
                 .contains_key(&egress_bind_txn)
         );
@@ -686,7 +677,7 @@ fn bind_reject(asm: &Arc<Assembly>, ingress_link_id: NonZero<LinkId>, txn_id: Tx
     // Remove state from the bind-request state table.
 
     if let Some((_, bind_st)) = ingress_peer_state
-        .docking_session_state
+        .node_state
         .bind_request_state
         .remove(&txn_id)
     {
@@ -705,7 +696,7 @@ fn bind_reject(asm: &Arc<Assembly>, ingress_link_id: NonZero<LinkId>, txn_id: Tx
             if let Some(egress_peer_state) = asm.peer_table.get(egress_link_id.get()) {
                 assert!(
                     !egress_peer_state
-                        .docking_session_state
+                        .node_state
                         .awaiting_next_hop_bind_table
                         .contains_key(&egress_bind_txn)
                 );
@@ -810,7 +801,7 @@ fn resolve_next_hop_bind_originator(
         return Err(InstallTetherError::LinkClosed);
     };
     let Some((_, (ingress_link_id, ingress_txn_id))) = egress_peer_state
-        .docking_session_state
+        .node_state
         .awaiting_next_hop_bind_table
         .remove(egress_txn)
     else {
@@ -822,7 +813,7 @@ fn resolve_next_hop_bind_originator(
         // (don't bother if originator no longer exists).
 
         let Some(bind_st) = ingress_peer_state
-            .docking_session_state
+            .node_state
             .bind_request_state
             .get(&ingress_txn_id)
         else {

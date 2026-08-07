@@ -5,7 +5,7 @@
 //! this module.
 
 use super::txn_mgr::TxnId;
-use super::{adapter, dock};
+use super::{adapter, node};
 use crate::auth;
 use crate::counters;
 use crate::link_state::{LinkEvent, LinkStateError, LinkType};
@@ -74,11 +74,11 @@ impl From<adapter::InstallTetherError> for HandleMgmtError {
     }
 }
 
-impl From<dock::InstallTetherError> for HandleMgmtError {
-    fn from(err: dock::InstallTetherError) -> Self {
+impl From<node::InstallTetherError> for HandleMgmtError {
+    fn from(err: node::InstallTetherError) -> Self {
         match err {
-            dock::InstallTetherError::NoSuchTransaction => HandleMgmtError::UnknownTransaction,
-            dock::InstallTetherError::LinkClosed => HandleMgmtError::LinkClosed,
+            node::InstallTetherError::NoSuchTransaction => HandleMgmtError::UnknownTransaction,
+            node::InstallTetherError::LinkClosed => HandleMgmtError::LinkClosed,
         }
     }
 }
@@ -619,7 +619,7 @@ pub async fn handle_bind_actor_address_request(
 
     debug!(target: ZDP, "{}: handlers.handle_bind_actor_address_request", asm.formatted_link_id(ingress_link_id.get()));
 
-    dock::bind_actor_address(asm, ingress_link_id, txn_id, l3_type, pkt.body());
+    node::bind_actor_address(asm, ingress_link_id, txn_id, l3_type, pkt.body());
 
     Ok(())
 }
@@ -655,7 +655,7 @@ pub async fn handle_stream_id_request(
         ingress_link_id.get(), visa_id
     );
 
-    dock::request_stream(asm, ingress_link_id, txn_id, visa_id);
+    node::request_stream(asm, ingress_link_id, txn_id, visa_id);
 
     Ok(())
 }
@@ -781,7 +781,7 @@ pub async fn handle_stream_id_response(
         zdp::ResponseCode::Success => {
             let stream_id = pkt.metadata().ingress_stream_id;
 
-            dock::install_tether(&asm, NonZero::new(link_id).unwrap(), &txn, stream_id)?;
+            node::install_tether(&asm, NonZero::new(link_id).unwrap(), &txn, stream_id)?;
             Ok(())
         }
 
@@ -794,7 +794,7 @@ pub async fn handle_stream_id_response(
                 return Err(HandleMgmtError::BadStructure);
             };
 
-            dock::deny_tether(&asm, NonZero::new(link_id).unwrap(), &txn, msg)?;
+            node::deny_tether(&asm, NonZero::new(link_id).unwrap(), &txn, msg)?;
             Ok(())
         }
 
@@ -825,7 +825,7 @@ pub async fn handle_bind_egress_stream_response(
         zdp::ResponseCode::Success => {
             let stream_id = pkt.metadata().ingress_stream_id;
 
-            dock::install_tether(&asm, NonZero::new(link_id).unwrap(), &txn, stream_id)?;
+            node::install_tether(&asm, NonZero::new(link_id).unwrap(), &txn, stream_id)?;
             Ok(())
         }
 
@@ -838,7 +838,7 @@ pub async fn handle_bind_egress_stream_response(
                 return Err(HandleMgmtError::BadStructure);
             };
 
-            dock::deny_tether(&asm, NonZero::new(link_id).unwrap(), &txn, msg)?;
+            node::deny_tether(&asm, NonZero::new(link_id).unwrap(), &txn, msg)?;
             Ok(())
         }
 
@@ -865,7 +865,7 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
             // We are the node
             debug!(target: ZDP, "{}: unbind actor address, node -> adapter", asm.formatted_link_id(ingress_link_id.get()));
             // Remove from PFT
-            dock::unbind_stream(asm, ingress_link_id, pkt.metadata().ingress_stream_id);
+            node::unbind_stream(asm, ingress_link_id, pkt.metadata().ingress_stream_id);
         }
         (LinkType::AdapterToNode, _) | (LinkType::Internal, DOCK_LINK_ID) => {
             // We are the adapter
