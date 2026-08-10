@@ -2,10 +2,8 @@
 
 use crate::rsa_sign::{load_rsa_key, sign_rsa_key};
 use aws_lc_rs::signature::RsaKeyPair;
-use rand::{TryRngCore, rngs::OsRng};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zpr::vsapi_types::{ChallengeAlg, SelfSignedBlob};
 
@@ -19,7 +17,7 @@ pub fn build_self_signed_blob(
     private_key: &RsaKeyPair,
 ) -> Result<SelfSignedBlob, Box<dyn std::error::Error>> {
     let mut challenge = vec![0u8; 32];
-    OsRng.try_fill_bytes(&mut challenge)?;
+    aws_lc_rs::rand::fill(&mut challenge)?;
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -45,7 +43,7 @@ pub fn build_self_signed_blob(
 /// Load an RSA private key from a PEM file.
 pub fn load_private_key(
     keyfile: &Path,
-) -> Result<Arc<RsaKeyPair>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<RsaKeyPair, Box<dyn std::error::Error + Send + Sync>> {
     let key_data = fs::read(keyfile)?;
     Ok(load_rsa_key(&key_data)?)
 }
