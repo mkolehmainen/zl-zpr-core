@@ -199,7 +199,6 @@ pub async fn handle_terminate_link_or_docking_session(
 
 /// handle a Hello Request (RFC 6.5 § 6.3.4)
 /// Reads the hello, fire a ReceivedHelloRequest event, and then sends a response.
-///
 pub async fn handle_hello_request(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
     let ingress_link_id = pkt.metadata().ingress_link_id;
     if asm.ph_mode != PhMode::Node {
@@ -216,20 +215,7 @@ pub async fn handle_hello_request(asm: &Arc<Assembly>, mut pkt: Packet) -> Handl
         }
     };
 
-    // We just emit the TLV stuff to log but only use window size.
-    for (tlv_type, tlv_value) in &tlv_data {
-        match *tlv_type {
-            tlv::DataType::WINDOW_SIZE => {
-                process_window_size_tlv(&asm, ingress_link_id, "HelloRequest", tlv_value)?;
-            }
-            _ => {
-                info!(
-                    "{}: HelloRequest includes ignored TLV type: {tlv_type} => {tlv_value:?}",
-                    asm.formatted_link_id(ingress_link_id)
-                );
-            }
-        }
-    }
+    process_hello_tlvs(&asm, ingress_link_id, "HelloRequest", tlv_data)?;
 
     asm.process_link_state_event(ingress_link_id, LinkEvent::ReceivedHelloRequest)?;
 
@@ -255,6 +241,19 @@ pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Hand
         }
     };
 
+    process_hello_tlvs(&asm, link_id, "HelloResponse", tlv_data)?;
+
+    asm.process_link_state_event(link_id, LinkEvent::ReceivedHelloResponse(status))?;
+
+    Ok(())
+}
+
+fn process_hello_tlvs(
+    asm: &Arc<Assembly>,
+    link_id: LinkId,
+    message_name: &str,
+    tlv_data: tlv::TlvMap) -> Result<(), HandleMgmtError> {
+
     // ASA = Authentication Service Address (will have a port too)
     let mut asa_addresses = Vec::<SocketAddr>::new();
     let mut aaa_address: Option<IpAddress> = None;
@@ -262,23 +261,23 @@ pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Hand
     for (tlv_type, tlv_value) in &tlv_data {
         match tlv_type {
             &tlv::DataType::VERSION => {
-                info!(target: ZDP, "{}: HelloResponse - peer version is : {}", asm.formatted_link_id(link_id), tlv_value[0]);
+                info!(target: ZDP, "{}: {message_name} - peer version is : {}", asm.formatted_link_id(link_id), tlv_value[0]);
             }
             &tlv::DataType::WINDOW_SIZE => {
-                process_window_size_tlv(&asm, link_id, "HelloResponse", tlv_value)?;
+                process_window_size_tlv(&asm, link_id, message_name, tlv_value)?;
             }
             &tlv::DataType::POLICY_ID => {
-                info!(target: ZDP, "{}: HelloResponse - peer policy ID is : {}", asm.formatted_link_id(link_id), tlv_value[0]);
+                info!(target: ZDP, "{}: {message_name} - peer policy ID is : {}", asm.formatted_link_id(link_id), tlv_value[0]);
             }
             &tlv::DataType::ASA => {
                 for asa_entry in tlv_value {
                     match asa_entry {
                         tlv::TlvValue::SocketAddr(sa) => {
-                            info!(target: ZDP, "{}: HelloResponse includes ASA address:{sa}", asm.formatted_link_id(link_id));
+                            info!(target: ZDP, "{}: {message_name} includes ASA address:{sa}", asm.formatted_link_id(link_id));
                             asa_addresses.push(sa.clone());
                         }
                         _ => {
-                            warn!(target: ZDP, "{}: HelloResponse ASA value type is wrong: {asa_entry:?}", asm.formatted_link_id(link_id));
+                            warn!(target: ZDP, "{}: {message_name} ASA value type is wrong: {asa_entry:?}", asm.formatted_link_id(link_id));
                             return Err(HandleMgmtError::BadStructure);
                         }
                     }
@@ -287,48 +286,44 @@ pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Hand
             &tlv::DataType::AAA => {
                 for aaa_entry in tlv_value {
                     if aaa_address.is_some() {
-                        warn!(target: ZDP, "{}: HelloResponse includes multiple AAA addresses", asm.formatted_link_id(link_id));
+                        warn!(target: ZDP, "{}: {message_name} includes multiple AAA addresses", asm.formatted_link_id(link_id));
                         return Err(HandleMgmtError::BadStructure);
                     }
                     match aaa_entry {
                         tlv::TlvValue::Ipv4Addr(ipa) => {
-                            info!(target: ZDP, "{}: HelloResponse includes AAA address:{ipa}", asm.formatted_link_id(link_id));
+                            info!(target: ZDP, "{}: {message_name} includes AAA address:{ipa}", asm.formatted_link_id(link_id));
                             aaa_address = Some(IpAddress::new_from_std_v4(ipa));
                         }
                         tlv::TlvValue::Ipv6Addr(ipa) => {
-                            info!(target: ZDP, "{}: HelloResponse includes AAA address:{ipa}", asm.formatted_link_id(link_id));
+                            info!(target: ZDP, "{}: {message_name} includes AAA address:{ipa}", asm.formatted_link_id(link_id));
                             aaa_address = Some(IpAddress::new_from_std_v6(ipa));
                         }
                         _ => {
-                            warn!(target: ZDP, "{}: HelloResponse AAA value type is wrong: {aaa_entry:?}", asm.formatted_link_id(link_id));
+                            warn!(target: ZDP, "{}: {message_name} AAA value type is wrong: {aaa_entry:?}", asm.formatted_link_id(link_id));
                             return Err(HandleMgmtError::BadStructure);
                         }
                     }
                 }
             }
             _ => {
-                info!(target: ZDP, "{}: HelloResponse includes ignored TLV type: {tlv_type}, continuing", asm.formatted_link_id(link_id));
+                info!(target: ZDP, "{}: {message_name} includes ignored TLV type: {tlv_type}, continuing", asm.formatted_link_id(link_id));
             }
         }
     }
 
-    if aaa_address.is_none() {
-        // Pretty sure only happens if node has no AAA pool from VS yet.
-        // Not an issue unless this adapter needs to talk to an authentication service.
-        warn!(target: ZDP, "{}: HelloResponse did not include AAA", asm.formatted_link_id(link_id));
+    if !asa_addresses.is_empty() {
+        asm.process_link_state_event(
+            link_id,
+            LinkEvent::ReceivedASA(asa_addresses),
+        )?;
     }
 
-    let maybe_asa_addrs = if asa_addresses.is_empty() {
-        warn!(target: ZDP, "{}: HelloResponse did not include ASA", asm.formatted_link_id(link_id));
-        None
-    } else {
-        Some(asa_addresses)
-    };
-
-    asm.process_link_state_event(
-        link_id,
-        LinkEvent::ReceivedHelloResponse(status, aaa_address, maybe_asa_addrs),
-    )?;
+    if let Some(aaa_address) = aaa_address {
+        asm.process_link_state_event(
+            link_id,
+            LinkEvent::AssignedAAA(aaa_address),
+        )?;
+    }
 
     Ok(())
 }

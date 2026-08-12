@@ -15,6 +15,9 @@ pub enum TlvError {
     BadStructure,
 }
 
+/// Result of parsing function
+pub type TlvMap = HashMap<TlvType, Vec<TlvValue>>;
+
 /// A single byte that identifies the type of TLV data.
 type TlvType = u8;
 
@@ -256,7 +259,7 @@ fn put_socketaddr(
 /// Null entries (type 0) are skipped over and not returned.
 pub fn parse_from_buf(
     buf: &mut dyn bytes::Buf,
-) -> Result<HashMap<TlvType, Vec<TlvValue>>, TlvError> {
+) -> Result<TlvMap, TlvError> {
     let mut tlv_map = HashMap::new();
 
     // The null type just uses 1 byte.

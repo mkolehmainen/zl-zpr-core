@@ -140,7 +140,8 @@ pub enum LinkEvent {
     KeyingDone,
     ReceivedHelloRequest,
     AssignedAAA(IpAddress), // Assigned AAA address for this link
-    ReceivedHelloResponse(ResponseCode, Option<IpAddress>, Option<Vec<SocketAddr>>), // (response code, AAA address, ASA addresses)
+    ReceivedASA(Vec<SocketAddr>),
+    ReceivedHelloResponse(ResponseCode),
 
     ReceivedInitAuth((bool, Option<auth::ZdpInitAuthenticationPayload>)), // (bootstrap_flag, challenge)
     ReceivedInitAuthAck,
@@ -172,17 +173,14 @@ pub enum LinkStateError {
     InvalidOperation(String),
     #[error("Link {0} does not exist in peer table")]
     NotFound(LinkId),
-    #[error("This operation is not supported yet")]
-    OperationNotSupportedYet,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum LinkType {
     Internal,
     AdapterToNode,
-    #[allow(dead_code)]
-    NodeToNode, // Currently unsupported
     NodeToAdapter,
+    NodeToNode,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -462,9 +460,8 @@ impl LinkStateWrapper {
             LinkEvent::KeyingDone => self.process_keying_done(asm),
             LinkEvent::ReceivedHelloRequest => self.process_hello_request(asm),
             LinkEvent::AssignedAAA(addr) => self.process_assigned_aaa(asm, addr),
-            LinkEvent::ReceivedHelloResponse(code, aaa_addr, maybe_asa_addrs) => {
-                self.process_hello_response(asm, code, aaa_addr, maybe_asa_addrs)
-            }
+            LinkEvent::ReceivedASA(asa_addrs) => self.update_asa(asm, asa_addrs),
+            LinkEvent::ReceivedHelloResponse(code) => self.process_hello_response(asm, code),
 
             LinkEvent::ReceivedAcquireZprAddressRequest(addrs, blob) => {
                 self.process_acquire_zpr_address_request(asm, addrs, blob)
@@ -534,9 +531,16 @@ impl LinkStateWrapper {
                 Ok(())
             }
             LinkType::NodeToNode => {
-                error!(target: LINK_STATE, "Error: Node to node not supported yet");
-                locked_fsm.set_state(LinkState::Error);
-                Err(LinkStateError::OperationNotSupportedYet)
+                km_multiplexor::add_adapter_link(
+                    asm,
+                    link_id,
+                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 3, 4),
+                    asm.self_noise_keypair.clone().unwrap(),
+                    asm.peer_noise_keypair.clone().unwrap().public,
+                    asm.certx.clone().unwrap(),
+                )
+                .unwrap();
+                Ok(())
             }
             LinkType::NodeToAdapter => {
                 km_multiplexor::add_node_link(
@@ -647,7 +651,8 @@ impl LinkStateWrapper {
         locked_fsm.set_state(LinkState::Helloing);
 
         // IF this is an adapter, it's expected to issue the hello
-        if self.link_type == LinkType::AdapterToNode {
+        // FIXME
+        if self.link_type == LinkType::AdapterToNode || self.link_type == LinkType::NodeToNode {
             let pub_key = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
             mgmt::requests::send_hello_request(asm, self.id, pub_key).enqueue();
             self.set_timeout(asm, &mut locked_fsm, config::LINK_HELLO_TIMEOUT);
@@ -754,6 +759,21 @@ impl LinkStateWrapper {
         Ok(())
     }
 
+    /// This is called when we receive an ASA update.
+    /// Does not generate an error.
+    fn update_asa(
+        &self,
+        _asm: &Arc<Assembly>,
+        asa_addrs: Vec<SocketAddr>,
+    ) -> Result<(), LinkStateError> {
+        // Just keep track of this for cleanup later.
+        let link_id = self.id;
+        debug!(target: LINK_STATE, "Link {link_id} updated ASA addresses with {} entries", asa_addrs.len());
+        let mut link_data = self.locked_data.lock().unwrap();
+        link_data.asa_addresses = Some(asa_addrs.clone());
+        Ok(())
+    }
+
     /// This is kicked off by [LinkEvent::ReceivedHelloResponse].
     /// That event may be generated when we have sent hello
     /// message ourselves [LinkStateWrapper::maybe_send_hello]
@@ -765,8 +785,6 @@ impl LinkStateWrapper {
         &self,
         asm: &Arc<Assembly>,
         code: ResponseCode,
-        maybe_aaa_addr: Option<IpAddress>,
-        maybe_asa_addrs: Option<Vec<SocketAddr>>,
     ) -> Result<(), LinkStateError> {
         if code == ResponseCode::Other {
             // Received an error response.
@@ -778,15 +796,6 @@ impl LinkStateWrapper {
 
         match (self.link_type, locked_fsm.state) {
             (LinkType::AdapterToNode, LinkState::Helloing) => {
-                let mut link_data = self.locked_data.lock().unwrap();
-                link_data.asa_addresses = maybe_asa_addrs.clone();
-
-                // On the node side, the aaa_address link_data field is used to keep track of the
-                // AAA we handed out to the peer.  On the client-adapter side, we hold the AAA
-                // we got from the node in there.
-                link_data.aaa_address = maybe_aaa_addr;
-                drop(link_data);
-
                 // The adapter is waiting for an init-auth-request.
                 locked_fsm.set_state(LinkState::WaitForInitAuth);
                 debug!(
@@ -797,9 +806,6 @@ impl LinkStateWrapper {
                 Ok(())
             }
             (LinkType::NodeToNode, LinkState::Helloing) => {
-                let mut link_data = self.locked_data.lock().unwrap();
-                link_data.asa_addresses = maybe_asa_addrs.clone();
-                drop(link_data);
                 locked_fsm.set_state(LinkState::Active);
                 debug!(target: LINK_STATE, "{} finished helloing.  Becoming active", asm.formatted_link_id(link_id));
                 Ok(())

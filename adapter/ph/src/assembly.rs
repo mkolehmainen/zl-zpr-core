@@ -332,16 +332,12 @@ impl Assembly {
     /// Add a tether to the peer table
     pub fn start_tether(
         self: &Arc<Self>,
-        adapter_addr: &SubstrateAddr,
+        peer_addr: &SubstrateAddr,
         interface_addr: &ScopedIpAddr,
         link_type: LinkType,
     ) -> Result<NonZero<LinkId>, PeerInsertError> {
-        assert!(matches!(
-            link_type,
-            LinkType::NodeToAdapter | LinkType::AdapterToNode
-        ));
-        debug!(target: PEER_MGMT, "Starting tether with {adapter_addr} connected to {interface_addr}");
-        let peer_id = self.add_peer(link_type, adapter_addr, interface_addr)?;
+        debug!(target: PEER_MGMT, "Starting link with {peer_addr} connected to {interface_addr}");
+        let peer_id = self.add_peer(link_type, peer_addr, interface_addr)?;
 
         let Some(peer) = self.peer_table.get(peer_id.get()) else {
             // Peer is gone already
@@ -358,7 +354,7 @@ impl Assembly {
                 .expect("This shouldn't error!");
             return Err(PeerInsertError::FailedToStart(e.to_string()));
         } else {
-            info!(target: PEER_MGMT, "Successfully started tether with {adapter_addr}.  Assigned ID {}", self.formatted_link_id(peer_id.get()));
+            info!(target: PEER_MGMT, "Successfully started link with {peer_addr}.  Assigned ID {}", self.formatted_link_id(peer_id.get()));
         }
 
         return Ok(peer_id);

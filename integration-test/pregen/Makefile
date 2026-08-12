@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2
+OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 v6-2node-3actor-ping.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
@@ -29,6 +29,9 @@ v6-1node-2actor-ping.bin2: v6-1node-2actor-ping.zplc v4-1node-2actor-ping.zpl
 v6-1node-3actor-ping.bin2: v6-1node-3actor-ping.zplc v4-1node-3actor-ping.zpl
 	$(ZPLC) -c v6-1node-3actor-ping.zplc -k $(KEY) -f v2 -o $@ v4-1node-3actor-ping.zpl
 
+
+v6-2node-3actor-ping.bin2: v6-2node-3actor-ping.zplc v4-2node-3actor-ping.zpl
+	$(ZPLC) -c v6-2node-3actor-ping.zplc -k $(KEY) -f v2 -o $@ v4-2node-3actor-ping.zpl
 
 %.bin2: %.zpl %.zplc
 	$(ZPLC) -k $(KEY) $<

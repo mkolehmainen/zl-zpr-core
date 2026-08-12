@@ -1,0 +1,63 @@
+# -*- mode: toml -*-
+
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"node0.zpr" = "fd5a:5052::2"
+"node1.zpr" = "fd5a:5052::3"
+
+[nodes.node0]
+provider = [ [ "device.zpr.adapter.cn", "node0" ] ]
+zpr_address = "node0.zpr"
+
+[nodes.node0.substrate_addrs]
+i0 = "10.2.0.1:5000"
+
+[nodes.node1]
+provider = [ [ "device.zpr.adapter.cn", "node1" ] ]
+zpr_address = "node1.zpr"
+
+[nodes.node1.substrate_addrs]
+i0 = "10.2.0.2:5000"
+
+[links.n0n1]
+attributes = [["zpr.cost", "1"], ["location", "us"]]
+peers = [{node="node0"}, {node="node1"}]
+
+[trusted_services.default]
+cert_path = "ca-cert.pem"
+
+[visa_service]
+dock_node = "node0"
+
+[bootstrap]
+"node0" = "node0-rsa-pubkey.pem"
+"node1" = "node1-rsa-pubkey.pem"
+"vs" = "actorvs.pem"
+"adapter1" = "actor1.pem"
+"adapter2" = "actor2.pem"
+"adapter3" = "actor3.pem"
+
+[protocols.ping]
+l4protocol = "iana.ICMP6"
+icmp_type = "request-response"
+icmp_codes = [ 128, 129 ]
+
+[services.A1Svc]
+protocol = "ping"
+
+[services.A2Svc]
+protocol = "ping"
+
+[services.A3Svc]
+protocol = "ping"
+
+[services.PingableVs]
+protocol = "ping"
+
+[services.PingableNode0]
+protocol = "ping"
+
+[services.PingableNode1]
+protocol = "ping"

@@ -1,10 +1,13 @@
 use crate::address_pool::AddressPool;
+use crate::link_state::LinkType;
 use crate::prelude::*;
 use crate::{visa_mgmt, visa_table};
 
 use libnode::vss::{ConfigureResponse, ListProcessingResponse, SetTopologyResponse, VSSMessage};
+use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use zpr::vsapi_types::{ApiResponseError, ErrorCode, Link, Param, ParamValue, VisaOp, pname};
+use zpr_utils::net_defs::SocketAddrExt;
 
 pub async fn launch(asm: Arc<Assembly>, mut queue: mpsc::Receiver<VSSMessage>) {
     while let Some(msg) = queue.recv().await {
@@ -143,10 +146,25 @@ fn process_configuration(asm: &Arc<Assembly>, params: Vec<Param>) -> ConfigureRe
 }
 
 /// Placeholder. Links not yet acted on.
-fn process_topology(_asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyResponse {
-    info!(target: VSS_RPC, "received topology update with {} links (not yet implemented)", links.len());
+fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyResponse {
+    let self_addr = &asm.config.get().self_addr.scoped_ip();
+
+    info!(target: VSS_RPC, "Received topology update with {} links", links.len());
     for (i, link) in links.iter().enumerate() {
         info!(target: VSS_RPC, "[link {i}]-> {:?}", link.peer);
+        let peer_addr = SocketAddr::from(link.peer.clone());
+        match asm
+            .peer_table
+            .lookup_peer(&peer_addr, &self_addr) {
+            Some(link_id) => {
+                info!(target:VSS_RPC, "Link already exists as {link_id}");
+            }
+            None => {
+                if asm.start_tether(&peer_addr, &self_addr, LinkType::NodeToNode).ok().is_none() {
+                    error!(target:VSS_RPC, "Failed to start link with {:?}", link.peer);
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -39,7 +39,8 @@ function wait_for() {
 }
 
 function create_network() {
-  sudo ip netns add zpr-node
+  sudo ip netns add zpr-node0
+  sudo ip netns add zpr-node1
   sudo ip netns add zpr-vs
   sudo ip netns add zpr-a
   sudo ip netns add zpr-b
@@ -47,7 +48,8 @@ function create_network() {
 
   # loopback
 
-  sudo ip -n zpr-node link set lo up
+  sudo ip -n zpr-node0 link set lo up
+  sudo ip -n zpr-node1 link set lo up
   sudo ip -n zpr-vs link set lo up
   sudo ip -n zpr-a link set lo up
   sudo ip -n zpr-b link set lo up
@@ -59,27 +61,31 @@ function create_network() {
   # a name matching that of a veth device in the root ns, but not the other
   # way around.  And weirdly, it will happily _autogenerate_ such names.
   # So we rely on that for now rather than explicitly specifying the names.
-  sudo ip link add netns zpr-vs type veth peer veth-zpr-vs netns zpr-node  # zpr-a:veth0 / zpr-node:veth-zpr-vs
-  sudo ip link add netns zpr-a type veth peer veth-zpr-a netns zpr-node  # zpr-a:veth0 / zpr-node:veth-zpr-a
-  sudo ip link add netns zpr-b type veth peer veth-zpr-b netns zpr-node  # zpr-b:veth0 / zpr-node:veth-zpr-b
-  sudo ip link add netns zpr-c type veth peer veth-zpr-c netns zpr-node  # zpr-c:veth0 / zpr-node:veth-zpr-c
+  sudo ip link add netns zpr-vs type veth peer veth-zpr-vs netns zpr-node0  # zpr-a:veth0 / zpr-node0:veth-zpr-vs
+  sudo ip link add netns zpr-node1 type veth peer veth-zpr-node1 netns zpr-node0  # zpr-node1:veth0 / zpr-node0:veth-zpr-node0
+  sudo ip link add netns zpr-a type veth peer veth-zpr-a netns zpr-node0  # zpr-a:veth0 / zpr-node0:veth-zpr-a
+  sudo ip link add netns zpr-b type veth peer veth-zpr-b netns zpr-node1  # zpr-b:veth0 / zpr-node0:veth-zpr-b
+  sudo ip link add netns zpr-c type veth peer veth-zpr-c netns zpr-node1  # zpr-c:veth0 / zpr-node0:veth-zpr-c
 
-  sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_VS" peer "$VS_SUBSTRATE_ADDR" dev veth-zpr-vs
-  sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_A" peer "$A_SUBSTRATE_ADDR" dev veth-zpr-a
-  sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_B" peer "$B_SUBSTRATE_ADDR" dev veth-zpr-b
-  sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_C/24" dev veth-zpr-c
-  if [ -n "${NODE_SUBSTRATE_ADDR_C_ALT-}" ]
-  then sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_C_ALT/24" dev veth-zpr-c  # Used for testing routing.
+  sudo ip -n zpr-node0 addr add "$NODE0_SUBSTRATE_ADDR_VS" peer "$VS_SUBSTRATE_ADDR" dev veth-zpr-vs
+  sudo ip -n zpr-node0 addr add "$NODE0_SUBSTRATE_ADDR_A" peer "$A_SUBSTRATE_ADDR" dev veth-zpr-a
+  # FIXME
+  sudo ip -n zpr-node1 addr add "$NODE1_SUBSTRATE_ADDR_B" peer "$B_SUBSTRATE_ADDR" dev veth-zpr-b
+  sudo ip -n zpr-node1 addr add "$NODE1_SUBSTRATE_ADDR_C/24" dev veth-zpr-c
+  if [ -n "${NODE1_SUBSTRATE_ADDR_C_ALT-}" ]
+  then sudo ip -n zpr-node1 addr add "$NODE1_SUBSTRATE_ADDR_C_ALT/24" dev veth-zpr-c  # Used for testing routing.
   fi
-  sudo ip -n zpr-vs addr add "$VS_SUBSTRATE_ADDR" peer "$NODE_SUBSTRATE_ADDR_VS" dev veth0
-  sudo ip -n zpr-a addr add "$A_SUBSTRATE_ADDR" peer "$NODE_SUBSTRATE_ADDR_A" dev veth0
-  sudo ip -n zpr-b addr add "$B_SUBSTRATE_ADDR" peer "$NODE_SUBSTRATE_ADDR_B" dev veth0
+  sudo ip -n zpr-vs addr add "$VS_SUBSTRATE_ADDR" peer "$NODE0_SUBSTRATE_ADDR_VS" dev veth0
+  sudo ip -n zpr-vs addr add "$NODE0_SUBSTRATE_ADDR_NODE" peer "$NODE1_SUBSTRATE_ADDR_NODE" dev veth0
+  sudo ip -n zpr-a addr add "$A_SUBSTRATE_ADDR" peer "$NODE0_SUBSTRATE_ADDR_A" dev veth0
+  sudo ip -n zpr-b addr add "$B_SUBSTRATE_ADDR" peer "$NODE1_SUBSTRATE_ADDR_B" dev veth0
   sudo ip -n zpr-c addr add "$C_SUBSTRATE_ADDR/24" dev veth0
 
-  sudo ip -n zpr-node link set veth-zpr-vs up
-  sudo ip -n zpr-node link set veth-zpr-a up
-  sudo ip -n zpr-node link set veth-zpr-b up
-  sudo ip -n zpr-node link set veth-zpr-c up
+  sudo ip -n zpr-node0 link set veth-zpr-vs up
+  sudo ip -n zpr-node0 link set veth-zpr-a up
+  sudo ip -n zpr-node1 link set veth-zpr-b up
+  sudo ip -n zpr-node1 link set veth-zpr-c up
+  sudo ip -n zpr-node0 link set veth-zpr-node1 up
   sudo ip -n zpr-vs link set veth0 up
   sudo ip -n zpr-a link set veth0 up
   sudo ip -n zpr-b link set veth0 up
@@ -87,13 +93,15 @@ function create_network() {
 
   # TUN devices
 
-  sudo ip -n zpr-node tuntap add name tun0 mode tun user "$ZPR_USER" multi_queue
+  sudo ip -n zpr-node0 tuntap add name tun0 mode tun user "$ZPR_USER" multi_queue
+  sudo ip -n zpr-node1 tuntap add name tun0 mode tun user "$ZPR_USER" multi_queue
   sudo ip -n zpr-vs tuntap add name tun0 mode tun user "$ZPR_USER" multi_queue
   sudo ip -n zpr-a tuntap add name tun0 mode tun user "$ZPR_USER" multi_queue
   sudo ip -n zpr-b tuntap add name tun0 mode tun user "$ZPR_USER" multi_queue
   sudo ip -n zpr-c tuntap add name tun0 mode tun user "$ZPR_USER" multi_queue
 
-  sudo ip -n zpr-node link set tun0 up
+  sudo ip -n zpr-node0 link set tun0 up
+  sudo ip -n zpr-node1 link set tun0 up
   sudo ip -n zpr-vs link set tun0 up
   sudo ip -n zpr-a link set tun0 up
   sudo ip -n zpr-b link set tun0 up
@@ -102,8 +110,9 @@ function create_network() {
   # Kernel bug: kernels older than 6.10 don't set peer route correctly
   # when interface is down.  I think <https://github.com/torvalds/linux/commit/d0098e4c6b83e502cc1cd96d67ca86bc79a6c559>
   # fixes this issue.  For now, add the addresses after we bring the link up.
-  sudo ip -n zpr-node addr add "$NODE_ZPR_ADDR" peer "$VS_ZPR_ADDR" dev tun0
-  sudo ip -n zpr-vs addr add "$VS_ZPR_ADDR" peer "$NODE_ZPR_ADDR" dev tun0
+  sudo ip -n zpr-node0 addr add "$NODE0_ZPR_ADDR" peer "$VS_ZPR_ADDR" dev tun0
+  sudo ip -n zpr-node1 addr add "$NODE1_ZPR_ADDR" peer "$VS_ZPR_ADDR" dev tun0
+  sudo ip -n zpr-vs addr add "$VS_ZPR_ADDR" peer "$NODE0_ZPR_ADDR" dev tun0
   sudo ip -n zpr-a addr add "$A_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
   sudo ip -n zpr-b addr add "$B_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
   sudo ip -n zpr-c addr add "$C_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
@@ -113,12 +122,13 @@ function configure_netem() {
   echo "Configuring netem $@" > /dev/stderr
   for NIC in vs a b c
   do
-    sudo tc -n zpr-node qdisc add dev veth-zpr-"$NIC" root netem "$@"
+    sudo tc -n zpr-node0 qdisc add dev veth-zpr-"$NIC" root netem "$@"
   done
 }
 
 function destroy_network() {
-  sudo ip netns delete zpr-node 2> /dev/null || true
+  sudo ip netns delete zpr-node0 2> /dev/null || true
+  sudo ip netns delete zpr-node1 2> /dev/null || true
   sudo ip netns delete zpr-vs 2> /dev/null || true
   sudo ip netns delete zpr-a 2> /dev/null || true
   sudo ip netns delete zpr-b 2> /dev/null || true
@@ -168,8 +178,8 @@ function check_vs_valkey_port() {
 function ping_test() {
   RESULT=0
 
-  sudo ip netns exec zpr-node ping -q -c 5 -w 5 "$VS_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-  sudo ip netns exec zpr-vs ping -q -c 5 -w 5 "$NODE_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
+  sudo ip netns exec zpr-node0 ping -q -c 5 -w 5 "$VS_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
+  sudo ip netns exec zpr-vs ping -q -c 5 -w 5 "$NODE0_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
   sudo ip netns exec zpr-a ping -q -c 5 -w 5 "$B_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
   sudo ip netns exec zpr-b ping -q -c 5 -w 5 "$A_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
 
