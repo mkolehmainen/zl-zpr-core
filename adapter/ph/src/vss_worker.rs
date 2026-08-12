@@ -153,14 +153,16 @@ fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyRespons
     for (i, link) in links.iter().enumerate() {
         info!(target: VSS_RPC, "[link {i}]-> {:?}", link.peer);
         let peer_addr = SocketAddr::from(link.peer.clone());
-        match asm
-            .peer_table
-            .lookup_peer(&peer_addr, &self_addr) {
+        match asm.peer_table.lookup_peer(&peer_addr, &self_addr) {
             Some(link_id) => {
                 info!(target:VSS_RPC, "Link already exists as {link_id}");
             }
             None => {
-                if asm.start_tether(&peer_addr, &self_addr, LinkType::NodeToNode).ok().is_none() {
+                if asm
+                    .start_tether(&peer_addr, &self_addr, LinkType::NodeToNode)
+                    .ok()
+                    .is_none()
+                {
                     error!(target:VSS_RPC, "Failed to start link with {:?}", link.peer);
                 }
             }

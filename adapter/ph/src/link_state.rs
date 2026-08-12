@@ -531,12 +531,12 @@ impl LinkStateWrapper {
                 Ok(())
             }
             LinkType::NodeToNode => {
-                km_multiplexor::add_adapter_link(
+                km_multiplexor::add_node_node_link(
                     asm,
+                    true, // FIXME: true to initiate
                     link_id,
                     ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 3, 4),
                     asm.self_noise_keypair.clone().unwrap(),
-                    asm.peer_noise_keypair.clone().unwrap().public,
                     asm.certx.clone().unwrap(),
                 )
                 .unwrap();

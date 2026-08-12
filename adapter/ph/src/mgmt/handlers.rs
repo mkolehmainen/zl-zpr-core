@@ -252,8 +252,8 @@ fn process_hello_tlvs(
     asm: &Arc<Assembly>,
     link_id: LinkId,
     message_name: &str,
-    tlv_data: tlv::TlvMap) -> Result<(), HandleMgmtError> {
-
+    tlv_data: tlv::TlvMap,
+) -> Result<(), HandleMgmtError> {
     // ASA = Authentication Service Address (will have a port too)
     let mut asa_addresses = Vec::<SocketAddr>::new();
     let mut aaa_address: Option<IpAddress> = None;
@@ -312,17 +312,11 @@ fn process_hello_tlvs(
     }
 
     if !asa_addresses.is_empty() {
-        asm.process_link_state_event(
-            link_id,
-            LinkEvent::ReceivedASA(asa_addresses),
-        )?;
+        asm.process_link_state_event(link_id, LinkEvent::ReceivedASA(asa_addresses))?;
     }
 
     if let Some(aaa_address) = aaa_address {
-        asm.process_link_state_event(
-            link_id,
-            LinkEvent::AssignedAAA(aaa_address),
-        )?;
+        asm.process_link_state_event(link_id, LinkEvent::AssignedAAA(aaa_address))?;
     }
 
     Ok(())

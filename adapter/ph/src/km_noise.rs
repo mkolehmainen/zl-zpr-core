@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 static PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+static PATTERN_NO_VALIDATE: &str = "Noise_IX_25519_ChaChaPoly_BLAKE2s";
 
 const MSG_BUF_SIZE: usize = 4096;
 
@@ -70,6 +71,9 @@ pub struct KmNoise {
     settings: KmSettings,
     state: KmSMState,
     initiate: bool,
+    /// should the initiator validate the public key?
+    /// must be the same value for BOTH initiator and responder as this determines the Noise pattern in use
+    validate: bool,
     peer_pub_key: Option<Vec<u8>>, // required if initiator
     local_keypair: NoiseKeypair,
     hs_sent_t: Option<Instant>,
@@ -177,13 +181,14 @@ impl KmNoise {
     /// - `certx` is the certificate exchange creator/verifier.
     pub fn new(
         initiate: bool,
+        validate: bool,
         peer_pub_key: Option<Vec<u8>>,
         local_keypair: Option<NoiseKeypair>,
         zpis: ZPIPair,
         certx: KmCertExchange,
     ) -> Result<Self, KmError> {
-        if initiate && peer_pub_key.is_none() {
-            error!(target: KEY_MGMT, "noise: peer public key required for initiator");
+        if initiate && validate && peer_pub_key.is_none() {
+            error!(target: KEY_MGMT, "noise: peer public key required for validating initiator");
             return Err(KmError::ConfigurationError);
         }
 
@@ -204,6 +209,7 @@ impl KmNoise {
             settings,
             state: KmSMState::Configuring,
             initiate,
+            validate,
             peer_pub_key,
             local_keypair: kp,
             hs_sent_t: None,
@@ -402,7 +408,13 @@ impl KeyManagerStateMachine for KmNoise {
 
     fn reset(&mut self) -> Result<Option<Bytes>, KmError> {
         self.state = KmSMState::Configuring;
-        let np: snow::params::NoiseParams = match PATTERN.parse() {
+        let pattern;
+        if self.validate {
+            pattern = PATTERN;
+        } else {
+            pattern = PATTERN_NO_VALIDATE;
+        }
+        let np: snow::params::NoiseParams = match pattern.parse() {
             Ok(p) => p,
             Err(e) => {
                 error!(target: KEY_MGMT, "noise: error parsing pattern: {e:?}");
@@ -413,14 +425,14 @@ impl KeyManagerStateMachine for KmNoise {
         rand_bytes(&mut self.recv_hmac_key).unwrap(); // generate an HMAC key
         self.send_hmac_key = None;
         if self.initiate {
-            let rpk = self.peer_pub_key.as_ref().unwrap();
-            let mut initiator = match snow::Builder::new(np)
+            let mut builder = snow::Builder::new(np)
                 .local_private_key(self.local_keypair.private.as_ref())
-                .unwrap()
-                .remote_public_key(rpk)
-                .unwrap()
-                .build_initiator()
-            {
+                .unwrap();
+            if self.validate {
+                let rpk = self.peer_pub_key.as_ref().unwrap();
+                builder = builder.remote_public_key(rpk).unwrap();
+            }
+            let mut initiator = match builder.build_initiator() {
                 Ok(i) => i,
                 Err(e) => {
                     error!(target: KEY_MGMT, "noise: error building initiator: {e:?}");
@@ -626,6 +638,7 @@ mod test {
 
         let mut initiator = KmNoise::new(
             true,
+            true,
             Some(node_kp.public.to_vec()),
             Some(initiator_keypair),
             ZPIPair::new(1, 2),
@@ -639,6 +652,7 @@ mod test {
 
         let mut responder = KmNoise::new(
             false,
+            true,
             None,
             Some(node_kp),
             ZPIPair::new(3, 4),
@@ -815,6 +829,7 @@ mod test {
 
         let mut initiator = KmNoise::new(
             true,
+            true,
             Some(node_kp.public.to_vec()),
             Some(adapter_kp),
             ZPIPair::new(1, 2),
@@ -825,6 +840,7 @@ mod test {
 
         let mut responder = KmNoise::new(
             false,
+            true,
             None,
             Some(node_kp),
             ZPIPair::new(3, 4),
@@ -937,6 +953,7 @@ mod test {
 
         let initiator = KmNoise::new(
             true,
+            true,
             Some(node_kp.public.to_vec()),
             Some(adapter_kp),
             ZPIPair::new(1, 2),
@@ -946,6 +963,7 @@ mod test {
 
         let responder = KmNoise::new(
             false,
+            true,
             None,
             Some(node_kp),
             ZPIPair::new(3, 4),

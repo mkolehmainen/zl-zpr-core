@@ -210,6 +210,7 @@ pub fn add_adapter_link(
 ) -> Result<(), KmSetupError> {
     let noise = match KmNoise::new(
         true,
+        true,
         Some(peer_noise_key.into()),
         Some(local_noise_key),
         recv_zpis,
@@ -237,9 +238,40 @@ pub fn add_node_link(
     local_noise_key: NoiseKeypair,
     certx: KmCertExchange,
 ) -> Result<(), KmSetupError> {
-    let noise = match KmNoise::new(false, None, Some(local_noise_key), recv_zpis, certx) {
+    let noise = match KmNoise::new(false, true, None, Some(local_noise_key), recv_zpis, certx) {
         Ok(n) => n,
         Err(e) => return Err(KmSetupError::InitializationError(e)),
+    };
+    add_noise_link(asm, link_id, noise)
+}
+
+/// Temporary hack for nodes to connect to other nodes.
+///
+/// This uses IX mode instead of IK mode, since the initiating node
+/// doesn't know the peer node's public key.
+///
+/// Eventually nodes will join the network like adapters but for now they don't
+/// so we need this hack.
+pub fn add_node_node_link(
+    asm: &Assembly,
+    initiate: bool,
+    link_id: LinkId,
+    recv_zpis: ZPIPair,
+    local_noise_key: NoiseKeypair,
+    certx: KmCertExchange,
+) -> Result<(), KmSetupError> {
+    let noise = match KmNoise::new(
+        initiate,
+        false,
+        None,
+        Some(local_noise_key),
+        recv_zpis,
+        certx,
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(KmSetupError::InitializationError(e));
+        }
     };
     add_noise_link(asm, link_id, noise)
 }
@@ -453,6 +485,7 @@ mod test {
                 // Pretend to be a node and send back a valid reply.
                 let mut responder = KmNoise::new(
                     false,
+                    true,
                     None,
                     Some(node_kp),
                     ZPIPair::new(3, 4),

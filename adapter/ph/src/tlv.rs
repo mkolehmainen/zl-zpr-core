@@ -257,9 +257,7 @@ fn put_socketaddr(
 /// Parse TLV data out of a buffer, advancing the internal position.  Only known
 /// TLV types are parsed, unknown are skipped.
 /// Null entries (type 0) are skipped over and not returned.
-pub fn parse_from_buf(
-    buf: &mut dyn bytes::Buf,
-) -> Result<TlvMap, TlvError> {
+pub fn parse_from_buf(buf: &mut dyn bytes::Buf) -> Result<TlvMap, TlvError> {
     let mut tlv_map = HashMap::new();
 
     // The null type just uses 1 byte.
