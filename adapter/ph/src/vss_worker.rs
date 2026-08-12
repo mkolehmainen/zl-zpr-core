@@ -1,5 +1,5 @@
 use crate::address_pool::AddressPool;
-use crate::link_state::LinkType;
+use crate::link_state::PeerMode;
 use crate::prelude::*;
 use crate::{visa_mgmt, visa_table};
 
@@ -145,7 +145,7 @@ fn process_configuration(asm: &Arc<Assembly>, params: Vec<Param>) -> ConfigureRe
     Ok(())
 }
 
-/// Placeholder. Links not yet acted on.
+/// Connect to other nodes as instructed by the Visa Service
 fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyResponse {
     let self_addr = &asm.config.get().self_addr.scoped_ip();
 
@@ -159,7 +159,7 @@ fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyRespons
             }
             None => {
                 if asm
-                    .start_tether(&peer_addr, &self_addr, LinkType::NodeToNode)
+                    .start_tether(&peer_addr, &self_addr, PeerMode::Node, true)
                     .ok()
                     .is_none()
                 {

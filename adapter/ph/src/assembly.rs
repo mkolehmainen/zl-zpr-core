@@ -6,7 +6,7 @@ use crate::flow_control::FlowControl;
 use crate::km_cert_exchange::KmCertExchange;
 use crate::km_multiplexor::KmState;
 use crate::km_noise;
-use crate::link_state::{LinkEvent, LinkStateError, LinkType};
+use crate::link_state::{LinkEvent, LinkStateError, PeerMode};
 use crate::mgmt_processor_worker;
 use crate::peer_table;
 use crate::peer_table::PeerInsertError;
@@ -261,7 +261,8 @@ impl Assembly {
 
     fn add_peer(
         self: &Arc<Self>,
-        link_type: LinkType,
+        peer_mode: PeerMode,
+        initiator: bool,
         peer_addr: &SubstrateAddr,
         interface_addr: &ScopedIpAddr,
     ) -> Result<NonZero<LinkId>, PeerInsertError> {
@@ -272,7 +273,7 @@ impl Assembly {
         };
 
         let peer_state =
-            peer_table::PeerState::new(entry.key(), link_type, *peer_addr, *interface_addr, |q| {
+            peer_table::PeerState::new(entry.key(), peer_mode, initiator, *peer_addr, *interface_addr, |q| {
                 mgmt_processor_worker::launch(worker_config, self.clone(), q)
             });
 
@@ -334,10 +335,11 @@ impl Assembly {
         self: &Arc<Self>,
         peer_addr: &SubstrateAddr,
         interface_addr: &ScopedIpAddr,
-        link_type: LinkType,
+        peer_mode: PeerMode,
+        initiator: bool,
     ) -> Result<NonZero<LinkId>, PeerInsertError> {
         debug!(target: PEER_MGMT, "Starting link with {peer_addr} connected to {interface_addr}");
-        let peer_id = self.add_peer(link_type, peer_addr, interface_addr)?;
+        let peer_id = self.add_peer(peer_mode, initiator, peer_addr, interface_addr)?;
 
         let Some(peer) = self.peer_table.get(peer_id.get()) else {
             // Peer is gone already

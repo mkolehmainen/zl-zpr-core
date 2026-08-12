@@ -3,7 +3,7 @@
 use super::core;
 use crate::counters::{ManagementCounterType, ManagementCounters};
 use crate::km_multiplexor;
-use crate::link_state::LinkType;
+use crate::link_state::PeerMode;
 use crate::prelude::*;
 use crate::queues;
 use crate::zdp;
@@ -27,9 +27,6 @@ pub fn dispatch_mgmt_packet_with_addr(
         Ok((base_hdr, _)) if base_hdr.packet_type == zdp::ZdpPacketType::KeyManagement => {
             pkt.advance(std::mem::size_of::<zdp::ZdpBaseHeader>());
 
-            // TODO: once we have multi-node, how do we know whether this is a link or a
-            // tether?
-
             // It is possible we are processing a queue of messages and we have already set up a
             // tether for this source.  So before trying to start a tether check if we already have one.
 
@@ -40,7 +37,7 @@ pub fn dispatch_mgmt_packet_with_addr(
 
             if ingress_link_id == LINK_ID_UNKNOWN {
                 let Some(i_link_id) = asm
-                    .start_tether(&peer_sa, &interface_addr, LinkType::NodeToAdapter)
+                    .start_tether(&peer_sa, &interface_addr, PeerMode::Unknown, false)
                     .ok()
                 else {
                     core::count_event(asm, ManagementCounterType::UnknownPeer);

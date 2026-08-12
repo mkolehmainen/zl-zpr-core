@@ -593,7 +593,8 @@ fn main() -> ExitCode {
                 .start_tether(
                     asm.config.get().node_addr.as_ref().unwrap(),
                     &asm.config.get().self_addr.scoped_ip(),
-                    link_state::LinkType::AdapterToNode,
+                    link_state::PeerMode::Node,
+                    true
                 )
                 .unwrap();
 

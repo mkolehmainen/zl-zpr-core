@@ -176,11 +176,11 @@ pub enum LinkStateError {
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
-pub enum LinkType {
+pub enum PeerMode {
     Internal,
-    AdapterToNode,
-    NodeToAdapter,
-    NodeToNode,
+    Node,
+    Adapter,
+    Unknown,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -215,6 +215,7 @@ impl LinkData {
 
 pub struct LinkStateMachine {
     id: LinkId,
+    peer_mode: PeerMode,
     state: LinkState,
     status: LinkStatus,
     silent: bool,
@@ -238,9 +239,10 @@ pub struct LinkStateMachine {
 }
 
 impl LinkStateMachine {
-    pub fn new(link_id: LinkId) -> Self {
+    pub fn new(link_id: LinkId, new_peer_mode: PeerMode) -> Self {
         Self {
             id: link_id,
+            peer_mode: new_peer_mode,
             state: LinkState::Inactive,
             status: LinkStatus::Down,
             silent: false,
@@ -313,7 +315,7 @@ impl LinkStateMachine {
 
 pub struct LinkStateWrapper {
     pub id: LinkId, // set at constructor, never changes.
-    link_type: LinkType,
+    initiator: bool,
     locked_fsm: Mutex<LinkStateMachine>,
     pub locked_data: Mutex<LinkData>,
     /// Internal links _may_ be associated with another internal link
@@ -322,10 +324,10 @@ pub struct LinkStateWrapper {
 }
 
 impl LinkStateWrapper {
-    pub fn new(new_id: LinkId, new_link_type: LinkType) -> Self {
-        let mut lsm = LinkStateMachine::new(new_id);
+    pub fn new(new_id: LinkId, new_peer_mode: PeerMode, new_initiator: bool) -> Self {
+        let mut lsm = LinkStateMachine::new(new_id, new_peer_mode);
 
-        if matches!(new_link_type, LinkType::Internal) {
+        if matches!(new_peer_mode, PeerMode::Internal) {
             // Internal links are always up and active, that is, `is_ready()`.
             lsm.state = LinkState::Active;
             lsm.status = LinkStatus::Up;
@@ -333,7 +335,7 @@ impl LinkStateWrapper {
 
         Self {
             id: new_id,
-            link_type: new_link_type,
+            initiator: new_initiator,
             locked_fsm: Mutex::new(lsm),
             locked_data: Mutex::new(LinkData::new()),
             internal_peer_id: None,
@@ -341,7 +343,11 @@ impl LinkStateWrapper {
     }
 
     pub fn is_internal(&self) -> bool {
-        matches!(self.link_type, LinkType::Internal)
+        matches!(self.locked_fsm.lock().unwrap().peer_mode, PeerMode::Internal)
+    }
+
+    pub fn get_peer_mode(&self) -> PeerMode {
+        return self.locked_fsm.lock().unwrap().peer_mode;
     }
 
     /// Get the link's current state
@@ -353,10 +359,6 @@ impl LinkStateWrapper {
         let locked_fsm = self.locked_fsm.lock().unwrap();
         locked_fsm.status == LinkStatus::Up
             && (locked_fsm.state == LinkState::Active || locked_fsm.state == LinkState::RegisterAA)
-    }
-
-    pub fn get_link_type(&self) -> LinkType {
-        self.link_type
     }
 
     /// Schedule a `Timeout` event to occur after the specified duration.
@@ -517,8 +519,8 @@ impl LinkStateWrapper {
 
         info!(target: LINK_STATE, "{} started.  Keying in progress", asm.formatted_link_id(link_id));
 
-        match self.link_type {
-            LinkType::AdapterToNode => {
+        match (asm.ph_mode, locked_fsm.peer_mode) {
+            (PhMode::Adapter, PeerMode::Node) => {
                 km_multiplexor::add_adapter_link(
                     asm,
                     link_id,
@@ -530,19 +532,19 @@ impl LinkStateWrapper {
                 .unwrap();
                 Ok(())
             }
-            LinkType::NodeToNode => {
+            (PhMode::Node, PeerMode::Node) => {
                 km_multiplexor::add_node_node_link(
                     asm,
-                    true, // FIXME: true to initiate
+                    self.initiator,
                     link_id,
-                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 3, 4),
+                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 5, 6),
                     asm.self_noise_keypair.clone().unwrap(),
                     asm.certx.clone().unwrap(),
                 )
                 .unwrap();
                 Ok(())
             }
-            LinkType::NodeToAdapter => {
+            (PhMode::Node, PeerMode::Adapter) => {
                 km_multiplexor::add_node_link(
                     asm,
                     link_id,
@@ -553,9 +555,15 @@ impl LinkStateWrapper {
                 .unwrap();
                 Ok(())
             }
-            LinkType::Internal => {
+            (_, PeerMode::Internal) => {
                 error!(target: LINK_STATE, "Coding error: internal link state machine should not be controlled");
                 Err(LinkStateError::InvalidOperation("coding error".into()))
+            }
+            (_, _) => {
+                Err(LinkStateError::UnexpectedTransition(
+                    locked_fsm.state,
+                    "Start",
+                ))
             }
         }
     }
@@ -596,19 +604,13 @@ impl LinkStateWrapper {
                         // - Nodes should accept unverified certs from adapters.
                         // - Nodes should not accept unverified certs from other nodes.
                         // - Adapters should not accept unverified certs from nodes.
-                        match self.link_type {
-                            LinkType::AdapterToNode => {
+                        match locked_fsm.peer_mode {
+                            PeerMode::Node => {
                                 return Err(LinkStateError::InvalidOperation(
-                                    "adapter received unverified certificate from node".to_string(),
+                                    "Received unverified certificate from node".to_string(),
                                 ));
                             }
-                            LinkType::NodeToAdapter => (), // OK
-                            LinkType::NodeToNode => {
-                                return Err(LinkStateError::InvalidOperation(
-                                    "node received unverified certificate from peer node"
-                                        .to_string(),
-                                ));
-                            }
+                            PeerMode::Adapter => (), // OK
                             _ => (),
                         }
                     }
@@ -650,9 +652,7 @@ impl LinkStateWrapper {
 
         locked_fsm.set_state(LinkState::Helloing);
 
-        // IF this is an adapter, it's expected to issue the hello
-        // FIXME
-        if self.link_type == LinkType::AdapterToNode || self.link_type == LinkType::NodeToNode {
+        if asm.ph_mode == PhMode::Adapter || self.initiator {
             let pub_key = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
             mgmt::requests::send_hello_request(asm, self.id, pub_key).enqueue();
             self.set_timeout(asm, &mut locked_fsm, config::LINK_HELLO_TIMEOUT);
@@ -671,13 +671,16 @@ impl LinkStateWrapper {
     fn process_hello_request(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
         let link_id = self.id;
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToNode, LinkState::Helloing) => {
-                locked_fsm.set_state(LinkState::Active);
-                debug!(target: LINK_STATE, "{} finished helloing.  Becoming active", asm.formatted_link_id(link_id));
-                Ok(())
-            }
-            (LinkType::NodeToAdapter, LinkState::Helloing) => {
+
+        // HACK: Based on current Hello TLVs, assume that if we haven't seen AAA or ASAs
+        // we're talking to an adapter instead of a node
+        if locked_fsm.peer_mode == PeerMode::Unknown {
+            locked_fsm.peer_mode = PeerMode::Adapter;
+        }
+
+        match (asm.ph_mode, locked_fsm.peer_mode, self.initiator) {
+            (PhMode::Node, PeerMode::Adapter, _)
+                | (PhMode::Node, PeerMode::Node, true) => {
                 debug!(
                     target: LINK_STATE,
                     "{} received hello request", asm.formatted_link_id(link_id)
@@ -730,14 +733,14 @@ impl LinkStateWrapper {
                 Ok(())
             }
 
-            (LinkType::AdapterToNode, _) => {
+            (PhMode::Adapter, _, _) => {
                 // Adapters should not be receiving these messages from nodes
                 Err(LinkStateError::InvalidOperation(
                     "Discarded unsolicited Hello Request".to_string(),
                 ))
             }
 
-            (_, _) => Err(LinkStateError::UnexpectedTransition(
+            (_, _, _) => Err(LinkStateError::UnexpectedTransition(
                 locked_fsm.state,
                 "ReceivedHelloRequest",
             )),
@@ -751,11 +754,13 @@ impl LinkStateWrapper {
         _asm: &Arc<Assembly>,
         aaa_addr: IpAddress,
     ) -> Result<(), LinkStateError> {
-        // Just keep track of this for cleanup later.
         let link_id = self.id;
         debug!(target: LINK_STATE, "Link {link_id} assigned AAA address {aaa_addr}");
-        let mut link_data = self.locked_data.lock().unwrap();
-        link_data.aaa_address = Some(aaa_addr);
+        self.locked_data.lock().unwrap().aaa_address = Some(aaa_addr);
+        let mut locked_fsm = self.locked_fsm.lock().unwrap();
+        if locked_fsm.peer_mode == PeerMode::Unknown {
+            locked_fsm.peer_mode = PeerMode::Node;
+        }
         Ok(())
     }
 
@@ -766,11 +771,13 @@ impl LinkStateWrapper {
         _asm: &Arc<Assembly>,
         asa_addrs: Vec<SocketAddr>,
     ) -> Result<(), LinkStateError> {
-        // Just keep track of this for cleanup later.
         let link_id = self.id;
         debug!(target: LINK_STATE, "Link {link_id} updated ASA addresses with {} entries", asa_addrs.len());
-        let mut link_data = self.locked_data.lock().unwrap();
-        link_data.asa_addresses = Some(asa_addrs.clone());
+        self.locked_data.lock().unwrap().asa_addresses = Some(asa_addrs.clone());
+        let mut locked_fsm = self.locked_fsm.lock().unwrap();
+        if locked_fsm.peer_mode == PeerMode::Unknown {
+            locked_fsm.peer_mode = PeerMode::Node;
+        }
         Ok(())
     }
 
@@ -794,8 +801,15 @@ impl LinkStateWrapper {
         let link_id = self.id;
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
 
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::AdapterToNode, LinkState::Helloing) => {
+        if locked_fsm.state != LinkState::Helloing {
+            return Err(LinkStateError::UnexpectedTransition(
+                locked_fsm.state,
+                "ReceivedHelloRespone",
+            ));
+        }
+
+        match (asm.ph_mode, locked_fsm.peer_mode) {
+            (PhMode::Adapter, PeerMode::Node) => {
                 // The adapter is waiting for an init-auth-request.
                 locked_fsm.set_state(LinkState::WaitForInitAuth);
                 debug!(
@@ -805,12 +819,12 @@ impl LinkStateWrapper {
                 drop(locked_fsm);
                 Ok(())
             }
-            (LinkType::NodeToNode, LinkState::Helloing) => {
+            (PhMode::Node, PeerMode::Node) => {
                 locked_fsm.set_state(LinkState::Active);
                 debug!(target: LINK_STATE, "{} finished helloing.  Becoming active", asm.formatted_link_id(link_id));
                 Ok(())
             }
-            (LinkType::NodeToAdapter, _) => {
+            (PhMode::Node, PeerMode::Adapter) => {
                 // Nodes should not be receiving these messages from adapters
                 Err(LinkStateError::InvalidOperation(
                     "Discarded unsolicited Hello Response".to_string(),
@@ -841,8 +855,8 @@ impl LinkStateWrapper {
         let link_id = self.id;
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
 
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::WaitForAcquireZprAddress) => {}
+        match (asm.ph_mode, locked_fsm.state) {
+            (PhMode::Node, LinkState::WaitForAcquireZprAddress) => {}
 
             (_, _) => {
                 return Err(LinkStateError::InvalidOperation(
@@ -985,8 +999,8 @@ impl LinkStateWrapper {
     ) -> Result<(), LinkStateError> {
         let link_id = self.id;
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::AdapterToNode, LinkState::RegisterAA) => {
+        match (asm.ph_mode, locked_fsm.state) {
+            (PhMode::Adapter, LinkState::RegisterAA) => {
                 match addrs {
                     Some(addrs) => {
                         // TODO: In future we will take addresses from here and configure TUN.
@@ -1043,7 +1057,7 @@ impl LinkStateWrapper {
                     }
                 }
             }
-            (LinkType::AdapterToNode, LinkState::Active) => {
+            (PhMode::Adapter, LinkState::Active) => {
                 // Assume this is just a retransmit.
                 debug!(target: LINK_STATE, "{} received unsolicited Grant ZPR Address request while already in active, ignoring", asm.formatted_link_id(link_id));
                 Ok(())
@@ -1072,8 +1086,8 @@ impl LinkStateWrapper {
 
         info!(target: LINK_STATE, "{} received authorize response with ZPR address {}", asm.formatted_link_id(self.id), zpr_addr);
 
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::RegisterAA) => {} // ok
+        match (asm.ph_mode, locked_fsm.state) {
+            (PhMode::Node, LinkState::RegisterAA) => {} // ok
             (_, _) => {
                 return Err(LinkStateError::InvalidOperation(
                     "Discarded unsolicited authorize response".to_string(),
@@ -1119,10 +1133,10 @@ impl LinkStateWrapper {
         drop(data);
 
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
-        match (self.link_type, locked_fsm.state) {
+        match (asm.ph_mode, locked_fsm.state) {
             // NOTE: This is not exactly right, in general we can get an InitAuth at any time, though we
             // may not want to act on it and sometimes may be a protocol error.
-            (LinkType::AdapterToNode, LinkState::WaitForInitAuth) => {
+            (PhMode::Adapter, LinkState::WaitForInitAuth) => {
                 debug!(target: LINK_STATE, "{} received init auth (bootstrap_supported: {}, bootstrap_configured: {})",
                     asm.formatted_link_id(link_id), bootstrap, asm.config.get().bootstrap.is_some());
 
@@ -1232,8 +1246,8 @@ impl LinkStateWrapper {
     /// message with the authentication results (blob).
     fn process_init_auth_ack(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::WaitForAcquireZprAddress) => {
+        match (asm.ph_mode, locked_fsm.state) {
+            (PhMode::Node, LinkState::WaitForAcquireZprAddress) => {
                 debug!(target: LINK_STATE, "{} received init auth ack", asm.formatted_link_id(self.id));
                 // Now we are waiting on the adapter to perform authentication and
                 // that may involve external services and could be quite slow relative to a
@@ -1251,8 +1265,8 @@ impl LinkStateWrapper {
 
     fn process_init_auth_timeout(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::WaitForAcquireZprAddress) => {
+        match (asm.ph_mode, locked_fsm.state) {
+            (PhMode::Node, LinkState::WaitForAcquireZprAddress) => {
                 error!(target: LINK_STATE, "{} received init auth timeout", asm.formatted_link_id(self.id));
                 locked_fsm.set_state(LinkState::Error);
                 drop(locked_fsm);
@@ -1473,9 +1487,8 @@ impl LinkStateWrapper {
         }
 
         // handle the timeout...
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::AdapterToNode, LinkState::RegisterAA)
-            | (LinkType::AdapterToNode, LinkState::Helloing) => {
+        match (asm.ph_mode, locked_fsm.state) {
+            (PhMode::Adapter, LinkState::RegisterAA | LinkState::Helloing) => {
                 // Timeout here means we give up on the link.
                 error!(target: LINK_STATE, "{}: timed out in state {:?}", asm.formatted_link_id(self.id), locked_fsm.state);
                 locked_fsm.set_state(LinkState::Error);
@@ -1560,7 +1573,7 @@ impl LinkStateWrapper {
             locked_fsm.shutting_down = true;
         }
 
-        if matches!(self.link_type, LinkType::NodeToAdapter) {
+        if matches!(asm.ph_mode, PhMode::Node) {
             let link_id = self.id;
             let vs_id = asm
                 .peer_table
@@ -1601,7 +1614,7 @@ impl LinkStateWrapper {
         asm: &Arc<Assembly>,
         reason: TerminateReason,
     ) -> Result<(), LinkStateError> {
-        if matches!(self.link_type, LinkType::Internal) {
+        if matches!(self.get_peer_mode(), PeerMode::Internal) {
             return Err(LinkStateError::InvalidOperation(
                 "cannot shutdown internal link".to_owned(),
             ));
@@ -1615,8 +1628,8 @@ impl LinkStateWrapper {
 
     fn process_disconnect_ack(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
         let locked_fsm = self.locked_fsm.lock().unwrap();
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::Disconnecting(reason)) => {
+        match (asm.ph_mode, locked_fsm.state) {
+            (PhMode::Node, LinkState::Disconnecting(reason)) => {
                 debug!(target: LINK_STATE, "{} received disconnect ack", asm.formatted_link_id(self.id));
                 self.continue_close(asm, locked_fsm, reason)
             }
@@ -1690,10 +1703,9 @@ impl LinkStateWrapper {
 
                 asm.peer_table.clear_peer_state(link_id);
 
-                match self.link_type {
-                    LinkType::AdapterToNode => asm.tun_ctl.set_carrier(false).unwrap(),
-                    LinkType::NodeToAdapter => join_set = self.deregister_actor_addresses(asm),
-                    _ => {}
+                match asm.ph_mode {
+                    PhMode::Adapter => asm.tun_ctl.set_carrier(false).unwrap(),
+                    PhMode::Node => join_set = self.deregister_actor_addresses(asm),
                 }
 
                 let task_asm = asm.clone();
@@ -1723,8 +1735,8 @@ impl LinkStateWrapper {
         info!(target: LINK_STATE, "Shutting down {}", asm.formatted_link_id(link_id));
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
 
-        match (locked_fsm.state, self.link_type) {
-            (LinkState::Closing, LinkType::NodeToAdapter) | (LinkState::Resetting, _) => {
+        match (locked_fsm.state, asm.ph_mode) {
+            (LinkState::Closing, PhMode::Node) | (LinkState::Resetting, _) => {
                 // Clear whole peer out
                 drop(locked_fsm);
                 asm.drop_peer(link_id);
@@ -1907,8 +1919,6 @@ impl Display for LinkStateWrapper {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         // FIXME: This doesn't print link ID because the caller is printing link ID
         // followed by substrate addr, which is out of scope for this display function
-        write!(f, "  Type: {:?}\n", self.link_type)?;
-
         write!(f, "{}", self.locked_fsm.lock().unwrap())?;
         if self.get_state() == LinkState::Active {
             write!(f, "{}", self.locked_data.lock().unwrap())?;
@@ -1919,6 +1929,8 @@ impl Display for LinkStateWrapper {
 
 impl Display for LinkStateMachine {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "  Peer Type: {:?}\n", self.peer_mode)?;
+
         if self.actor_addresses.is_empty() {
             write!(f, "  Actor Addresses: None\n")?;
         } else {

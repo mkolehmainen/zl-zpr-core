@@ -8,7 +8,7 @@ use super::txn_mgr::TxnId;
 use super::{adapter, node};
 use crate::auth;
 use crate::counters;
-use crate::link_state::{LinkEvent, LinkStateError, LinkType};
+use crate::link_state::{LinkEvent, LinkStateError};
 use crate::peer_table::PeerType;
 use crate::prelude::*;
 use crate::tc;
@@ -17,7 +17,6 @@ use crate::zdp;
 use std::net::SocketAddr;
 use std::num::NonZero;
 use thiserror::Error;
-use zpr::packet_info::DOCK_LINK_ID;
 use zpr_ext::zerocopy::FromBytesExt;
 use zpr_utils::net_defs::IpAddress;
 
@@ -201,10 +200,6 @@ pub async fn handle_terminate_link_or_docking_session(
 /// Reads the hello, fire a ReceivedHelloRequest event, and then sends a response.
 pub async fn handle_hello_request(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
     let ingress_link_id = pkt.metadata().ingress_link_id;
-    if asm.ph_mode != PhMode::Node {
-        warn!(target: ZDP, "{} received Hello Request but not in node mode", asm.formatted_link_id(ingress_link_id));
-        return Err(HandleMgmtError::MessageNotPermitted);
-    }
     debug!(target: ZDP, "Received Hello Request for {}", asm.formatted_link_id(ingress_link_id));
 
     let tlv_data = match tlv::parse_from_buf(&mut pkt) {
@@ -844,21 +839,14 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
         return Ok(());
     };
 
-    let link_type = match asm.peer_table.get(ingress_link_id.get()) {
-        Some(peer_state) => peer_state.link_state_machine.get_link_type(),
-        None => {
-            return Err(HandleMgmtError::LinkClosed);
-        }
-    };
-
-    match (link_type, ingress_link_id.get()) {
-        (LinkType::NodeToAdapter, _) | (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
+    match peer_type_by_id(asm, ingress_link_id) {
+        PeerType::Node | PeerType::Adapter => {
             // We are the node
             debug!(target: ZDP, "{}: unbind actor address, node -> adapter", asm.formatted_link_id(ingress_link_id.get()));
             // Remove from PFT
             node::unbind_stream(asm, ingress_link_id, pkt.metadata().ingress_stream_id);
         }
-        (LinkType::AdapterToNode, _) | (LinkType::Internal, DOCK_LINK_ID) => {
+        PeerType::Dock => {
             // We are the adapter
             debug!(
                 target: ZDP,
@@ -868,15 +856,7 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
             // Remove from DLT
             adapter::unbind_stream(asm, ingress_link_id, pkt.metadata().ingress_stream_id);
         }
-        (LinkType::NodeToNode, _) => {
-            debug!(
-                target: ZDP,
-                "{}: node -> node UNIMPLEMENTED",
-                asm.formatted_link_id(ingress_link_id.get())
-            );
-            return Err(HandleMgmtError::MessageNotPermitted);
-        }
-        (LinkType::Internal, _) => {
+        PeerType::Unknown => {
             error!(
                 target: ZDP,
                 "{}: internal",

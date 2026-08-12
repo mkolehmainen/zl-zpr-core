@@ -3,7 +3,7 @@ use crate::auth::AUTH_KEY_SIZE_BYTES;
 use crate::config;
 use crate::forwarding_tables::PeerForwardingTable;
 use crate::km::{KeyManager, KmTransportSA};
-use crate::link_state::{LinkStateWrapper, LinkType};
+use crate::link_state::{LinkStateWrapper, PeerMode};
 use crate::mgmt::{self, txn_mgr};
 use crate::prelude::*;
 use crate::queues;
@@ -86,7 +86,8 @@ const MGMT_PROCESSOR_QUEUE_SIZE: usize = 16;
 impl PeerState {
     pub fn new<Worker>(
         link_id: NonZero<LinkId>,
-        link_type: LinkType,
+        peer_type: PeerMode,
+        initiator: bool,
         substrate_addr: SubstrateAddr,
         interface_addr: ScopedIpAddr,
         launch_mgmt_processor_worker: impl FnOnce(
@@ -102,13 +103,13 @@ impl PeerState {
         let mgmt_processor_worker = task::spawn_local(launch_mgmt_processor_worker(mp_outq));
 
         let mut key = [0u8; AUTH_KEY_SIZE_BYTES];
-        if link_type == LinkType::NodeToAdapter {
+        if peer_type == PeerMode::Adapter {
             rand_bytes(&mut key).expect("failed to generate random bytes for peer auth key");
         }
         Self {
             substrate_addr,
             interface_addr,
-            link_state_machine: LinkStateWrapper::new(link_id.get(), link_type),
+            link_state_machine: LinkStateWrapper::new(link_id.get(), peer_type, initiator),
             pft: PeerForwardingTable::new(),
             node_state: mgmt::node::NodePeerState::new(),
             mgmt_processor,
@@ -144,7 +145,8 @@ impl PeerState {
     {
         let mut ps = PeerState::new(
             link_id,
-            LinkType::Internal,
+            PeerMode::Internal,
+            false,
             std::net::SocketAddrV6::new(std::net::Ipv6Addr::from_bits(0), 0, 0, 0).into(),
             ScopedIpv6Addr::new(std::net::Ipv6Addr::from_bits(0), 0).into(),
             launch_mgmt_processor_worker,
@@ -160,16 +162,15 @@ impl PeerState {
     /// What type of peer is this.  Accounts for well-known internal links
     /// (local actor and dock).
     pub fn peer_type(&self) -> PeerType {
-        match self.link_state_machine.get_link_type() {
-            LinkType::Internal => match self.link_state_machine.id {
-                LOCAL_ACTOR_LINK_ID => PeerType::Adapter,
-                DOCK_LINK_ID => PeerType::Dock,
-                _ => PeerType::Unknown,
-            },
-
-            LinkType::NodeToAdapter => PeerType::Adapter,
-            LinkType::AdapterToNode => PeerType::Dock,
-            LinkType::NodeToNode => PeerType::Node,
+        match self.link_state_machine.id {
+            LOCAL_ACTOR_LINK_ID => PeerType::Adapter,
+            DOCK_LINK_ID => PeerType::Dock,
+            _ => match self.link_state_machine.get_peer_mode() {
+                PeerMode::Adapter => PeerType::Adapter,
+                PeerMode::Node => PeerType::Node,
+                PeerMode::Internal => PeerType::Unknown,
+                PeerMode::Unknown => PeerType::Unknown,
+            }
         }
     }
 }
@@ -528,7 +529,8 @@ pub mod test {
     #[allow(dead_code)]
     pub fn create_dummy_peer_state(
         link_id: NonZero<LinkId>,
-        link_type: LinkType,
+        peer_mode: PeerMode,
+        initiator: bool,
         substrate_addr: SubstrateAddr,
         interface_addr: ScopedIpAddr,
     ) -> PeerState {
@@ -538,7 +540,7 @@ pub mod test {
         PeerState {
             substrate_addr,
             interface_addr,
-            link_state_machine: LinkStateWrapper::new(link_id.get(), link_type),
+            link_state_machine: LinkStateWrapper::new(link_id.get(), peer_mode, initiator),
             pft: PeerForwardingTable::new(),
             node_state: mgmt::node::NodePeerState::new(),
             mgmt_processor,
