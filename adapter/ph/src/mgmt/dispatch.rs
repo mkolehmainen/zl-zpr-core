@@ -9,7 +9,6 @@ use crate::queues;
 use crate::zdp;
 use crate::zdpr;
 use strum::IntoEnumIterator;
-use zpr::vsapi_types;
 use zpr_ext::std::num::NonZeroExt;
 use zpr_ext::zerocopy::FromBytesExt;
 use zpr_utils::net_defs;
@@ -312,6 +311,7 @@ mod test {
     use std::num::NonZero;
     use std::sync::Arc;
     use std::time::SystemTime;
+    use zpr::vsapi_types;
 
     /// Create a new vsapi_types::Visa, only having to specify the id and the expiration
     pub fn new_vsapi_visa_tcp_default(issuer_id: u64, expires: SystemTime) -> vsapi_types::Visa {
