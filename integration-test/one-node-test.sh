@@ -13,7 +13,7 @@ VS_ADMIN_BIN="${VS_ADMIN_BIN:-$(realpath "$(dirname "$0")/vs-admin")}"
 VALKEY_SERVER_BIN="${VALKEY_SERVER_BIN:-$(realpath -s "$(dirname "$0")/valkey-server")}"
 
 PREGEN=$(realpath "$(dirname $0)/pregen")
-NODE1_AUTH_PRIVATE_KEY="${NODE1_AUTH_PRIVATE_KEY:-$PREGEN/node-rsa-key.pem}"
+NODE0_AUTH_PRIVATE_KEY="${NODE0_AUTH_PRIVATE_KEY:-$PREGEN/node-rsa-key.pem}"
 
 # netem parameters to configure on all links; e.g. "loss random 10%"
 # blank for no netem
@@ -24,11 +24,11 @@ source "$(dirname $0)/lib/common_funcs.sh"
 ZPR_USER=$USER
 
 # TODO: IPv6 link-local??
-NODE1_SUBSTRATE_ADDR_VS=10.0.0.1
-NODE1_SUBSTRATE_ADDR_A=10.0.1.1
-NODE1_SUBSTRATE_ADDR_B=10.0.2.1
-NODE1_SUBSTRATE_ADDR_C=10.0.3.1
-NODE1_SUBSTRATE_ADDR_C_ALT=10.0.3.129  # Used for testing routing when a dock has multiple addresses.
+NODE0_SUBSTRATE_ADDR_VS=10.0.0.1
+NODE0_SUBSTRATE_ADDR_A=10.0.1.1
+NODE0_SUBSTRATE_ADDR_B=10.0.2.1
+NODE0_SUBSTRATE_ADDR_C=10.0.3.1
+NODE0_SUBSTRATE_ADDR_C_ALT=10.0.3.129  # Used for testing routing when a dock has multiple addresses.
 VS_SUBSTRATE_ADDR=10.0.0.2
 A_SUBSTRATE_ADDR=10.0.1.2
 B_SUBSTRATE_ADDR=10.0.2.2
@@ -37,7 +37,7 @@ C_SUBSTRATE_ADDR=10.0.3.2
 # Default protocol is ipv6.
 ACTOR_PROTOCOL="ipv6"
 NUM_ACTORS=3
-# Note: POLICY_BIN, NODE1_ZPR_ADDR, VS_ZPR_ADDR, A_ZPR_ADDR, and B_ZPR_ADDR are defined by parsing the input arguments.
+# Note: POLICY_BIN, NODE0_ZPR_ADDR, VS_ZPR_ADDR, A_ZPR_ADDR, and B_ZPR_ADDR are defined by parsing the input arguments.
 source "$(dirname $0)/lib/parse_arguments.sh"
 
 if [ ! -e "$VS_BIN" ]; then
@@ -76,17 +76,17 @@ if [ ! -x "$PH_DEBUG_BIN" ]; then
   exit 1
 fi
 
-if [ ! -e "$NODE1_AUTH_PRIVATE_KEY" ]; then
-  echo "node auth private key not found: $NODE1_AUTH_PRIVATE_KEY"
+if [ ! -e "$NODE0_AUTH_PRIVATE_KEY" ]; then
+  echo "node auth private key not found: $NODE0_AUTH_PRIVATE_KEY"
   exit 1
 fi
 
-NODE1_SOCK=node.sock
+NODE0_SOCK=node.sock
 VS_SOCK=vs.sock
 ADAPTER1_SOCK=adapter1.sock
 ADAPTER2_SOCK=adapter2.sock
 ADAPTER3_SOCK=adapter3.sock
-NODE1_CAP_SOCK=node_cap.sock
+NODE0_CAP_SOCK=node_cap.sock
 VS_CAP_SOCK=vs_cap.sock
 ADAPTER1_CAP_SOCK=adapter1_cap.sock
 ADAPTER2_CAP_SOCK=adapter2_cap.sock
@@ -169,15 +169,15 @@ echo "Launching Node"
 sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
   node \
   --logging "$DEBUG_TARGETS" \
-  --control-path "$NODE1_SOCK" \
-  --capture-path "$NODE1_CAP_SOCK" \
+  --control-path "$NODE0_SOCK" \
+  --capture-path "$NODE0_CAP_SOCK" \
   --ca-file ca.crt \
   --certificate-file node.crt \
   --private-key-file node.key \
-  --auth-private-key "$NODE1_AUTH_PRIVATE_KEY" \
+  --auth-private-key "$NODE0_AUTH_PRIVATE_KEY" \
   --km-impl "$KM_IMPL" \
   --tun-if tun0 \
-  --zpr-addr "$NODE1_ZPR_ADDR" 2>&1 | tee node.log | prefix_log zpr-node &
+  --zpr-addr "$NODE0_ZPR_ADDR" 2>&1 | tee node.log | prefix_log zpr-node &
 
 sleep 2  # TODO: remove?
 
@@ -196,7 +196,7 @@ sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$PH_BIN" \
   --km-impl "$KM_IMPL" \
   --tun-if tun0 \
   --io-engine auto \
-  --node-addr "$NODE1_SUBSTRATE_ADDR_VS" \
+  --node-addr "$NODE0_SUBSTRATE_ADDR_VS" \
   --node-public-key-file node.pubkey \
   --zpr-addr "$VS_ZPR_ADDR" 2>&1 | tee adapter-vs.log | prefix_log zpr-vs &
 
@@ -215,7 +215,7 @@ sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" "$PH_BIN" \
   --km-impl "$KM_IMPL" \
   --tun-if tun0 \
   --io-engine io_uring \
-  --node-addr "$NODE1_SUBSTRATE_ADDR_A" \
+  --node-addr "$NODE0_SUBSTRATE_ADDR_A" \
   --node-public-key-file node.pubkey \
   --zpr-addr "$A_ZPR_ADDR" 2>&1 | tee adapter1.log | prefix_log zpr-a &
 
@@ -232,7 +232,7 @@ sudo -E ip netns exec zpr-b sudo -E -u "$ZPR_USER" "$PH_BIN" \
   --km-impl "$KM_IMPL" \
   --tun-if tun0 \
   --io-engine posix_unbatched \
-  --node-addr "$NODE1_SUBSTRATE_ADDR_B" \
+  --node-addr "$NODE0_SUBSTRATE_ADDR_B" \
   --node-public-key-file node.pubkey \
   --zpr-addr "$B_ZPR_ADDR" 2>&1 | tee adapter2.log | prefix_log zpr-b &
 
@@ -251,7 +251,7 @@ if [[ "$NUM_ACTORS" -ge 3 ]]; then
     --bootstrap-key actor3-rsa.key \
     --km-impl "$KM_IMPL" \
     --tun-if tun0 \
-    --node-addr "$NODE1_SUBSTRATE_ADDR_C_ALT" \
+    --node-addr "$NODE0_SUBSTRATE_ADDR_C_ALT" \
     --node-public-key-file node.pubkey \
     --zpr-addr "$C_ZPR_ADDR" 2>&1 | tee adapter3.log | prefix_log zpr-c &
 fi
@@ -298,7 +298,7 @@ fi
 # Check stats
 #
 
-for SOCK in "$NODE1_SOCK" "$VS_SOCK" "$ADAPTER1_SOCK" "$ADAPTER2_SOCK"
+for SOCK in "$NODE0_SOCK" "$VS_SOCK" "$ADAPTER1_SOCK" "$ADAPTER2_SOCK"
 do
 	# TODO: test also with encrypted actor traffic
 	APOOO=$(counters "$SOCK" | awk -F': ' '$1 == "Actor Packets Out-Of-Order" { apooo += $2 } END { print apooo }')

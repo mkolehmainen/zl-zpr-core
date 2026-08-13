@@ -170,7 +170,7 @@ impl PeerState {
                 PeerMode::Node => PeerType::Node,
                 PeerMode::Internal => PeerType::Unknown,
                 PeerMode::Unknown => PeerType::Unknown,
-            }
+            },
         }
     }
 }

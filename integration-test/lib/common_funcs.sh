@@ -62,16 +62,27 @@ function create_network() {
   # way around.  And weirdly, it will happily _autogenerate_ such names.
   # So we rely on that for now rather than explicitly specifying the names.
   sudo ip link add netns zpr-vs type veth peer veth-zpr-vs netns zpr-node0  # zpr-vs:veth0 / zpr-node0:veth-zpr-vs
-  sudo ip link add netns zpr-node1 type veth peer veth-zpr-node1 netns zpr-node0  # zpr-node1:veth0 / zpr-node0:veth-zpr-node1
   sudo ip link add netns zpr-a type veth peer veth-zpr-a netns zpr-node0  # zpr-a:veth0 / zpr-node0:veth-zpr-a
-  sudo ip link add netns zpr-b type veth peer veth-zpr-b netns zpr-node1  # zpr-b:veth0 / zpr-node1:veth-zpr-b
-  sudo ip link add netns zpr-c type veth peer veth-zpr-c netns zpr-node1  # zpr-c:veth0 / zpr-node1:veth-zpr-c
+  if [[ "$NUM_ACTORS" -ge 2 ]]; then
+    sudo ip link add netns zpr-node1 type veth peer veth-zpr-node1 netns zpr-node0  # zpr-node1:veth0 / zpr-node0:veth-zpr-node1
+    sudo ip link add netns zpr-b type veth peer veth-zpr-b netns zpr-node1  # zpr-b:veth0 / zpr-node1:veth-zpr-b
+    sudo ip link add netns zpr-c type veth peer veth-zpr-c netns zpr-node1  # zpr-c:veth0 / zpr-node1:veth-zpr-c
+  else
+    sudo ip link add netns zpr-b type veth peer veth-zpr-b netns zpr-node0  # zpr-b:veth0 / zpr-node1:veth-zpr-b
+    sudo ip link add netns zpr-c type veth peer veth-zpr-c netns zpr-node0  # zpr-c:veth0 / zpr-node1:veth-zpr-c
+  fi
 
   sudo ip -n zpr-node0 addr add "$NODE0_SUBSTRATE_ADDR_VS" peer "$VS_SUBSTRATE_ADDR" dev veth-zpr-vs
   sudo ip -n zpr-node0 addr add "$NODE0_SUBSTRATE_ADDR_A" peer "$A_SUBSTRATE_ADDR" dev veth-zpr-a
-  # FIXME
-  sudo ip -n zpr-node1 addr add "$NODE1_SUBSTRATE_ADDR_B" peer "$B_SUBSTRATE_ADDR" dev veth-zpr-b
-  sudo ip -n zpr-node1 addr add "$NODE1_SUBSTRATE_ADDR_C/24" dev veth-zpr-c
+
+  if [[ "$NUM_ACTORS" -ge 2 ]]; then
+    sudo ip -n zpr-node1 addr add "$NODE1_SUBSTRATE_ADDR_B" peer "$B_SUBSTRATE_ADDR" dev veth-zpr-b
+    sudo ip -n zpr-node1 addr add "$NODE1_SUBSTRATE_ADDR_C/24" dev veth-zpr-c
+  else
+    sudo ip -n zpr-node1 addr add "$NODE0_SUBSTRATE_ADDR_B" peer "$B_SUBSTRATE_ADDR" dev veth-zpr-b
+    sudo ip -n zpr-node1 addr add "$NODE0_SUBSTRATE_ADDR_C/24" dev veth-zpr-c
+  fi
+
   if [ -n "${NODE1_SUBSTRATE_ADDR_C_ALT-}" ]
   then sudo ip -n zpr-node1 addr add "$NODE1_SUBSTRATE_ADDR_C_ALT/24" dev veth-zpr-c  # Used for testing routing.
   fi
@@ -79,7 +90,13 @@ function create_network() {
   sudo ip -n zpr-node0 addr add "$NODE0_SUBSTRATE_ADDR_NODE" peer "$NODE1_SUBSTRATE_ADDR_NODE" dev veth-zpr-node1
   sudo ip -n zpr-node1 addr add "$NODE1_SUBSTRATE_ADDR_NODE" peer "$NODE0_SUBSTRATE_ADDR_NODE" dev veth0
   sudo ip -n zpr-a addr add "$A_SUBSTRATE_ADDR" peer "$NODE0_SUBSTRATE_ADDR_A" dev veth0
-  sudo ip -n zpr-b addr add "$B_SUBSTRATE_ADDR" peer "$NODE1_SUBSTRATE_ADDR_B" dev veth0
+
+  if [[ "$NUM_ACTORS" -ge 2 ]]; then
+    sudo ip -n zpr-b addr add "$B_SUBSTRATE_ADDR" peer "$NODE1_SUBSTRATE_ADDR_B" dev veth0
+  else
+    sudo ip -n zpr-b addr add "$B_SUBSTRATE_ADDR" peer "$NODE0_SUBSTRATE_ADDR_B" dev veth0
+  fi
+
   sudo ip -n zpr-c addr add "$C_SUBSTRATE_ADDR/24" dev veth0
 
   sudo ip -n zpr-node0 link set veth-zpr-vs up

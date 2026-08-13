@@ -50,15 +50,25 @@ pub fn send_echo_request(asm: &Assembly, link_id: LinkId) -> Sent<'_> {
 }
 
 /// send a Hello Request (RFC 6.5 § 6.3.4)
-pub fn send_hello_request(
-    asm: &Assembly,
+pub fn send_hello_request<'a>(
+    asm: &'a Assembly,
     link_id: LinkId,
     pub_key: x25519_dalek::PublicKey,
-) -> Sent<'_> {
+    asa_addresses: &[SocketAddr],
+    aaa_address: Option<IpAddress>,
+) -> Sent<'a> {
     let mut pkt = core::new_heap_packet();
     pkt.alloc_zeroed_header::<zdp::ZdpHelloRequestHeader>();
     super::helpers::put_window_size_tlv(asm, link_id, &mut pkt);
     tlv::TlvEncoding::new_a2a_dh_pubkey(pub_key).put(&mut pkt);
+
+    for asa_address in asa_addresses {
+        tlv::TlvEncoding::new_asa(*asa_address).put(&mut pkt);
+    }
+
+    if let Some(aaa_addr) = aaa_address {
+        tlv::TlvEncoding::new_aaa(aaa_addr).put(&mut pkt);
+    }
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::HelloRequest, pkt)
 }
 

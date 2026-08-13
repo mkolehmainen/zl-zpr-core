@@ -273,10 +273,14 @@ impl Assembly {
             link_id: entry.key(),
         };
 
-        let peer_state =
-            peer_table::PeerState::new(entry.key(), peer_mode, initiator, *peer_addr, *interface_addr, |q| {
-                mgmt_processor_worker::launch(worker_config, self.clone(), q)
-            });
+        let peer_state = peer_table::PeerState::new(
+            entry.key(),
+            peer_mode,
+            initiator,
+            *peer_addr,
+            *interface_addr,
+            |q| mgmt_processor_worker::launch(worker_config, self.clone(), q),
+        );
 
         let link_id = entry.insert(peer_state);
 
@@ -339,7 +343,7 @@ impl Assembly {
         peer_mode: PeerMode,
         initiator: bool,
     ) -> Result<NonZero<LinkId>, PeerInsertError> {
-        debug!(target: PEER_MGMT, "Starting link with {peer_addr} connected to {interface_addr}");
+        info!(target: PEER_MGMT, "Starting link with {peer_addr} connected to {interface_addr}");
         let peer_id = self.add_peer(peer_mode, initiator, peer_addr, interface_addr)?;
 
         let Some(peer) = self.peer_table.get(peer_id.get()) else {

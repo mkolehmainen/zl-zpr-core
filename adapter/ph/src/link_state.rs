@@ -343,7 +343,10 @@ impl LinkStateWrapper {
     }
 
     pub fn is_internal(&self) -> bool {
-        matches!(self.locked_fsm.lock().unwrap().peer_mode, PeerMode::Internal)
+        matches!(
+            self.locked_fsm.lock().unwrap().peer_mode,
+            PeerMode::Internal
+        )
     }
 
     pub fn get_peer_mode(&self) -> PeerMode {
@@ -461,7 +464,7 @@ impl LinkStateWrapper {
             LinkEvent::Start => self.process_start(asm),
             LinkEvent::KeyingDone => self.process_keying_done(asm),
             LinkEvent::ReceivedHelloRequest => self.process_hello_request(asm),
-            LinkEvent::AssignedAAA(addr) => self.process_assigned_aaa(asm, addr),
+            LinkEvent::AssignedAAA(addr) => self.update_aaa(asm, addr),
             LinkEvent::ReceivedASA(asa_addrs) => self.update_asa(asm, asa_addrs),
             LinkEvent::ReceivedHelloResponse(code) => self.process_hello_response(asm, code),
 
@@ -521,6 +524,7 @@ impl LinkStateWrapper {
             asm.formatted_link_id(link_id),
             if self.initiator { "initiator" } else { "responder" });
         assert!(locked_fsm.peer_mode != PeerMode::Internal);
+        drop(locked_fsm);
         km_multiplexor::add_node_node_link(
             asm,
             self.initiator,
@@ -617,10 +621,35 @@ impl LinkStateWrapper {
         debug!(target: LINK_STATE, "{} finished keying.  Starting hello", asm.formatted_link_id(link_id));
 
         locked_fsm.set_state(LinkState::Helloing);
+        drop(locked_fsm);
 
         if asm.ph_mode == PhMode::Adapter || self.initiator {
             let pub_key = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
-            mgmt::requests::send_hello_request(asm, self.id, pub_key).enqueue();
+            let maybe_aaa_address = {
+                let mut address_pool = asm.address_pool.lock().unwrap();
+                if let Some(pool) = address_pool.as_mut() {
+                    let aaa_address = pool.get_aaa_address();
+                    debug!(target: LINK_STATE, "{}: HelloResponse - allocated AAA address: {aaa_address} (active pool size: {})",
+                        asm.formatted_link_id(link_id), pool.len());
+                    Some(aaa_address)
+                } else {
+                    None
+                }
+            };
+            if let Some(aaa_address) = maybe_aaa_address {
+                self.update_aaa(asm, aaa_address)?;
+            } else {
+            }
+            let asa_addresses = get_available_asa_addresses(&asm, link_id);
+            mgmt::requests::send_hello_request(
+                asm,
+                self.id,
+                pub_key,
+                &asa_addresses,
+                maybe_aaa_address,
+            )
+            .enqueue();
+            locked_fsm = self.locked_fsm.lock().unwrap();
             self.set_timeout(asm, &mut locked_fsm, config::LINK_HELLO_TIMEOUT);
             debug!(
                 target: LINK_STATE,
@@ -645,12 +674,12 @@ impl LinkStateWrapper {
         }
 
         match (asm.ph_mode, locked_fsm.peer_mode, self.initiator) {
-            (PhMode::Node, PeerMode::Adapter, _)
-                | (PhMode::Node, PeerMode::Node, true) => {
+            (PhMode::Node, PeerMode::Adapter, _) => {
                 debug!(
                     target: LINK_STATE,
                     "{} received hello request", asm.formatted_link_id(link_id)
                 );
+                drop(locked_fsm);
 
                 // Reply with a Hello Response.
 
@@ -670,7 +699,7 @@ impl LinkStateWrapper {
                     }
                 };
                 if let Some(aaa_address) = maybe_aaa_address {
-                    self.process_assigned_aaa(asm, aaa_address)?;
+                    self.update_aaa(asm, aaa_address)?;
                 } else {
                     // No pool.  Use dummy address.
                     debug!(target: LINK_STATE, "{}: HelloResponse - no AAA pool available, no AAA address assigned", asm.formatted_link_id(link_id));
@@ -690,12 +719,22 @@ impl LinkStateWrapper {
 
                 // Now follow with an init auth request.
 
-                locked_fsm.set_state(LinkState::WaitForAcquireZprAddress);
+                self.locked_fsm
+                    .lock()
+                    .unwrap()
+                    .set_state(LinkState::WaitForAcquireZprAddress);
                 self.send_init_authentication_request(asm);
                 debug!(
                     target: LINK_STATE,
                     "{} finished helloing.  Waiting for other side to respond to init-auth", asm.formatted_link_id(link_id)
                 );
+                Ok(())
+            }
+
+            (PhMode::Node, PeerMode::Node, false) => {
+                mgmt::requests::send_hello_success_response(&asm, link_id, 0, &[], None).enqueue();
+
+                locked_fsm.set_state(LinkState::Active);
                 Ok(())
             }
 
@@ -715,11 +754,7 @@ impl LinkStateWrapper {
 
     /// This is called when we receive an AAA address assignment.
     /// Does not generate an error.
-    fn process_assigned_aaa(
-        &self,
-        _asm: &Arc<Assembly>,
-        aaa_addr: IpAddress,
-    ) -> Result<(), LinkStateError> {
+    fn update_aaa(&self, _asm: &Arc<Assembly>, aaa_addr: IpAddress) -> Result<(), LinkStateError> {
         let link_id = self.id;
         debug!(target: LINK_STATE, "Link {link_id} assigned AAA address {aaa_addr}");
         self.locked_data.lock().unwrap().aaa_address = Some(aaa_addr);
