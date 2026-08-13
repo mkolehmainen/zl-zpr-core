@@ -117,7 +117,6 @@ impl TlvEncoding {
         }
     }
 
-    #[allow(dead_code)]
     pub fn new_bootstrap_visa(visa: zpr::vsapi_types::Visa) -> TlvEncoding {
         TlvEncoding {
             tlv_type: DataType::BOOTSTRAP_VISA,

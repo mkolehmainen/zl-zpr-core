@@ -647,6 +647,7 @@ impl LinkStateWrapper {
                 pub_key,
                 &asa_addresses,
                 maybe_aaa_address,
+                std::iter::empty(),
             )
             .enqueue();
             locked_fsm = self.locked_fsm.lock().unwrap();

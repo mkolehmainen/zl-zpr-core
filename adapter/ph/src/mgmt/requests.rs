@@ -56,6 +56,7 @@ pub fn send_hello_request<'a>(
     pub_key: x25519_dalek::PublicKey,
     asa_addresses: &[SocketAddr],
     aaa_address: Option<IpAddress>,
+    bootstrap_visas: impl Iterator<Item = zpr::vsapi_types::Visa>,
 ) -> Sent<'a> {
     let mut pkt = core::new_heap_packet();
     pkt.alloc_zeroed_header::<zdp::ZdpHelloRequestHeader>();
@@ -69,6 +70,11 @@ pub fn send_hello_request<'a>(
     if let Some(aaa_addr) = aaa_address {
         tlv::TlvEncoding::new_aaa(aaa_addr).put(&mut pkt);
     }
+
+    for visa in bootstrap_visas {
+        tlv::TlvEncoding::new_bootstrap_visa(visa).put(&mut pkt);
+    }
+
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::HelloRequest, pkt)
 }
 
