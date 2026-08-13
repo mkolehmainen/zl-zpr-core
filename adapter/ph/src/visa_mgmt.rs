@@ -193,7 +193,11 @@ pub fn get_egress_link_for_visa(
     asm: &Arc<Assembly>,
     visa_id: VisaId,
 ) -> Result<NonZero<LinkId>, visa_table::VisaTableError> {
-    let addr = asm.visa_table.read().unwrap().get_visa_dest_addr(visa_id)?;
+    let addr = asm
+        .visa_table
+        .read()
+        .unwrap()
+        .get_visa_next_hop_addr(visa_id)?;
     let Some(link_id) = asm.find_egress_link(addr) else {
         return Err(visa_table::VisaTableError::DestNotFound(addr));
     };
