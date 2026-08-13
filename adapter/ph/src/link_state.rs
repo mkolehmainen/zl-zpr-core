@@ -641,6 +641,7 @@ impl LinkStateWrapper {
             }
             (PhMode::Node, true) => {
                 let pub_key = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
+                drop(locked_fsm);
                 let (asa_addresses, maybe_aaa_address) = self.get_aaa_asa(&asm)?;
                 mgmt::requests::send_hello_request_node(
                     asm,
@@ -651,6 +652,7 @@ impl LinkStateWrapper {
                     self.temp_visas.clone(),
                 )
                 .enqueue();
+                locked_fsm = self.locked_fsm.lock().unwrap();
                 self.set_timeout(asm, &mut locked_fsm, config::LINK_HELLO_TIMEOUT);
                 debug!(
                     target: LINK_STATE,
