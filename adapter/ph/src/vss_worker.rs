@@ -147,7 +147,7 @@ fn process_configuration(asm: &Arc<Assembly>, params: Vec<Param>) -> ConfigureRe
 
 /// Connect to other nodes as instructed by the Visa Service
 fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyResponse {
-    let self_addr = &asm.config.get().self_addr.scoped_ip();
+    let mut self_addr = asm.config.get().self_addr.scoped_ip().clone();
 
     info!(target: VSS_RPC, "Received topology update with {} links", links.len());
     for (i, link) in links.iter().enumerate() {
@@ -158,6 +158,25 @@ fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyRespons
                 info!(target:VSS_RPC, "Link already exists as {link_id}");
             }
             None => {
+                if self_addr.ip().is_unspecified() {
+                    let temp_socket = socket2::Socket::new(
+                        socket2::Domain::for_address(peer_addr),
+                        socket2::Type::DGRAM,
+                        None,
+                    )
+                    .unwrap();
+                    temp_socket
+                        .connect(&socket2::SockAddr::from(peer_addr))
+                        .expect(&format!("unable to connect to peer_addr ({})", peer_addr));
+
+                    self_addr = temp_socket
+                        .local_addr()
+                        .unwrap()
+                        .as_socket()
+                        .unwrap()
+                        .scoped_ip();
+                    info!(target: STARTUP, "assigned substrate address {peer_addr}");
+                }
                 if asm
                     .start_tether(&peer_addr, &self_addr, PeerMode::Node, true)
                     .ok()

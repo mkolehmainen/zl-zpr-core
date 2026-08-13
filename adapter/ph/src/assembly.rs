@@ -89,6 +89,7 @@ pub struct Assembly {
     pub km_state: KmState,
 
     pub self_noise_keypair: Option<NoiseKeypair>,
+    #[allow(dead_code)]
     pub peer_noise_keypair: Option<NoiseKeypair>,
     pub a2a_dh_keypair: ReusableSecret,
     pub certx: Option<KmCertExchange>,
@@ -356,7 +357,7 @@ impl Assembly {
                 .expect("This shouldn't error!");
             return Err(PeerInsertError::FailedToStart(e.to_string()));
         } else {
-            info!(target: PEER_MGMT, "Successfully started link with {peer_addr}.  Assigned ID {}", self.formatted_link_id(peer_id.get()));
+            info!(target: PEER_MGMT, "Successfully started link {interface_addr} with {peer_addr}.  Assigned ID {}", self.formatted_link_id(peer_id.get()));
         }
 
         return Ok(peer_id);

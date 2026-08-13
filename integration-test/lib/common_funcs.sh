@@ -76,7 +76,8 @@ function create_network() {
   then sudo ip -n zpr-node1 addr add "$NODE1_SUBSTRATE_ADDR_C_ALT/24" dev veth-zpr-c  # Used for testing routing.
   fi
   sudo ip -n zpr-vs addr add "$VS_SUBSTRATE_ADDR" peer "$NODE0_SUBSTRATE_ADDR_VS" dev veth0
-  sudo ip -n zpr-vs addr add "$NODE0_SUBSTRATE_ADDR_NODE" peer "$NODE1_SUBSTRATE_ADDR_NODE" dev veth0
+  sudo ip -n zpr-node0 addr add "$NODE0_SUBSTRATE_ADDR_NODE" peer "$NODE1_SUBSTRATE_ADDR_NODE" dev veth-zpr-node1
+  sudo ip -n zpr-node1 addr add "$NODE1_SUBSTRATE_ADDR_NODE" peer "$NODE0_SUBSTRATE_ADDR_NODE" dev veth0
   sudo ip -n zpr-a addr add "$A_SUBSTRATE_ADDR" peer "$NODE0_SUBSTRATE_ADDR_A" dev veth0
   sudo ip -n zpr-b addr add "$B_SUBSTRATE_ADDR" peer "$NODE1_SUBSTRATE_ADDR_B" dev veth0
   sudo ip -n zpr-c addr add "$C_SUBSTRATE_ADDR/24" dev veth0

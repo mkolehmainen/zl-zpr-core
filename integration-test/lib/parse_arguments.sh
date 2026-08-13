@@ -28,6 +28,15 @@ while [[ "$#" -gt 0 ]]; do
 		usage
 	    fi
 	    ;;
+	--num_nodes)
+            if [[ -n $2 && ! $2 == --* && $2 -ge 1 && $2 -le 2 ]]; then
+	        NUM_NODES=$2
+	        shift 2
+	    else
+	        echo "Error: Only 1 or 2 nodes currently supported." >&2
+		usage
+	    fi
+	    ;;
         --help)
             usage
             ;;
@@ -61,7 +70,7 @@ case "$ACTOR_PROTOCOL" in
 		C_ZPR_ADDR=10.253.3.1
 		ZPR_SUBNET=10.253.0.0/16
 
-		POLICY_BIN="v4-2node-${NUM_ACTORS}actor-ping.bin2"
+		POLICY_BIN="v4-${NUM_NODES}node-${NUM_ACTORS}actor-ping.bin2"
         ;;
     ipv6)
         echo "Running test in IPv6 mode"
@@ -75,7 +84,7 @@ case "$ACTOR_PROTOCOL" in
 		C_ZPR_ADDR=fd00:1:3::1
 		ZPR_SUBNET=fd00:1::0/32
 
-		POLICY_BIN="v6-2node-${NUM_ACTORS}actor-ping.bin2"
+		POLICY_BIN="v6-${NUM_NODES}node-${NUM_ACTORS}actor-ping.bin2"
         ;;
     *)
         echo "Protocol '$ACTOR_PROTOCOL' not supported."

@@ -518,54 +518,18 @@ impl LinkStateWrapper {
         locked_fsm.set_state(LinkState::Keying);
 
         info!(target: LINK_STATE, "{} started.  Keying in progress", asm.formatted_link_id(link_id));
+        assert!(locked_fsm.peer_mode != PeerMode::Internal);
+        km_multiplexor::add_node_node_link(
+            asm,
+            self.initiator,
+            link_id,
+            ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 5, 6),
+            asm.self_noise_keypair.clone().unwrap(),
+            asm.certx.clone().unwrap(),
+        )
+        .unwrap();
 
-        match (asm.ph_mode, locked_fsm.peer_mode) {
-            (PhMode::Adapter, PeerMode::Node) => {
-                km_multiplexor::add_adapter_link(
-                    asm,
-                    link_id,
-                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 5, 6),
-                    asm.self_noise_keypair.clone().unwrap(),
-                    asm.peer_noise_keypair.clone().unwrap().public,
-                    asm.certx.clone().unwrap(),
-                )
-                .unwrap();
-                Ok(())
-            }
-            (PhMode::Node, PeerMode::Node) => {
-                km_multiplexor::add_node_node_link(
-                    asm,
-                    self.initiator,
-                    link_id,
-                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 5, 6),
-                    asm.self_noise_keypair.clone().unwrap(),
-                    asm.certx.clone().unwrap(),
-                )
-                .unwrap();
-                Ok(())
-            }
-            (PhMode::Node, PeerMode::Adapter) => {
-                km_multiplexor::add_node_link(
-                    asm,
-                    link_id,
-                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 3, 4),
-                    asm.self_noise_keypair.clone().unwrap(),
-                    asm.certx.clone().unwrap(),
-                )
-                .unwrap();
-                Ok(())
-            }
-            (_, PeerMode::Internal) => {
-                error!(target: LINK_STATE, "Coding error: internal link state machine should not be controlled");
-                Err(LinkStateError::InvalidOperation("coding error".into()))
-            }
-            (_, _) => {
-                Err(LinkStateError::UnexpectedTransition(
-                    locked_fsm.state,
-                    "Start",
-                ))
-            }
-        }
+        Ok(())
     }
 
     /// The Key Manager sends in the [LinkEvent::KeyingDone] event when it is done with initial keying.

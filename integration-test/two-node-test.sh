@@ -40,6 +40,7 @@ C_SUBSTRATE_ADDR=10.1.2.2
 # Default protocol is ipv6.
 ACTOR_PROTOCOL="ipv6"
 NUM_ACTORS=3
+NUM_NODES=2
 # Note: POLICY_BIN, NODE0_ZPR_ADDR, VS_ZPR_ADDR, A_ZPR_ADDR, and B_ZPR_ADDR are defined by parsing the input arguments.
 source "$(dirname $0)/lib/parse_arguments.sh"
 
