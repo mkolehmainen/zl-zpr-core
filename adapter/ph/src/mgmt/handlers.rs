@@ -253,18 +253,18 @@ fn process_hello_tlvs(
     let mut asa_addresses = Vec::<SocketAddr>::new();
     let mut aaa_address: Option<IpAddress> = None;
 
-    for (tlv_type, tlv_value) in &tlv_data {
+    for (tlv_type, tlv_value) in tlv_data {
         match tlv_type {
-            &tlv::DataType::VERSION => {
+            tlv::DataType::VERSION => {
                 info!(target: ZDP, "{}: {message_name} - peer version is : {}", asm.formatted_link_id(link_id), tlv_value[0]);
             }
-            &tlv::DataType::WINDOW_SIZE => {
-                process_window_size_tlv(&asm, link_id, message_name, tlv_value)?;
+            tlv::DataType::WINDOW_SIZE => {
+                process_window_size_tlv(&asm, link_id, message_name, &tlv_value)?;
             }
-            &tlv::DataType::POLICY_ID => {
+            tlv::DataType::POLICY_ID => {
                 info!(target: ZDP, "{}: {message_name} - peer policy ID is : {}", asm.formatted_link_id(link_id), tlv_value[0]);
             }
-            &tlv::DataType::ASA => {
+            tlv::DataType::ASA => {
                 for asa_entry in tlv_value {
                     match asa_entry {
                         tlv::TlvValue::SocketAddr(sa) => {
@@ -278,7 +278,7 @@ fn process_hello_tlvs(
                     }
                 }
             }
-            &tlv::DataType::AAA => {
+            tlv::DataType::AAA => {
                 for aaa_entry in tlv_value {
                     if aaa_address.is_some() {
                         warn!(target: ZDP, "{}: {message_name} includes multiple AAA addresses", asm.formatted_link_id(link_id));
@@ -287,14 +287,34 @@ fn process_hello_tlvs(
                     match aaa_entry {
                         tlv::TlvValue::Ipv4Addr(ipa) => {
                             info!(target: ZDP, "{}: {message_name} includes AAA address:{ipa}", asm.formatted_link_id(link_id));
-                            aaa_address = Some(IpAddress::new_from_std_v4(ipa));
+                            aaa_address = Some(IpAddress::new_from_std_v4(&ipa));
                         }
                         tlv::TlvValue::Ipv6Addr(ipa) => {
                             info!(target: ZDP, "{}: {message_name} includes AAA address:{ipa}", asm.formatted_link_id(link_id));
-                            aaa_address = Some(IpAddress::new_from_std_v6(ipa));
+                            aaa_address = Some(IpAddress::new_from_std_v6(&ipa));
                         }
                         _ => {
                             warn!(target: ZDP, "{}: {message_name} AAA value type is wrong: {aaa_entry:?}", asm.formatted_link_id(link_id));
+                            return Err(HandleMgmtError::BadStructure);
+                        }
+                    }
+                }
+            }
+            tlv::DataType::BOOTSTRAP_VISA => {
+                let mut visa_table = asm.visa_table.write().unwrap();
+                // FIXME: we should only apply these if we are a NEW node
+                for visa_entry in tlv_value {
+                    match visa_entry {
+                        tlv::TlvValue::Visa(visa) => match visa_table.insert_visa(visa) {
+                            Ok(visa_id) => {
+                                info!(target: ZDP, "{}: received and ingested bootstrap visa {visa_id}", asm.formatted_link_id(link_id));
+                            }
+                            Err(err) => {
+                                warn!(target: ZDP, "{}: {message_name} bootstrap visa error: {err:?}", asm.formatted_link_id(link_id));
+                            }
+                        },
+                        _ => {
+                            warn!(target: ZDP, "{}: {message_name} bootstrap visa value type is wrong: {visa_entry:?}", asm.formatted_link_id(link_id));
                             return Err(HandleMgmtError::BadStructure);
                         }
                     }
