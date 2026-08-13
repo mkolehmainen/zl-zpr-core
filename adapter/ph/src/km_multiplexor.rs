@@ -372,16 +372,36 @@ mod test {
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
     use crate::km::KmLinkMsg;
     use crate::km_testdata::test::*;
-    use crate::link_state::LinkType;
+    use crate::link_state::PeerMode;
     use crate::mgmt_processor_worker;
     use crate::peer_table;
     use base64::prelude::*;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
+    use std::time::SystemTime;
     use tokio::task::{self, yield_now};
     use tokio::time::timeout;
     use zpr::packet_info::{KM_ID_NOISE, SubstrateAddr};
+    use zpr::vsapi_types;
     use zpr_utils::net_defs;
+
+    /// Create a new vsapi_types::Visa, only having to specify the id and the expiration
+    pub fn new_vsapi_visa_tcp_default(issuer_id: u64, expires: SystemTime) -> vsapi_types::Visa {
+        vsapi_types::Visa::new(
+            issuer_id,
+            1,
+            expires,
+            [0; 4].into(),
+            [0; 4].into(),
+            vsapi_types::DockPepType::TCP(vsapi_types::TcpUdpPep {
+                source_port: 0,
+                dest_port: 0,
+                endpoint: vsapi_types::EndpointT::Any,
+            }),
+            vsapi_types::KeySet::default(),
+            None,
+        )
+    }
 
     #[tokio::test]
     async fn test_km_multiplexor_updates_assembly_state() {
@@ -436,9 +456,11 @@ mod test {
 
                     let peer_state = peer_table::PeerState::new(
                         entry.key(),
-                        LinkType::NodeToAdapter,
+                        PeerMode::Adapter,
+                        true,
                         fake_sa,
                         fake_intf_addr,
+                        vec![new_vsapi_visa_tcp_default(0, SystemTime::now())],
                         |q| mgmt_processor_worker::launch(worker_config, asm.clone(), q),
                     );
 

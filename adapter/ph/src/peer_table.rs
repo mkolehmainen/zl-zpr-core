@@ -110,7 +110,12 @@ impl PeerState {
         Self {
             substrate_addr,
             interface_addr,
-            link_state_machine: LinkStateWrapper::new(link_id.get(), peer_type, initiator, temp_visas),
+            link_state_machine: LinkStateWrapper::new(
+                link_id.get(),
+                peer_type,
+                initiator,
+                temp_visas,
+            ),
             pft: PeerForwardingTable::new(),
             node_state: mgmt::node::NodePeerState::new(),
             mgmt_processor,
@@ -527,6 +532,26 @@ pub mod test {
 
     use super::*;
     use std::sync::Mutex;
+    use std::time::SystemTime;
+    use zpr::vsapi_types;
+
+    /// Create a new vsapi_types::Visa, only having to specify the id and the expiration
+    pub fn new_vsapi_visa_tcp_default(issuer_id: u64, expires: SystemTime) -> vsapi_types::Visa {
+        vsapi_types::Visa::new(
+            issuer_id,
+            1,
+            expires,
+            [0; 4].into(),
+            [0; 4].into(),
+            vsapi_types::DockPepType::TCP(vsapi_types::TcpUdpPep {
+                source_port: 0,
+                dest_port: 0,
+                endpoint: vsapi_types::EndpointT::Any,
+            }),
+            vsapi_types::KeySet::default(),
+            None,
+        )
+    }
 
     #[allow(dead_code)]
     pub fn create_dummy_peer_state(
@@ -542,7 +567,12 @@ pub mod test {
         PeerState {
             substrate_addr,
             interface_addr,
-            link_state_machine: LinkStateWrapper::new(link_id.get(), peer_mode, initiator),
+            link_state_machine: LinkStateWrapper::new(
+                link_id.get(),
+                peer_mode,
+                initiator,
+                vec![new_vsapi_visa_tcp_default(0, SystemTime::now())],
+            ),
             pft: PeerForwardingTable::new(),
             node_state: mgmt::node::NodePeerState::new(),
             mgmt_processor,

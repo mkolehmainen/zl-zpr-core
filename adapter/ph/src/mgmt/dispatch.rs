@@ -9,6 +9,7 @@ use crate::queues;
 use crate::zdp;
 use crate::zdpr;
 use strum::IntoEnumIterator;
+use zpr::vsapi_types;
 use zpr_ext::std::num::NonZeroExt;
 use zpr_ext::zerocopy::FromBytesExt;
 use zpr_utils::net_defs;
@@ -305,11 +306,30 @@ mod test {
     use crate::km_cert_exchange::KmCertExchange;
     use crate::km_noise::NoiseKeypair;
     use crate::km_testdata::test::*;
-    use crate::link_state::LinkType;
+    use crate::link_state::PeerMode;
     use crate::peer_table::PeerState;
     use std::net::Ipv4Addr;
     use std::num::NonZero;
     use std::sync::Arc;
+    use std::time::SystemTime;
+
+    /// Create a new vsapi_types::Visa, only having to specify the id and the expiration
+    pub fn new_vsapi_visa_tcp_default(issuer_id: u64, expires: SystemTime) -> vsapi_types::Visa {
+        vsapi_types::Visa::new(
+            issuer_id,
+            1,
+            expires,
+            [0; 4].into(),
+            [0; 4].into(),
+            vsapi_types::DockPepType::TCP(vsapi_types::TcpUdpPep {
+                source_port: 0,
+                dest_port: 0,
+                endpoint: vsapi_types::EndpointT::Any,
+            }),
+            vsapi_types::KeySet::default(),
+            None,
+        )
+    }
 
     // Ensure that this old issue is fixed:
     // https://github.com/org-zpr/zpr-core/issues/929
@@ -358,9 +378,11 @@ mod test {
         let (mp_outq_out, mut mp_outq_in) = tokio::sync::oneshot::channel();
         let peer_state = PeerState::new(
             peer_entry.key(),
-            LinkType::NodeToAdapter,
+            PeerMode::Adapter,
+            true,
             peer_sa,
             intf_addr,
+            vec![new_vsapi_visa_tcp_default(0, SystemTime::now())],
             move |q| {
                 mp_outq_out.send(q).unwrap();
                 std::future::pending()

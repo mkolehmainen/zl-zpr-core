@@ -325,7 +325,12 @@ pub struct LinkStateWrapper {
 }
 
 impl LinkStateWrapper {
-    pub fn new(new_id: LinkId, new_peer_mode: PeerMode, new_initiator: bool, new_visas: Vec<zpr::vsapi_types::Visa>) -> Self {
+    pub fn new(
+        new_id: LinkId,
+        new_peer_mode: PeerMode,
+        new_initiator: bool,
+        new_visas: Vec<zpr::vsapi_types::Visa>,
+    ) -> Self {
         let mut lsm = LinkStateMachine::new(new_id, new_peer_mode);
 
         if matches!(new_peer_mode, PeerMode::Internal) {
@@ -627,12 +632,7 @@ impl LinkStateWrapper {
         match (asm.ph_mode, self.initiator) {
             (PhMode::Adapter, _) => {
                 let pub_key = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
-                mgmt::requests::send_hello_request_adapter(
-                    asm,
-                    self.id,
-                    pub_key,
-                )
-                .enqueue();
+                mgmt::requests::send_hello_request_adapter(asm, self.id, pub_key).enqueue();
                 self.set_timeout(asm, &mut locked_fsm, config::LINK_HELLO_TIMEOUT);
                 debug!(
                     target: LINK_STATE,
@@ -659,7 +659,7 @@ impl LinkStateWrapper {
             }
             (_, _) => {} // Otherwise we are a node so wait for an adapter to reach out
         }
-        
+
         Ok(())
     }
 
@@ -738,7 +738,10 @@ impl LinkStateWrapper {
         }
     }
 
-    fn get_aaa_asa(&self, asm: &Arc<Assembly>) -> Result<(Vec<SocketAddr>, Option<IpAddress>), LinkStateError> {
+    fn get_aaa_asa(
+        &self,
+        asm: &Arc<Assembly>,
+    ) -> Result<(Vec<SocketAddr>, Option<IpAddress>), LinkStateError> {
         let link_id = self.id;
         let mut asa_addresses = Vec::<SocketAddr>::new();
         let mut maybe_aaa_address: Option<IpAddress> = None;
@@ -1983,7 +1986,7 @@ impl Display for LinkData {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkState, LinkStateMachine};
+    use super::{LinkState, LinkStateMachine, PeerMode};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -1993,7 +1996,7 @@ mod tests {
     async fn timeout_test() {
         LocalSet::new()
             .run_until(async {
-                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
+                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1, PeerMode::Unknown)));
                 let (tx, rx) = oneshot::channel();
 
                 set_timeout(&sm, Duration::from_secs(5), tx);
@@ -2013,7 +2016,7 @@ mod tests {
     async fn timeout_explicit_cancel_test() {
         LocalSet::new()
             .run_until(async {
-                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
+                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1, PeerMode::Unknown)));
                 let (tx, rx) = oneshot::channel();
 
                 set_timeout(&sm, Duration::from_secs(5), tx);
@@ -2033,7 +2036,7 @@ mod tests {
     async fn timeout_implicit_cancel_test() {
         LocalSet::new()
             .run_until(async {
-                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
+                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1, PeerMode::Unknown)));
                 let (tx, rx) = oneshot::channel();
 
                 set_timeout(&sm, Duration::from_secs(5), tx);
@@ -2053,7 +2056,7 @@ mod tests {
     async fn timeout_reschedule_test() {
         LocalSet::new()
             .run_until(async {
-                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
+                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1, PeerMode::Unknown)));
                 let (tx1, rx1) = oneshot::channel();
                 let (tx2, rx2) = oneshot::channel();
 

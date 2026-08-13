@@ -420,7 +420,7 @@ mod tests {
 
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
     use crate::forwarding_tables::PftPep;
-    use crate::link_state::LinkType;
+    use crate::link_state::PeerMode;
     use crate::peer_table::test::create_dummy_peer_state;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
@@ -507,7 +507,8 @@ mod tests {
         let link_id = entry
             .insert(create_dummy_peer_state(
                 entry_key,
-                LinkType::Internal,
+                PeerMode::Internal,
+                false,
                 SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
                 net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
             ))
@@ -572,7 +573,8 @@ mod tests {
         let link_a = entry
             .insert(create_dummy_peer_state(
                 entry_key,
-                LinkType::Internal,
+                PeerMode::Internal,
+                false,
                 SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
                 net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
             ))
@@ -610,7 +612,8 @@ mod tests {
         let link_a = entry_a
             .insert(create_dummy_peer_state(
                 key_a,
-                LinkType::Internal,
+                PeerMode::Internal,
+                false,
                 SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
                 net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
             ))
@@ -621,7 +624,8 @@ mod tests {
         let link_b = entry_b
             .insert(create_dummy_peer_state(
                 key_b,
-                LinkType::Internal,
+                PeerMode::Internal,
+                false,
                 SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(2, 2, 3, 4)), 443),
                 net_defs::ScopedIpAddr::V4(Ipv4Addr::new(2, 2, 3, 5)),
             ))
@@ -659,7 +663,8 @@ mod tests {
         let link_a = entry_a
             .insert(create_dummy_peer_state(
                 key_a,
-                LinkType::Internal,
+                PeerMode::Internal,
+                false,
                 SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
                 net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
             ))
@@ -670,7 +675,8 @@ mod tests {
         let link_b = entry_b
             .insert(create_dummy_peer_state(
                 key_b,
-                LinkType::Internal,
+                PeerMode::Internal,
+                false,
                 SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(2, 2, 3, 4)), 443),
                 net_defs::ScopedIpAddr::V4(Ipv4Addr::new(2, 2, 3, 5)),
             ))
@@ -719,7 +725,8 @@ mod tests {
         let link_a = entry_a
             .insert(create_dummy_peer_state(
                 key_a,
-                LinkType::Internal,
+                PeerMode::Internal,
+                false,
                 SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
                 net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
             ))
@@ -730,7 +737,8 @@ mod tests {
         let link_b = entry_b
             .insert(create_dummy_peer_state(
                 key_b,
-                LinkType::Internal,
+                PeerMode::Internal,
+                false,
                 SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(2, 2, 3, 4)), 443),
                 net_defs::ScopedIpAddr::V4(Ipv4Addr::new(2, 2, 3, 5)),
             ))
