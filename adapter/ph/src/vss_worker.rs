@@ -150,7 +150,7 @@ fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyRespons
     let mut self_addr = asm.config.get().self_addr.scoped_ip().clone();
 
     info!(target: VSS_RPC, "Received topology update with {} links", links.len());
-    for (i, link) in links.iter().enumerate() {
+    for (i, link) in links.into_iter().enumerate() {
         info!(target: VSS_RPC, "[link {i}]-> {:?}", link.peer);
         let peer_addr = SocketAddr::from(link.peer.clone());
         match asm.peer_table.lookup_peer(&peer_addr, &self_addr) {
@@ -178,7 +178,7 @@ fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyRespons
                     info!(target: VSS_RPC, "assigned substrate address {self_addr}");
                 }
                 if asm
-                    .start_tether(&peer_addr, &self_addr, PeerMode::Node, true)
+                    .start_tether(&peer_addr, &self_addr, PeerMode::Node, true, link.visas)
                     .ok()
                     .is_none()
                 {

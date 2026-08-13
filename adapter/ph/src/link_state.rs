@@ -321,10 +321,11 @@ pub struct LinkStateWrapper {
     /// Internal links _may_ be associated with another internal link
     /// representing its remote side.
     pub internal_peer_id: Option<NonZero<LinkId>>,
+    pub temp_visas: Vec<zpr::vsapi_types::Visa>,
 }
 
 impl LinkStateWrapper {
-    pub fn new(new_id: LinkId, new_peer_mode: PeerMode, new_initiator: bool) -> Self {
+    pub fn new(new_id: LinkId, new_peer_mode: PeerMode, new_initiator: bool, new_visas: Vec<zpr::vsapi_types::Visa>) -> Self {
         let mut lsm = LinkStateMachine::new(new_id, new_peer_mode);
 
         if matches!(new_peer_mode, PeerMode::Internal) {
@@ -339,6 +340,7 @@ impl LinkStateWrapper {
             locked_fsm: Mutex::new(lsm),
             locked_data: Mutex::new(LinkData::new()),
             internal_peer_id: None,
+            temp_visas: new_visas,
         }
     }
 
@@ -621,43 +623,43 @@ impl LinkStateWrapper {
         debug!(target: LINK_STATE, "{} finished keying.  Starting hello", asm.formatted_link_id(link_id));
 
         locked_fsm.set_state(LinkState::Helloing);
-        drop(locked_fsm);
 
-        if asm.ph_mode == PhMode::Adapter || self.initiator {
-            let pub_key = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
-            let maybe_aaa_address = {
-                let mut address_pool = asm.address_pool.lock().unwrap();
-                if let Some(pool) = address_pool.as_mut() {
-                    let aaa_address = pool.get_aaa_address();
-                    debug!(target: LINK_STATE, "{}: HelloResponse - allocated AAA address: {aaa_address} (active pool size: {})",
-                        asm.formatted_link_id(link_id), pool.len());
-                    Some(aaa_address)
-                } else {
-                    None
-                }
-            };
-            if let Some(aaa_address) = maybe_aaa_address {
-                self.update_aaa(asm, aaa_address)?;
-            } else {
+        match (asm.ph_mode, self.initiator) {
+            (PhMode::Adapter, _) => {
+                let pub_key = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
+                mgmt::requests::send_hello_request_adapter(
+                    asm,
+                    self.id,
+                    pub_key,
+                )
+                .enqueue();
+                self.set_timeout(asm, &mut locked_fsm, config::LINK_HELLO_TIMEOUT);
+                debug!(
+                    target: LINK_STATE,
+                    "{} sent HelloRequest to adapter.  Waiting for other side to respond.", asm.formatted_link_id(link_id)
+                );
             }
-            let asa_addresses = get_available_asa_addresses(&asm, link_id);
-            mgmt::requests::send_hello_request(
-                asm,
-                self.id,
-                pub_key,
-                &asa_addresses,
-                maybe_aaa_address,
-                std::iter::empty(),
-            )
-            .enqueue();
-            locked_fsm = self.locked_fsm.lock().unwrap();
-            self.set_timeout(asm, &mut locked_fsm, config::LINK_HELLO_TIMEOUT);
-            debug!(
-                target: LINK_STATE,
-                "{} sent HelloRequest.  Waiting for other side to respond.", asm.formatted_link_id(link_id)
-            );
+            (PhMode::Node, true) => {
+                let pub_key = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
+                let (asa_addresses, maybe_aaa_address) = self.get_aaa_asa(&asm)?;
+                mgmt::requests::send_hello_request_node(
+                    asm,
+                    self.id,
+                    pub_key,
+                    &asa_addresses,
+                    maybe_aaa_address,
+                    self.temp_visas.clone(),
+                )
+                .enqueue();
+                self.set_timeout(asm, &mut locked_fsm, config::LINK_HELLO_TIMEOUT);
+                debug!(
+                    target: LINK_STATE,
+                    "{} sent HelloRequest to new Node.  Waiting for other side to respond.", asm.formatted_link_id(link_id)
+                );
+            }
+            (_, _) => {} // Otherwise we are a node so wait for an adapter to reach out
         }
-        // Otherwise we are a node so wait for an adapter to reach out
+        
         Ok(())
     }
 
@@ -688,26 +690,9 @@ impl LinkStateWrapper {
                 // or if we do not have an external authentication service available.  For simplicity we just
                 // always hand one out -- if we have a pool. And we only have a pool if we have already
                 // connected to the visa service.
-                let maybe_aaa_address = {
-                    let mut address_pool = asm.address_pool.lock().unwrap();
-                    if let Some(pool) = address_pool.as_mut() {
-                        let aaa_address = pool.get_aaa_address();
-                        debug!(target: LINK_STATE, "{}: HelloResponse - allocated AAA address: {aaa_address} (active pool size: {})",
-                            asm.formatted_link_id(link_id), pool.len());
-                        Some(aaa_address)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(aaa_address) = maybe_aaa_address {
-                    self.update_aaa(asm, aaa_address)?;
-                } else {
-                    // No pool.  Use dummy address.
-                    debug!(target: LINK_STATE, "{}: HelloResponse - no AAA pool available, no AAA address assigned", asm.formatted_link_id(link_id));
-                }
+                let (asa_addresses, maybe_aaa_address) = self.get_aaa_asa(&asm)?;
 
                 let policy_id: i64 = 0; // TODO: We get policy ID from visa service. Record that somewhere, access it here.
-                let asa_addresses = get_available_asa_addresses(&asm, link_id);
 
                 mgmt::requests::send_hello_success_response(
                     &asm,
@@ -751,6 +736,27 @@ impl LinkStateWrapper {
                 "ReceivedHelloRequest",
             )),
         }
+    }
+
+    fn get_aaa_asa(&self, asm: &Arc<Assembly>) -> Result<(Vec<SocketAddr>, Option<IpAddress>), LinkStateError> {
+        let link_id = self.id;
+        let mut asa_addresses = Vec::<SocketAddr>::new();
+        let mut maybe_aaa_address: Option<IpAddress> = None;
+
+        if asm.ph_mode == PhMode::Node && self.initiator {
+            let mut address_pool = asm.address_pool.lock().unwrap();
+            if let Some(pool) = address_pool.as_mut() {
+                let aaa_address = pool.get_aaa_address();
+                debug!(target: LINK_STATE, "{}: HelloResponse - allocated AAA address: {aaa_address} (active pool size: {})",
+                    asm.formatted_link_id(link_id), pool.len());
+                self.update_aaa(asm, aaa_address)?;
+                maybe_aaa_address = Some(aaa_address)
+            }
+
+            asa_addresses = get_available_asa_addresses(&asm, link_id);
+        }
+
+        Ok((asa_addresses, maybe_aaa_address))
     }
 
     /// This is called when we receive an AAA address assignment.

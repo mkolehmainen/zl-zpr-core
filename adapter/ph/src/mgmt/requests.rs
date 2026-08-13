@@ -49,8 +49,21 @@ pub fn send_echo_request(asm: &Assembly, link_id: LinkId) -> Sent<'_> {
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::Echo, pkt)
 }
 
-/// send a Hello Request (RFC 6.5 § 6.3.4)
-pub fn send_hello_request<'a>(
+/// send a Hello Request (RFC 6.5 § 6.3.4) from an adapter
+pub fn send_hello_request_adapter(
+    asm: &Assembly,
+    link_id: LinkId,
+    pub_key: x25519_dalek::PublicKey,
+) -> Sent<'_> {
+    let mut pkt = core::new_heap_packet();
+    pkt.alloc_zeroed_header::<zdp::ZdpHelloRequestHeader>();
+    super::helpers::put_window_size_tlv(asm, link_id, &mut pkt);
+    tlv::TlvEncoding::new_a2a_dh_pubkey(pub_key).put(&mut pkt);
+    core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::HelloRequest, pkt)
+}
+
+/// send a Hello Request (RFC 6.5 § 6.3.4) from a node to another node
+pub fn send_hello_request_node<'a>(
     asm: &'a Assembly,
     link_id: LinkId,
     pub_key: x25519_dalek::PublicKey,

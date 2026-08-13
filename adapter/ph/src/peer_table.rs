@@ -90,6 +90,7 @@ impl PeerState {
         initiator: bool,
         substrate_addr: SubstrateAddr,
         interface_addr: ScopedIpAddr,
+        temp_visas: Vec<zpr::vsapi_types::Visa>,
         launch_mgmt_processor_worker: impl FnOnce(
             mpsc::Receiver<queues::MgmtProcessorMessage>,
         ) -> Worker,
@@ -109,7 +110,7 @@ impl PeerState {
         Self {
             substrate_addr,
             interface_addr,
-            link_state_machine: LinkStateWrapper::new(link_id.get(), peer_type, initiator),
+            link_state_machine: LinkStateWrapper::new(link_id.get(), peer_type, initiator, temp_visas),
             pft: PeerForwardingTable::new(),
             node_state: mgmt::node::NodePeerState::new(),
             mgmt_processor,
@@ -149,6 +150,7 @@ impl PeerState {
             false,
             std::net::SocketAddrV6::new(std::net::Ipv6Addr::from_bits(0), 0, 0, 0).into(),
             ScopedIpv6Addr::new(std::net::Ipv6Addr::from_bits(0), 0).into(),
+            vec![],
             launch_mgmt_processor_worker,
         );
         ps.link_state_machine.internal_peer_id = peer_id;

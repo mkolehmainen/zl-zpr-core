@@ -119,6 +119,7 @@ pub fn build_connect_request(
         claims: request_claims,
         substrate_addr: asm.get_local_dock_addr(),
         dock_interface: 0,
+        a2a_dh_public_key: Default::default(),
     };
     Ok(Some(connect_req))
 }

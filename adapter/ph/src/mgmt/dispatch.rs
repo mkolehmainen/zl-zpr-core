@@ -37,7 +37,7 @@ pub fn dispatch_mgmt_packet_with_addr(
 
             if ingress_link_id == LINK_ID_UNKNOWN {
                 let Some(i_link_id) = asm
-                    .start_tether(&peer_sa, &interface_addr, PeerMode::Unknown, false)
+                    .start_tether(&peer_sa, &interface_addr, PeerMode::Unknown, false, vec![])
                     .ok()
                 else {
                     core::count_event(asm, ManagementCounterType::UnknownPeer);

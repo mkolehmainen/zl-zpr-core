@@ -266,6 +266,7 @@ impl Assembly {
         initiator: bool,
         peer_addr: &SubstrateAddr,
         interface_addr: &ScopedIpAddr,
+        temp_visas: Vec<zpr::vsapi_types::Visa>,
     ) -> Result<NonZero<LinkId>, PeerInsertError> {
         let entry = self.peer_table.vacant_entry()?;
 
@@ -279,6 +280,7 @@ impl Assembly {
             initiator,
             *peer_addr,
             *interface_addr,
+            temp_visas,
             |q| mgmt_processor_worker::launch(worker_config, self.clone(), q),
         );
 
@@ -342,9 +344,10 @@ impl Assembly {
         interface_addr: &ScopedIpAddr,
         peer_mode: PeerMode,
         initiator: bool,
+        temp_visas: Vec<zpr::vsapi_types::Visa>,
     ) -> Result<NonZero<LinkId>, PeerInsertError> {
         info!(target: PEER_MGMT, "Starting link with {peer_addr} connected to {interface_addr}");
-        let peer_id = self.add_peer(peer_mode, initiator, peer_addr, interface_addr)?;
+        let peer_id = self.add_peer(peer_mode, initiator, peer_addr, interface_addr, temp_visas)?;
 
         let Some(peer) = self.peer_table.get(peer_id.get()) else {
             // Peer is gone already
