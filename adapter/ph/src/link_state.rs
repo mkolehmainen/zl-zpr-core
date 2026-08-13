@@ -230,8 +230,6 @@ pub struct LinkStateMachine {
     /// Counter available for use by states which wish to count timeouts.
     /// Reset to 0 on any state transition.
     timeout_count: usize,
-    /// present only while in RegisterAA state; used for retransmits
-    auth_blob: Option<String>,
     /// Handle to an outstanding echo/keepalive task; used only during Active.
     /// Instant is time at which the echo was sent.
     echo_handle: Option<(Instant, tokio::task::AbortHandle)>,
@@ -251,7 +249,6 @@ impl LinkStateMachine {
             logical_clock: 0,
             timeout_handle: None,
             timeout_count: 0,
-            auth_blob: None,
             echo_handle: None,
             shutting_down: false,
         }
@@ -265,7 +262,6 @@ impl LinkStateMachine {
         self.last_state_change = std::time::Instant::now();
         self.cancel_timeout();
         self.timeout_count = 0;
-        self.auth_blob = None;
     }
 
     /// Schedule the given callback to be invoked asynchronously after the
@@ -1174,7 +1170,6 @@ impl LinkStateWrapper {
                                     &blobstr,
                                 );
                                 locked_fsm.set_state(LinkState::RegisterAA);
-                                locked_fsm.auth_blob = Some(blobstr);
                                 self.set_timeout(
                                     asm,
                                     &mut locked_fsm,
@@ -1457,7 +1452,6 @@ impl LinkStateWrapper {
         let blobstr = blob.encode();
         let requested_addrs = asm.get_local_zpr_addrs_std();
         self.send_acquire_zpr_address_request(asm, &requested_addrs, &blobstr);
-        locked_fsm.auth_blob = Some(blobstr);
         self.set_timeout(asm, &mut locked_fsm, config::VS_AUTHENTICATION_TIMEOUT);
         Ok(())
     }
