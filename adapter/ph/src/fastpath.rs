@@ -138,6 +138,8 @@ impl FastpathWorker {
             .lookup_peer(peer_sa, interface_addr)
             .unwrap_or_zero();
 
+        //debug!(target: DATAPATH, "CTP INGRESS packet len={} src={peer_sa} dst={interface_addr} link={}", pkt.len(), pkt.metadata_mut().ingress_link_id);
+
         // Read, but do not remove the ZPI header
         let Ok((zpi_hdr, _)) = zdp::ZdpZpiHeader::read_from_prefix(&pkt.body()) else {
             self.drop_and_count(pkt, FastpathCounterType::BadStructure);
@@ -466,6 +468,8 @@ impl FastpathWorker {
 
         assert!(!dest_sa.ip().is_unspecified());
         assert!(!src_intf.ip().is_unspecified());
+
+        //debug!(target: DATAPATH, "CTP EGRESS packet len={} src={src_intf} dst={dest_sa} link={link_id}", pkt.len());
 
         // queue packet for send via substrate
         self.substrate_egress_q.push(QueuedEgressPacket {

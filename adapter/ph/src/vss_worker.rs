@@ -175,7 +175,7 @@ fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyRespons
                         .as_socket()
                         .unwrap()
                         .scoped_ip();
-                    info!(target: STARTUP, "assigned substrate address {peer_addr}");
+                    info!(target: VSS_RPC, "assigned substrate address {self_addr}");
                 }
                 if asm
                     .start_tether(&peer_addr, &self_addr, PeerMode::Node, true)

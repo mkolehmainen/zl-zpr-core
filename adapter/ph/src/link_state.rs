@@ -517,7 +517,9 @@ impl LinkStateWrapper {
         locked_fsm.status = LinkStatus::Up;
         locked_fsm.set_state(LinkState::Keying);
 
-        info!(target: LINK_STATE, "{} started.  Keying in progress", asm.formatted_link_id(link_id));
+        info!(target: LINK_STATE, "{} started.  Keying in progress; role is {}",
+            asm.formatted_link_id(link_id),
+            if self.initiator { "initiator" } else { "responder" });
         assert!(locked_fsm.peer_mode != PeerMode::Internal);
         km_multiplexor::add_node_node_link(
             asm,

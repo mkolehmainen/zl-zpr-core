@@ -61,11 +61,11 @@ function create_network() {
   # a name matching that of a veth device in the root ns, but not the other
   # way around.  And weirdly, it will happily _autogenerate_ such names.
   # So we rely on that for now rather than explicitly specifying the names.
-  sudo ip link add netns zpr-vs type veth peer veth-zpr-vs netns zpr-node0  # zpr-a:veth0 / zpr-node0:veth-zpr-vs
-  sudo ip link add netns zpr-node1 type veth peer veth-zpr-node1 netns zpr-node0  # zpr-node1:veth0 / zpr-node0:veth-zpr-node0
+  sudo ip link add netns zpr-vs type veth peer veth-zpr-vs netns zpr-node0  # zpr-vs:veth0 / zpr-node0:veth-zpr-vs
+  sudo ip link add netns zpr-node1 type veth peer veth-zpr-node1 netns zpr-node0  # zpr-node1:veth0 / zpr-node0:veth-zpr-node1
   sudo ip link add netns zpr-a type veth peer veth-zpr-a netns zpr-node0  # zpr-a:veth0 / zpr-node0:veth-zpr-a
-  sudo ip link add netns zpr-b type veth peer veth-zpr-b netns zpr-node1  # zpr-b:veth0 / zpr-node0:veth-zpr-b
-  sudo ip link add netns zpr-c type veth peer veth-zpr-c netns zpr-node1  # zpr-c:veth0 / zpr-node0:veth-zpr-c
+  sudo ip link add netns zpr-b type veth peer veth-zpr-b netns zpr-node1  # zpr-b:veth0 / zpr-node1:veth-zpr-b
+  sudo ip link add netns zpr-c type veth peer veth-zpr-c netns zpr-node1  # zpr-c:veth0 / zpr-node1:veth-zpr-c
 
   sudo ip -n zpr-node0 addr add "$NODE0_SUBSTRATE_ADDR_VS" peer "$VS_SUBSTRATE_ADDR" dev veth-zpr-vs
   sudo ip -n zpr-node0 addr add "$NODE0_SUBSTRATE_ADDR_A" peer "$A_SUBSTRATE_ADDR" dev veth-zpr-a
@@ -87,6 +87,7 @@ function create_network() {
   sudo ip -n zpr-node1 link set veth-zpr-b up
   sudo ip -n zpr-node1 link set veth-zpr-c up
   sudo ip -n zpr-node0 link set veth-zpr-node1 up
+  sudo ip -n zpr-node1 link set veth0 up
   sudo ip -n zpr-vs link set veth0 up
   sudo ip -n zpr-a link set veth0 up
   sudo ip -n zpr-b link set veth0 up
