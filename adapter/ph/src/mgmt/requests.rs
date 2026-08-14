@@ -91,7 +91,7 @@ pub fn send_hello_request_node<'a>(
         tlv::TlvEncoding::new_bootstrap_visa(visa).put(&mut pkt);
     }
 
-    for zpr_addr in asm.config.get().zpr_addr.clone() {
+    for zpr_addr in &asm.config.get().zpr_addr {
         tlv::TlvEncoding::new_static_addr(zpr_addr.into()).put(&mut pkt);
     }
 
@@ -123,6 +123,10 @@ pub fn send_hello_success_response<'a>(
 
     if let Some(aaa_addr) = aaa_address {
         tlv::TlvEncoding::new_aaa(aaa_addr).put(&mut pkt);
+    }
+
+    for zpr_addr in &asm.config.get().zpr_addr {
+        tlv::TlvEncoding::new_static_addr(zpr_addr.into()).put(&mut pkt);
     }
 
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::HelloResponse, pkt)

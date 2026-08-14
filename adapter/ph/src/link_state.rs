@@ -730,6 +730,7 @@ impl LinkStateWrapper {
             }
 
             (PhMode::Node, PeerMode::Node, false) => {
+                info!(target: LINK_STATE, "{} assigned actor addresses {addrs:?}", asm.formatted_link_id(link_id));
                 locked_fsm.actor_addresses = addrs;
                 mgmt::requests::send_hello_success_response(&asm, link_id, 0, &[], None).enqueue();
                 locked_fsm.set_state(LinkState::Active);
@@ -853,6 +854,7 @@ impl LinkStateWrapper {
                 }
             }
             (PhMode::Node, PeerMode::Node) => {
+                info!(target: LINK_STATE, "{} assigned actor addresses {addrs:?}", asm.formatted_link_id(link_id));
                 locked_fsm.actor_addresses = addrs;
                 locked_fsm.set_state(LinkState::Active);
                 debug!(target: LINK_STATE, "{} finished helloing.  Becoming active", asm.formatted_link_id(link_id));
