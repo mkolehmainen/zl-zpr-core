@@ -336,14 +336,17 @@ fn process_hello_tlvs(
                 }
                 for visa_entry in tlv_value {
                     match visa_entry {
-                        tlv::TlvValue::Visa(visa) => match visa_table.insert_visa(visa) {
-                            Ok(visa_id) => {
-                                info!(target: ZDP, "{}: received and ingested bootstrap visa {visa_id}", asm.formatted_link_id(link_id));
+                        tlv::TlvValue::Visa(visa) => {
+                            // FIXME; should use visa_mgmt::insert_visa but we don't yet have our peer addr assigned
+                            match visa_table.insert_visa(visa) {
+                                Ok(visa_id) => {
+                                    info!(target: ZDP, "{}: received and ingested bootstrap visa {visa_id}", asm.formatted_link_id(link_id));
+                                }
+                                Err(err) => {
+                                    warn!(target: ZDP, "{}: {message_name} bootstrap visa error: {err:?}", asm.formatted_link_id(link_id));
+                                }
                             }
-                            Err(err) => {
-                                warn!(target: ZDP, "{}: {message_name} bootstrap visa error: {err:?}", asm.formatted_link_id(link_id));
-                            }
-                        },
+                        }
                         _ => {
                             warn!(target: ZDP, "{}: {message_name} bootstrap visa value type is wrong: {visa_entry:?}", asm.formatted_link_id(link_id));
                             return Err(HandleMgmtError::BadStructure);
