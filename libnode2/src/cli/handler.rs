@@ -178,6 +178,7 @@ pub async fn run_handler(
                                 claims,
                                 substrate_addr,
                                 dock_interface: 0,
+                                a2a_dh_public_key: Default::default(),
                             };
 
                             match handle.authorize_connect(connect_req).await {
