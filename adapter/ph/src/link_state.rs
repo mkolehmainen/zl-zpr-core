@@ -138,7 +138,7 @@ pub enum LinkState {
 pub enum LinkEvent {
     Start,
     KeyingDone,
-    ReceivedHelloRequest,
+    ReceivedHelloRequest(Vec<IpAddress>),
     AssignedAAA(IpAddress), // Assigned AAA address for this link
     ReceivedASA(Vec<SocketAddr>),
     ReceivedHelloResponse(ResponseCode, Vec<IpAddress>),
@@ -474,7 +474,7 @@ impl LinkStateWrapper {
         match event {
             LinkEvent::Start => self.process_start(asm),
             LinkEvent::KeyingDone => self.process_keying_done(asm),
-            LinkEvent::ReceivedHelloRequest => self.process_hello_request(asm),
+            LinkEvent::ReceivedHelloRequest(addrs) => self.process_hello_request(asm, addrs),
             LinkEvent::AssignedAAA(addr) => self.update_aaa(asm, addr),
             LinkEvent::ReceivedASA(asa_addrs) => self.update_asa(asm, asa_addrs),
             LinkEvent::ReceivedHelloResponse(code, addrs) => {
@@ -674,7 +674,11 @@ impl LinkStateWrapper {
     /// Update link state based on received hello request
     /// Transitions from Helloing to Registering Actor Address
     /// Does not generate any packets
-    fn process_hello_request(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
+    fn process_hello_request(
+        &self,
+        asm: &Arc<Assembly>,
+        addrs: Vec<IpAddress>, // Requested ZPR Addrs of the peer
+    ) -> Result<(), LinkStateError> {
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
         let link_id = self.id;
 
@@ -726,8 +730,8 @@ impl LinkStateWrapper {
             }
 
             (PhMode::Node, PeerMode::Node, false) => {
+                locked_fsm.actor_addresses = addrs;
                 mgmt::requests::send_hello_success_response(&asm, link_id, 0, &[], None).enqueue();
-
                 locked_fsm.set_state(LinkState::Active);
                 Ok(())
             }

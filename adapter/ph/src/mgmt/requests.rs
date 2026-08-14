@@ -91,11 +91,9 @@ pub fn send_hello_request_node<'a>(
         tlv::TlvEncoding::new_bootstrap_visa(visa).put(&mut pkt);
     }
 
-
     for zpr_addr in asm.config.get().zpr_addr.clone() {
         tlv::TlvEncoding::new_static_addr(zpr_addr.into()).put(&mut pkt);
     }
-
 
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::HelloRequest, pkt)
 }

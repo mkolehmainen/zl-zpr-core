@@ -210,9 +210,12 @@ pub async fn handle_hello_request(asm: &Arc<Assembly>, mut pkt: Packet) -> Handl
         }
     };
 
-    process_hello_tlvs(&asm, ingress_link_id, "HelloRequest", tlv_data)?;
+    let static_addrs = process_hello_tlvs(&asm, ingress_link_id, "HelloRequest", tlv_data)?;
 
-    asm.process_link_state_event(ingress_link_id, LinkEvent::ReceivedHelloRequest)?;
+    asm.process_link_state_event(
+        ingress_link_id,
+        LinkEvent::ReceivedHelloRequest(static_addrs),
+    )?;
 
     Ok(())
 }
