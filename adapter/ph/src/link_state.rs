@@ -141,7 +141,7 @@ pub enum LinkEvent {
     ReceivedHelloRequest,
     AssignedAAA(IpAddress), // Assigned AAA address for this link
     ReceivedASA(Vec<SocketAddr>),
-    ReceivedHelloResponse(ResponseCode),
+    ReceivedHelloResponse(ResponseCode, Vec<IpAddress>),
 
     ReceivedInitAuth((bool, Option<auth::ZdpInitAuthenticationPayload>)), // (bootstrap_flag, challenge)
     ReceivedInitAuthAck,
@@ -477,7 +477,7 @@ impl LinkStateWrapper {
             LinkEvent::ReceivedHelloRequest => self.process_hello_request(asm),
             LinkEvent::AssignedAAA(addr) => self.update_aaa(asm, addr),
             LinkEvent::ReceivedASA(asa_addrs) => self.update_asa(asm, asa_addrs),
-            LinkEvent::ReceivedHelloResponse(code) => self.process_hello_response(asm, code),
+            LinkEvent::ReceivedHelloResponse(code, addrs) => self.process_hello_response(asm, code, addrs),
 
             LinkEvent::ReceivedAcquireZprAddressRequest(addrs, blob) => {
                 self.process_acquire_zpr_address_request(asm, addrs, blob)
@@ -809,6 +809,7 @@ impl LinkStateWrapper {
         &self,
         asm: &Arc<Assembly>,
         code: ResponseCode,
+        addrs: Vec<IpAddress>, // Requested ZPR Addrs of the peer
     ) -> Result<(), LinkStateError> {
         if code == ResponseCode::Other {
             // Received an error response.
@@ -846,6 +847,7 @@ impl LinkStateWrapper {
                 }
             }
             (PhMode::Node, PeerMode::Node) => {
+                locked_fsm.actor_addresses = addrs;
                 locked_fsm.set_state(LinkState::Active);
                 debug!(target: LINK_STATE, "{} finished helloing.  Becoming active", asm.formatted_link_id(link_id));
                 Ok(())

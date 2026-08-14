@@ -75,7 +75,6 @@ impl TlvEncoding {
     }
 
     /// Actor requested static address for an adapter.
-    #[allow(dead_code)]
     pub fn new_static_addr(addr: IpAddress) -> TlvEncoding {
         Self::new_static_addr_std(addr.into())
     }
