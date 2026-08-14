@@ -213,6 +213,11 @@ impl LinkData {
     }
 }
 
+struct InitAuthData {
+    bootstrap: bool,
+    challenge: Option<auth::ZdpInitAuthenticationPayload>,
+}
+
 pub struct LinkStateMachine {
     id: LinkId,
     peer_mode: PeerMode,
@@ -230,6 +235,8 @@ pub struct LinkStateMachine {
     /// Counter available for use by states which wish to count timeouts.
     /// Reset to 0 on any state transition.
     timeout_count: usize,
+    /// Used in Helloing when a racy InitAuthRequest arrived
+    stowed_init_auth: Option<InitAuthData>,
     /// Handle to an outstanding echo/keepalive task; used only during Active.
     /// Instant is time at which the echo was sent.
     echo_handle: Option<(Instant, tokio::task::AbortHandle)>,
@@ -249,6 +256,7 @@ impl LinkStateMachine {
             logical_clock: 0,
             timeout_handle: None,
             timeout_count: 0,
+            stowed_init_auth: None,
             echo_handle: None,
             shutting_down: false,
         }
@@ -825,8 +833,17 @@ impl LinkStateWrapper {
                     target: LINK_STATE,
                     "{} finished helloing.  Now waiting for init auth.", asm.formatted_link_id(link_id)
                 );
+                let stowed_init_auth = std::mem::take(&mut locked_fsm.stowed_init_auth);
                 drop(locked_fsm);
-                Ok(())
+                if let Some(stowed_init_auth) = stowed_init_auth {
+                    self.process_init_auth(
+                        asm,
+                        stowed_init_auth.bootstrap,
+                        stowed_init_auth.challenge,
+                    )
+                } else {
+                    Ok(())
+                }
             }
             (PhMode::Node, PeerMode::Node) => {
                 locked_fsm.set_state(LinkState::Active);
@@ -1236,6 +1253,13 @@ impl LinkStateWrapper {
                         }
                     }
                 }
+            }
+            (PhMode::Adapter, LinkState::Helloing) => {
+                // init auth can race helloing; if so, stow it away until we finish helloing
+                locked_fsm.stowed_init_auth = Some(InitAuthData {
+                    bootstrap,
+                    challenge,
+                });
             }
             (_, _) => {
                 return Err(LinkStateError::UnexpectedTransition(
