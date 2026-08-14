@@ -303,6 +303,12 @@ fn process_hello_tlvs(
             tlv::DataType::BOOTSTRAP_VISA => {
                 let mut visa_table = asm.visa_table.write().unwrap();
                 // FIXME: we should only apply these if we are a NEW node
+                if !tlv_value.is_empty() {
+                    // HACK: revoke our two self-granted bootstrap visas, if we've received any here
+                    // Instead, we OUGHT to only install those if a VS connects to us.
+                    let _ = visa_table.revoke(&asm.peer_table, 1);
+                    let _ = visa_table.revoke(&asm.peer_table, 2);
+                }
                 for visa_entry in tlv_value {
                     match visa_entry {
                         tlv::TlvValue::Visa(visa) => match visa_table.insert_visa(visa) {

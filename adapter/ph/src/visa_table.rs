@@ -90,6 +90,7 @@ impl Eq for VisaTimeout {}
 
 impl Visa {
     pub fn new(visa: vsapi_types::Visa) -> Self {
+        //info!(target: VISA_MGMT, "CTP: NEW VISA {visa:?}");
         if visa.visa_type != vsapi_types::VisaType::Full {
             panic!("Forward only visas not yet supported")
         }
