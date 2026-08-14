@@ -70,6 +70,9 @@ case "$ACTOR_PROTOCOL" in
 		C_ZPR_ADDR=10.253.3.1
 		ZPR_SUBNET=10.253.0.0/16
 
+		ZPR_VS_PREFIXLEN=32
+		ZPR_PREFIXLEN=16
+
 		POLICY_BIN="v4-${NUM_NODES}node-${NUM_ACTORS}actor-ping.bin2"
         ;;
     ipv6)
@@ -83,6 +86,9 @@ case "$ACTOR_PROTOCOL" in
 		B_ZPR_ADDR=fd00:1:2::1
 		C_ZPR_ADDR=fd00:1:3::1
 		ZPR_SUBNET=fd00:1::0/32
+
+		ZPR_VS_PREFIXLEN=32
+		ZPR_PREFIXLEN=32
 
 		POLICY_BIN="v6-${NUM_NODES}node-${NUM_ACTORS}actor-ping.bin2"
         ;;

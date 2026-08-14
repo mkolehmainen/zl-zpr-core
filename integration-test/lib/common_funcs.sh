@@ -129,12 +129,12 @@ function create_network() {
   # Kernel bug: kernels older than 6.10 don't set peer route correctly
   # when interface is down.  I think <https://github.com/torvalds/linux/commit/d0098e4c6b83e502cc1cd96d67ca86bc79a6c559>
   # fixes this issue.  For now, add the addresses after we bring the link up.
-  sudo ip -n zpr-node0 addr add "$NODE0_ZPR_ADDR" peer "$VS_ZPR_ADDR" dev tun0
-  sudo ip -n zpr-node1 addr add "$NODE1_ZPR_ADDR" peer "$VS_ZPR_ADDR" dev tun0
-  sudo ip -n zpr-vs addr add "$VS_ZPR_ADDR" peer "$NODE0_ZPR_ADDR" dev tun0
-  sudo ip -n zpr-a addr add "$A_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
-  sudo ip -n zpr-b addr add "$B_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
-  sudo ip -n zpr-c addr add "$C_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
+  sudo ip -n zpr-node0 addr add "$NODE0_ZPR_ADDR/$ZPR_VS_PREFIXLEN" dev tun0
+  sudo ip -n zpr-node1 addr add "$NODE1_ZPR_ADDR/$ZPR_VS_PREFIXLEN" dev tun0
+  sudo ip -n zpr-vs addr add "$VS_ZPR_ADDR/$ZPR_VS_PREFIXLEN" dev tun0
+  sudo ip -n zpr-a addr add "$A_ZPR_ADDR/$ZPR_PREFIXLEN" dev tun0
+  sudo ip -n zpr-b addr add "$B_ZPR_ADDR/$ZPR_PREFIXLEN" dev tun0
+  sudo ip -n zpr-c addr add "$C_ZPR_ADDR/$ZPR_PREFIXLEN" dev tun0
 }
 
 function configure_netem() {
