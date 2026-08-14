@@ -238,7 +238,10 @@ pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Hand
 
     let static_addrs = process_hello_tlvs(&asm, link_id, "HelloResponse", tlv_data)?;
 
-    asm.process_link_state_event(link_id, LinkEvent::ReceivedHelloResponse(status, static_addrs))?;
+    asm.process_link_state_event(
+        link_id,
+        LinkEvent::ReceivedHelloResponse(status, static_addrs),
+    )?;
 
     Ok(())
 }
@@ -257,19 +260,19 @@ fn process_hello_tlvs(
     for (tlv_type, tlv_value) in tlv_data {
         match tlv_type {
             tlv::DataType::VERSION => {
-                info!(target: ZDP, "{}: {message_name} - peer version is : {}", asm.formatted_link_id(link_id), tlv_value[0]);
+                info!(target: ZDP, "{}: {message_name} - peer version is: {}", asm.formatted_link_id(link_id), tlv_value[0]);
             }
             tlv::DataType::WINDOW_SIZE => {
                 process_window_size_tlv(&asm, link_id, message_name, &tlv_value)?;
             }
             tlv::DataType::POLICY_ID => {
-                info!(target: ZDP, "{}: {message_name} - peer policy ID is : {}", asm.formatted_link_id(link_id), tlv_value[0]);
+                info!(target: ZDP, "{}: {message_name} - peer policy ID is: {}", asm.formatted_link_id(link_id), tlv_value[0]);
             }
             tlv::DataType::ASA => {
                 for asa_entry in tlv_value {
                     match asa_entry {
                         tlv::TlvValue::SocketAddr(sa) => {
-                            info!(target: ZDP, "{}: {message_name} includes ASA address:{sa}", asm.formatted_link_id(link_id));
+                            info!(target: ZDP, "{}: {message_name} includes ASA address: {sa}", asm.formatted_link_id(link_id));
                             asa_addresses.push(sa.clone());
                         }
                         _ => {
@@ -287,11 +290,11 @@ fn process_hello_tlvs(
                     }
                     match aaa_entry {
                         tlv::TlvValue::Ipv4Addr(ipa) => {
-                            info!(target: ZDP, "{}: {message_name} includes AAA address:{ipa}", asm.formatted_link_id(link_id));
+                            info!(target: ZDP, "{}: {message_name} includes AAA address: {ipa}", asm.formatted_link_id(link_id));
                             aaa_address = Some(IpAddress::new_from_std_v4(&ipa));
                         }
                         tlv::TlvValue::Ipv6Addr(ipa) => {
-                            info!(target: ZDP, "{}: {message_name} includes AAA address:{ipa}", asm.formatted_link_id(link_id));
+                            info!(target: ZDP, "{}: {message_name} includes AAA address: {ipa}", asm.formatted_link_id(link_id));
                             aaa_address = Some(IpAddress::new_from_std_v6(&ipa));
                         }
                         _ => {
@@ -305,11 +308,11 @@ fn process_hello_tlvs(
                 for static_addr in tlv_value {
                     match static_addr {
                         tlv::TlvValue::Ipv4Addr(ipa) => {
-                            info!(target: ZDP, "{}: {message_name} includes ZPR address:{ipa}", asm.formatted_link_id(link_id));
+                            info!(target: ZDP, "{}: {message_name} includes ZPR address: {ipa}", asm.formatted_link_id(link_id));
                             static_addrs.push(IpAddress::new_from_std_v4(&ipa));
                         }
                         tlv::TlvValue::Ipv6Addr(ipa) => {
-                            info!(target: ZDP, "{}: {message_name} includes ZPR address:{ipa}", asm.formatted_link_id(link_id));
+                            info!(target: ZDP, "{}: {message_name} includes ZPR address: {ipa}", asm.formatted_link_id(link_id));
                             static_addrs.push(IpAddress::new_from_std_v6(&ipa));
                         }
                         _ => {
@@ -318,7 +321,6 @@ fn process_hello_tlvs(
                         }
                     }
                 }
-
             }
             tlv::DataType::BOOTSTRAP_VISA => {
                 let mut visa_table = asm.visa_table.write().unwrap();

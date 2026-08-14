@@ -477,7 +477,9 @@ impl LinkStateWrapper {
             LinkEvent::ReceivedHelloRequest => self.process_hello_request(asm),
             LinkEvent::AssignedAAA(addr) => self.update_aaa(asm, addr),
             LinkEvent::ReceivedASA(asa_addrs) => self.update_asa(asm, asa_addrs),
-            LinkEvent::ReceivedHelloResponse(code, addrs) => self.process_hello_response(asm, code, addrs),
+            LinkEvent::ReceivedHelloResponse(code, addrs) => {
+                self.process_hello_response(asm, code, addrs)
+            }
 
             LinkEvent::ReceivedAcquireZprAddressRequest(addrs, blob) => {
                 self.process_acquire_zpr_address_request(asm, addrs, blob)
