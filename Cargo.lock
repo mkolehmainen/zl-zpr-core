@@ -2208,6 +2208,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-input",
+ "x25519-dalek",
  "zpr 0.25.0",
  "zpr-utils",
 ]
