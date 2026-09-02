@@ -2,16 +2,42 @@ use crate::auth::AuthBlob;
 use crate::counters::ManagementCounterType;
 use crate::link_state::{LinkEvent, LinkStateError};
 use crate::prelude::*;
-use crate::special_peers::SpecialPeerName;
 use crate::visa_table;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use libnode::claims;
+use libnode::error::VSApiError;
 use std::net::IpAddr;
 use std::num::NonZero;
 use zpr::vsapi_types::{self, DisconnectNotice, DisconnectReason};
 use zpr_utils::net_defs::IpAddress;
+
+/// Register the visa service adapter with the visa service, now that the node can reach it.
+pub async fn send_deferred_vs_connect(
+    asm: &Arc<Assembly>,
+    link_id: LinkId,
+    assigned_addr: IpAddress,
+    connect_req: vsapi_types::ConnectRequest,
+) -> Result<(), VSApiError> {
+    let conn = asm
+        .vsconn
+        .as_ref()
+        .unwrap()
+        .authorize_connect(connect_req)
+        .await?;
+
+    if IpAddress::new_from_std(&conn.zpr_addr) != assigned_addr {
+        return Err(VSApiError::CommandFailed(format!(
+            "visa service granted {} to the visa service adapter, which is already assigned {assigned_addr}",
+            conn.zpr_addr
+        )));
+    }
+
+    info!(target: VISA_MGMT, "{}: visa service adapter registered with the visa service as {}",
+        asm.formatted_link_id(link_id), conn.zpr_addr);
+    Ok(())
+}
 
 pub fn authorize_connect(
     asm: &Arc<Assembly>,
@@ -62,25 +88,10 @@ pub fn authorize_connect(
 /// If it is a specified address we pass it as the "zpr.addr" claim.
 pub fn build_connect_request(
     asm: &Arc<Assembly>,
-    id: LinkId,
     addr: IpAddress,
     blob: &AuthBlob,
     a2a_dh_public_key: Option<x25519_dalek::PublicKey>,
-) -> Result<Option<vsapi_types::ConnectRequest>, LinkStateError> {
-    // Check if this link is "blessed" as the visa service. This happens in link_state and is sensitive
-    // to whether the certificate was verified or not.
-    {
-        let vs_peer = asm
-            .peer_table
-            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
-        if let Some(vs_peer_id) = vs_peer {
-            if vs_peer_id.get() == id {
-                // This link is to the visa service itself, so no connect request is needed.
-                return Ok(None);
-            }
-        }
-    }
-
+) -> Result<vsapi_types::ConnectRequest, LinkStateError> {
     // Convert the adapter's AuthBlob to the vsapi_types AuthBlob for the v2 protocol.
     let vsapi_blob = match blob {
         AuthBlob::SelfSigned(ss) => vsapi_types::AuthBlob::SS(vsapi_types::SelfSignedBlob {
@@ -131,7 +142,7 @@ pub fn build_connect_request(
         dock_interface: 0,
         a2a_dh_public_key,
     };
-    Ok(Some(connect_req))
+    Ok(connect_req)
 }
 
 /// This uses "RemoteDisconnect" as the reason passed to the visa service.
