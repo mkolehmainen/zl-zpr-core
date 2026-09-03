@@ -1885,6 +1885,9 @@ fn get_available_asa_addresses(asm: &Assembly, link_id: LinkId) -> Vec<SocketAdd
     if svclist.is_valid() {
         // If we have a list of services, include them in the response.
         // TODO: The ASA is set as a SocketAddr which doesn't feel quite right.  Maybe should be a URI.
+        // Only on-net ActorAuthentication services carry a ZPR socket address;
+        // `get_socket_addr()` returns `None` for off-net OidcAuthentication
+        // descriptors, which are advertised separately via OIDC_IDP TLVs.
         for authservice in &svclist.services {
             if let Some(sa) = authservice.get_socket_addr() {
                 debug!(target: LINK_STATE, "{}: HelloResponse - adding ASA address: {sa}", asm.formatted_link_id(link_id));
