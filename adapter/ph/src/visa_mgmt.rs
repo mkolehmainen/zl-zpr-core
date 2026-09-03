@@ -110,6 +110,9 @@ pub fn build_connect_request(
             pkce: ac.pkce.clone(),
             client_id: ac.client_id.clone(),
         }),
+        // OIDC blobs are forwarded with the multi-blob acquire path
+        // (zipline#12 commit 4); until then they are rejected upstream.
+        AuthBlob::Oidc(_) => return Err(LinkStateError::OperationNotSupportedYet),
     };
 
     let mut request_claims = Vec::new();

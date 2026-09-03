@@ -36,6 +36,9 @@ pub const BLOB_TYPE_SS: &str = "SS";
 /// Auth Code blob type
 pub const BLOB_TYPE_AC: &str = "AC";
 
+/// OIDC blob type
+pub const BLOB_TYPE_OIDC: &str = "OIDC";
+
 /// When checking a challenge returned to a node by an adapter, it may
 /// be no older than this.
 pub const MAX_BLOB_AGE_SECONDS: u64 = 120; // 2 minutes
@@ -142,12 +145,31 @@ pub struct ZdpAuthCodeBlob {
     pub asa: String,
 }
 
+/// The OIDC authentication BLOB which originates on an adapter and is passed
+/// to a node via a [zdp::PacketType::AcquireZprAddressRequest] message.
+///
+/// Carries an OIDC ID token from an off-net identity provider plus the node's
+/// init-auth challenge, binding the token presentation to this link.
+///
+/// Note that this passed around as JSON text encoded in base64.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ZdpOidcBlob {
+    pub blob_type: String, // "OIDC"
+    /// Issuer URL of the identity provider that minted `id_token`.
+    pub issuer: String,
+    /// The OIDC ID token (JWT) as obtained from the IdP.
+    pub id_token: String,
+    /// The node's init-auth challenge (nonce, ctime, hmac), base64 encoded.
+    pub challenge: String,
+}
+
 /// Enum used to return different blob types based on their blob_type field.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum AuthBlob {
     SelfSigned(ZdpSelfSignedBlob),
     AuthCode(ZdpAuthCodeBlob),
+    Oidc(ZdpOidcBlob),
 }
 
 #[derive(Debug, Error)]
@@ -234,45 +256,94 @@ impl ZdpSelfSignedBlob {
         }
 
         let payload_bytes = BASE64_STANDARD.decode(self.challenge.clone())?;
-        if payload_bytes.len() != size_of::<ZdpInitAuthenticationPayload>() {
-            return Err(AuthError::FormatError(format!(
-                "challenge size is incorrect"
-            )));
-        }
-        let zpayload = match ZdpInitAuthenticationPayload::read_from_bytes(&payload_bytes) {
-            Ok(zpayload) => zpayload,
-            Err(e) => {
-                return Err(AuthError::FormatError(format!(
-                    "failed to deserialize ZdpInitAuthenticationPayload: {e}"
-                )));
-            }
-        };
-
-        let hash_ok = {
-            let mut hasher = blake3::Hasher::new_keyed(&key);
-            hasher.update(&zpayload.nonce);
-            hasher.update(&zpayload.ctime.to_bytes());
-            let computed_hmac = hasher.finalize();
-            let presented_hmac = blake3::Hash::from_bytes(zpayload.hmac);
-            computed_hmac == presented_hmac
-        };
-
-        if !hash_ok {
-            return Err(AuthError::InvalidHmac);
-        }
-
-        // Now can check age of blob.
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u64;
-
-        if now > zpayload.ctime.get() + MAX_BLOB_AGE_SECONDS {
-            return Err(AuthError::ChallengeTooOld);
-        }
-
+        verify_challenge_bytes(&payload_bytes, key)?;
         Ok(())
     }
+}
+
+impl ZdpOidcBlob {
+    /// Gets the "encoded" form of the blob: base64 encoded JSON.
+    #[allow(dead_code)]
+    pub fn encode(&self) -> String {
+        let json_txt = serde_json::to_string(self).unwrap();
+        BASE64_STANDARD.encode(&json_txt)
+    }
+
+    /// The `challenge` field in the blob is a base64 encoded
+    /// [ZdpInitAuthenticationPayload]. This extracts that data and checks that:
+    ///   - The HMAC in the challenge is valid for the provided `key`.
+    ///   - The challenge is not older than `MAX_BLOB_AGE_SECONDS`.
+    ///
+    /// Unlike [ZdpSelfSignedBlob::verify_blob_challenge] there is no CN leg:
+    /// an OIDC blob carries no CN, identity comes from the ID token which the
+    /// visa service verifies.
+    ///
+    /// On success, returns the verified challenge bytes so the caller can
+    /// derive the OIDC nonce from data it has authenticated.
+    #[allow(dead_code)] // used from the multi-blob acquire path (zipline#12 commit 4)
+    pub fn verify_challenge(&self, key: &[u8; AUTH_KEY_SIZE_BYTES]) -> Result<[u8; 48], AuthError> {
+        let payload_bytes = BASE64_STANDARD.decode(self.challenge.clone())?;
+        verify_challenge_bytes(&payload_bytes, key)?;
+        let mut challenge = [0u8; 48];
+        challenge.copy_from_slice(&payload_bytes);
+        Ok(challenge)
+    }
+}
+
+/// Shared challenge-verification core: checks that `payload_bytes` is a
+/// well-formed [ZdpInitAuthenticationPayload] (48 bytes), that its HMAC is
+/// valid for `key`, and that it is not older than [MAX_BLOB_AGE_SECONDS].
+fn verify_challenge_bytes(
+    payload_bytes: &[u8],
+    key: &[u8; AUTH_KEY_SIZE_BYTES],
+) -> Result<(), AuthError> {
+    if payload_bytes.len() != size_of::<ZdpInitAuthenticationPayload>() {
+        return Err(AuthError::FormatError(
+            "challenge size is incorrect".to_string(),
+        ));
+    }
+    let zpayload = match ZdpInitAuthenticationPayload::read_from_bytes(payload_bytes) {
+        Ok(zpayload) => zpayload,
+        Err(e) => {
+            return Err(AuthError::FormatError(format!(
+                "failed to deserialize ZdpInitAuthenticationPayload: {e}"
+            )));
+        }
+    };
+
+    let hash_ok = {
+        let mut hasher = blake3::Hasher::new_keyed(key);
+        hasher.update(&zpayload.nonce);
+        hasher.update(&zpayload.ctime.to_bytes());
+        let computed_hmac = hasher.finalize();
+        let presented_hmac = blake3::Hash::from_bytes(zpayload.hmac);
+        computed_hmac == presented_hmac
+    };
+
+    if !hash_ok {
+        return Err(AuthError::InvalidHmac);
+    }
+
+    // Now can check age of blob.
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u64;
+
+    if now > zpayload.ctime.get() + MAX_BLOB_AGE_SECONDS {
+        return Err(AuthError::ChallengeTooOld);
+    }
+
+    Ok(())
+}
+
+/// The OIDC `nonce` claim binding an ID token to a link challenge:
+/// base64url (no padding) of the SHA-256 of the raw challenge bytes.
+#[allow(dead_code)] // used from the multi-blob acquire path (zipline#12 commit 4)
+pub fn oidc_nonce_for_challenge(challenge: &[u8; 48]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(challenge);
+    BASE64_URL_SAFE_NO_PAD.encode(digest)
 }
 
 impl ZdpInitAuthenticationPayload {
@@ -302,24 +373,67 @@ pub fn decode_blob(blob_str: &str) -> Result<AuthBlob, AuthError> {
     let json_txt = BASE64_STANDARD.decode(blob_str)?;
 
     let jobj: Value = serde_json::from_slice(&json_txt)?;
+    decode_blob_value(&jobj)
+}
+
+/// Decode a single JSON blob object (already parsed) into an [AuthBlob],
+/// dispatching on its "blob_type" field.
+fn decode_blob_value(jobj: &Value) -> Result<AuthBlob, AuthError> {
     let blob_type = jobj.get("blob_type").ok_or_else(|| {
-        AuthError::FormatError(format!("missing blob_type field in blob: {}", blob_str))
+        AuthError::FormatError(format!("missing blob_type field in blob: {}", jobj))
     })?;
 
     match blob_type.as_str() {
         Some(BLOB_TYPE_SS) => {
-            let ss_blob = serde_json::from_slice::<ZdpSelfSignedBlob>(&json_txt)?;
+            let ss_blob = serde_json::from_value::<ZdpSelfSignedBlob>(jobj.clone())?;
             Ok(AuthBlob::SelfSigned(ss_blob))
         }
         Some(BLOB_TYPE_AC) => {
-            let ac_blob = serde_json::from_slice::<ZdpAuthCodeBlob>(&json_txt)?;
+            let ac_blob = serde_json::from_value::<ZdpAuthCodeBlob>(jobj.clone())?;
             Ok(AuthBlob::AuthCode(ac_blob))
+        }
+        Some(BLOB_TYPE_OIDC) => {
+            let oidc_blob = serde_json::from_value::<ZdpOidcBlob>(jobj.clone())?;
+            Ok(AuthBlob::Oidc(oidc_blob))
         }
         _ => Err(AuthError::FormatError(format!(
             "unknown blob_type: {:?}",
             blob_type
         ))),
     }
+}
+
+/// Decode a blob string into a list of [AuthBlob] objects.
+///
+/// The blob string is base64 encoded JSON: either a single blob object
+/// (the legacy encoding) or a top-level array of blob objects. A bare object
+/// decodes to a one-element list. Any element with an unknown or missing
+/// `blob_type` fails the whole decode.
+#[allow(dead_code)] // used from the multi-blob acquire path (zipline#12 commit 4)
+pub fn decode_blobs(blob_str: &str) -> Result<Vec<AuthBlob>, AuthError> {
+    let json_txt = BASE64_STANDARD.decode(blob_str)?;
+
+    let jval: Value = serde_json::from_slice(&json_txt)?;
+    match jval {
+        Value::Array(items) => items.iter().map(decode_blob_value).collect(),
+        obj => Ok(vec![decode_blob_value(&obj)?]),
+    }
+}
+
+/// Encode a list of [AuthBlob] objects as a blob string:
+/// base64 encoded JSON, always a top-level array.
+#[allow(dead_code)]
+pub fn encode_blobs(blobs: &[AuthBlob]) -> String {
+    let values: Vec<Value> = blobs
+        .iter()
+        .map(|blob| match blob {
+            AuthBlob::SelfSigned(ss) => serde_json::to_value(ss).unwrap(),
+            AuthBlob::AuthCode(ac) => serde_json::to_value(ac).unwrap(),
+            AuthBlob::Oidc(oidc) => serde_json::to_value(oidc).unwrap(),
+        })
+        .collect();
+    let json_txt = serde_json::to_string(&Value::Array(values)).unwrap();
+    BASE64_STANDARD.encode(&json_txt)
 }
 
 /// Implementes BootstrapAuth using our RSA signature scheme.
@@ -573,6 +687,132 @@ mod test {
     use super::*;
     use aws_lc_rs::signature::{KeyPair, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
     use std::path::PathBuf;
+
+    fn make_ss_blob() -> ZdpSelfSignedBlob {
+        ZdpSelfSignedBlob {
+            blob_type: BLOB_TYPE_SS.to_string(),
+            ts: 12345,
+            cn: "test.cn.zpr".to_string(),
+            challenge: BASE64_STANDARD.encode([1u8; 48]),
+            sig: BASE64_STANDARD.encode([2u8; 16]),
+        }
+    }
+
+    fn make_oidc_blob() -> ZdpOidcBlob {
+        ZdpOidcBlob {
+            blob_type: BLOB_TYPE_OIDC.to_string(),
+            issuer: "https://accounts.google.com".to_string(),
+            id_token: "eyJ.header.payload".to_string(),
+            challenge: BASE64_STANDARD.encode([3u8; 48]),
+        }
+    }
+
+    #[test]
+    fn test_decode_blobs_legacy_object() {
+        // A legacy bare (non-array) SS blob object decodes to a one-element vec.
+        let encoded = make_ss_blob().encode();
+        let blobs = decode_blobs(&encoded).unwrap();
+        assert_eq!(blobs.len(), 1);
+        match &blobs[0] {
+            AuthBlob::SelfSigned(ss) => assert_eq!(ss.cn, "test.cn.zpr"),
+            other => panic!("expected SelfSigned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_blobs_array_ss_and_oidc() {
+        // A JSON-array blob string decodes to all elements, order preserved.
+        let encoded = encode_blobs(&[
+            AuthBlob::SelfSigned(make_ss_blob()),
+            AuthBlob::Oidc(make_oidc_blob()),
+        ]);
+        let blobs = decode_blobs(&encoded).unwrap();
+        assert_eq!(blobs.len(), 2);
+        match &blobs[0] {
+            AuthBlob::SelfSigned(ss) => assert_eq!(ss.cn, "test.cn.zpr"),
+            other => panic!("expected SelfSigned first, got {other:?}"),
+        }
+        match &blobs[1] {
+            AuthBlob::Oidc(oidc) => {
+                assert_eq!(oidc.issuer, "https://accounts.google.com");
+                assert_eq!(oidc.id_token, "eyJ.header.payload");
+            }
+            other => panic!("expected Oidc second, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_blobs_unknown_type_errors() {
+        let json = r#"[{"blob_type": "XX", "stuff": 1}]"#;
+        let encoded = BASE64_STANDARD.encode(json);
+        match decode_blobs(&encoded) {
+            Err(AuthError::FormatError(_)) => {}
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_oidc_nonce_is_b64url_sha256() {
+        // Vector computed independently (python3 hashlib/base64):
+        // challenge = bytes(range(48))
+        // base64.urlsafe_b64encode(hashlib.sha256(challenge).digest()).rstrip(b'=')
+        let mut challenge = [0u8; 48];
+        for (i, b) in challenge.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        assert_eq!(
+            oidc_nonce_for_challenge(&challenge),
+            "Tb3CsrYssAdJeFvIQgIjbbw3d9dGYGEbjliBLwz95sM"
+        );
+    }
+
+    #[test]
+    fn test_oidc_blob_verify_challenge_rejects_bad_hmac_and_old_ctime() {
+        let key = [7u8; AUTH_KEY_SIZE_BYTES];
+
+        // A fresh, correctly HMAC'd challenge verifies and returns its bytes.
+        let payload = ZdpInitAuthenticationPayload::new(&key);
+        let mut challenge = [0u8; 48];
+        challenge[0..8].copy_from_slice(&payload.nonce);
+        challenge[8..16].copy_from_slice(&payload.ctime.to_bytes());
+        challenge[16..48].copy_from_slice(&payload.hmac);
+        let mut blob = make_oidc_blob();
+        blob.challenge = BASE64_STANDARD.encode(challenge);
+        let verified = blob.verify_challenge(&key).unwrap();
+        assert_eq!(verified, challenge);
+
+        // Flipping one HMAC byte fails.
+        let mut bad = challenge;
+        bad[16] ^= 0x01;
+        blob.challenge = BASE64_STANDARD.encode(bad);
+        match blob.verify_challenge(&key) {
+            Err(AuthError::InvalidHmac) => {}
+            other => panic!("expected InvalidHmac, got {other:?}"),
+        }
+
+        // A correctly HMAC'd but stale ctime fails.
+        let old_ctime = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - MAX_BLOB_AGE_SECONDS
+            - 10;
+        let nonce = [9u8; 8];
+        let be_time = old_ctime.to_be_bytes();
+        let mut hasher = blake3::Hasher::new_keyed(&key);
+        hasher.update(&nonce);
+        hasher.update(&be_time);
+        let hmac = hasher.finalize();
+        let mut stale = [0u8; 48];
+        stale[0..8].copy_from_slice(&nonce);
+        stale[8..16].copy_from_slice(&be_time);
+        stale[16..48].copy_from_slice(hmac.as_bytes());
+        blob.challenge = BASE64_STANDARD.encode(stale);
+        match blob.verify_challenge(&key) {
+            Err(AuthError::ChallengeTooOld) => {}
+            other => panic!("expected ChallengeTooOld, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_rsa_bootstrap_auth() {

@@ -885,6 +885,13 @@ impl LinkStateWrapper {
                     return self.process_error_response(asm);
                 }
             }
+            // Forwarding OIDC blobs to the visa service lands with the
+            // multi-blob acquire path (zipline#12 commit 4).
+            AuthBlob::Oidc(_) => {
+                warn!(target: LINK_STATE, "{} OIDC blob in acquire request not yet supported", asm.formatted_link_id(link_id));
+                drop(locked_fsm);
+                return self.process_error_response(asm);
+            }
         }
 
         locked_fsm.set_state(LinkState::RegisterAA);
