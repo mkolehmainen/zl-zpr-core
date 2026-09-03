@@ -977,3 +977,32 @@ fn peer_type_by_id(asm: &Assembly, link_id: NonZero<LinkId>) -> PeerType {
         .inspect(link_id.get(), |ps| ps.peer_type())
         .unwrap_or(PeerType::Unknown)
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::mgmt::core;
+    use zpr_ext::zerocopy::IntoBytesExt;
+
+    /// A ~3 KB blob (JWT plus a self-signed blob in a JSON array) must fit
+    /// through a management packet built the way
+    /// send_acquire_zpr_address_request builds it, and parse back intact.
+    #[test]
+    fn test_acquire_zpr_address_request_3kb_blob_roundtrip() {
+        let blob = "A".repeat(3 * 1024);
+
+        // Build exactly like requests::send_acquire_zpr_address_request.
+        let mut req = core::new_heap_packet();
+        let hdr = zdp::ZdpAcquireZprAddressHeader {
+            blob_len: (blob.len() as u16).into(),
+            ip_version: L3Type::Ipv6,
+            addr_count: 0,
+        };
+        hdr.write_to_buf(&mut req).unwrap();
+        req.put_slice(blob.as_bytes());
+
+        let (addrs, parsed_blob) = parse_acquire_zpr_address_request(&mut req).unwrap();
+        assert!(addrs.is_none());
+        assert_eq!(parsed_blob, blob);
+    }
+}
