@@ -690,12 +690,14 @@ impl LinkStateWrapper {
 
                 let policy_id: i64 = 0; // TODO: We get policy ID from visa service. Record that somewhere, access it here.
                 let asa_addresses = get_available_asa_addresses(&asm, link_id);
+                let oidc_idps = get_available_oidc_idps(&asm, link_id);
 
                 mgmt::requests::send_hello_success_response(
                     &asm,
                     link_id,
                     policy_id,
                     &asa_addresses,
+                    &oidc_idps,
                     maybe_aaa_address,
                 )
                 .enqueue();
@@ -1908,6 +1910,40 @@ fn get_available_asa_addresses(asm: &Assembly, link_id: LinkId) -> Vec<SocketAdd
     }
 
     asa_addresses
+}
+
+/// Collect OIDC identity-provider advertisements from the auth-services list:
+/// one [auth::OidcIdpInfo] per descriptor with `stype == OidcAuthentication`
+/// that carries an `OidcClientConfig`.
+fn get_available_oidc_idps(asm: &Assembly, link_id: LinkId) -> Vec<auth::OidcIdpInfo> {
+    use zpr::vsapi_types::ServiceT;
+
+    let mut idps = Vec::new();
+
+    let svclist = asm.vs_auth_services.read().unwrap();
+    if svclist.is_valid() {
+        for authservice in &svclist.services {
+            if authservice.stype != ServiceT::OidcAuthentication {
+                continue;
+            }
+            let Some(cfg) = &authservice.oidc else {
+                warn!(target: LINK_STATE, "{}: HelloResponse - OIDC service {} has no client config",
+                    asm.formatted_link_id(link_id), authservice.service_id);
+                continue;
+            };
+            debug!(target: LINK_STATE, "{}: HelloResponse - adding OIDC IdP: {}",
+                asm.formatted_link_id(link_id), cfg.issuer);
+            idps.push(auth::OidcIdpInfo {
+                issuer: cfg.issuer.clone(),
+                client_id: cfg.client_id.clone(),
+                client_secret: cfg.client_secret.clone(),
+                scopes: cfg.scopes.clone(),
+                allow_offline_access: cfg.allow_offline_access,
+            });
+        }
+    }
+
+    idps
 }
 
 impl Display for LinkStateWrapper {

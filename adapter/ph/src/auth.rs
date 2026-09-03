@@ -172,6 +172,19 @@ pub enum AuthBlob {
     Oidc(ZdpOidcBlob),
 }
 
+/// What a client adapter needs to talk to an off-net OIDC identity provider.
+/// Advertised by the node in HelloResponse via `OIDC_IDP` TLVs (JSON encoded);
+/// mirrors the visa service's `OidcClientConfig`. All public data.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OidcIdpInfo {
+    pub issuer: String,
+    pub client_id: String,
+    /// `None` for public clients (RFC 8252 s8.5); not a secret when present.
+    pub client_secret: Option<String>,
+    pub scopes: Vec<String>,
+    pub allow_offline_access: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("OpenSSL Error: {0}")]

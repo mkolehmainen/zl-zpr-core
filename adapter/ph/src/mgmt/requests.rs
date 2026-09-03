@@ -64,11 +64,15 @@ pub fn send_hello_request(
 
 /// AAA address is optional, but will usually be specified.  Only is not specified if this node
 /// has not established a VSS connection with the visa service yet.
+///
+/// `oidc_idps` advertises off-net OIDC identity providers (one `OIDC_IDP` TLV
+/// each); empty when the visa service has none configured.
 pub fn send_hello_success_response<'a>(
     asm: &'a Assembly,
     link_id: LinkId,
     policy_id: i64,
     asa_addresses: &[SocketAddr],
+    oidc_idps: &[auth::OidcIdpInfo],
     aaa_address: Option<IpAddress>,
 ) -> Sent<'a> {
     let mut pkt = core::new_heap_packet();
@@ -83,6 +87,18 @@ pub fn send_hello_success_response<'a>(
 
     for asa_address in asa_addresses {
         tlv::TlvEncoding::new_asa(*asa_address).put(&mut pkt);
+    }
+
+    for idp in oidc_idps {
+        match tlv::TlvEncoding::new_oidc_idp(idp) {
+            Ok(enc) => enc.put(&mut pkt),
+            Err(e) => {
+                // Skip an unencodable IdP rather than fail the hello: the
+                // adapter can still authenticate via any other advertised
+                // mechanism.
+                warn!(target: ZDP, "{}: HelloResponse - skipping OIDC IdP {}: {e}", asm.formatted_link_id(link_id), idp.issuer);
+            }
+        }
     }
 
     if let Some(aaa_addr) = aaa_address {
