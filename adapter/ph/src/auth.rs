@@ -293,7 +293,6 @@ impl ZdpOidcBlob {
     ///
     /// On success, returns the verified challenge bytes so the caller can
     /// derive the OIDC nonce from data it has authenticated.
-    #[allow(dead_code)] // used from the multi-blob acquire path (zipline#12 commit 4)
     pub fn verify_challenge(&self, key: &[u8; AUTH_KEY_SIZE_BYTES]) -> Result<[u8; 48], AuthError> {
         let payload_bytes = BASE64_STANDARD.decode(self.challenge.clone())?;
         verify_challenge_bytes(&payload_bytes, key)?;
@@ -352,7 +351,6 @@ fn verify_challenge_bytes(
 
 /// The OIDC `nonce` claim binding an ID token to a link challenge:
 /// base64url (no padding) of the SHA-256 of the raw challenge bytes.
-#[allow(dead_code)] // used from the multi-blob acquire path (zipline#12 commit 4)
 pub fn oidc_nonce_for_challenge(challenge: &[u8; 48]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(challenge);
@@ -378,15 +376,6 @@ impl ZdpInitAuthenticationPayload {
             hmac: hmac.into(),
         }
     }
-}
-
-/// Decode a blob string into a [AuthBlob] object.
-/// The blob string is base64 encoded JSON which contains a "blob_type" field.
-pub fn decode_blob(blob_str: &str) -> Result<AuthBlob, AuthError> {
-    let json_txt = BASE64_STANDARD.decode(blob_str)?;
-
-    let jobj: Value = serde_json::from_slice(&json_txt)?;
-    decode_blob_value(&jobj)
 }
 
 /// Decode a single JSON blob object (already parsed) into an [AuthBlob],
@@ -422,7 +411,6 @@ fn decode_blob_value(jobj: &Value) -> Result<AuthBlob, AuthError> {
 /// (the legacy encoding) or a top-level array of blob objects. A bare object
 /// decodes to a one-element list. Any element with an unknown or missing
 /// `blob_type` fails the whole decode.
-#[allow(dead_code)] // used from the multi-blob acquire path (zipline#12 commit 4)
 pub fn decode_blobs(blob_str: &str) -> Result<Vec<AuthBlob>, AuthError> {
     let json_txt = BASE64_STANDARD.decode(blob_str)?;
 

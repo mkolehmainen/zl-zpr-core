@@ -871,28 +871,29 @@ impl LinkStateWrapper {
             "{} received acquire addr request for actor (requested_addr = {}).", asm.formatted_link_id(link_id), requested_addr
         );
 
-        // A self-signed blob needs to be checked before we forward it on.
+        // Every blob needs its challenge checked before we forward it on.
 
-        let Ok(d_blob) = auth::decode_blob(&blob) else {
+        let Ok(d_blobs) = auth::decode_blobs(&blob) else {
             warn!(target: LINK_STATE, "{} received acquire request with invalid blob", asm.formatted_link_id(link_id));
             drop(locked_fsm);
             return self.process_error_response(asm);
         };
 
-        match &d_blob {
-            AuthBlob::AuthCode(_) => {}
-            AuthBlob::SelfSigned(ss_blob) => {
-                if !self.check_self_signed_blob(asm, link_id, ss_blob) {
-                    drop(locked_fsm);
-                    return self.process_error_response(asm);
+        for d_blob in &d_blobs {
+            match d_blob {
+                AuthBlob::AuthCode(_) => {} // passthrough: the VS checks the code
+                AuthBlob::SelfSigned(ss_blob) => {
+                    if !self.check_self_signed_blob(asm, link_id, ss_blob) {
+                        drop(locked_fsm);
+                        return self.process_error_response(asm);
+                    }
                 }
-            }
-            // Forwarding OIDC blobs to the visa service lands with the
-            // multi-blob acquire path (zipline#12 commit 4).
-            AuthBlob::Oidc(_) => {
-                warn!(target: LINK_STATE, "{} OIDC blob in acquire request not yet supported", asm.formatted_link_id(link_id));
-                drop(locked_fsm);
-                return self.process_error_response(asm);
+                AuthBlob::Oidc(oidc_blob) => {
+                    if !self.check_oidc_blob(asm, link_id, oidc_blob) {
+                        drop(locked_fsm);
+                        return self.process_error_response(asm);
+                    }
+                }
             }
         }
 
@@ -905,7 +906,7 @@ impl LinkStateWrapper {
 
         // Now we have verified our part of the blob, we can send to the visa service for checking the signature.
         let conn_req =
-            visa_mgmt::build_connect_request(asm, requested_addr, &d_blob, a2a_dh_public_key)?;
+            visa_mgmt::build_connect_request(asm, requested_addr, &d_blobs, a2a_dh_public_key)?;
         drop(locked_fsm);
 
         if !is_vs_link {
@@ -964,6 +965,34 @@ impl LinkStateWrapper {
             ss_blob.verify_blob_challenge(sa.peer_cert.as_ref().map(|c| c.get_cert()), &key)
         {
             warn!(target: LINK_STATE, "{} challenge verification failed: {e}", asm.formatted_link_id(link_id));
+            return false;
+        }
+        true
+    }
+
+    /// Verify an OIDC blob's challenge: HMAC with this link's auth key plus
+    /// freshness. Identity itself is carried by the ID token, which the visa
+    /// service verifies; there is no CN leg here.
+    fn check_oidc_blob(
+        &self,
+        asm: &Arc<Assembly>,
+        link_id: LinkId,
+        oidc_blob: &auth::ZdpOidcBlob,
+    ) -> bool {
+        let key = asm.peer_table.inspect(link_id, {
+            |peer| {
+                let mut key = [0u8; AUTH_KEY_SIZE_BYTES];
+                key[0..AUTH_KEY_SIZE_BYTES].copy_from_slice(&peer.auth_key[0..AUTH_KEY_SIZE_BYTES]);
+                key
+            }
+        });
+        let Some(key) = key else {
+            warn!(target: LINK_STATE, "{} received acquire request but have no auth key", asm.formatted_link_id(link_id));
+            return false;
+        };
+
+        if let Err(e) = oidc_blob.verify_challenge(&key) {
+            warn!(target: LINK_STATE, "{} OIDC challenge verification failed: {e}", asm.formatted_link_id(link_id));
             return false;
         }
         true
