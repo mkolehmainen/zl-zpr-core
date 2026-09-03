@@ -43,6 +43,12 @@ pub const BLOB_TYPE_OIDC: &str = "OIDC";
 /// be no older than this.
 pub const MAX_BLOB_AGE_SECONDS: u64 = 120; // 2 minutes
 
+/// OIDC-specific challenge freshness window. The challenge is issued before
+/// the end user completes the OIDC browser flow, which is allowed up to
+/// OIDC_USER_INTERACTION_TIMEOUT (300 s, D2); this bound must cover that plus
+/// margin, consistent with ACTOR_AUTHENTICATION_TIMEOUT (330 s).
+pub const MAX_OIDC_BLOB_AGE_SECONDS: u64 = 330;
+
 // TODO: Not sure how we get these out or if we need them.
 pub const HARD_CODED_BAS_TLS_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
 MIIFmzCCA4OgAwIBAgIUJSg4OHOfPqY+lD7ymZy6akX/ZZ8wDQYJKoZIhvcNAQEL
@@ -269,7 +275,7 @@ impl ZdpSelfSignedBlob {
         }
 
         let payload_bytes = BASE64_STANDARD.decode(self.challenge.clone())?;
-        verify_challenge_bytes(&payload_bytes, key)?;
+        verify_challenge_bytes(&payload_bytes, key, MAX_BLOB_AGE_SECONDS)?;
         Ok(())
     }
 }
@@ -285,7 +291,10 @@ impl ZdpOidcBlob {
     /// The `challenge` field in the blob is a base64 encoded
     /// [ZdpInitAuthenticationPayload]. This extracts that data and checks that:
     ///   - The HMAC in the challenge is valid for the provided `key`.
-    ///   - The challenge is not older than `MAX_BLOB_AGE_SECONDS`.
+    ///   - The challenge is not older than `MAX_OIDC_BLOB_AGE_SECONDS` — the
+    ///     OIDC window, not `MAX_BLOB_AGE_SECONDS`: the challenge is issued
+    ///     before the user completes the browser flow, so the bound must cover
+    ///     the permitted user-interaction time.
     ///
     /// Unlike [ZdpSelfSignedBlob::verify_blob_challenge] there is no CN leg:
     /// an OIDC blob carries no CN, identity comes from the ID token which the
@@ -295,7 +304,7 @@ impl ZdpOidcBlob {
     /// derive the OIDC nonce from data it has authenticated.
     pub fn verify_challenge(&self, key: &[u8; AUTH_KEY_SIZE_BYTES]) -> Result<[u8; 48], AuthError> {
         let payload_bytes = BASE64_STANDARD.decode(self.challenge.clone())?;
-        verify_challenge_bytes(&payload_bytes, key)?;
+        verify_challenge_bytes(&payload_bytes, key, MAX_OIDC_BLOB_AGE_SECONDS)?;
         let mut challenge = [0u8; 48];
         challenge.copy_from_slice(&payload_bytes);
         Ok(challenge)
@@ -304,10 +313,11 @@ impl ZdpOidcBlob {
 
 /// Shared challenge-verification core: checks that `payload_bytes` is a
 /// well-formed [ZdpInitAuthenticationPayload] (48 bytes), that its HMAC is
-/// valid for `key`, and that it is not older than [MAX_BLOB_AGE_SECONDS].
+/// valid for `key`, and that it is not older than `max_age_seconds`.
 fn verify_challenge_bytes(
     payload_bytes: &[u8],
     key: &[u8; AUTH_KEY_SIZE_BYTES],
+    max_age_seconds: u64,
 ) -> Result<(), AuthError> {
     if payload_bytes.len() != size_of::<ZdpInitAuthenticationPayload>() {
         return Err(AuthError::FormatError(
@@ -342,7 +352,7 @@ fn verify_challenge_bytes(
         .unwrap()
         .as_secs() as u64;
 
-    if now > zpayload.ctime.get() + MAX_BLOB_AGE_SECONDS {
+    if now > zpayload.ctime.get() + max_age_seconds {
         return Err(AuthError::ChallengeTooOld);
     }
 
@@ -408,15 +418,21 @@ fn decode_blob_value(jobj: &Value) -> Result<AuthBlob, AuthError> {
 /// Decode a blob string into a list of [AuthBlob] objects.
 ///
 /// The blob string is base64 encoded JSON: either a single blob object
-/// (the legacy encoding) or a top-level array of blob objects. A bare object
-/// decodes to a one-element list. Any element with an unknown or missing
-/// `blob_type` fails the whole decode.
+/// (the legacy encoding) or a non-empty top-level array of blob objects. A
+/// bare object decodes to a one-element list. An empty array or any element
+/// with an unknown or missing `blob_type` fails the whole decode: every
+/// accepted request must carry authentication material.
 pub fn decode_blobs(blob_str: &str) -> Result<Vec<AuthBlob>, AuthError> {
     let json_txt = BASE64_STANDARD.decode(blob_str)?;
 
     let jval: Value = serde_json::from_slice(&json_txt)?;
     match jval {
-        Value::Array(items) => items.iter().map(decode_blob_value).collect(),
+        Value::Array(items) => {
+            if items.is_empty() {
+                return Err(AuthError::FormatError("empty blob array".to_string()));
+            }
+            items.iter().map(decode_blob_value).collect()
+        }
         obj => Ok(vec![decode_blob_value(&obj)?]),
     }
 }
@@ -753,6 +769,17 @@ mod test {
     }
 
     #[test]
+    fn test_decode_blobs_empty_array_errors() {
+        // "[]" must not decode to zero blobs: an accepted acquire request
+        // always carries authentication material.
+        let encoded = BASE64_STANDARD.encode("[]");
+        match decode_blobs(&encoded) {
+            Err(AuthError::FormatError(_)) => {}
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_oidc_nonce_is_b64url_sha256() {
         // Vector computed independently (python3 hashlib/base64):
         // challenge = bytes(range(48))
@@ -791,12 +818,14 @@ mod test {
             other => panic!("expected InvalidHmac, got {other:?}"),
         }
 
-        // A correctly HMAC'd but stale ctime fails.
+        // A correctly HMAC'd but stale ctime fails. The OIDC window is
+        // MAX_OIDC_BLOB_AGE_SECONDS (covers the browser flow), not the
+        // 120-second SS window.
         let old_ctime = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
-            - MAX_BLOB_AGE_SECONDS
+            - MAX_OIDC_BLOB_AGE_SECONDS
             - 10;
         let nonce = [9u8; 8];
         let be_time = old_ctime.to_be_bytes();

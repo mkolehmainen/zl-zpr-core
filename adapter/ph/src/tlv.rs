@@ -153,6 +153,26 @@ impl TlvEncoding {
             TlvValue::Visa(v) => put_visa(buf, self.tlv_type, v),
         }
     }
+
+    /// The number of bytes [Self::put] will write: 2-byte header + value.
+    /// Only implemented for the value shapes with a fixed or precomputed
+    /// length (all but `Visa`, which serializes on `put`).
+    pub fn encoded_len(&self) -> usize {
+        let value_len = match &self.value {
+            TlvValue::U16(_) => 2,
+            TlvValue::I64(_) => 8,
+            TlvValue::Str(v) => v.len().min(u8::MAX as usize),
+            TlvValue::Ipv6Addr(_) => 16,
+            TlvValue::Ipv4Addr(_) => 4,
+            TlvValue::SocketAddr(SocketAddr::V4(_)) => SOCKADDR_LEN_V4 as usize,
+            TlvValue::SocketAddr(SocketAddr::V6(_)) => SOCKADDR_LEN_V6 as usize,
+            TlvValue::X25519PubKey(_) => X25519_KEY_LEN as usize,
+            TlvValue::Visa(_) => {
+                unimplemented!("encoded_len is not implemented for Visa TLVs")
+            }
+        };
+        size_of::<TLVHdr>() + value_len
+    }
 }
 
 #[derive(Clone, Debug)]
