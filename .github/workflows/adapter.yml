@@ -92,6 +92,11 @@ jobs:
   # Integration tests
   basic-integration-test:
     name: Run 1-Node Test (v6)
+    # Disabled on the zipline forks: this job downloads a visa service release
+    # tarball, and mkolehmainen/zl-zpr-visaservice has no releases yet (D5,
+    # zipline#16, publishes the first one). Re-enable by dropping this `if`
+    # once that release exists. Run the integration tests locally meanwhile.
+    if: false
     needs: [build-ph, build-ph-cli]
     strategy:
       matrix:
@@ -138,7 +143,7 @@ jobs:
     - name: Download Asset
       uses: robinraju/release-downloader@v1
       with:
-        repository: 'org-zpr/zpr-visaservice'
+        repository: 'mkolehmainen/zl-zpr-visaservice'
         tag: ${{ env.VISA_SERVICE_RELEASE }}
         fileName: 'release-linux-x86_64.tar.gz'
         extract: true
@@ -164,6 +169,11 @@ jobs:
 
   capture-integration-test:
     name: Run Capture Test
+    # Disabled on the zipline forks: this job downloads a visa service release
+    # tarball, and mkolehmainen/zl-zpr-visaservice has no releases yet (D5,
+    # zipline#16, publishes the first one). Re-enable by dropping this `if`
+    # once that release exists. Run the integration tests locally meanwhile.
+    if: false
     needs: [build-ph, build-ph-cli]
     strategy:
       matrix:
@@ -210,7 +220,7 @@ jobs:
     - name: Download Asset
       uses: robinraju/release-downloader@v1
       with:
-        repository: 'org-zpr/zpr-visaservice'
+        repository: 'mkolehmainen/zl-zpr-visaservice'
         tag: ${{ env.VISA_SERVICE_RELEASE }}
         fileName: 'release-linux-x86_64.tar.gz'
         extract: true
