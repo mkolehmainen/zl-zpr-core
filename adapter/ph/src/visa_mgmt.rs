@@ -75,10 +75,50 @@ pub fn authorize_connect(
 
             Err(err) => {
                 warn!(target: VISA_MGMT, "{}: VS authorize_connect failed with error: {err}", task_asm.formatted_link_id(link_id));
-                let _ignore_error = task_asm.process_link_state_event(link_id, LinkEvent::Error);
+                let _ignore_error =
+                    task_asm.process_link_state_event(link_id, authorize_failure_event(&err));
             }
         }
     });
+}
+
+/// Map a visa service [ErrorCode](zpr::vsapi_types::ErrorCode) to the ZDP
+/// [ResponseCode](crate::zdp::ResponseCode) reported to the adapter in the
+/// grant, or `None` for codes that keep the generic error path.
+fn response_code_for_vs_error(
+    code: &zpr::vsapi_types::ErrorCode,
+) -> Option<crate::zdp::ResponseCode> {
+    use crate::zdp::ResponseCode;
+    use zpr::vsapi_types::ErrorCode;
+    match code {
+        ErrorCode::InvalidSignature | ErrorCode::AuthError | ErrorCode::ParamError => {
+            Some(ResponseCode::AuthFailed)
+        }
+        ErrorCode::PolicyDenied => Some(ResponseCode::PolicyDenied),
+        ErrorCode::TemporarilyUnavailable => Some(ResponseCode::AuthUnavailable),
+        _ => None,
+    }
+}
+
+/// Map an authorize_connect failure to the link event to raise: a
+/// [VSApiError::CodedError] whose code has a ZDP mapping becomes
+/// [LinkEvent::ReceivedAuthorizeFailure] (so the failure reason reaches the
+/// adapter in the grant); everything else keeps the generic
+/// [LinkEvent::Error] path.
+fn authorize_failure_event(err: &VSApiError) -> LinkEvent {
+    if let VSApiError::CodedError(api_err) = err
+        && response_code_for_vs_error(&api_err.code).is_some()
+    {
+        return LinkEvent::ReceivedAuthorizeFailure(api_err.code.clone(), api_err.message.clone());
+    }
+    LinkEvent::Error
+}
+
+/// The ZDP ResponseCode for a VS error carried by
+/// [LinkEvent::ReceivedAuthorizeFailure]. The event is only constructed for
+/// mapped codes, so the fallback is defensive.
+pub fn grant_code_for_vs_error(code: &zpr::vsapi_types::ErrorCode) -> crate::zdp::ResponseCode {
+    response_code_for_vs_error(code).unwrap_or(crate::zdp::ResponseCode::Other)
 }
 
 /// Creates a ConnectRequest, unless none is necessary because the link is
@@ -248,6 +288,68 @@ pub fn handle_revocation(
 mod tests {
     use super::*;
     use crate::auth::{self, BLOB_TYPE_OIDC, BLOB_TYPE_SS, ZdpOidcBlob, ZdpSelfSignedBlob};
+    use crate::zdp::ResponseCode;
+    use zpr::vsapi_types::{ApiResponseError, ErrorCode};
+
+    #[test]
+    fn test_response_code_for_vs_error_mapping_table() {
+        // Auth-mechanism failures -> AuthFailed.
+        for code in [
+            ErrorCode::InvalidSignature,
+            ErrorCode::AuthError,
+            ErrorCode::ParamError,
+        ] {
+            assert_eq!(
+                response_code_for_vs_error(&code),
+                Some(ResponseCode::AuthFailed),
+                "{code:?}"
+            );
+        }
+        // Authenticated but no admitting policy -> PolicyDenied.
+        assert_eq!(
+            response_code_for_vs_error(&ErrorCode::PolicyDenied),
+            Some(ResponseCode::PolicyDenied)
+        );
+        // Transient VS-side failure -> AuthUnavailable.
+        assert_eq!(
+            response_code_for_vs_error(&ErrorCode::TemporarilyUnavailable),
+            Some(ResponseCode::AuthUnavailable)
+        );
+        // Everything else keeps the existing generic error path.
+        for code in [
+            ErrorCode::Internal,
+            ErrorCode::NotFound,
+            ErrorCode::Fail,
+            ErrorCode::QuotaExceeded,
+        ] {
+            assert_eq!(response_code_for_vs_error(&code), None, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn test_authorize_failure_event_mapping() {
+        // A CodedError with a mapped code produces ReceivedAuthorizeFailure
+        // carrying the code and message.
+        let err = VSApiError::CodedError(ApiResponseError::new_code_msg(
+            ErrorCode::PolicyDenied,
+            "no join policy admits this endpoint",
+        ));
+        match authorize_failure_event(&err) {
+            LinkEvent::ReceivedAuthorizeFailure(ErrorCode::PolicyDenied, msg) => {
+                assert_eq!(msg, "no join policy admits this endpoint");
+            }
+            other => panic!("expected ReceivedAuthorizeFailure(PolicyDenied), got {other:?}"),
+        }
+
+        // A CodedError with an unmapped code keeps the generic error path.
+        let err =
+            VSApiError::CodedError(ApiResponseError::new_code_msg(ErrorCode::Internal, "boom"));
+        assert!(matches!(authorize_failure_event(&err), LinkEvent::Error));
+
+        // A non-coded error keeps the generic error path.
+        let err = VSApiError::CommandFailed("nope".to_string());
+        assert!(matches!(authorize_failure_event(&err), LinkEvent::Error));
+    }
 
     #[test]
     fn test_build_connect_request_two_blobs_maps_oidc_with_nonce() {

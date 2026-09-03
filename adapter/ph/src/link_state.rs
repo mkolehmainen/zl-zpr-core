@@ -154,6 +154,8 @@ pub enum LinkEvent {
     AuthenticationFailure,                        // From an authentication service
 
     ReceivedAuthorizeResponse(IpAddress), // from visa service
+    /// Visa service refused the authorize; carries the VS error code and message.
+    ReceivedAuthorizeFailure(zpr::vsapi_types::ErrorCode, String),
     ReceivedKeepAliveResponse,
     ReceivedTerminateLink(TerminateReason),
     ReceivedTerminateAck,
@@ -161,7 +163,9 @@ pub enum LinkEvent {
     Close(TerminateReason),
     CloseDone,
     Error,
-    Timeout { logical_clock: u64 },
+    Timeout {
+        logical_clock: u64,
+    },
 }
 
 #[derive(Error, Debug)]
@@ -492,6 +496,10 @@ impl LinkStateWrapper {
 
             LinkEvent::ReceivedAuthorizeResponse(zpr_addr) => {
                 self.process_authorize_response(asm, zpr_addr)
+            }
+
+            LinkEvent::ReceivedAuthorizeFailure(code, msg) => {
+                self.process_authorize_failure(asm, code, msg)
             }
 
             LinkEvent::ReceivedKeepAliveResponse => self.process_keep_alive_response(asm),
@@ -1121,6 +1129,48 @@ impl LinkStateWrapper {
         self.send_grant_zpr_address_request(asm, &locked_fsm.actor_addresses);
         debug!(target: LINK_STATE, "{} has ACKd the grant.  Becoming active", asm.formatted_link_id(self.id));
         self.run_active(asm, locked_fsm)
+    }
+
+    /// Handle an authorize failure from the visa service: report the reason to
+    /// the adapter in a Grant with the mapped failure code and no addresses,
+    /// then tear the link down.
+    ///
+    /// This is happening on a NODE.
+    fn process_authorize_failure(
+        &self,
+        asm: &Arc<Assembly>,
+        code: zpr::vsapi_types::ErrorCode,
+        msg: String,
+    ) -> Result<(), LinkStateError> {
+        let link_id = self.id;
+        let mut locked_fsm = self.locked_fsm.lock().unwrap();
+
+        warn!(target: LINK_STATE, "{} visa service refused authorization: {code:?}: {msg}",
+            asm.formatted_link_id(link_id));
+
+        match (self.link_type, locked_fsm.state) {
+            (LinkType::NodeToAdapter, LinkState::RegisterAA) => {} // ok
+            (_, _) => {
+                return Err(LinkStateError::InvalidOperation(
+                    "Discarded unsolicited authorize failure".to_string(),
+                ));
+            }
+        }
+
+        // The failure grant must go out before the close, or the adapter only
+        // ever observes a terminated link with no reason.
+        mgmt::requests::send_grant_zpr_address_request(
+            asm,
+            link_id,
+            visa_mgmt::grant_code_for_vs_error(&code),
+            &[],
+        )
+        .enqueue();
+
+        asm.counters.management[ManagementCounterType::PeerHandshakeFailure].increment();
+        locked_fsm.set_state(LinkState::Error);
+        drop(locked_fsm);
+        self.initiate_close(asm, TerminateReason::Other)
     }
 
     /// Handle an init-auth message from sender.
