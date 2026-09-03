@@ -18,6 +18,8 @@ cbpf-rs = { workspace = true }
 chrono = "0.4.39"
 clap = { workspace = true, features = ["env"] }
 clap_complete = { workspace = true, optional = true }
+# `cslab` and `rcu` stay on `org-zpr/zpr-utils` on purpose: `rcu` pins `cslab`
+# by URL, so both sides must move together. See the root Cargo.toml.
 cslab = { git = "https://github.com/org-zpr/zpr-utils.git", tag = "cslab-v0.1.2" }
 curve25519-dalek = "4.1.3"
 dashmap = { version = "6.0.1" }
