@@ -154,6 +154,8 @@ pub enum LinkEvent {
     AuthenticationFailure,                        // From an authentication service
 
     ReceivedAuthorizeResponse(IpAddress), // from visa service
+    /// Visa service refused the authorize; carries the VS error code and message.
+    ReceivedAuthorizeFailure(zpr::vsapi_types::ErrorCode, String),
     ReceivedKeepAliveResponse,
     ReceivedTerminateLink(TerminateReason),
     ReceivedTerminateAck,
@@ -161,7 +163,9 @@ pub enum LinkEvent {
     Close(TerminateReason),
     CloseDone,
     Error,
-    Timeout { logical_clock: u64 },
+    Timeout {
+        logical_clock: u64,
+    },
 }
 
 #[derive(Error, Debug)]
@@ -494,6 +498,10 @@ impl LinkStateWrapper {
                 self.process_authorize_response(asm, zpr_addr)
             }
 
+            LinkEvent::ReceivedAuthorizeFailure(code, msg) => {
+                self.process_authorize_failure(asm, code, msg)
+            }
+
             LinkEvent::ReceivedKeepAliveResponse => self.process_keep_alive_response(asm),
             LinkEvent::ReceivedTerminateLink(code) => self.process_terminate_link(asm, code),
             LinkEvent::ReceivedTerminateAck => self.process_terminate_ack(asm),
@@ -690,12 +698,14 @@ impl LinkStateWrapper {
 
                 let policy_id: i64 = 0; // TODO: We get policy ID from visa service. Record that somewhere, access it here.
                 let asa_addresses = get_available_asa_addresses(&asm, link_id);
+                let oidc_idps = get_available_oidc_idps(&asm, link_id);
 
                 mgmt::requests::send_hello_success_response(
                     &asm,
                     link_id,
                     policy_id,
                     &asa_addresses,
+                    &oidc_idps,
                     maybe_aaa_address,
                 )
                 .enqueue();
@@ -869,20 +879,28 @@ impl LinkStateWrapper {
             "{} received acquire addr request for actor (requested_addr = {}).", asm.formatted_link_id(link_id), requested_addr
         );
 
-        // A self-signed blob needs to be checked before we forward it on.
+        // Every blob needs its challenge checked before we forward it on.
 
-        let Ok(d_blob) = auth::decode_blob(&blob) else {
+        let Ok(d_blobs) = auth::decode_blobs(&blob) else {
             warn!(target: LINK_STATE, "{} received acquire request with invalid blob", asm.formatted_link_id(link_id));
             drop(locked_fsm);
             return self.process_error_response(asm);
         };
 
-        match &d_blob {
-            AuthBlob::AuthCode(_) => {}
-            AuthBlob::SelfSigned(ss_blob) => {
-                if !self.check_self_signed_blob(asm, link_id, ss_blob) {
-                    drop(locked_fsm);
-                    return self.process_error_response(asm);
+        for d_blob in &d_blobs {
+            match d_blob {
+                AuthBlob::AuthCode(_) => {} // passthrough: the VS checks the code
+                AuthBlob::SelfSigned(ss_blob) => {
+                    if !self.check_self_signed_blob(asm, link_id, ss_blob) {
+                        drop(locked_fsm);
+                        return self.process_error_response(asm);
+                    }
+                }
+                AuthBlob::Oidc(oidc_blob) => {
+                    if !self.check_oidc_blob(asm, link_id, oidc_blob) {
+                        drop(locked_fsm);
+                        return self.process_error_response(asm);
+                    }
                 }
             }
         }
@@ -896,7 +914,7 @@ impl LinkStateWrapper {
 
         // Now we have verified our part of the blob, we can send to the visa service for checking the signature.
         let conn_req =
-            visa_mgmt::build_connect_request(asm, requested_addr, &d_blob, a2a_dh_public_key)?;
+            visa_mgmt::build_connect_request(asm, requested_addr, &d_blobs, a2a_dh_public_key)?;
         drop(locked_fsm);
 
         if !is_vs_link {
@@ -955,6 +973,34 @@ impl LinkStateWrapper {
             ss_blob.verify_blob_challenge(sa.peer_cert.as_ref().map(|c| c.get_cert()), &key)
         {
             warn!(target: LINK_STATE, "{} challenge verification failed: {e}", asm.formatted_link_id(link_id));
+            return false;
+        }
+        true
+    }
+
+    /// Verify an OIDC blob's challenge: HMAC with this link's auth key plus
+    /// freshness. Identity itself is carried by the ID token, which the visa
+    /// service verifies; there is no CN leg here.
+    fn check_oidc_blob(
+        &self,
+        asm: &Arc<Assembly>,
+        link_id: LinkId,
+        oidc_blob: &auth::ZdpOidcBlob,
+    ) -> bool {
+        let key = asm.peer_table.inspect(link_id, {
+            |peer| {
+                let mut key = [0u8; AUTH_KEY_SIZE_BYTES];
+                key[0..AUTH_KEY_SIZE_BYTES].copy_from_slice(&peer.auth_key[0..AUTH_KEY_SIZE_BYTES]);
+                key
+            }
+        });
+        let Some(key) = key else {
+            warn!(target: LINK_STATE, "{} received acquire request but have no auth key", asm.formatted_link_id(link_id));
+            return false;
+        };
+
+        if let Err(e) = oidc_blob.verify_challenge(&key) {
+            warn!(target: LINK_STATE, "{} OIDC challenge verification failed: {e}", asm.formatted_link_id(link_id));
             return false;
         }
         true
@@ -1083,6 +1129,48 @@ impl LinkStateWrapper {
         self.send_grant_zpr_address_request(asm, &locked_fsm.actor_addresses);
         debug!(target: LINK_STATE, "{} has ACKd the grant.  Becoming active", asm.formatted_link_id(self.id));
         self.run_active(asm, locked_fsm)
+    }
+
+    /// Handle an authorize failure from the visa service: report the reason to
+    /// the adapter in a Grant with the mapped failure code and no addresses,
+    /// then tear the link down.
+    ///
+    /// This is happening on a NODE.
+    fn process_authorize_failure(
+        &self,
+        asm: &Arc<Assembly>,
+        code: zpr::vsapi_types::ErrorCode,
+        msg: String,
+    ) -> Result<(), LinkStateError> {
+        let link_id = self.id;
+        let mut locked_fsm = self.locked_fsm.lock().unwrap();
+
+        warn!(target: LINK_STATE, "{} visa service refused authorization: {code:?}: {msg}",
+            asm.formatted_link_id(link_id));
+
+        match (self.link_type, locked_fsm.state) {
+            (LinkType::NodeToAdapter, LinkState::RegisterAA) => {} // ok
+            (_, _) => {
+                return Err(LinkStateError::InvalidOperation(
+                    "Discarded unsolicited authorize failure".to_string(),
+                ));
+            }
+        }
+
+        // The failure grant must go out before the close, or the adapter only
+        // ever observes a terminated link with no reason.
+        mgmt::requests::send_grant_zpr_address_request(
+            asm,
+            link_id,
+            visa_mgmt::grant_code_for_vs_error(&code),
+            &[],
+        )
+        .enqueue();
+
+        asm.counters.management[ManagementCounterType::PeerHandshakeFailure].increment();
+        locked_fsm.set_state(LinkState::Error);
+        drop(locked_fsm);
+        self.initiate_close(asm, TerminateReason::Other)
     }
 
     /// Handle an init-auth message from sender.
@@ -1885,6 +1973,9 @@ fn get_available_asa_addresses(asm: &Assembly, link_id: LinkId) -> Vec<SocketAdd
     if svclist.is_valid() {
         // If we have a list of services, include them in the response.
         // TODO: The ASA is set as a SocketAddr which doesn't feel quite right.  Maybe should be a URI.
+        // Only on-net ActorAuthentication services carry a ZPR socket address;
+        // `get_socket_addr()` returns `None` for off-net OidcAuthentication
+        // descriptors, which are advertised separately via OIDC_IDP TLVs.
         for authservice in &svclist.services {
             if let Some(sa) = authservice.get_socket_addr() {
                 debug!(target: LINK_STATE, "{}: HelloResponse - adding ASA address: {sa}", asm.formatted_link_id(link_id));
@@ -1898,6 +1989,40 @@ fn get_available_asa_addresses(asm: &Assembly, link_id: LinkId) -> Vec<SocketAdd
     }
 
     asa_addresses
+}
+
+/// Collect OIDC identity-provider advertisements from the auth-services list:
+/// one [auth::OidcIdpInfo] per descriptor with `stype == OidcAuthentication`
+/// that carries an `OidcClientConfig`.
+fn get_available_oidc_idps(asm: &Assembly, link_id: LinkId) -> Vec<auth::OidcIdpInfo> {
+    use zpr::vsapi_types::ServiceT;
+
+    let mut idps = Vec::new();
+
+    let svclist = asm.vs_auth_services.read().unwrap();
+    if svclist.is_valid() {
+        for authservice in &svclist.services {
+            if authservice.stype != ServiceT::OidcAuthentication {
+                continue;
+            }
+            let Some(cfg) = &authservice.oidc else {
+                warn!(target: LINK_STATE, "{}: HelloResponse - OIDC service {} has no client config",
+                    asm.formatted_link_id(link_id), authservice.service_id);
+                continue;
+            };
+            debug!(target: LINK_STATE, "{}: HelloResponse - adding OIDC IdP: {}",
+                asm.formatted_link_id(link_id), cfg.issuer);
+            idps.push(auth::OidcIdpInfo {
+                issuer: cfg.issuer.clone(),
+                client_id: cfg.client_id.clone(),
+                client_secret: cfg.client_secret.clone(),
+                scopes: cfg.scopes.clone(),
+                allow_offline_access: cfg.allow_offline_access,
+            });
+        }
+    }
+
+    idps
 }
 
 impl Display for LinkStateWrapper {

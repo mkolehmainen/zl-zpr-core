@@ -75,10 +75,50 @@ pub fn authorize_connect(
 
             Err(err) => {
                 warn!(target: VISA_MGMT, "{}: VS authorize_connect failed with error: {err}", task_asm.formatted_link_id(link_id));
-                let _ignore_error = task_asm.process_link_state_event(link_id, LinkEvent::Error);
+                let _ignore_error =
+                    task_asm.process_link_state_event(link_id, authorize_failure_event(&err));
             }
         }
     });
+}
+
+/// Map a visa service [ErrorCode](zpr::vsapi_types::ErrorCode) to the ZDP
+/// [ResponseCode](crate::zdp::ResponseCode) reported to the adapter in the
+/// grant, or `None` for codes that keep the generic error path.
+fn response_code_for_vs_error(
+    code: &zpr::vsapi_types::ErrorCode,
+) -> Option<crate::zdp::ResponseCode> {
+    use crate::zdp::ResponseCode;
+    use zpr::vsapi_types::ErrorCode;
+    match code {
+        ErrorCode::InvalidSignature | ErrorCode::AuthError | ErrorCode::ParamError => {
+            Some(ResponseCode::AuthFailed)
+        }
+        ErrorCode::PolicyDenied => Some(ResponseCode::PolicyDenied),
+        ErrorCode::TemporarilyUnavailable => Some(ResponseCode::AuthUnavailable),
+        _ => None,
+    }
+}
+
+/// Map an authorize_connect failure to the link event to raise: a
+/// [VSApiError::CodedError] whose code has a ZDP mapping becomes
+/// [LinkEvent::ReceivedAuthorizeFailure] (so the failure reason reaches the
+/// adapter in the grant); everything else keeps the generic
+/// [LinkEvent::Error] path.
+fn authorize_failure_event(err: &VSApiError) -> LinkEvent {
+    if let VSApiError::CodedError(api_err) = err
+        && response_code_for_vs_error(&api_err.code).is_some()
+    {
+        return LinkEvent::ReceivedAuthorizeFailure(api_err.code.clone(), api_err.message.clone());
+    }
+    LinkEvent::Error
+}
+
+/// The ZDP ResponseCode for a VS error carried by
+/// [LinkEvent::ReceivedAuthorizeFailure]. The event is only constructed for
+/// mapped codes, so the fallback is defensive.
+pub fn grant_code_for_vs_error(code: &zpr::vsapi_types::ErrorCode) -> crate::zdp::ResponseCode {
+    response_code_for_vs_error(code).unwrap_or(crate::zdp::ResponseCode::Other)
 }
 
 /// Creates a ConnectRequest, unless none is necessary because the link is
@@ -86,31 +126,63 @@ pub fn authorize_connect(
 ///
 /// `addr` is either UNSPECIFIED or an address requested by the client adapter.
 /// If it is a specified address we pass it as the "zpr.addr" claim.
+///
+/// All `blobs` are forwarded to the visa service, in order.
 pub fn build_connect_request(
     asm: &Arc<Assembly>,
     addr: IpAddress,
-    blob: &AuthBlob,
+    blobs: &[AuthBlob],
     a2a_dh_public_key: Option<x25519_dalek::PublicKey>,
 ) -> Result<vsapi_types::ConnectRequest, LinkStateError> {
-    // Convert the adapter's AuthBlob to the vsapi_types AuthBlob for the v2 protocol.
-    let vsapi_blob = match blob {
-        AuthBlob::SelfSigned(ss) => vsapi_types::AuthBlob::SS(vsapi_types::SelfSignedBlob {
-            alg: vsapi_types::ChallengeAlg::RsaSha256Pkcs1v15,
-            challenge: BASE64_STANDARD.decode(&ss.challenge).unwrap_or_default(),
-            cn: ss.cn.clone(),
-            timestamp: ss.ts,
-            signature: BASE64_STANDARD.decode(&ss.sig).unwrap_or_default(),
-        }),
-        AuthBlob::AuthCode(ac) => vsapi_types::AuthBlob::AC(vsapi_types::AuthCodeBlob {
-            asa_addr: ac
-                .asa
-                .parse()
-                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-            code: ac.code.clone(),
-            pkce: ac.pkce.clone(),
-            client_id: ac.client_id.clone(),
-        }),
-    };
+    build_connect_request_from_parts(addr, blobs, a2a_dh_public_key, asm.get_local_dock_addr())
+}
+
+/// Assembly-free core of [build_connect_request], for testability.
+fn build_connect_request_from_parts(
+    addr: IpAddress,
+    blobs: &[AuthBlob],
+    a2a_dh_public_key: Option<x25519_dalek::PublicKey>,
+    substrate_addr: IpAddr,
+) -> Result<vsapi_types::ConnectRequest, LinkStateError> {
+    // Convert the adapter's AuthBlobs to the vsapi_types AuthBlobs for the v2 protocol.
+    let vsapi_blobs = blobs
+        .iter()
+        .map(|blob| match blob {
+            AuthBlob::SelfSigned(ss) => vsapi_types::AuthBlob::SS(vsapi_types::SelfSignedBlob {
+                alg: vsapi_types::ChallengeAlg::RsaSha256Pkcs1v15,
+                challenge: BASE64_STANDARD.decode(&ss.challenge).unwrap_or_default(),
+                cn: ss.cn.clone(),
+                timestamp: ss.ts,
+                signature: BASE64_STANDARD.decode(&ss.sig).unwrap_or_default(),
+            }),
+            AuthBlob::AuthCode(ac) => vsapi_types::AuthBlob::AC(vsapi_types::AuthCodeBlob {
+                asa_addr: ac
+                    .asa
+                    .parse()
+                    .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                code: ac.code.clone(),
+                pkce: ac.pkce.clone(),
+                client_id: ac.client_id.clone(),
+            }),
+            AuthBlob::Oidc(oidc) => {
+                // The nonce claim expected in the ID token is derived from the
+                // link challenge. The caller has already verified the
+                // challenge HMAC (see process_acquire_zpr_address_request),
+                // so deriving from the blob's challenge field here is
+                // deriving from authenticated bytes.
+                let challenge_bytes = BASE64_STANDARD.decode(&oidc.challenge).unwrap_or_default();
+                let mut challenge = [0u8; 48];
+                if challenge_bytes.len() == 48 {
+                    challenge.copy_from_slice(&challenge_bytes);
+                }
+                vsapi_types::AuthBlob::Oidc(vsapi_types::OidcBlob {
+                    issuer: oidc.issuer.clone(),
+                    id_token: oidc.id_token.clone(),
+                    nonce: crate::auth::oidc_nonce_for_challenge(&challenge),
+                })
+            }
+        })
+        .collect::<Vec<_>>();
 
     let mut request_claims = Vec::new();
     if addr != IpAddress::UNSPECIFIED {
@@ -122,9 +194,13 @@ pub fn build_connect_request(
     // The CN claim always comes from the AuthBlob certificate, never from the
     // SA cert: the SA cert only validates the node-adapter link, while the
     // AuthBlob cert authenticates an actor to the VS (and multiple actors may
-    // sit behind one adapter, so the two CNs must be independent). With an
-    // AuthCode blob there is no AuthBlob cert, so no CN claim is sent.
-    if let AuthBlob::SelfSigned(ss) = blob {
+    // sit behind one adapter, so the two CNs must be independent). Only a
+    // SelfSigned blob carries a CN; OIDC identity comes from the ID token and
+    // AuthCode blobs have no AuthBlob cert, so neither contributes a CN claim.
+    if let Some(ss) = blobs.iter().find_map(|blob| match blob {
+        AuthBlob::SelfSigned(ss) => Some(ss),
+        _ => None,
+    }) {
         request_claims.push(vsapi_types::Claim {
             key: claims::key::CN.into(),
             value: ss.cn.clone(),
@@ -136,9 +212,9 @@ pub fn build_connect_request(
         .unwrap_or_else(|| vsapi_types::PublicKey::new(&[]));
 
     let connect_req = vsapi_types::ConnectRequest {
-        blobs: vec![vsapi_blob],
+        blobs: vsapi_blobs,
         claims: request_claims,
-        substrate_addr: asm.get_local_dock_addr(),
+        substrate_addr,
         dock_interface: 0,
         a2a_dh_public_key,
     };
@@ -206,4 +282,122 @@ pub fn handle_revocation(
         .write()
         .unwrap()
         .revoke(&asm.peer_table, visa_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{self, BLOB_TYPE_OIDC, BLOB_TYPE_SS, ZdpOidcBlob, ZdpSelfSignedBlob};
+    use crate::zdp::ResponseCode;
+    use zpr::vsapi_types::{ApiResponseError, ErrorCode};
+
+    #[test]
+    fn test_response_code_for_vs_error_mapping_table() {
+        // Auth-mechanism failures -> AuthFailed.
+        for code in [
+            ErrorCode::InvalidSignature,
+            ErrorCode::AuthError,
+            ErrorCode::ParamError,
+        ] {
+            assert_eq!(
+                response_code_for_vs_error(&code),
+                Some(ResponseCode::AuthFailed),
+                "{code:?}"
+            );
+        }
+        // Authenticated but no admitting policy -> PolicyDenied.
+        assert_eq!(
+            response_code_for_vs_error(&ErrorCode::PolicyDenied),
+            Some(ResponseCode::PolicyDenied)
+        );
+        // Transient VS-side failure -> AuthUnavailable.
+        assert_eq!(
+            response_code_for_vs_error(&ErrorCode::TemporarilyUnavailable),
+            Some(ResponseCode::AuthUnavailable)
+        );
+        // Everything else keeps the existing generic error path.
+        for code in [
+            ErrorCode::Internal,
+            ErrorCode::NotFound,
+            ErrorCode::Fail,
+            ErrorCode::QuotaExceeded,
+        ] {
+            assert_eq!(response_code_for_vs_error(&code), None, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn test_authorize_failure_event_mapping() {
+        // A CodedError with a mapped code produces ReceivedAuthorizeFailure
+        // carrying the code and message.
+        let err = VSApiError::CodedError(ApiResponseError::new_code_msg(
+            ErrorCode::PolicyDenied,
+            "no join policy admits this endpoint",
+        ));
+        match authorize_failure_event(&err) {
+            LinkEvent::ReceivedAuthorizeFailure(ErrorCode::PolicyDenied, msg) => {
+                assert_eq!(msg, "no join policy admits this endpoint");
+            }
+            other => panic!("expected ReceivedAuthorizeFailure(PolicyDenied), got {other:?}"),
+        }
+
+        // A CodedError with an unmapped code keeps the generic error path.
+        let err =
+            VSApiError::CodedError(ApiResponseError::new_code_msg(ErrorCode::Internal, "boom"));
+        assert!(matches!(authorize_failure_event(&err), LinkEvent::Error));
+
+        // A non-coded error keeps the generic error path.
+        let err = VSApiError::CommandFailed("nope".to_string());
+        assert!(matches!(authorize_failure_event(&err), LinkEvent::Error));
+    }
+
+    #[test]
+    fn test_build_connect_request_two_blobs_maps_oidc_with_nonce() {
+        let challenge = [5u8; 48];
+        let ss = ZdpSelfSignedBlob {
+            blob_type: BLOB_TYPE_SS.to_string(),
+            ts: 4242,
+            cn: "adapter.cn.zpr".to_string(),
+            challenge: BASE64_STANDARD.encode(challenge),
+            sig: BASE64_STANDARD.encode([6u8; 16]),
+        };
+        let oidc = ZdpOidcBlob {
+            blob_type: BLOB_TYPE_OIDC.to_string(),
+            issuer: "https://accounts.google.com".to_string(),
+            id_token: "eyJ.header.payload".to_string(),
+            challenge: BASE64_STANDARD.encode(challenge),
+        };
+        let blobs = vec![AuthBlob::SelfSigned(ss), AuthBlob::Oidc(oidc)];
+
+        let req = build_connect_request_from_parts(
+            IpAddress::UNSPECIFIED,
+            &blobs,
+            None,
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        )
+        .unwrap();
+
+        assert_eq!(req.blobs.len(), 2);
+        match &req.blobs[1] {
+            vsapi_types::AuthBlob::Oidc(o) => {
+                assert_eq!(o.issuer, "https://accounts.google.com");
+                assert_eq!(o.id_token, "eyJ.header.payload");
+                assert_eq!(o.nonce, auth::oidc_nonce_for_challenge(&challenge));
+            }
+            other => panic!("expected vsapi Oidc blob second, got {other:?}"),
+        }
+        match &req.blobs[0] {
+            vsapi_types::AuthBlob::SS(s) => assert_eq!(s.cn, "adapter.cn.zpr"),
+            other => panic!("expected vsapi SS blob first, got {other:?}"),
+        }
+
+        // The CN claim comes from the SS blob only: exactly one CN claim.
+        let cn_claims: Vec<_> = req
+            .claims
+            .iter()
+            .filter(|c| c.key == claims::key::CN)
+            .collect();
+        assert_eq!(cn_claims.len(), 1);
+        assert_eq!(cn_claims[0].value, "adapter.cn.zpr");
+    }
 }

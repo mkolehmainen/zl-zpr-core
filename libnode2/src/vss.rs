@@ -40,10 +40,7 @@ pub type SetTopologyResponse = Result<(), ApiResponseError>;
 pub enum VSSMessage {
     PushVisaOp(Vec<VisaOp>, oneshot::Sender<ListProcessingResponse>),
     RevokeAuth(Vec<IpAddr>, oneshot::Sender<ListProcessingResponse>),
-    SetServices(
-        Vec<ServiceDescriptor>, // TODO: need to get TYPE into service descriptor
-        oneshot::Sender<SetServicesResponse>,
-    ),
+    SetServices(Vec<ServiceDescriptor>, oneshot::Sender<SetServicesResponse>),
     Configure(Vec<Param>, oneshot::Sender<ConfigureResponse>),
     SetTopology(Vec<Link>, oneshot::Sender<SetTopologyResponse>),
 }

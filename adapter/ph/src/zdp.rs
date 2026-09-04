@@ -70,6 +70,12 @@ impl ZdpPacketType {
 pub enum ResponseCode {
     Success = 0,
     Other = 1,
+    /// Authentication failed: bad signature, bad token, or malformed request.
+    AuthFailed = 2,
+    /// Authentication succeeded, but no join policy admits this endpoint.
+    PolicyDenied = 3,
+    /// The authentication backend is temporarily unavailable; retry later.
+    AuthUnavailable = 4,
 }
 
 #[derive(Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]

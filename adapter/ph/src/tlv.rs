@@ -14,6 +14,8 @@ const X25519_KEY_LEN: u8 = 32; // 32 bytes for X25519 key
 pub enum TlvError {
     #[error("bad TLV structure")]
     BadStructure,
+    #[error("TLV value too large: {0} bytes exceeds the 255-byte cap")]
+    ValueTooLarge(usize),
 }
 
 /// A single byte that identifies the type of TLV data.
@@ -32,6 +34,7 @@ impl DataType {
     pub const WINDOW_SIZE: TlvType = 6;
     pub const A2A_DH_PUBKEY: TlvType = 7; // Actor to Actor Diffie-Hellman Public Key
     pub const BOOTSTRAP_VISA: TlvType = 8;
+    pub const OIDC_IDP: TlvType = 9; // OIDC identity provider advertisement (JSON OidcIdpInfo)
 }
 
 /// TlvEncoding is a designed to be an easy way to create and write TLV data
@@ -122,6 +125,21 @@ impl TlvEncoding {
         }
     }
 
+    /// OIDC identity provider advertisement. The value is the JSON encoding of
+    /// an [crate::auth::OidcIdpInfo]. The TLV length field is a single u8, so
+    /// the encoded value is hard-capped at 255 bytes; an oversize config is an
+    /// encode-time error rather than a silent truncation.
+    pub fn new_oidc_idp(info: &crate::auth::OidcIdpInfo) -> Result<TlvEncoding, TlvError> {
+        let json = serde_json::to_string(info).map_err(|_| TlvError::BadStructure)?;
+        if json.len() > u8::MAX as usize {
+            return Err(TlvError::ValueTooLarge(json.len()));
+        }
+        Ok(TlvEncoding {
+            tlv_type: DataType::OIDC_IDP,
+            value: TlvValue::Str(json),
+        })
+    }
+
     /// Write this encoding to the buffer, advancing the buffer position.
     pub fn put(&self, buf: &mut dyn bytes::BufMut) {
         match &self.value {
@@ -134,6 +152,26 @@ impl TlvEncoding {
             TlvValue::X25519PubKey(v) => put_x25519_pubkey(buf, self.tlv_type, v),
             TlvValue::Visa(v) => put_visa(buf, self.tlv_type, v),
         }
+    }
+
+    /// The number of bytes [Self::put] will write: 2-byte header + value.
+    /// Only implemented for the value shapes with a fixed or precomputed
+    /// length (all but `Visa`, which serializes on `put`).
+    pub fn encoded_len(&self) -> usize {
+        let value_len = match &self.value {
+            TlvValue::U16(_) => 2,
+            TlvValue::I64(_) => 8,
+            TlvValue::Str(v) => v.len().min(u8::MAX as usize),
+            TlvValue::Ipv6Addr(_) => 16,
+            TlvValue::Ipv4Addr(_) => 4,
+            TlvValue::SocketAddr(SocketAddr::V4(_)) => SOCKADDR_LEN_V4 as usize,
+            TlvValue::SocketAddr(SocketAddr::V6(_)) => SOCKADDR_LEN_V6 as usize,
+            TlvValue::X25519PubKey(_) => X25519_KEY_LEN as usize,
+            TlvValue::Visa(_) => {
+                unimplemented!("encoded_len is not implemented for Visa TLVs")
+            }
+        };
+        size_of::<TLVHdr>() + value_len
     }
 }
 
@@ -315,7 +353,7 @@ pub fn parse_from_buf(
                     .or_insert_with(Vec::new)
                     .push(TlvValue::I64(value));
             }
-            DataType::VERSION => {
+            DataType::VERSION | DataType::OIDC_IDP => {
                 let strbuf = buf.copy_to_bytes(tlv_length as usize);
                 let ver_str = String::from_utf8_lossy(&strbuf);
                 tlv_map
@@ -531,6 +569,46 @@ mod tests {
             }
             _ => panic!("Expected Str value for VERSION"),
         }
+    }
+
+    #[test]
+    fn test_put_and_parse_oidc_idp() {
+        use crate::auth::OidcIdpInfo;
+
+        let info = OidcIdpInfo {
+            issuer: "https://accounts.google.com".to_string(),
+            client_id: "1234-abc.apps.googleusercontent.com".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string(), "email".to_string()],
+            allow_offline_access: true,
+        };
+
+        // Round-trip: encode -> put -> parse -> deserialize.
+        let mut buf = BytesMut::new();
+        TlvEncoding::new_oidc_idp(&info).unwrap().put(&mut buf);
+        let mut buf_reader = buf.as_ref();
+        let result = parse_from_buf(&mut buf_reader).unwrap();
+        assert_eq!(result.len(), 1);
+        let values = result.get(&DataType::OIDC_IDP).unwrap();
+        assert_eq!(values.len(), 1);
+        match &values[0] {
+            TlvValue::Str(json) => {
+                let decoded: OidcIdpInfo = serde_json::from_str(json).unwrap();
+                assert_eq!(decoded, info);
+            }
+            _ => panic!("Expected Str value for OIDC_IDP"),
+        }
+
+        // A value that would exceed the u8 TLV length cap (255 bytes) is an
+        // encode-time error, never a silent truncation.
+        let oversize = OidcIdpInfo {
+            issuer: format!("https://{}.example.com", "i".repeat(200)),
+            client_id: "c".repeat(100),
+            client_secret: None,
+            scopes: vec![],
+            allow_offline_access: false,
+        };
+        assert!(TlvEncoding::new_oidc_idp(&oversize).is_err());
     }
 
     #[test]
