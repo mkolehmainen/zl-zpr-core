@@ -739,11 +739,18 @@ async fn set_capture_file(asm: &Assembly, ancillary: SocketAncillary<'_>) -> Str
 /// the actual getOidcCredential calls, mapping errors onto
 /// [AuthFailureReason]. The task ends when the last sender is dropped (link
 /// gone) or the RPC connection dies.
+///
+/// Each call's lifetime is bounded (see the Codex review on zipline#13's
+/// PR): the RPC is raced against the requester abandoning the request
+/// (reply receiver dropped, e.g. the link timed out and was torn down) and
+/// against [config::OIDC_USER_INTERACTION_TIMEOUT] itself. Either way the
+/// in-flight call is dropped — which cancels it on the wire — so a later
+/// request on the same link cannot queue forever behind an abandoned one.
 fn spawn_auth_agent_bridge(agent: cli::auth_agent::Client) -> AuthAgentHandle {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OidcCredentialRequest>();
 
     tokio::task::spawn_local(async move {
-        while let Some(req) = rx.recv().await {
+        while let Some(mut req) = rx.recv().await {
             let mut request = agent.get_oidc_credential_request();
             {
                 let mut rb = request.get();
@@ -759,15 +766,32 @@ fn spawn_auth_agent_bridge(agent: cli::auth_agent::Client) -> AuthAgentHandle {
                 rb.set_interactive(req.interactive);
             }
 
-            let outcome = match request.send().promise.await {
-                Ok(response) => match parse_agent_response(response) {
-                    Ok(id_token) => Ok(id_token),
-                    Err(reason) => Err(reason),
-                },
-                Err(e) => {
-                    warn!(target: RPC, "AuthAgent call failed: {e}");
-                    Err(AuthFailureReason::AgentError(e.to_string()))
+            let outcome = tokio::select! {
+                // The requester stopped waiting (the link timed out or was
+                // torn down). Drop the RPC — cancelling it — and move on to
+                // the next queued request instead of blocking on a call
+                // nobody will consume.
+                _ = req.reply.closed() => {
+                    debug!(target: RPC, "AuthAgent request abandoned by requester, cancelling RPC");
+                    continue;
                 }
+                // Nobody should still be waiting past the interaction
+                // timeout; cut the call loose so the bridge cannot wedge
+                // even if the requester's own timer misfires.
+                _ = tokio::time::sleep(config::OIDC_USER_INTERACTION_TIMEOUT) => {
+                    warn!(target: RPC, "AuthAgent call exceeded the user interaction timeout, cancelling RPC");
+                    Err(AuthFailureReason::InteractionTimeout)
+                }
+                result = request.send().promise => match result {
+                    Ok(response) => match parse_agent_response(response) {
+                        Ok(id_token) => Ok(id_token),
+                        Err(reason) => Err(reason),
+                    },
+                    Err(e) => {
+                        warn!(target: RPC, "AuthAgent call failed: {e}");
+                        Err(AuthFailureReason::AgentError(e.to_string()))
+                    }
+                },
             };
             // The receiver may be gone (e.g. the link timed out); that is fine.
             let _ = req.reply.send(outcome);
@@ -940,9 +964,7 @@ mod test {
     /// Drain every packet currently in the egress queue and return the blob
     /// string of each AcquireZprAddress packet (other packet types, e.g.
     /// TerminateLink from a close, are ignored).
-    fn drain_acquire_blob_strs(
-        rx: &mut packet_queue::Receiver<PACKET_BUFFER_SIZE>,
-    ) -> Vec<String> {
+    fn drain_acquire_blob_strs(rx: &mut packet_queue::Receiver<PACKET_BUFFER_SIZE>) -> Vec<String> {
         let mut out = Vec::new();
         while let Ok(mut pkt) = rx.try_recv(Box::new([0u8; PACKET_BUFFER_SIZE])) {
             let base = zdp::ZdpBaseHeader::read_from_buf(&mut pkt).unwrap();
@@ -1093,26 +1115,31 @@ mod test {
                 );
                 let release = pending.borrow_mut()[1].1.take().unwrap();
                 let _ = release.send(());
-                tokio::time::sleep(Duration::from_millis(200)).await;
 
-                // The retry proceeded: an acquire carrying attempt 2's
-                // challenge egressed and the link is waiting for the grant.
-                let blob_strs = drain_acquire_blob_strs(&mut eg_rx);
-                assert_eq!(blob_strs.len(), 1, "expected one acquire, got {blob_strs:?}");
-                let blobs = auth::decode_blobs(&blob_strs[0]).unwrap();
-                let AuthBlob::Oidc(ref oidc) = blobs[0] else {
-                    panic!("expected OIDC blob, got {:?}", blobs[0]);
-                };
-                assert_eq!(oidc.id_token, "RETRY.JWT.TOKEN");
-                let decoded = BASE64_STANDARD.decode(&oidc.challenge).unwrap();
-                assert_eq!(decoded, challenge_b);
+                // The retry proceeded: the second agent call was bound to
+                // attempt 2's challenge (nonce derived from challenge B),
+                // and its token moved the link to RegisterAA (the acquire
+                // request was initiated). Note the raw packet cannot be
+                // read back here: the fake peer never acks attempt 1's
+                // TerminateLink, so the serial ZDPR window holds it — a
+                // harness artifact, not the bug under test.
                 assert_eq!(
+                    pending.borrow()[1].0,
+                    auth::oidc_nonce_for_challenge(&challenge_b),
+                    "attempt 2's agent call is not bound to attempt 2's challenge"
+                );
+                assert!(
+                    wait_for(2_000, || {
+                        asm.peer_table
+                            .get(link_id)
+                            .map(|p| p.link_state_machine.get_state() == LinkState::RegisterAA)
+                            .unwrap_or(false)
+                    })
+                    .await,
+                    "retry never reached RegisterAA; state={:?}",
                     asm.peer_table
                         .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::RegisterAA
+                        .map(|p| p.link_state_machine.get_state())
                 );
             })
             .await

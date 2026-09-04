@@ -437,6 +437,16 @@ impl LinkStateWrapper {
         self.locked_data.lock().unwrap().auth_agent = Some(agent);
     }
 
+    /// True if `attempt_clock` still identifies the FSM's current
+    /// timeout/attempt. The logical clock advances on every state change
+    /// (and every re-armed timeout), so a mismatch means the attempt that
+    /// captured the value has been superseded. Used to discard a stale
+    /// AuthAgent completion so it cannot be consumed by a newer
+    /// WaitForUserAuth attempt with a different challenge.
+    fn auth_attempt_is_current(&self, attempt_clock: u64) -> bool {
+        self.locked_fsm.lock().unwrap().logical_clock == attempt_clock
+    }
+
     /// The most recent out-of-band authentication failure on this link, if any.
     pub fn get_last_auth_failure(&self) -> Option<AuthFailureReason> {
         self.locked_data.lock().unwrap().last_auth_failure.clone()
@@ -1351,6 +1361,11 @@ impl LinkStateWrapper {
                             &mut locked_fsm,
                             config::OIDC_USER_INTERACTION_TIMEOUT,
                         );
+                        // Tag this attempt with the logical clock its timeout
+                        // was armed with; do_oidc_authenticate discards the
+                        // completion if the clock has moved on (timeout fired,
+                        // link restarted, a newer attempt is underway).
+                        let attempt_clock = locked_fsm.logical_clock;
                         drop(locked_fsm);
                         self.do_oidc_authenticate(
                             asm,
@@ -1358,6 +1373,7 @@ impl LinkStateWrapper {
                             oidc_idps[0].clone(),
                             &challenge,
                             blobs,
+                            attempt_clock,
                         );
                         return Ok(());
                     }
@@ -1607,9 +1623,14 @@ impl LinkStateWrapper {
     ///   blob on success
     /// - [LinkEvent::AuthenticationFailure] with the agent's reason on failure
     ///
-    /// The caller has already entered [LinkState::WaitForUserAuth] and armed
-    /// [config::OIDC_USER_INTERACTION_TIMEOUT]; a late agent reply after that
-    /// timeout is ignored by the state check in process_authentication_success.
+    /// The caller has already entered [LinkState::WaitForUserAuth], armed
+    /// [config::OIDC_USER_INTERACTION_TIMEOUT], and passed the logical clock
+    /// captured at arming as `attempt_clock`. A completion whose clock no
+    /// longer matches the FSM's is STALE — its timeout fired, the link was
+    /// closed/restarted, or a newer attempt (with a different challenge) is
+    /// underway — and is discarded here rather than delivered, so an old
+    /// token bound to an old challenge can never be consumed by a newer
+    /// WaitForUserAuth attempt.
     fn do_oidc_authenticate(
         &self,
         asm: &Arc<Assembly>,
@@ -1617,6 +1638,7 @@ impl LinkStateWrapper {
         idp: auth::OidcIdpInfo,
         challenge_payload: &auth::ZdpInitAuthenticationPayload,
         base_blobs: Vec<AuthBlob>,
+        attempt_clock: u64,
     ) {
         let link_id = self.id;
 
@@ -1650,7 +1672,27 @@ impl LinkStateWrapper {
 
         let task_asm = asm.clone();
         tokio::task::spawn_local(async move {
-            let event = match reply_rx.await {
+            let outcome = reply_rx.await;
+
+            // Discard a stale completion: if the logical clock moved on, this
+            // attempt's timeout fired (or the link was closed/restarted) and a
+            // newer attempt may be underway with a different challenge. The
+            // old token must not be delivered as that newer attempt's result.
+            let is_current = task_asm
+                .peer_table
+                .get(link_id)
+                .map(|peer| {
+                    peer.link_state_machine
+                        .auth_attempt_is_current(attempt_clock)
+                })
+                .unwrap_or(false);
+            if !is_current {
+                debug!(target: LINK_STATE, "{}: discarding stale AuthAgent completion (attempt superseded)",
+                    task_asm.formatted_link_id(link_id));
+                return;
+            }
+
+            let event = match outcome {
                 Ok(Ok(id_token)) => {
                     let oidc_blob = auth::ZdpOidcBlob {
                         blob_type: auth::BLOB_TYPE_OIDC.to_string(),
