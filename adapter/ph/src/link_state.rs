@@ -632,6 +632,13 @@ impl LinkStateWrapper {
         locked_fsm.status = LinkStatus::Up;
         locked_fsm.set_state(LinkState::Keying);
 
+        // A Start begins a fresh authentication attempt: drop the previous
+        // attempt's recorded failure so showLink (and ph-cli's `connect`
+        // poll, which treats a teardown state with a recorded failure as
+        // that attempt's terminal outcome) never reports a stale reason
+        // against the new attempt.
+        self.locked_data.lock().unwrap().last_auth_failure = None;
+
         info!(target: LINK_STATE, "{} started.  Keying in progress", asm.formatted_link_id(link_id));
 
         match self.link_type {
@@ -2535,6 +2542,59 @@ mod tests {
                 assert_eq!(
                     peer.link_state_machine.get_last_auth_failure(),
                     Some(AuthFailureReason::NoAgent)
+                );
+            })
+            .await
+    }
+
+    /// `LinkEvent::Start` on an Inactive link begins a fresh authentication
+    /// attempt, so it must clear the previous attempt's recorded failure:
+    /// the CLI treats a teardown state that carries a `Last auth failure`
+    /// line as that attempt's terminal outcome, so a stale reason surviving
+    /// into a restarted link would be misread as a new failure.
+    #[tokio::test(start_paused = true)]
+    async fn test_start_clears_previous_auth_failure() {
+        LocalSet::new()
+            .run_until(async {
+                // process_start (AdapterToNode) keys the link, which needs a
+                // noise keypair and a certificate exchange on the assembly.
+                let mut builder = TestAssemblyBuilder::new();
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+
+                // A previous attempt failed and the auto-close completed.
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForUserAuth);
+                }
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::AuthenticationFailure(AuthFailureReason::UserDeclined),
+                )
+                .unwrap();
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    assert_eq!(
+                        peer.link_state_machine.get_last_auth_failure(),
+                        Some(AuthFailureReason::UserDeclined)
+                    );
+                    // Model the close completing (Closing -> Inactive).
+                    peer.link_state_machine.test_set_state(LinkState::Inactive);
+                }
+
+                // A fresh Start (manual restart or the automatic holddown
+                // restart) begins a new attempt: the stale reason must go.
+                asm.process_link_state_event(link_id, LinkEvent::Start)
+                    .unwrap();
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(peer.link_state_machine.get_state(), LinkState::Keying);
+                assert_eq!(
+                    peer.link_state_machine.get_last_auth_failure(),
+                    None,
+                    "stale auth failure survived into the new attempt"
                 );
             })
             .await

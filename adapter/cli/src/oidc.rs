@@ -442,9 +442,11 @@ fn open_in_browser(url: &str) -> Result<(), OidcCliError> {
 pub enum LinkOutcome {
     /// `State: Active` — the link is up.
     Up,
-    /// `State: Error` — authentication failed; carries the Debug spelling of
-    /// ph's `AuthFailureReason` from the `Last auth failure:` line (empty if
-    /// none was printed).
+    /// Authentication failed; carries the Debug spelling of ph's
+    /// `AuthFailureReason` from the `Last auth failure:` line. Reported for
+    /// the transient `Error` state (empty reason if none was printed) and
+    /// for any teardown state that carries a recorded failure — see
+    /// [`parse_show_link_state`].
     Failed(String),
     /// Any other state — keep polling.
     Pending,
@@ -454,6 +456,15 @@ pub enum LinkOutcome {
 /// (Display for LinkStateMachine) and, when a failure was recorded,
 /// `  Last auth failure: {:?}` (Display for LinkStateWrapper), both in
 /// adapter/ph/src/link_state.rs.
+///
+/// The `Error` state is transient: ph's `process_authentication_failure`
+/// sets it and synchronously initiates the close, so a 1-second poll usually
+/// observes the link already in `Closing` (then `Inactive` once the
+/// terminate completes, then restarting). The durable trace of the failure
+/// is the recorded reason, which ph clears when a fresh Start begins a new
+/// attempt — so a teardown state accompanied by a `Last auth failure:` line
+/// is this attempt's terminal outcome, while a teardown state without one is
+/// an ordinary stop/restart and polling continues.
 pub fn parse_show_link_state(text: &str) -> LinkOutcome {
     let mut state = None;
     let mut reason = None;
@@ -467,9 +478,18 @@ pub fn parse_show_link_state(text: &str) -> LinkOutcome {
             reason = Some(rest.to_string());
         }
     }
+    // States a failed authentication tears the link down through
+    // (initiate_close / continue_close / complete_close).
+    let is_teardown = matches!(
+        state.as_deref(),
+        Some("Closing") | Some("Inactive") | Some("Resetting")
+    ) || state
+        .as_deref()
+        .is_some_and(|s| s.starts_with("Disconnecting"));
     match state.as_deref() {
         Some("Active") => LinkOutcome::Up,
         Some("Error") => LinkOutcome::Failed(reason.unwrap_or_default()),
+        _ if is_teardown && reason.is_some() => LinkOutcome::Failed(reason.unwrap_or_default()),
         _ => LinkOutcome::Pending,
     }
 }
@@ -1003,6 +1023,44 @@ mod tests {
         );
         assert_eq!(
             parse_show_link_state("  State: Keying (for 10ms)\n"),
+            LinkOutcome::Pending
+        );
+    }
+
+    /// The Error state is transient: `process_authentication_failure` sets it
+    /// and synchronously initiates the close, so the 1-second poll normally
+    /// observes the link already in Closing (or Inactive, once the terminate
+    /// completes). A teardown state accompanied by a recorded failure is the
+    /// current attempt's outcome — ph clears `last_auth_failure` on Start, so
+    /// a reason that is visible always belongs to the attempt this `connect`
+    /// started — and must be terminal, not Pending.
+    #[test]
+    fn test_parse_show_link_state_teardown_with_reason_is_terminal() {
+        for state in ["Closing", "Inactive", "Resetting", "Disconnecting(Other)"] {
+            assert_eq!(
+                parse_show_link_state(&format!(
+                    "  State: {state} (for 3ms)\n  Last auth failure: InteractionTimeout\n"
+                )),
+                LinkOutcome::Failed("InteractionTimeout".to_string()),
+                "teardown state {state} with a recorded failure must be terminal"
+            );
+        }
+        // A teardown state with no recorded failure is an ordinary
+        // stop/restart, not an authentication outcome: keep polling.
+        assert_eq!(
+            parse_show_link_state("  State: Closing (for 3ms)\n"),
+            LinkOutcome::Pending
+        );
+        assert_eq!(
+            parse_show_link_state("  State: Inactive (for 3ms)\n"),
+            LinkOutcome::Pending
+        );
+        // A running state ignores the reason line (defense in depth: ph
+        // clears it on Start, so it should never be visible here anyway).
+        assert_eq!(
+            parse_show_link_state(
+                "  State: WaitForUserAuth (for 10s)\n  Last auth failure: NoAgent\n"
+            ),
             LinkOutcome::Pending
         );
     }
