@@ -73,6 +73,12 @@ pub const VS_GRANT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// browser flow, see zipline#13/D2) plus margin.
 pub const ACTOR_AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
 
+/// How long the adapter waits in WaitForUserAuth for the AuthAgent to return
+/// an OIDC credential: the human has this long to complete the browser login.
+/// Must stay under ACTOR_AUTHENTICATION_TIMEOUT (330 s), which is the node's
+/// bound on the whole out-of-band exchange.
+pub const OIDC_USER_INTERACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// How long to wait when we expect the VS to have to talk to external auth services.
 pub const VS_AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 

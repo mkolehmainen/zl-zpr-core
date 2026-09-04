@@ -1,4 +1,4 @@
-use crate::auth::{self, AUTH_KEY_SIZE_BYTES, AuthBlob, ZdpAuthCodeBlob, ZdpSelfSignedBlob};
+use crate::auth::{self, AUTH_KEY_SIZE_BYTES, AuthBlob, ZdpSelfSignedBlob};
 use crate::counters::ManagementCounterType;
 use crate::km::ZPIPair;
 use crate::km_multiplexor;
@@ -12,6 +12,7 @@ use crate::special_peers::SpecialPeerName;
 use crate::visa_mgmt;
 use crate::zdp::{self, ResponseCode, TerminateReason};
 
+use base64::prelude::*;
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZero;
@@ -130,8 +131,54 @@ pub enum LinkState {
     RegisterAA, // aka acquiring ZPR address
     WaitForInitAuth,
     WaitForAcquireZprAddress,
+    /// Adapter side: waiting for the out-of-band AuthAgent (a human in a
+    /// browser) to return an OIDC credential. Bounded by
+    /// [config::OIDC_USER_INTERACTION_TIMEOUT].
+    WaitForUserAuth,
     Error,
 }
+
+/// Why an out-of-band authentication attempt failed, as reported to ph-cli.
+/// Mirrors the spec's error taxonomy (see zipline#13 / OIDC master plan D2).
+#[allow(dead_code)] // some variants are constructed only by later deliverables
+#[derive(Clone, Debug, PartialEq, strum::IntoStaticStr)]
+pub enum AuthFailureReason {
+    /// OIDC required but startLink registered no AuthAgent.
+    NoAgent,
+    /// The agent returned access_denied: the user refused the login.
+    UserDeclined,
+    /// The user did not complete the login within OIDC_USER_INTERACTION_TIMEOUT.
+    InteractionTimeout,
+    /// Discovery/token endpoint failure (not an authentication problem).
+    IdpUnreachable(String),
+    AgentError(String),
+    /// ResponseCode::AuthFailed -> misconfiguration / token rejected.
+    VisaServiceRejected(String),
+    /// ResponseCode::PolicyDenied -> login worked, endpoint not admitted.
+    PolicyDenied,
+    /// ResponseCode::AuthUnavailable.
+    AuthUnavailable,
+    DeviceBlobRejected,
+}
+
+/// A single credential request forwarded to the out-of-band AuthAgent
+/// (ph-cli). The admin worker bridges these onto the Cap'n Proto client it
+/// received in startLink.
+pub struct OidcCredentialRequest {
+    /// The advertised identity provider to authenticate against.
+    pub idp: auth::OidcIdpInfo,
+    /// OIDC nonce derived from the link challenge
+    /// ([auth::oidc_nonce_for_challenge]).
+    pub nonce: String,
+    /// `false` means "satisfy from a stored refresh token or fail"; the agent
+    /// must never open a browser on a non-interactive request.
+    pub interactive: bool,
+    /// `Ok(id_token)` on success, otherwise the failure reason.
+    pub reply: tokio::sync::oneshot::Sender<Result<String, AuthFailureReason>>,
+}
+
+/// Handle to the AuthAgent registered for a link via startLink.
+pub type AuthAgentHandle = tokio::sync::mpsc::UnboundedSender<OidcCredentialRequest>;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, strum::IntoStaticStr)]
@@ -140,7 +187,12 @@ pub enum LinkEvent {
     KeyingDone,
     ReceivedHelloRequest,
     AssignedAAA(IpAddress), // Assigned AAA address for this link
-    ReceivedHelloResponse(ResponseCode, Option<IpAddress>, Option<Vec<SocketAddr>>), // (response code, AAA address, ASA addresses)
+    ReceivedHelloResponse(
+        ResponseCode,
+        Option<IpAddress>,
+        Option<Vec<SocketAddr>>,
+        Option<Vec<auth::OidcIdpInfo>>,
+    ), // (response code, AAA address, ASA addresses, advertised OIDC IdPs)
 
     ReceivedInitAuth((bool, Option<auth::ZdpInitAuthenticationPayload>)), // (bootstrap_flag, challenge)
     ReceivedInitAuthAck,
@@ -148,10 +200,11 @@ pub enum LinkEvent {
 
     ReceivedAcquireZprAddressRequest(Option<Vec<IpAddress>>, String), // (requested_addrs, auth_blob)
 
-    ReceivedGrantZprAddressRequest(Option<Vec<IpAddress>>), // granted_addrs, None means failure.
+    /// Ok(granted_addrs) on success, Err(the grant's failure code) otherwise.
+    ReceivedGrantZprAddressRequest(Result<Vec<IpAddress>, ResponseCode>),
 
-    AuthenticationSuccess(auth::ZdpAuthCodeBlob), // From an authentication service
-    AuthenticationFailure,                        // From an authentication service
+    AuthenticationSuccess(Vec<AuthBlob>), // Blobs collected from the configured authentication method(s)
+    AuthenticationFailure(AuthFailureReason), // Why authentication failed
 
     ReceivedAuthorizeResponse(IpAddress), // from visa service
     /// Visa service refused the authorize; carries the VS error code and message.
@@ -205,6 +258,12 @@ pub struct LinkData {
     latency_data: SampleRing<Duration, 100>,
     asa_addresses: Option<Vec<SocketAddr>>, // Addresses of ASA servers told to us by our peer, if any
     aaa_address: Option<IpAddress>,         // AAA address assigned this link (if any)
+    /// OIDC identity providers advertised by our peer in HelloResponse, if any.
+    oidc_idps: Option<Vec<auth::OidcIdpInfo>>,
+    /// The out-of-band AuthAgent registered for this link via startLink, if any.
+    auth_agent: Option<AuthAgentHandle>,
+    /// The most recent out-of-band authentication failure, surfaced in showLink.
+    last_auth_failure: Option<AuthFailureReason>,
 }
 
 impl LinkData {
@@ -215,6 +274,9 @@ impl LinkData {
             latency_data: SampleRing::new(Duration::ZERO),
             asa_addresses: None,
             aaa_address: None,
+            oidc_idps: None,
+            auth_agent: None,
+            last_auth_failure: None,
         }
     }
 }
@@ -369,6 +431,44 @@ impl LinkStateWrapper {
         self.link_type
     }
 
+    /// Register (or replace) the out-of-band AuthAgent handle for this link.
+    /// Set by the admin worker's startLink handler; lives for the link's lifetime.
+    pub fn set_auth_agent(&self, agent: AuthAgentHandle) {
+        self.locked_data.lock().unwrap().auth_agent = Some(agent);
+    }
+
+    /// True if `attempt_clock` still identifies the FSM's current
+    /// timeout/attempt. The logical clock advances on every state change
+    /// (and every re-armed timeout), so a mismatch means the attempt that
+    /// captured the value has been superseded. Used to discard a stale
+    /// AuthAgent completion so it cannot be consumed by a newer
+    /// WaitForUserAuth attempt with a different challenge.
+    fn auth_attempt_is_current(&self, attempt_clock: u64) -> bool {
+        self.locked_fsm.lock().unwrap().logical_clock == attempt_clock
+    }
+
+    /// The most recent out-of-band authentication failure on this link, if any.
+    pub fn get_last_auth_failure(&self) -> Option<AuthFailureReason> {
+        self.locked_data.lock().unwrap().last_auth_failure.clone()
+    }
+
+    /// Record why authentication failed, for showLink / ph-cli reporting.
+    fn record_auth_failure(&self, reason: AuthFailureReason) {
+        self.locked_data.lock().unwrap().last_auth_failure = Some(reason);
+    }
+
+    /// Test-only: force the FSM into a state without walking the transitions.
+    #[cfg(test)]
+    pub fn test_set_state(&self, state: LinkState) {
+        self.locked_fsm.lock().unwrap().set_state(state);
+    }
+
+    /// Test-only: pretend a HelloResponse advertised these IdPs.
+    #[cfg(test)]
+    pub fn test_set_oidc_idps(&self, idps: Vec<auth::OidcIdpInfo>) {
+        self.locked_data.lock().unwrap().oidc_idps = Some(idps);
+    }
+
     /// Schedule a `Timeout` event to occur after the specified duration.
     ///
     /// Any existing timeout is canceled atomically.
@@ -470,8 +570,8 @@ impl LinkStateWrapper {
             LinkEvent::KeyingDone => self.process_keying_done(asm),
             LinkEvent::ReceivedHelloRequest => self.process_hello_request(asm),
             LinkEvent::AssignedAAA(addr) => self.process_assigned_aaa(asm, addr),
-            LinkEvent::ReceivedHelloResponse(code, aaa_addr, maybe_asa_addrs) => {
-                self.process_hello_response(asm, code, aaa_addr, maybe_asa_addrs)
+            LinkEvent::ReceivedHelloResponse(code, aaa_addr, maybe_asa_addrs, maybe_oidc_idps) => {
+                self.process_hello_response(asm, code, aaa_addr, maybe_asa_addrs, maybe_oidc_idps)
             }
 
             LinkEvent::ReceivedAcquireZprAddressRequest(addrs, blob) => {
@@ -485,13 +585,15 @@ impl LinkStateWrapper {
             LinkEvent::ReceivedInitAuthAck => self.process_init_auth_ack(asm),
             LinkEvent::ReceivedInitAuthTimeout => self.process_init_auth_timeout(asm),
 
-            LinkEvent::ReceivedGrantZprAddressRequest(addrs) => {
-                self.process_grant_zpr_address_request(asm, addrs)
+            LinkEvent::ReceivedGrantZprAddressRequest(result) => {
+                self.process_grant_zpr_address_request(asm, result)
             }
-            LinkEvent::AuthenticationFailure => self.process_authentication_failure(asm),
+            LinkEvent::AuthenticationFailure(reason) => {
+                self.process_authentication_failure(asm, reason)
+            }
 
-            LinkEvent::AuthenticationSuccess(blob) => {
-                self.process_authentication_success(asm, blob)
+            LinkEvent::AuthenticationSuccess(blobs) => {
+                self.process_authentication_success(asm, blobs)
             }
 
             LinkEvent::ReceivedAuthorizeResponse(zpr_addr) => {
@@ -763,6 +865,7 @@ impl LinkStateWrapper {
         code: ResponseCode,
         maybe_aaa_addr: Option<IpAddress>,
         maybe_asa_addrs: Option<Vec<SocketAddr>>,
+        maybe_oidc_idps: Option<Vec<auth::OidcIdpInfo>>,
     ) -> Result<(), LinkStateError> {
         if code == ResponseCode::Other {
             // Received an error response.
@@ -776,6 +879,7 @@ impl LinkStateWrapper {
             (LinkType::AdapterToNode, LinkState::Helloing) => {
                 let mut link_data = self.locked_data.lock().unwrap();
                 link_data.asa_addresses = maybe_asa_addrs.clone();
+                link_data.oidc_idps = maybe_oidc_idps;
 
                 // On the node side, the aaa_address link_data field is used to keep track of the
                 // AAA we handed out to the peer.  On the client-adapter side, we hold the AAA
@@ -1015,18 +1119,20 @@ impl LinkStateWrapper {
     /// Currently we tell the node what address we want so these should be no
     /// suprise and are actually already set.
     ///
-    /// `addrs` has granted address on success, None on failure.
+    /// `result` is Ok(granted addresses) on success; Err(code) carries the
+    /// node's failure code, which we map to an [AuthFailureReason] so ph-cli
+    /// can report why the connection failed.
     fn process_grant_zpr_address_request(
         &self,
         asm: &Arc<Assembly>,
-        addrs: Option<Vec<IpAddress>>,
+        result: Result<Vec<IpAddress>, ResponseCode>,
     ) -> Result<(), LinkStateError> {
         let link_id = self.id;
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
         match (self.link_type, locked_fsm.state) {
             (LinkType::AdapterToNode, LinkState::RegisterAA) => {
-                match addrs {
-                    Some(addrs) => {
+                match result {
+                    Ok(addrs) => {
                         // TODO: In future we will take addresses from here and configure TUN.
                         info!(target: LINK_STATE, "{} granted ZPR addresses {:?}, becoming ACTIVE", asm.formatted_link_id(link_id), addrs);
 
@@ -1072,9 +1178,20 @@ impl LinkStateWrapper {
                         );
                         self.run_active(asm, locked_fsm)
                     }
-                    None => {
-                        // Grant failed.
-                        warn!(target: LINK_STATE, "{} failed to be granted ZPR address", asm.formatted_link_id(link_id));
+                    Err(code) => {
+                        // Grant failed: record why so showLink / ph-cli can report it.
+                        let reason = match code {
+                            ResponseCode::PolicyDenied => AuthFailureReason::PolicyDenied,
+                            ResponseCode::AuthUnavailable => AuthFailureReason::AuthUnavailable,
+                            ResponseCode::AuthFailed => AuthFailureReason::VisaServiceRejected(
+                                "visa service rejected authentication".to_string(),
+                            ),
+                            other => AuthFailureReason::VisaServiceRejected(format!(
+                                "grant failed with code {other:?}"
+                            )),
+                        };
+                        warn!(target: LINK_STATE, "{} failed to be granted ZPR address: {reason:?}", asm.formatted_link_id(link_id));
+                        self.record_auth_failure(reason);
                         locked_fsm.set_state(LinkState::Error);
                         drop(locked_fsm);
                         self.initiate_close(asm, TerminateReason::Other)
@@ -1192,10 +1309,12 @@ impl LinkStateWrapper {
     ) -> Result<(), LinkStateError> {
         let link_id = self.id;
 
-        // Grab a copy of our ASA, AAA addresses.
+        // Grab a copy of our ASA, AAA addresses plus what we know about OIDC.
         let data = self.locked_data.lock().unwrap();
         let asa_addrs = data.asa_addresses.clone();
         let aaa_addr = data.aaa_address.clone();
+        let oidc_idps = data.oidc_idps.clone().unwrap_or_default();
+        let auth_agent = data.auth_agent.clone();
         drop(data);
 
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
@@ -1203,8 +1322,72 @@ impl LinkStateWrapper {
             // NOTE: This is not exactly right, in general we can get an InitAuth at any time, though we
             // may not want to act on it and sometimes may be a protocol error.
             (LinkType::AdapterToNode, LinkState::WaitForInitAuth) => {
-                debug!(target: LINK_STATE, "{} received init auth (bootstrap_supported: {}, bootstrap_configured: {})",
-                    asm.formatted_link_id(link_id), bootstrap, asm.config.get().bootstrap.is_some());
+                debug!(target: LINK_STATE, "{} received init auth (bootstrap_supported: {}, bootstrap_configured: {}, oidc_idps: {}, agent: {})",
+                    asm.formatted_link_id(link_id), bootstrap, asm.config.get().bootstrap.is_some(),
+                    oidc_idps.len(), auth_agent.is_some());
+
+                // An advertised OIDC IdP means the network wants user
+                // authentication: run it through the out-of-band AuthAgent,
+                // adding a bootstrap (SS) blob alongside when a key is
+                // configured. With no agent registered we can still proceed
+                // on the legacy device-only paths below if bootstrap is
+                // available; otherwise the connection cannot be authenticated.
+                if !oidc_idps.is_empty() {
+                    let Some(challenge) = challenge.clone() else {
+                        error!(target: LINK_STATE, "{} received init auth with no challenge", asm.formatted_link_id(link_id));
+                        locked_fsm.set_state(LinkState::Error);
+                        drop(locked_fsm);
+                        return self.initiate_close(asm, TerminateReason::Other);
+                    };
+
+                    if let Some(agent) = auth_agent {
+                        // Bootstrap key configured -> the SS blob rides along.
+                        let mut blobs = Vec::new();
+                        if let Some(bs) = asm.config.get().bootstrap.as_ref() {
+                            match bs.authenticate_blob(&challenge) {
+                                Ok(ss_blob) => blobs.push(AuthBlob::SelfSigned(ss_blob)),
+                                Err(e) => {
+                                    error!(target: LINK_STATE, "{} failed to self-authenticate: {e:?}", asm.formatted_link_id(link_id));
+                                    locked_fsm.set_state(LinkState::Error);
+                                    drop(locked_fsm);
+                                    return self.initiate_close(asm, TerminateReason::Other);
+                                }
+                            }
+                        }
+
+                        locked_fsm.set_state(LinkState::WaitForUserAuth);
+                        self.set_timeout(
+                            asm,
+                            &mut locked_fsm,
+                            config::OIDC_USER_INTERACTION_TIMEOUT,
+                        );
+                        // Tag this attempt with the logical clock its timeout
+                        // was armed with; do_oidc_authenticate discards the
+                        // completion if the clock has moved on (timeout fired,
+                        // link restarted, a newer attempt is underway).
+                        let attempt_clock = locked_fsm.logical_clock;
+                        drop(locked_fsm);
+                        self.do_oidc_authenticate(
+                            asm,
+                            agent,
+                            oidc_idps[0].clone(),
+                            &challenge,
+                            blobs,
+                            attempt_clock,
+                        );
+                        return Ok(());
+                    }
+
+                    if asm.config.get().bootstrap.is_none() {
+                        // OIDC required, no agent, and no device key either.
+                        warn!(target: LINK_STATE, "{} OIDC IdP advertised but no AuthAgent registered and no bootstrap key", asm.formatted_link_id(link_id));
+                        drop(locked_fsm);
+                        return self
+                            .process_authentication_failure(asm, AuthFailureReason::NoAgent);
+                    }
+                    // No agent but a bootstrap key exists: fall through to the
+                    // device-only bootstrap path, exactly as before OIDC.
+                }
 
                 // If we can do bootstrap and it is allowed, then do that.
                 if bootstrap && asm.config.get().bootstrap.is_some() {
@@ -1434,6 +1617,105 @@ impl LinkStateWrapper {
         .enqueue();
     }
 
+    /// Run the out-of-band OIDC authentication through the registered
+    /// AuthAgent in a tokio task.
+    /// - [LinkEvent::AuthenticationSuccess] with `base_blobs` plus the OIDC
+    ///   blob on success
+    /// - [LinkEvent::AuthenticationFailure] with the agent's reason on failure
+    ///
+    /// The caller has already entered [LinkState::WaitForUserAuth], armed
+    /// [config::OIDC_USER_INTERACTION_TIMEOUT], and passed the logical clock
+    /// captured at arming as `attempt_clock`. A completion whose clock no
+    /// longer matches the FSM's is STALE — its timeout fired, the link was
+    /// closed/restarted, or a newer attempt (with a different challenge) is
+    /// underway — and is discarded here rather than delivered, so an old
+    /// token bound to an old challenge can never be consumed by a newer
+    /// WaitForUserAuth attempt.
+    fn do_oidc_authenticate(
+        &self,
+        asm: &Arc<Assembly>,
+        agent: AuthAgentHandle,
+        idp: auth::OidcIdpInfo,
+        challenge_payload: &auth::ZdpInitAuthenticationPayload,
+        base_blobs: Vec<AuthBlob>,
+        attempt_clock: u64,
+    ) {
+        let link_id = self.id;
+
+        // The raw 48-byte challenge: nonce || ctime || hmac.
+        let mut challenge = [0u8; 48];
+        challenge[0..8].copy_from_slice(&challenge_payload.nonce);
+        challenge[8..16].copy_from_slice(&challenge_payload.ctime.to_bytes());
+        challenge[16..48].copy_from_slice(&challenge_payload.hmac);
+
+        let nonce = auth::oidc_nonce_for_challenge(&challenge);
+        let issuer = idp.issuer.clone();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let request = OidcCredentialRequest {
+            idp,
+            nonce,
+            interactive: true,
+            reply: reply_tx,
+        };
+
+        if agent.send(request).is_err() {
+            // The agent went away (ph-cli disconnected).
+            warn!(target: LINK_STATE, "{}: AuthAgent is gone, cannot authenticate", asm.formatted_link_id(link_id));
+            if let Err(e) = asm.process_link_state_event(
+                link_id,
+                LinkEvent::AuthenticationFailure(AuthFailureReason::NoAgent),
+            ) {
+                error!(target: LINK_STATE, "{}: event handling error {e}", asm.formatted_link_id(link_id));
+            }
+            return;
+        }
+
+        let task_asm = asm.clone();
+        tokio::task::spawn_local(async move {
+            let outcome = reply_rx.await;
+
+            // Discard a stale completion: if the logical clock moved on, this
+            // attempt's timeout fired (or the link was closed/restarted) and a
+            // newer attempt may be underway with a different challenge. The
+            // old token must not be delivered as that newer attempt's result.
+            let is_current = task_asm
+                .peer_table
+                .get(link_id)
+                .map(|peer| {
+                    peer.link_state_machine
+                        .auth_attempt_is_current(attempt_clock)
+                })
+                .unwrap_or(false);
+            if !is_current {
+                debug!(target: LINK_STATE, "{}: discarding stale AuthAgent completion (attempt superseded)",
+                    task_asm.formatted_link_id(link_id));
+                return;
+            }
+
+            let event = match outcome {
+                Ok(Ok(id_token)) => {
+                    let oidc_blob = auth::ZdpOidcBlob {
+                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+                        issuer,
+                        id_token,
+                        challenge: BASE64_STANDARD.encode(challenge),
+                    };
+                    let mut blobs = base_blobs;
+                    blobs.push(AuthBlob::Oidc(oidc_blob));
+                    LinkEvent::AuthenticationSuccess(blobs)
+                }
+                Ok(Err(reason)) => LinkEvent::AuthenticationFailure(reason),
+                // The bridge dropped the reply without answering.
+                Err(_) => LinkEvent::AuthenticationFailure(AuthFailureReason::AgentError(
+                    "AuthAgent dropped the request".to_string(),
+                )),
+            };
+            if let Err(e) = task_asm.process_link_state_event(link_id, event) {
+                error!(target: LINK_STATE, "{}: event handling error {e}", task_asm.formatted_link_id(link_id));
+            }
+        });
+    }
+
     /// Run the HTTPS authentication process in a tokio task.
     /// - [LinkEvent::AuthenticationSuccess] on success
     /// - [LinkEvent::AuthenticationFailure] on failure
@@ -1445,8 +1727,12 @@ impl LinkStateWrapper {
 
         if asa_addrs.is_empty() {
             error!(target: LINK_STATE, "{}: no ASA addresses provided for authentication", asm.formatted_link_id(link_id));
-            if let Err(e) = asm.process_link_state_event(link_id, LinkEvent::AuthenticationFailure)
-            {
+            if let Err(e) = asm.process_link_state_event(
+                link_id,
+                LinkEvent::AuthenticationFailure(AuthFailureReason::IdpUnreachable(
+                    "no ASA addresses provided".to_string(),
+                )),
+            ) {
                 error!(target: LINK_STATE, "{}: event handling error {e}", asm.formatted_link_id(link_id));
             }
             return;
@@ -1460,18 +1746,23 @@ impl LinkStateWrapper {
             let binding = task_asm.config.get();
             let Some(rsauth) = binding.rsaoauth.as_ref() else {
                 error!(target: LINK_STATE, "{}: auth requested but no auth service configured", task_asm.formatted_link_id(link_id));
-                if let Err(e) =
-                    task_asm.process_link_state_event(link_id, LinkEvent::AuthenticationFailure)
-                {
+                if let Err(e) = task_asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::AuthenticationFailure(AuthFailureReason::IdpUnreachable(
+                        "no auth service configured".to_string(),
+                    )),
+                ) {
                     error!(target: LINK_STATE, "{}: event handling error {e}", task_asm.formatted_link_id(link_id));
                 }
                 return;
             };
             let event = match rsauth.authenticate(service_addr, tls_cert).await {
-                Ok(blob) => LinkEvent::AuthenticationSuccess(blob),
+                Ok(blob) => LinkEvent::AuthenticationSuccess(vec![AuthBlob::AuthCode(blob)]),
                 Err(e) => {
                     error!(target: LINK_STATE, "{}: failed to authenticate with auth service: {e:?}", task_asm.formatted_link_id(link_id));
-                    LinkEvent::AuthenticationFailure
+                    LinkEvent::AuthenticationFailure(AuthFailureReason::IdpUnreachable(format!(
+                        "{e:?}"
+                    )))
                 }
             };
             if let Err(e) = task_asm.process_link_state_event(link_id, event) {
@@ -1481,29 +1772,39 @@ impl LinkStateWrapper {
     }
 
     /// Callback via the AuthenticationFailure event.
-    fn process_authentication_failure(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
+    /// Records the reason (for showLink / ph-cli) and tears the link down.
+    fn process_authentication_failure(
+        &self,
+        asm: &Arc<Assembly>,
+        reason: AuthFailureReason,
+    ) -> Result<(), LinkStateError> {
         let link_id = self.id;
+        self.record_auth_failure(reason.clone());
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
         locked_fsm.set_state(LinkState::Error);
         drop(locked_fsm);
-        info!(target: LINK_STATE, "{}: authentication failed", asm.formatted_link_id(link_id));
+        info!(target: LINK_STATE, "{}: authentication failed: {reason:?}", asm.formatted_link_id(link_id));
         self.initiate_close(asm, TerminateReason::Other)
     }
 
     /// Callback via the AuthenticationSuccess event.
     ///
-    /// We expect to be in the RegisterAA state.
-    ///
-    /// TODO: Should we have a state to represent waiting-for-authentication?
+    /// We expect to be in the RegisterAA state (legacy ASA path) or
+    /// WaitForUserAuth (OIDC via AuthAgent). Either way we send the encoded
+    /// blob array in an acquire request and move to RegisterAA to wait for
+    /// the grant.
     fn process_authentication_success(
         &self,
         asm: &Arc<Assembly>,
-        blob: ZdpAuthCodeBlob,
+        blobs: Vec<AuthBlob>,
     ) -> Result<(), LinkStateError> {
         let link_id = self.id;
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
 
-        if locked_fsm.state != LinkState::RegisterAA {
+        if !matches!(
+            locked_fsm.state,
+            LinkState::RegisterAA | LinkState::WaitForUserAuth
+        ) {
             error!(
                 "{}: authentication success ignored in unexpected state {:?}",
                 asm.formatted_link_id(link_id),
@@ -1512,10 +1813,11 @@ impl LinkStateWrapper {
             return Ok(());
         }
 
-        info!(target: LINK_STATE, "{}: authentication success, client_id={}", asm.formatted_link_id(link_id), blob.client_id);
-        let blobstr = blob.encode();
+        info!(target: LINK_STATE, "{}: authentication success ({} blob(s))", asm.formatted_link_id(link_id), blobs.len());
+        let blobstr = auth::encode_blobs(&blobs);
         let requested_addrs = asm.get_local_zpr_addrs_std();
         self.send_acquire_zpr_address_request(asm, &requested_addrs, &blobstr);
+        locked_fsm.set_state(LinkState::RegisterAA);
         self.set_timeout(asm, &mut locked_fsm, config::VS_AUTHENTICATION_TIMEOUT);
         Ok(())
     }
@@ -1559,6 +1861,14 @@ impl LinkStateWrapper {
 
         // handle the timeout...
         match (self.link_type, locked_fsm.state) {
+            (LinkType::AdapterToNode, LinkState::WaitForUserAuth) => {
+                // The user did not complete the out-of-band login in time.
+                error!(target: LINK_STATE, "{}: user authentication timed out", asm.formatted_link_id(self.id));
+                drop(locked_fsm);
+                return self
+                    .process_authentication_failure(asm, AuthFailureReason::InteractionTimeout);
+            }
+
             (LinkType::AdapterToNode, LinkState::RegisterAA)
             | (LinkType::AdapterToNode, LinkState::Helloing) => {
                 // Timeout here means we give up on the link.
@@ -2032,6 +2342,9 @@ impl Display for LinkStateWrapper {
         write!(f, "  Type: {:?}\n", self.link_type)?;
 
         write!(f, "{}", self.locked_fsm.lock().unwrap())?;
+        if let Some(reason) = self.get_last_auth_failure() {
+            write!(f, "  Last auth failure: {:?}\n", reason)?;
+        }
         if self.get_state() == LinkState::Active {
             write!(f, "{}", self.locked_data.lock().unwrap())?;
         }
@@ -2085,11 +2398,190 @@ impl Display for LinkData {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkState, LinkStateMachine};
+    use super::{AuthFailureReason, LinkEvent, LinkState, LinkStateMachine, LinkType};
+    use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+    use crate::auth;
+    use crate::peer_table;
+    use crate::prelude::*;
+    use crate::zdp::ResponseCode;
+    use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
+    use zpr_utils::net_defs;
+
+    /// Insert an adapter-side (AdapterToNode) peer into the table and return
+    /// its link id. Each call gets a distinct substrate port: the peer table
+    /// rejects duplicate substrate addresses.
+    fn add_adapter_peer(asm: &Arc<Assembly>) -> LinkId {
+        let entry = asm.peer_table.vacant_entry().unwrap();
+        let link_id = entry.key();
+        let ps = peer_table::test::create_dummy_peer_state(
+            link_id,
+            LinkType::AdapterToNode,
+            SubstrateAddr::from(([127, 0, 0, 1], 9000 + link_id.get() as u16)),
+            net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 2).into()),
+        );
+        entry.insert(ps).get()
+    }
+
+    /// A fixed InitAuth challenge payload. The adapter side does not verify
+    /// the HMAC (the node minted it), so arbitrary bytes are fine.
+    fn test_challenge_payload() -> auth::ZdpInitAuthenticationPayload {
+        auth::ZdpInitAuthenticationPayload {
+            nonce: [7u8; 8],
+            ctime: 424242u64.into(),
+            hmac: [9u8; 32],
+        }
+    }
+
+    /// A minimal advertised OIDC identity provider.
+    fn test_idp() -> auth::OidcIdpInfo {
+        auth::OidcIdpInfo {
+            issuer: "https://idp.test".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string()],
+            allow_offline_access: false,
+        }
+    }
+
+    /// WaitForUserAuth with an agent that never replies must fail with
+    /// `AuthFailureReason::InteractionTimeout` once
+    /// `OIDC_USER_INTERACTION_TIMEOUT` (300 s) elapses. The Error state is
+    /// transient — the same callback initiates the close — so the state
+    /// assertion accepts the close already being underway.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_user_auth_times_out_with_interaction_timeout() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+
+                // Agent that accepts requests but never answers them.
+                let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
+                    peer.link_state_machine.set_auth_agent(agent_tx);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((false, Some(test_challenge_payload()))),
+                )
+                .unwrap();
+
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::WaitForUserAuth
+                );
+
+                tokio::time::sleep(
+                    config::OIDC_USER_INTERACTION_TIMEOUT + Duration::from_millis(100),
+                )
+                .await;
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let state = peer.link_state_machine.get_state();
+                assert!(
+                    matches!(state, LinkState::Error | LinkState::Closing),
+                    "expected Error (or the close it initiates), got {state:?}"
+                );
+                assert_eq!(
+                    peer.link_state_machine.get_last_auth_failure(),
+                    Some(AuthFailureReason::InteractionTimeout)
+                );
+            })
+            .await
+    }
+
+    /// An advertised IdP with no registered agent and no bootstrap key must
+    /// fail authentication with `AuthFailureReason::NoAgent`.
+    #[tokio::test(start_paused = true)]
+    async fn test_no_agent_with_idp_and_no_bootstrap_fails_with_no_agent() {
+        LocalSet::new()
+            .run_until(async {
+                // Default config: no bootstrap key.
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
+                    // no auth agent registered
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((true, Some(test_challenge_payload()))),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let state = peer.link_state_machine.get_state();
+                assert!(
+                    matches!(state, LinkState::Error | LinkState::Closing),
+                    "expected Error (or the close it initiates), got {state:?}"
+                );
+                assert_eq!(
+                    peer.link_state_machine.get_last_auth_failure(),
+                    Some(AuthFailureReason::NoAgent)
+                );
+            })
+            .await
+    }
+
+    /// A failed grant carries the node's ResponseCode; the link must record
+    /// the corresponding `AuthFailureReason`.
+    #[tokio::test(start_paused = true)]
+    async fn test_grant_failure_code_maps_to_reason() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+
+                for (code, expect_policy_denied, expect_unavailable) in [
+                    (ResponseCode::PolicyDenied, true, false),
+                    (ResponseCode::AuthFailed, false, false),
+                    (ResponseCode::AuthUnavailable, false, true),
+                ] {
+                    let link_id = add_adapter_peer(&asm);
+                    {
+                        let peer = asm.peer_table.get(link_id).unwrap();
+                        peer.link_state_machine
+                            .test_set_state(LinkState::RegisterAA);
+                    }
+
+                    asm.process_link_state_event(
+                        link_id,
+                        LinkEvent::ReceivedGrantZprAddressRequest(Err(code)),
+                    )
+                    .unwrap();
+
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    let reason = peer.link_state_machine.get_last_auth_failure();
+                    if expect_policy_denied {
+                        assert_eq!(reason, Some(AuthFailureReason::PolicyDenied));
+                    } else if expect_unavailable {
+                        assert_eq!(reason, Some(AuthFailureReason::AuthUnavailable));
+                    } else {
+                        assert!(
+                            matches!(reason, Some(AuthFailureReason::VisaServiceRejected(_))),
+                            "expected VisaServiceRejected, got {reason:?}"
+                        );
+                    }
+                }
+            })
+            .await
+    }
 
     #[tokio::test(start_paused = true)]
     async fn timeout_test() {

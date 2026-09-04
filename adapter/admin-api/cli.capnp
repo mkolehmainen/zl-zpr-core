@@ -13,7 +13,7 @@ interface CmdLineInter {
     showLinkSummary      @9 () -> (summary: List(Text));
     showLink             @10 (id: UInt32) -> (result: Text);
     configureLink        @11 (id: UInt32) -> (); # Currently unsupported in PH
-    startLink            @12 (id: UInt32) -> (result: SuccessOrError);
+    startLink            @12 (id: UInt32, authAgent: AuthAgent) -> (result: SuccessOrError); # authAgent is optional (null): a link started without one is device-only
     stopLink             @13 (id: UInt32) -> (result: SuccessOrError);
     resetLink            @14 (id: UInt32) -> ();
     changeLogging        @15 (logs: List(Log)) -> (result: LogsApplied);
@@ -22,6 +22,16 @@ interface CmdLineInter {
 
 interface CaptureFile {
     # expects an FD to be passed as ancillary data
+}
+
+# Provided by ph-cli (or another controller); called by ph when a credential
+# requiring a user session is needed (Contract 6 of the OIDC master plan).
+# `interactive = false` means "satisfy from a stored refresh token or fail";
+# the agent must never open a browser on a non-interactive request.
+interface AuthAgent {
+    getOidcCredential @0 (issuer :Text, clientId :Text, clientSecret :Text, scopes :List(Text),
+                          allowOfflineAccess :Bool, nonce :Text, interactive :Bool)
+                      -> (result :SuccessOrError, idToken :Text);
 }
 
 struct SuccessOrError {

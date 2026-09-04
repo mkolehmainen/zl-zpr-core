@@ -5,7 +5,9 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
-use crate::link_state::{LinkEvent, LinkState};
+use crate::link_state::{
+    AuthAgentHandle, AuthFailureReason, LinkEvent, LinkState, OidcCredentialRequest,
+};
 use crate::logging;
 use crate::logging::{levels, targets};
 use crate::prelude::*;
@@ -374,6 +376,21 @@ impl svc::Server for AdminServiceImpl {
         let id = params.get()?.get_id();
         debug!(target: RPC, "Start {} requested", self.asm.formatted_link_id(id));
 
+        // An AuthAgent capability is optional: a null (absent) agent means a
+        // device-only link, which behaves exactly as before OIDC. When one is
+        // supplied, hold it on the link for the link's lifetime so the FSM
+        // can request user credentials out of band.
+        if params.get()?.has_auth_agent() {
+            let agent_client = params.get()?.get_auth_agent()?;
+            if let Some(peer) = self.asm.peer_table.get(id) {
+                peer.link_state_machine
+                    .set_auth_agent(spawn_auth_agent_bridge(agent_client));
+                debug!(target: RPC, "AuthAgent registered for {}", self.asm.formatted_link_id(id));
+            } else {
+                warn!(target: RPC, "startLink: no such link {id}, cannot register AuthAgent");
+            }
+        }
+
         let results_builder = results.get().init_result();
 
         match self.asm.process_link_state_event(id, LinkEvent::Start) {
@@ -713,6 +730,122 @@ async fn set_capture_file(asm: &Assembly, ancillary: SocketAncillary<'_>) -> Str
     }
 }
 
+/// Bridge a Cap'n Proto [cli::auth_agent::Client] onto the channel-based
+/// [AuthAgentHandle] the link state machine consumes.
+///
+/// Cap'n Proto clients are !Send and bound to this RPC task's LocalSet, so
+/// the FSM cannot hold one directly; instead it sends
+/// [OidcCredentialRequest]s down an unbounded channel and this task performs
+/// the actual getOidcCredential calls, mapping errors onto
+/// [AuthFailureReason]. The task ends when the last sender is dropped (link
+/// gone) or the RPC connection dies.
+///
+/// Each call's lifetime is bounded (see the Codex review on zipline#13's
+/// PR): the RPC is raced against the requester abandoning the request
+/// (reply receiver dropped, e.g. the link timed out and was torn down) and
+/// against [config::OIDC_USER_INTERACTION_TIMEOUT] itself. Either way the
+/// in-flight call is dropped — which cancels it on the wire — so a later
+/// request on the same link cannot queue forever behind an abandoned one.
+fn spawn_auth_agent_bridge(agent: cli::auth_agent::Client) -> AuthAgentHandle {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OidcCredentialRequest>();
+
+    tokio::task::spawn_local(async move {
+        while let Some(mut req) = rx.recv().await {
+            let mut request = agent.get_oidc_credential_request();
+            {
+                let mut rb = request.get();
+                rb.set_issuer(&req.idp.issuer[..]);
+                rb.set_client_id(&req.idp.client_id[..]);
+                rb.set_client_secret(req.idp.client_secret.as_deref().unwrap_or(""));
+                let mut scopes = rb.reborrow().init_scopes(req.idp.scopes.len() as u32);
+                for (i, scope) in req.idp.scopes.iter().enumerate() {
+                    scopes.set(i as u32, &scope[..]);
+                }
+                rb.set_allow_offline_access(req.idp.allow_offline_access);
+                rb.set_nonce(&req.nonce[..]);
+                rb.set_interactive(req.interactive);
+            }
+
+            let outcome = tokio::select! {
+                // The requester stopped waiting (the link timed out or was
+                // torn down). Drop the RPC — cancelling it — and move on to
+                // the next queued request instead of blocking on a call
+                // nobody will consume.
+                _ = req.reply.closed() => {
+                    debug!(target: RPC, "AuthAgent request abandoned by requester, cancelling RPC");
+                    continue;
+                }
+                // Nobody should still be waiting past the interaction
+                // timeout; cut the call loose so the bridge cannot wedge
+                // even if the requester's own timer misfires.
+                _ = tokio::time::sleep(config::OIDC_USER_INTERACTION_TIMEOUT) => {
+                    warn!(target: RPC, "AuthAgent call exceeded the user interaction timeout, cancelling RPC");
+                    Err(AuthFailureReason::InteractionTimeout)
+                }
+                result = request.send().promise => match result {
+                    Ok(response) => match parse_agent_response(response) {
+                        Ok(id_token) => Ok(id_token),
+                        Err(reason) => Err(reason),
+                    },
+                    Err(e) => {
+                        warn!(target: RPC, "AuthAgent call failed: {e}");
+                        Err(AuthFailureReason::AgentError(e.to_string()))
+                    }
+                },
+            };
+            // The receiver may be gone (e.g. the link timed out); that is fine.
+            let _ = req.reply.send(outcome);
+        }
+        debug!(target: RPC, "AuthAgent bridge shutting down");
+    });
+
+    tx
+}
+
+/// Decode a getOidcCredential response into the ID token or a failure reason.
+/// The agent reports "access_denied" for a user refusal per the spec's error
+/// taxonomy; anything else in the error text is an agent-side failure.
+fn parse_agent_response(
+    response: capnp::capability::Response<cli::auth_agent::get_oidc_credential_results::Owned>,
+) -> Result<String, AuthFailureReason> {
+    let results = response
+        .get()
+        .map_err(|e| AuthFailureReason::AgentError(e.to_string()))?;
+    let result = results
+        .get_result()
+        .map_err(|e| AuthFailureReason::AgentError(e.to_string()))?;
+    match result
+        .which()
+        .map_err(|e| AuthFailureReason::AgentError(e.to_string()))?
+    {
+        cli::success_or_error::Which::Success(_) => {
+            let id_token = results
+                .get_id_token()
+                .and_then(|t| t.to_str().map_err(|e| capnp::Error::failed(e.to_string())))
+                .map_err(|e| AuthFailureReason::AgentError(e.to_string()))?
+                .to_string();
+            if id_token.is_empty() {
+                return Err(AuthFailureReason::AgentError(
+                    "agent returned an empty id_token".to_string(),
+                ));
+            }
+            Ok(id_token)
+        }
+        cli::success_or_error::Which::Error(e) => {
+            let txt = e
+                .and_then(|ev| ev.get_txt())
+                .and_then(|t| t.to_str().map_err(|e| capnp::Error::failed(e.to_string())))
+                .unwrap_or("unknown agent error")
+                .to_string();
+            if txt.contains("access_denied") {
+                Err(AuthFailureReason::UserDeclined)
+            } else {
+                Err(AuthFailureReason::AgentError(txt))
+            }
+        }
+    }
+}
+
 // Helper for show_link_summary
 fn get_link_summary(asm: &Arc<Assembly>, link_id: LinkId) -> String {
     match asm.peer_table.get(link_id) {
@@ -722,5 +855,528 @@ fn get_link_summary(asm: &Arc<Assembly>, link_id: LinkId) -> String {
             peer.link_state_machine.get_state()
         ),
         None => format!("Unconfigured"),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+    use crate::auth::{self, AuthBlob};
+    use crate::config::PACKET_BUFFER_SIZE;
+    use crate::link_state::LinkType;
+    use crate::packet_queue;
+    use crate::peer_table;
+    use crate::queues::MgmtSubstrateEgress;
+    use crate::zdp;
+    use base64::prelude::*;
+    use std::cell::RefCell;
+    use std::net::Ipv4Addr;
+    use tokio::task::LocalSet;
+    use zpr_ext::zerocopy::FromBytesExt;
+    use zpr_utils::net_defs;
+
+    /// In-process fake AuthAgent whose calls complete only when the test
+    /// releases them: each getOidcCredential call appends `(nonce,
+    /// Some(release_sender))` to `pending` and then waits for the test to
+    /// fire that sender. Leaving the sender in place models a user who
+    /// never completes the login; firing it models a (possibly very late)
+    /// completion.
+    struct GatedAuthAgent {
+        id_token: String,
+        pending: Rc<RefCell<Vec<(String, Option<tokio::sync::oneshot::Sender<()>>)>>>,
+    }
+
+    impl cli::auth_agent::Server for GatedAuthAgent {
+        async fn get_oidc_credential(
+            self: Rc<Self>,
+            params: cli::auth_agent::GetOidcCredentialParams,
+            mut results: cli::auth_agent::GetOidcCredentialResults,
+        ) -> Result<(), capnp::Error> {
+            let nonce = params.get()?.get_nonce()?.to_str()?.to_string();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending.borrow_mut().push((nonce, Some(tx)));
+            // Held until the test releases this call (or the caller cancels
+            // the RPC, which drops this task).
+            let _ = rx.await;
+            let mut rb = results.get();
+            rb.set_id_token(&self.id_token[..]);
+            rb.init_result().init_success().set_none(());
+            Ok(())
+        }
+    }
+
+    /// A minimal advertised OIDC identity provider for bridge/FSM tests.
+    fn test_idp() -> auth::OidcIdpInfo {
+        auth::OidcIdpInfo {
+            issuer: "https://idp.test".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string()],
+            allow_offline_access: false,
+        }
+    }
+
+    /// Assembly with a readable management egress queue and one
+    /// AdapterToNode peer; no bootstrap key, so OIDC is the only
+    /// authentication path.
+    fn oidc_test_assembly() -> (
+        Arc<Assembly>,
+        packet_queue::Receiver<PACKET_BUFFER_SIZE>,
+        LinkId,
+    ) {
+        let (eg_tx, eg_rx) = packet_queue::packet_queue::<PACKET_BUFFER_SIZE>(32);
+        let mut builder = TestAssemblyBuilder::new();
+        builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(eg_tx));
+        let asm = Arc::new(create_assembly(builder));
+
+        let entry = asm.peer_table.vacant_entry().unwrap();
+        let link_id = entry.key();
+        let ps = peer_table::test::create_dummy_peer_state(
+            link_id,
+            LinkType::AdapterToNode,
+            SubstrateAddr::from(([127, 0, 0, 1], 9000)),
+            net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 2).into()),
+        );
+        let link_id = entry.insert(ps).get();
+        (asm, eg_rx, link_id)
+    }
+
+    /// A 48-byte InitAuth challenge whose nonce bytes are `tag`, so two
+    /// attempts can be told apart by their challenge.
+    fn challenge_payload(tag: u8) -> auth::ZdpInitAuthenticationPayload {
+        auth::ZdpInitAuthenticationPayload {
+            nonce: [tag; 8],
+            ctime: 424242u64.into(),
+            hmac: [6u8; 32],
+        }
+    }
+
+    /// The raw challenge bytes the OIDC blob must round-trip.
+    fn challenge_bytes(payload: &auth::ZdpInitAuthenticationPayload) -> [u8; 48] {
+        let mut challenge = [0u8; 48];
+        challenge[0..8].copy_from_slice(&payload.nonce);
+        challenge[8..16].copy_from_slice(&payload.ctime.to_bytes());
+        challenge[16..48].copy_from_slice(&payload.hmac);
+        challenge
+    }
+
+    /// Drain every packet currently in the egress queue and return the blob
+    /// string of each AcquireZprAddress packet (other packet types, e.g.
+    /// TerminateLink from a close, are ignored).
+    fn drain_acquire_blob_strs(rx: &mut packet_queue::Receiver<PACKET_BUFFER_SIZE>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(mut pkt) = rx.try_recv(Box::new([0u8; PACKET_BUFFER_SIZE])) {
+            let base = zdp::ZdpBaseHeader::read_from_buf(&mut pkt).unwrap();
+            if base.packet_type != zdp::ZdpPacketType::AcquireZprAddress {
+                continue;
+            }
+            let _mgmt = zdp::ZdpMgmtHeader::read_from_buf(&mut pkt).unwrap();
+            let acq = zdp::ZdpAcquireZprAddressHeader::read_from_buf(&mut pkt).unwrap();
+            let blob_len = acq.blob_len.get() as usize;
+            let blob_bytes = pkt.copy_to_bytes(blob_len);
+            out.push(String::from_utf8(blob_bytes.into()).unwrap());
+        }
+        out
+    }
+
+    /// Sleep in small steps until `cond` holds or `max_ms` elapses.
+    async fn wait_for(max_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..(max_ms / 10) {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    /// The bridge must not stay blocked on a getOidcCredential call whose
+    /// requester has gone away (link timed out): the abandoned call is
+    /// cancelled and the next queued request still reaches the agent.
+    #[tokio::test(start_paused = true)]
+    async fn test_bridge_abandons_call_when_requester_goes_away() {
+        LocalSet::new()
+            .run_until(async {
+                let pending = Rc::new(RefCell::new(Vec::new()));
+                let client: cli::auth_agent::Client = capnp_rpc::new_client(GatedAuthAgent {
+                    id_token: "SECOND.JWT.TOKEN".to_string(),
+                    pending: pending.clone(),
+                });
+                let handle = spawn_auth_agent_bridge(client);
+
+                // Request 1: the requester stops waiting (link timeout).
+                let (tx1, rx1) = tokio::sync::oneshot::channel();
+                handle
+                    .send(OidcCredentialRequest {
+                        idp: test_idp(),
+                        nonce: "nonce-1".to_string(),
+                        interactive: true,
+                        reply: tx1,
+                    })
+                    .unwrap();
+                assert!(
+                    wait_for(2_000, || pending.borrow().len() == 1).await,
+                    "agent never saw request 1"
+                );
+                drop(rx1); // the requester gave up; the bridge must notice
+
+                // Request 2 must still be serviced.
+                let (tx2, rx2) = tokio::sync::oneshot::channel();
+                handle
+                    .send(OidcCredentialRequest {
+                        idp: test_idp(),
+                        nonce: "nonce-2".to_string(),
+                        interactive: true,
+                        reply: tx2,
+                    })
+                    .unwrap();
+                assert!(
+                    wait_for(5_000, || pending.borrow().len() == 2).await,
+                    "request 2 is stuck behind the abandoned request 1"
+                );
+                let release = pending.borrow_mut()[1].1.take().unwrap();
+                let _ = release.send(());
+
+                let outcome = tokio::time::timeout(Duration::from_secs(5), rx2)
+                    .await
+                    .expect("bridge never answered request 2")
+                    .expect("bridge dropped request 2's reply");
+                assert_eq!(outcome, Ok("SECOND.JWT.TOKEN".to_string()));
+            })
+            .await
+    }
+
+    /// After WaitForUserAuth times out with the agent call still pending,
+    /// a fresh authentication attempt on the same link (same registered
+    /// AuthAgent, as after the auto-close/restart path) must reach the
+    /// agent and succeed — it must not queue forever behind the abandoned
+    /// first call.
+    #[tokio::test(start_paused = true)]
+    async fn test_timed_out_agent_call_is_abandoned_and_retry_proceeds() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut eg_rx, link_id) = oidc_test_assembly();
+
+                let pending = Rc::new(RefCell::new(Vec::new()));
+                let client: cli::auth_agent::Client = capnp_rpc::new_client(GatedAuthAgent {
+                    id_token: "RETRY.JWT.TOKEN".to_string(),
+                    pending: pending.clone(),
+                });
+                let handle = spawn_auth_agent_bridge(client);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
+                    peer.link_state_machine.set_auth_agent(handle);
+                }
+
+                // Attempt 1: the user never completes the login.
+                let payload_a = challenge_payload(1);
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((false, Some(payload_a))),
+                )
+                .unwrap();
+                assert!(
+                    wait_for(2_000, || pending.borrow().len() == 1).await,
+                    "agent never saw attempt 1's call"
+                );
+
+                // Let the interaction timeout fire and the link close.
+                tokio::time::sleep(config::OIDC_USER_INTERACTION_TIMEOUT).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    assert_eq!(
+                        peer.link_state_machine.get_last_auth_failure(),
+                        Some(AuthFailureReason::InteractionTimeout)
+                    );
+                    // The restart path preserves LinkData (and thus the
+                    // AuthAgent handle); model it by rewinding the FSM.
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                }
+                // Ignore attempt 1's close traffic.
+                let _ = drain_acquire_blob_strs(&mut eg_rx);
+
+                // Attempt 2: a new challenge, and this time the user logs in.
+                let payload_b = challenge_payload(2);
+                let challenge_b = challenge_bytes(&payload_b);
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((false, Some(payload_b))),
+                )
+                .unwrap();
+                assert!(
+                    wait_for(5_000, || pending.borrow().len() == 2).await,
+                    "attempt 2's call is stuck behind the abandoned attempt-1 call"
+                );
+                let release = pending.borrow_mut()[1].1.take().unwrap();
+                let _ = release.send(());
+
+                // The retry proceeded: the second agent call was bound to
+                // attempt 2's challenge (nonce derived from challenge B),
+                // and its token moved the link to RegisterAA (the acquire
+                // request was initiated). Note the raw packet cannot be
+                // read back here: the fake peer never acks attempt 1's
+                // TerminateLink, so the serial ZDPR window holds it — a
+                // harness artifact, not the bug under test.
+                assert_eq!(
+                    pending.borrow()[1].0,
+                    auth::oidc_nonce_for_challenge(&challenge_b),
+                    "attempt 2's agent call is not bound to attempt 2's challenge"
+                );
+                assert!(
+                    wait_for(2_000, || {
+                        asm.peer_table
+                            .get(link_id)
+                            .map(|p| p.link_state_machine.get_state() == LinkState::RegisterAA)
+                            .unwrap_or(false)
+                    })
+                    .await,
+                    "retry never reached RegisterAA; state={:?}",
+                    asm.peer_table
+                        .get(link_id)
+                        .map(|p| p.link_state_machine.get_state())
+                );
+            })
+            .await
+    }
+
+    /// A very late completion of attempt 1's agent call (after its
+    /// WaitForUserAuth timed out and a NEW attempt with a new challenge is
+    /// underway) must be discarded, not consumed by the new attempt: the
+    /// old token is bound to the old challenge/nonce.
+    #[tokio::test(start_paused = true)]
+    async fn test_stale_completion_from_prior_attempt_is_discarded() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut eg_rx, link_id) = oidc_test_assembly();
+
+                let pending = Rc::new(RefCell::new(Vec::new()));
+                let client: cli::auth_agent::Client = capnp_rpc::new_client(GatedAuthAgent {
+                    id_token: "STALE.JWT.TOKEN".to_string(),
+                    pending: pending.clone(),
+                });
+                let handle = spawn_auth_agent_bridge(client);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
+                    peer.link_state_machine.set_auth_agent(handle);
+                }
+
+                // Attempt 1 (challenge A): times out.
+                let payload_a = challenge_payload(1);
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((false, Some(payload_a))),
+                )
+                .unwrap();
+                assert!(
+                    wait_for(2_000, || pending.borrow().len() == 1).await,
+                    "agent never saw attempt 1's call"
+                );
+                tokio::time::sleep(config::OIDC_USER_INTERACTION_TIMEOUT).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    assert_eq!(
+                        peer.link_state_machine.get_last_auth_failure(),
+                        Some(AuthFailureReason::InteractionTimeout)
+                    );
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                }
+                let _ = drain_acquire_blob_strs(&mut eg_rx);
+
+                // Attempt 2 (challenge B) is now waiting for the user.
+                let payload_b = challenge_payload(2);
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((false, Some(payload_b))),
+                )
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::WaitForUserAuth
+                );
+
+                // Attempt 1's call completes very late. If it was cancelled,
+                // this release is a no-op; either way its token must not be
+                // consumed by attempt 2.
+                let release = pending.borrow_mut()[0].1.take().unwrap();
+                let _ = release.send(());
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                let blob_strs = drain_acquire_blob_strs(&mut eg_rx);
+                assert!(
+                    blob_strs.is_empty(),
+                    "stale attempt-1 completion produced an acquire: {blob_strs:?}"
+                );
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::WaitForUserAuth,
+                    "stale attempt-1 completion moved the FSM off attempt 2"
+                );
+            })
+            .await
+    }
+
+    /// In-process fake AuthAgent: returns a fixed ID token and records the
+    /// nonce it was asked to bind into it.
+    struct FakeAuthAgent {
+        id_token: String,
+        seen_nonce: Rc<RefCell<Option<String>>>,
+    }
+
+    impl cli::auth_agent::Server for FakeAuthAgent {
+        async fn get_oidc_credential(
+            self: Rc<Self>,
+            params: cli::auth_agent::GetOidcCredentialParams,
+            mut results: cli::auth_agent::GetOidcCredentialResults,
+        ) -> Result<(), capnp::Error> {
+            let nonce = params.get()?.get_nonce()?.to_str()?.to_string();
+            *self.seen_nonce.borrow_mut() = Some(nonce);
+            let mut rb = results.get();
+            rb.set_id_token(&self.id_token[..]);
+            rb.init_result().init_success().set_none(());
+            Ok(())
+        }
+    }
+
+    /// Full OIDC callback flow against a fake in-process `AuthAgent`:
+    /// InitAuth with a known challenge must produce an AcquireZprAddress
+    /// packet whose blob array carries both the SS (bootstrap) and OIDC
+    /// blobs, with the OIDC blob's challenge equal to the InitAuth payload
+    /// and the agent called with `oidc_nonce_for_challenge(&challenge)`.
+    #[tokio::test(start_paused = true)]
+    async fn test_agent_token_becomes_oidc_blob_with_challenge_nonce() {
+        LocalSet::new()
+            .run_until(async {
+                // Egress queue we can read the AcquireZprAddress packet back from.
+                let (eg_tx, mut eg_rx) = packet_queue::packet_queue::<PACKET_BUFFER_SIZE>(8);
+                let mut builder = TestAssemblyBuilder::new();
+                builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(eg_tx));
+
+                // Bootstrap key configured, so an SS blob is produced alongside OIDC.
+                let mut cfg = <config::Config as std::default::Default>::default();
+                let mut keypath = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                keypath.push("tests");
+                keypath.push("data");
+                keypath.push("rsa-key.pem");
+                cfg.bootstrap = Some(auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap());
+                builder.config = Some(rcu::RcuBox::new(cfg));
+
+                let asm = Arc::new(create_assembly(builder));
+
+                // Insert an adapter-side peer.
+                let entry = asm.peer_table.vacant_entry().unwrap();
+                let link_id = entry.key();
+                let ps = peer_table::test::create_dummy_peer_state(
+                    link_id,
+                    LinkType::AdapterToNode,
+                    SubstrateAddr::from(([127, 0, 0, 1], 9000)),
+                    net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 2).into()),
+                );
+                let link_id = entry.insert(ps).get();
+
+                // Fake agent, bridged the same way start_link registers a real one.
+                let seen_nonce = Rc::new(RefCell::new(None));
+                let client: cli::auth_agent::Client = capnp_rpc::new_client(FakeAuthAgent {
+                    id_token: "FAKE.JWT.TOKEN".to_string(),
+                    seen_nonce: seen_nonce.clone(),
+                });
+                let agent_handle = spawn_auth_agent_bridge(client);
+
+                let idp = auth::OidcIdpInfo {
+                    issuer: "https://idp.test".to_string(),
+                    client_id: "test-client".to_string(),
+                    client_secret: None,
+                    scopes: vec!["openid".to_string()],
+                    allow_offline_access: false,
+                };
+
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(crate::link_state::LinkState::WaitForInitAuth);
+                    peer.link_state_machine.test_set_oidc_idps(vec![idp]);
+                    peer.link_state_machine.set_auth_agent(agent_handle);
+                }
+
+                // Known 48-byte challenge: nonce || ctime || hmac.
+                let payload = auth::ZdpInitAuthenticationPayload {
+                    nonce: [5u8; 8],
+                    ctime: 777777u64.into(),
+                    hmac: [6u8; 32],
+                };
+                let mut challenge = [0u8; 48];
+                challenge[0..8].copy_from_slice(&payload.nonce);
+                challenge[8..16].copy_from_slice(&payload.ctime.to_bytes());
+                challenge[16..48].copy_from_slice(&payload.hmac);
+
+                asm.process_link_state_event(
+                    link_id,
+                    crate::link_state::LinkEvent::ReceivedInitAuth((true, Some(payload))),
+                )
+                .unwrap();
+
+                // Wait for the agent round trip and the acquire to egress.
+                let mut pkt = None;
+                for _ in 0..200 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    match eg_rx.try_recv(Box::new([0u8; PACKET_BUFFER_SIZE])) {
+                        Ok(p) => {
+                            pkt = Some(p);
+                            break;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                let mut pkt = pkt.expect("no packet egressed after agent replied");
+
+                // Parse: base header, mgmt header, acquire header, blob.
+                let base = zdp::ZdpBaseHeader::read_from_buf(&mut pkt).unwrap();
+                assert_eq!(base.packet_type, zdp::ZdpPacketType::AcquireZprAddress);
+                let _mgmt = zdp::ZdpMgmtHeader::read_from_buf(&mut pkt).unwrap();
+                let acq = zdp::ZdpAcquireZprAddressHeader::read_from_buf(&mut pkt).unwrap();
+                let blob_len = acq.blob_len.get() as usize;
+                assert!(blob_len > 0);
+                let blob_bytes = pkt.copy_to_bytes(blob_len);
+                let blob_str = String::from_utf8(blob_bytes.into()).unwrap();
+
+                let blobs = auth::decode_blobs(&blob_str).unwrap();
+                assert_eq!(blobs.len(), 2, "expected SS + OIDC blobs, got {blobs:?}");
+                assert!(matches!(blobs[0], AuthBlob::SelfSigned(_)));
+                let AuthBlob::Oidc(ref oidc) = blobs[1] else {
+                    panic!("expected OIDC blob second, got {:?}", blobs[1]);
+                };
+                assert_eq!(oidc.id_token, "FAKE.JWT.TOKEN");
+                assert_eq!(oidc.issuer, "https://idp.test");
+
+                // The OIDC blob's challenge round-trips against the InitAuth payload.
+                let decoded = BASE64_STANDARD.decode(&oidc.challenge).unwrap();
+                assert_eq!(decoded, challenge);
+
+                // The agent was called with the nonce derived from that challenge.
+                assert_eq!(
+                    seen_nonce.borrow().as_deref(),
+                    Some(auth::oidc_nonce_for_challenge(&challenge).as_str())
+                );
+            })
+            .await
     }
 }

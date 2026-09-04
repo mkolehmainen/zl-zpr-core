@@ -128,7 +128,7 @@ impl std::fmt::Debug for ZdpInitAuthenticationPayload {
 /// message.
 ///
 /// Note that this passed around as JSON text encoded in base64.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ZdpSelfSignedBlob {
     pub blob_type: String, // "SS"
     pub ts: u64,
@@ -171,7 +171,7 @@ pub struct ZdpOidcBlob {
 
 /// Enum used to return different blob types based on their blob_type field.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AuthBlob {
     SelfSigned(ZdpSelfSignedBlob),
     AuthCode(ZdpAuthCodeBlob),
@@ -482,6 +482,15 @@ impl RsaBootstrapAuth {
         &self,
         payload: &ZdpInitAuthenticationPayload,
     ) -> Result<String, AuthError> {
+        Ok(self.authenticate_blob(payload)?.encode())
+    }
+
+    /// Like [Self::authenticate] but returns the [ZdpSelfSignedBlob] itself,
+    /// for callers assembling a multi-blob array (e.g. SS + OIDC).
+    pub fn authenticate_blob(
+        &self,
+        payload: &ZdpInitAuthenticationPayload,
+    ) -> Result<ZdpSelfSignedBlob, AuthError> {
         // TODO: Check the payload.flags?
         // TODO: This could be an impl function in zdp
         let mut challenge = [0u8; 48];
@@ -510,7 +519,7 @@ impl RsaBootstrapAuth {
             challenge: BASE64_STANDARD.encode(&challenge),
             sig: sig_str,
         };
-        Ok(blob.encode())
+        Ok(blob)
     }
 
     #[cfg(test)]
