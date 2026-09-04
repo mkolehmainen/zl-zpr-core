@@ -837,12 +837,38 @@ fn parse_agent_response(
                 .and_then(|t| t.to_str().map_err(|e| capnp::Error::failed(e.to_string())))
                 .unwrap_or("unknown agent error")
                 .to_string();
-            if txt.contains("access_denied") {
-                Err(AuthFailureReason::UserDeclined)
-            } else {
-                Err(AuthFailureReason::AgentError(txt))
+            Err(classify_agent_error(&txt))
+        }
+    }
+}
+
+/// Map the agent's error text onto an [AuthFailureReason].
+///
+/// ph-cli's `rpc_error_text` (adapter/cli/src/oidc.rs) prefixes the display
+/// text with a stable `[class:<token>]` tag naming the failure class, so the
+/// class survives the RPC and `connect` can apply its advertised exit codes;
+/// the two sides must agree on the tokens matched here. A bare
+/// "access_denied" (no tag) is still recognized for the user-refusal case —
+/// that spelling is the spec's error-taxonomy contract and keeps
+/// third-party/older agents classifiable. Anything else, including an
+/// unknown class token, is an agent-side failure.
+fn classify_agent_error(txt: &str) -> AuthFailureReason {
+    if let Some(rest) = txt.strip_prefix("[class:") {
+        if let Some((class, detail)) = rest.split_once(']') {
+            let detail = detail.trim_start().to_string();
+            match class {
+                "user_declined" => return AuthFailureReason::UserDeclined,
+                "interaction_timeout" => return AuthFailureReason::InteractionTimeout,
+                "idp_unreachable" => return AuthFailureReason::IdpUnreachable(detail),
+                // Unknown token: fall through and keep the full text.
+                _ => {}
             }
         }
+    }
+    if txt.contains("access_denied") {
+        AuthFailureReason::UserDeclined
+    } else {
+        AuthFailureReason::AgentError(txt.to_string())
     }
 }
 
@@ -989,6 +1015,51 @@ mod test {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         cond()
+    }
+
+    /// The agent (ph-cli's CliAuthAgent) prefixes its error text with a
+    /// stable `[class:...]` token (oidc.rs::rpc_error_text). The classifier
+    /// must map each token onto the matching `AuthFailureReason` so `connect`
+    /// can apply its advertised exit codes, keep the legacy access_denied
+    /// spelling working, and fall back to AgentError for untagged text.
+    #[test]
+    fn test_classify_agent_error_maps_class_tokens() {
+        assert_eq!(
+            classify_agent_error("[class:user_declined] authorization failed: access_denied"),
+            AuthFailureReason::UserDeclined
+        );
+        assert_eq!(
+            classify_agent_error(
+                "[class:interaction_timeout] timed out waiting for the authorization callback"
+            ),
+            AuthFailureReason::InteractionTimeout
+        );
+        assert_eq!(
+            classify_agent_error("[class:idp_unreachable] OIDC discovery failed: HTTP 503"),
+            AuthFailureReason::IdpUnreachable("OIDC discovery failed: HTTP 503".to_string())
+        );
+        assert_eq!(
+            classify_agent_error("[class:idp_unreachable] token exchange failed: HTTP 400"),
+            AuthFailureReason::IdpUnreachable("token exchange failed: HTTP 400".to_string())
+        );
+        // Legacy/third-party agents: a bare access_denied still means the
+        // user declined, per the spec's error taxonomy.
+        assert_eq!(
+            classify_agent_error("authorization failed: access_denied"),
+            AuthFailureReason::UserDeclined
+        );
+        // Untagged text stays an agent-side failure (exit 1).
+        assert_eq!(
+            classify_agent_error("state parameter mismatch in authorization redirect"),
+            AuthFailureReason::AgentError(
+                "state parameter mismatch in authorization redirect".to_string()
+            )
+        );
+        // An unknown class token is not silently dropped.
+        assert_eq!(
+            classify_agent_error("[class:something_new] hmm"),
+            AuthFailureReason::AgentError("[class:something_new] hmm".to_string())
+        );
     }
 
     /// The bridge must not stay blocked on a getOidcCredential call whose

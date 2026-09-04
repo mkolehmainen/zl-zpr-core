@@ -3,6 +3,7 @@
 //! when a command is multiple words, this program assumes the spaces are replaced
 //! with a '-' on the command line
 mod main_args;
+mod oidc;
 mod rusty_helper;
 
 use crate::main_args::{CaptureCommands, CliCommand, CmdlineArgs, Commands, LinkCommands};
@@ -176,6 +177,27 @@ async fn process_command(
         return Ok(true);
     }
 
+    // The standalone OIDC login test harness talks to the IdP only; it does
+    // not need the packet handler's management socket.
+    if let Commands::OidcLogin {
+        issuer,
+        client_id,
+        client_secret,
+        scopes,
+        nonce,
+        no_browser,
+    } = command
+    {
+        let idp = oidc::OidcIdpInfo {
+            issuer,
+            client_id,
+            client_secret,
+            scopes,
+            allow_offline_access: false,
+        };
+        return oidc_login_task(idp, nonce, no_browser).await;
+    }
+
     let sock = tokio::net::UnixStream::connect(socket).await?;
     let (reader, writer) = sock.into_split();
 
@@ -251,12 +273,151 @@ async fn process_command(
                 },
                 Commands::Logging { logs } => change_logging_task(service, logs).await?,
                 Commands::Addr => get_node_addr_task(service).await?,
+                Commands::Connect { id, no_browser } => {
+                    connect_task(service, id, no_browser).await?
+                }
+                Commands::AuthAgent { id } => auth_agent_task(service, id).await?,
+                Commands::OidcLogin { .. } => unreachable!("handled before connecting"),
                 Commands::Quit => return Ok(true), // Will never reach here
             }
 
             Ok(false)
         })
         .await
+}
+
+/// Run the standalone OIDC login flow (hidden `oidc-login` debug command)
+/// and print the resulting id_token to stdout. On failure, exits with the
+/// contract exit code for the failure class.
+async fn oidc_login_task(
+    idp: oidc::OidcIdpInfo,
+    nonce: String,
+    no_browser: bool,
+) -> Result<bool, CliError> {
+    match oidc::login(&idp, &nonce, !no_browser, oidc::OIDC_LOGIN_TIMEOUT).await {
+        Ok(id_token) => {
+            // The one deliberate place the token is emitted: stdout, for the
+            // test harness. Progress/log output never carries it.
+            println!("{id_token}");
+            Ok(false)
+        }
+        Err(err) => {
+            eprintln!("oidc-login failed: {err}");
+            std::process::exit(oidc::exit_code_for_oidc_error(&err));
+        }
+    }
+}
+
+/// How long `connect` waits for the link to come up. Slightly above ph's
+/// authentication budget (the node's 330 s ACTOR_AUTHENTICATION_TIMEOUT
+/// bounds the 300 s user-interaction window), so ph decides the outcome and
+/// this deadline only catches a wedged link.
+const CONNECT_DEADLINE: Duration = Duration::from_secs(330);
+
+/// How often `connect` polls `showLink` while waiting for the outcome.
+const CONNECT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `connect`: start a link, supplying this process as its AuthAgent
+/// (Contract 6), and hold the RPC connection open so the packet handler's
+/// `getOidcCredential` callback can reach us while the link authenticates.
+///
+/// `startLink` returns as soon as the Start event is accepted, so the
+/// outcome is observed by polling `showLink` until the state is `Active`
+/// (exit 0) or `Error` (exit per the failure-class contract: 2 declined,
+/// 3 timeout, 4 IdP unreachable, 5 VS rejected token, 6 policy denied,
+/// 7 device blob rejected, 1 anything else). On a device-only link the
+/// agent is supplied but never called and the link simply comes up.
+async fn connect_task(service: svc::Client, id: u32, no_browser: bool) -> Result<(), CliError> {
+    println!("Connecting link {id}…");
+    let mut request = service.start_link_request();
+    request.get().set_id(id);
+    // The agent prints its own progress ("Authentication with <issuer>
+    // required…") when — and only when — ph calls back for a credential,
+    // since the issuer is not known until then.
+    request
+        .get()
+        .set_auth_agent(capnp_rpc::new_client(oidc::CliAuthAgent {
+            open_browser: !no_browser,
+            progress: None,
+        }));
+
+    let response = request.send().promise.await?;
+    let results = response.get()?;
+    if let cli::success_or_error::Which::Error(e) = results.get_result()?.which()? {
+        let msg = e?.get_txt()?.to_string()?;
+        eprintln!("connect failed: {msg}");
+        std::process::exit(1);
+    }
+
+    // Started. Poll showLink for the outcome; the RpcSystem stays alive on
+    // this LocalSet the whole time, serving getOidcCredential callbacks.
+    let deadline = tokio::time::Instant::now() + CONNECT_DEADLINE;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!("connect failed: timed out waiting for link {id} to come up");
+            std::process::exit(3);
+        }
+        sleep(CONNECT_POLL_INTERVAL).await;
+
+        let mut show = service.show_link_request();
+        show.get().set_id(id);
+        let response = show.send().promise.await?;
+        let text = response.get()?.get_result()?.to_string()?;
+        match oidc::parse_show_link_state(&text) {
+            oidc::LinkOutcome::Up => {
+                println!("Link {id} up");
+                return Ok(());
+            }
+            oidc::LinkOutcome::Failed(reason) => {
+                if reason.is_empty() {
+                    eprintln!("connect failed: link {id} is in the Error state");
+                } else {
+                    eprintln!("connect failed: {reason}");
+                }
+                std::process::exit(oidc::exit_code_for_auth_failure(&reason));
+            }
+            oidc::LinkOutcome::Pending => {}
+        }
+    }
+}
+
+/// `auth-agent`: register as the authentication agent for a link and serve
+/// interactive OIDC requests until SIGINT.
+///
+/// Registration goes through `startLink` with the agent capability: ph
+/// registers the agent before firing the Start event, so on a link that is
+/// already started the resulting `UnexpectedTransition` error is benign and
+/// tolerated (see [oidc::start_link_error_is_fatal]).
+async fn auth_agent_task(service: svc::Client, id: u32) -> Result<(), CliError> {
+    let mut request = service.start_link_request();
+    request.get().set_id(id);
+    request
+        .get()
+        .set_auth_agent(capnp_rpc::new_client(oidc::CliAuthAgent {
+            open_browser: true,
+            progress: None,
+        }));
+
+    let response = request.send().promise.await?;
+    let results = response.get()?;
+    match results.get_result()?.which()? {
+        cli::success_or_error::Which::Success(_) => {
+            println!("Registered as authentication agent for link {id} (link started)");
+        }
+        cli::success_or_error::Which::Error(e) => {
+            let msg = e?.get_txt()?.to_string()?;
+            if oidc::start_link_error_is_fatal(&msg) {
+                eprintln!("auth-agent registration failed: {msg}");
+                std::process::exit(1);
+            }
+            println!("Registered as authentication agent for already-started link {id}");
+        }
+    }
+
+    println!("Serving authentication requests until interrupted (Ctrl-C)…");
+    tokio::signal::ctrl_c().await?;
+    println!("auth-agent: interrupted, exiting");
+    Ok(())
 }
 
 // TODO combine no arg tasks into one func w/ closure
