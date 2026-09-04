@@ -2,10 +2,10 @@
 //!
 //! Implements the OAuth 2.0 authorization-code flow with PKCE (RFC 7636,
 //! S256 only) against an OIDC provider, using a single-use loopback HTTP
-//! listener as the redirect target. The entry point is [`login`], which is
-//! used standalone by the hidden `ph-cli oidc-login` debug subcommand and
-//! will be wired behind the packet handler's `AuthAgent` interface when the
-//! D2 plan item lands.
+//! listener as the redirect target. The entry point is [`login`], used
+//! standalone by the hidden `ph-cli oidc-login` debug subcommand and served
+//! to the packet handler behind the `AuthAgent` capability ([`CliAuthAgent`],
+//! Contract 6) by the `connect` and `auth-agent` commands.
 //!
 //! Security invariants:
 //! - The authorization `code`, the `id_token`, and the PKCE `verifier` are
@@ -64,9 +64,8 @@ pub enum OidcCliError {
 /// Description of an OIDC identity provider a link may authenticate against.
 ///
 /// Field set matches Contract "OidcIdpInfo" in the OIDC master plan
-/// (docs/plans/2026-09-02-oidc-implementation-plan.md); when the D2 plan item
-/// lands this type is expected to move to (or be re-exported from) the
-/// packet-handler side.
+/// (docs/plans/2026-09-02-oidc-implementation-plan.md) and the wire fields
+/// of `AuthAgent.getOidcCredential` (adapter/admin-api/cli.capnp).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OidcIdpInfo {
     pub issuer: String,
@@ -268,11 +267,11 @@ pub async fn login(
     .await
 }
 
-/// Agent-facing wrapper matching the D2 `getOidcCredential` contract: the
+/// Wrapper matching the `getOidcCredential` contract semantics: the
 /// non-interactive path (refresh tokens / `offline_access` / keyring) is a
 /// follow-up issue, so `interactive = false` is rejected.
-// Not called from the binary until plan item D2 wires the auth-agent; kept
-// (and tested) so D2 can consume it as-is.
+// [CliAuthAgent] inlines the same logic to thread its progress sink; this
+// stays as the plain-function form of the contract, exercised by tests.
 #[allow(dead_code)]
 pub async fn get_oidc_credential(
     idp: &OidcIdpInfo,
@@ -438,27 +437,76 @@ fn open_in_browser(url: &str) -> Result<(), OidcCliError> {
         .map_err(|e| OidcCliError::Browser(format!("{program}: {e}")))
 }
 
-/// Map a `startLink` / link-authentication failure message to the `connect`
-/// exit code contract:
-/// 2 user declined, 3 timeout, 4 IdP unreachable, 5 visa service rejected the
-/// token, 6 policy denied, 7 device blob rejected, 1 anything else.
-pub fn exit_code_for_link_error(msg: &str) -> i32 {
-    let m = msg.to_ascii_lowercase();
-    if m.contains("declined") || m.contains("denied by user") || m.contains("cancelled") {
+/// What one `showLink` snapshot says about a starting link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkOutcome {
+    /// `State: Active` — the link is up.
+    Up,
+    /// `State: Error` — authentication failed; carries the Debug spelling of
+    /// ph's `AuthFailureReason` from the `Last auth failure:` line (empty if
+    /// none was printed).
+    Failed(String),
+    /// Any other state — keep polling.
+    Pending,
+}
+
+/// Parse the text `showLink` returns. ph prints `  State: {:?} (for {:?})`
+/// (Display for LinkStateMachine) and, when a failure was recorded,
+/// `  Last auth failure: {:?}` (Display for LinkStateWrapper), both in
+/// adapter/ph/src/link_state.rs.
+pub fn parse_show_link_state(text: &str) -> LinkOutcome {
+    let mut state = None;
+    let mut reason = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("State: ") {
+            // "Active (for 1.2s)" -> "Active"; Disconnecting(..) has no
+            // space before its parenthesis, so split on " (" only.
+            state = Some(rest.split(" (").next().unwrap_or(rest).to_string());
+        } else if let Some(rest) = line.strip_prefix("Last auth failure: ") {
+            reason = Some(rest.to_string());
+        }
+    }
+    match state.as_deref() {
+        Some("Active") => LinkOutcome::Up,
+        Some("Error") => LinkOutcome::Failed(reason.unwrap_or_default()),
+        _ => LinkOutcome::Pending,
+    }
+}
+
+/// Map the Debug spelling of ph's `AuthFailureReason` (as printed by
+/// `showLink`'s `Last auth failure:` line) to the `connect` exit-code
+/// contract: 2 user declined, 3 timeout, 4 IdP unreachable, 5 visa service
+/// rejected the token, 6 policy denied, 7 device blob rejected, 1 anything
+/// else (NoAgent, AgentError, AuthUnavailable, unrecognized).
+pub fn exit_code_for_auth_failure(reason: &str) -> i32 {
+    if reason.starts_with("UserDeclined") {
         2
-    } else if m.contains("timed out") || m.contains("timeout") {
+    } else if reason.starts_with("InteractionTimeout") {
         3
-    } else if m.contains("unreachable") || m.contains("idp unavailable") {
+    } else if reason.starts_with("IdpUnreachable(") {
         4
-    } else if m.contains("token") && (m.contains("reject") || m.contains("invalid")) {
+    } else if reason.starts_with("VisaServiceRejected(") {
         5
-    } else if m.contains("policy") {
+    } else if reason.starts_with("PolicyDenied") {
         6
-    } else if m.contains("blob") {
+    } else if reason.starts_with("DeviceBlobRejected") {
         7
     } else {
         1
     }
+}
+
+/// Whether a `startLink` error means agent registration failed.
+///
+/// ph registers the AuthAgent capability *before* firing the Start event
+/// (admin_worker.rs::start_link), and starting a non-Inactive link answers
+/// with an `UnexpectedTransition` error after the registration already
+/// happened — so for `auth-agent` that error is benign: the agent is
+/// registered on the running link and must keep serving. Anything else
+/// (e.g. `NotFound`: no such link, so nothing was registered) is fatal.
+pub fn start_link_error_is_fatal(msg: &str) -> bool {
+    !msg.contains("UnexpectedTransition")
 }
 
 /// Map an [`OidcCliError`] from the standalone `oidc-login` flow onto the
@@ -865,17 +913,33 @@ mod tests {
     }
 
     /// The seven `connect` failure classes map onto exit codes 2-7 (and 1
-    /// for anything unrecognized).
+    /// for anything unrecognized), keyed on the Debug spellings of ph's
+    /// `AuthFailureReason` as printed by `showLink`'s "Last auth failure:"
+    /// line (adapter/ph/src/link_state.rs).
     #[test]
-    fn test_exit_code_mapping() {
-        assert_eq!(exit_code_for_link_error("user declined authentication"), 2);
-        assert_eq!(exit_code_for_link_error("authentication timed out"), 3);
-        assert_eq!(exit_code_for_link_error("IdP unreachable"), 4);
-        assert_eq!(exit_code_for_link_error("visa service rejected token"), 5);
-        assert_eq!(exit_code_for_link_error("policy denied"), 6);
-        assert_eq!(exit_code_for_link_error("device blob rejected"), 7);
-        assert_eq!(exit_code_for_link_error("something else entirely"), 1);
+    fn test_reason_to_exit_code() {
+        assert_eq!(exit_code_for_auth_failure("UserDeclined"), 2);
+        assert_eq!(exit_code_for_auth_failure("InteractionTimeout"), 3);
+        assert_eq!(
+            exit_code_for_auth_failure("IdpUnreachable(\"connect refused\")"),
+            4
+        );
+        assert_eq!(
+            exit_code_for_auth_failure("VisaServiceRejected(\"bad token\")"),
+            5
+        );
+        assert_eq!(exit_code_for_auth_failure("PolicyDenied"), 6);
+        assert_eq!(exit_code_for_auth_failure("DeviceBlobRejected"), 7);
+        // Not one of the seven contract classes:
+        assert_eq!(exit_code_for_auth_failure("NoAgent"), 1);
+        assert_eq!(exit_code_for_auth_failure("AgentError(\"x\")"), 1);
+        assert_eq!(exit_code_for_auth_failure("AuthUnavailable"), 1);
+        assert_eq!(exit_code_for_auth_failure("something else"), 1);
 
+        assert_eq!(
+            exit_code_for_oidc_error(&OidcCliError::AuthorizationDenied("access_denied".into())),
+            2
+        );
         assert_eq!(exit_code_for_oidc_error(&OidcCliError::Timeout), 3);
         assert_eq!(
             exit_code_for_oidc_error(&OidcCliError::Discovery("x".into())),
@@ -886,6 +950,61 @@ mod tests {
             5
         );
         assert_eq!(exit_code_for_oidc_error(&OidcCliError::StateMismatch), 1);
+    }
+
+    /// `auth-agent` registers by calling startLink; on an already-started
+    /// link ph answers with an UnexpectedTransition error *after* the agent
+    /// was registered, so that error must not be fatal — the task keeps
+    /// serving. Genuinely broken registrations (no such link) are fatal.
+    #[test]
+    fn test_auth_agent_tolerates_already_started_link() {
+        assert!(!start_link_error_is_fatal(
+            "Failed to start link 3: UnexpectedTransition(Keying, \"Start\")\n"
+        ));
+        assert!(!start_link_error_is_fatal(
+            "Failed to start link 3: UnexpectedTransition(Active, \"Start\")\n"
+        ));
+        assert!(start_link_error_is_fatal(
+            "Failed to start link 9: NotFound(9)\n"
+        ));
+        assert!(start_link_error_is_fatal("something unexpected"));
+    }
+
+    /// Pure parser over the `showLink` result text, matching what ph's
+    /// Display impls actually print: `  State: {:?} (for {:?})` and, when
+    /// set, `  Last auth failure: {:?}`.
+    #[test]
+    fn test_parse_show_link_state() {
+        assert_eq!(
+            parse_show_link_state("  Type: AdapterToNode\n  State: Active (for 1.2s)\n"),
+            LinkOutcome::Up
+        );
+        assert_eq!(
+            parse_show_link_state(
+                "  State: Error (for 3ms)\n  Last auth failure: InteractionTimeout\n"
+            ),
+            LinkOutcome::Failed("InteractionTimeout".to_string())
+        );
+        assert_eq!(
+            parse_show_link_state(
+                "  State: Error (for 3ms)\n  Last auth failure: IdpUnreachable(\"conn refused\")\n"
+            ),
+            LinkOutcome::Failed("IdpUnreachable(\"conn refused\")".to_string())
+        );
+        // Error with no recorded reason still terminates the wait.
+        assert_eq!(
+            parse_show_link_state("  State: Error (for 3ms)\n"),
+            LinkOutcome::Failed(String::new())
+        );
+        // Anything in-flight keeps polling.
+        assert_eq!(
+            parse_show_link_state("  State: WaitForUserAuth (for 10s)\n"),
+            LinkOutcome::Pending
+        );
+        assert_eq!(
+            parse_show_link_state("  State: Keying (for 10ms)\n"),
+            LinkOutcome::Pending
+        );
     }
 
     /// Build an in-process Cap'n Proto client for [CliAuthAgent] with a
