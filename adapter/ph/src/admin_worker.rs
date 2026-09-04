@@ -852,6 +852,362 @@ mod test {
     use zpr_ext::zerocopy::FromBytesExt;
     use zpr_utils::net_defs;
 
+    /// In-process fake AuthAgent whose calls complete only when the test
+    /// releases them: each getOidcCredential call appends `(nonce,
+    /// Some(release_sender))` to `pending` and then waits for the test to
+    /// fire that sender. Leaving the sender in place models a user who
+    /// never completes the login; firing it models a (possibly very late)
+    /// completion.
+    struct GatedAuthAgent {
+        id_token: String,
+        pending: Rc<RefCell<Vec<(String, Option<tokio::sync::oneshot::Sender<()>>)>>>,
+    }
+
+    impl cli::auth_agent::Server for GatedAuthAgent {
+        async fn get_oidc_credential(
+            self: Rc<Self>,
+            params: cli::auth_agent::GetOidcCredentialParams,
+            mut results: cli::auth_agent::GetOidcCredentialResults,
+        ) -> Result<(), capnp::Error> {
+            let nonce = params.get()?.get_nonce()?.to_str()?.to_string();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending.borrow_mut().push((nonce, Some(tx)));
+            // Held until the test releases this call (or the caller cancels
+            // the RPC, which drops this task).
+            let _ = rx.await;
+            let mut rb = results.get();
+            rb.set_id_token(&self.id_token[..]);
+            rb.init_result().init_success().set_none(());
+            Ok(())
+        }
+    }
+
+    /// A minimal advertised OIDC identity provider for bridge/FSM tests.
+    fn test_idp() -> auth::OidcIdpInfo {
+        auth::OidcIdpInfo {
+            issuer: "https://idp.test".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string()],
+            allow_offline_access: false,
+        }
+    }
+
+    /// Assembly with a readable management egress queue and one
+    /// AdapterToNode peer; no bootstrap key, so OIDC is the only
+    /// authentication path.
+    fn oidc_test_assembly() -> (
+        Arc<Assembly>,
+        packet_queue::Receiver<PACKET_BUFFER_SIZE>,
+        LinkId,
+    ) {
+        let (eg_tx, eg_rx) = packet_queue::packet_queue::<PACKET_BUFFER_SIZE>(32);
+        let mut builder = TestAssemblyBuilder::new();
+        builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(eg_tx));
+        let asm = Arc::new(create_assembly(builder));
+
+        let entry = asm.peer_table.vacant_entry().unwrap();
+        let link_id = entry.key();
+        let ps = peer_table::test::create_dummy_peer_state(
+            link_id,
+            LinkType::AdapterToNode,
+            SubstrateAddr::from(([127, 0, 0, 1], 9000)),
+            net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 2).into()),
+        );
+        let link_id = entry.insert(ps).get();
+        (asm, eg_rx, link_id)
+    }
+
+    /// A 48-byte InitAuth challenge whose nonce bytes are `tag`, so two
+    /// attempts can be told apart by their challenge.
+    fn challenge_payload(tag: u8) -> auth::ZdpInitAuthenticationPayload {
+        auth::ZdpInitAuthenticationPayload {
+            nonce: [tag; 8],
+            ctime: 424242u64.into(),
+            hmac: [6u8; 32],
+        }
+    }
+
+    /// The raw challenge bytes the OIDC blob must round-trip.
+    fn challenge_bytes(payload: &auth::ZdpInitAuthenticationPayload) -> [u8; 48] {
+        let mut challenge = [0u8; 48];
+        challenge[0..8].copy_from_slice(&payload.nonce);
+        challenge[8..16].copy_from_slice(&payload.ctime.to_bytes());
+        challenge[16..48].copy_from_slice(&payload.hmac);
+        challenge
+    }
+
+    /// Drain every packet currently in the egress queue and return the blob
+    /// string of each AcquireZprAddress packet (other packet types, e.g.
+    /// TerminateLink from a close, are ignored).
+    fn drain_acquire_blob_strs(
+        rx: &mut packet_queue::Receiver<PACKET_BUFFER_SIZE>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(mut pkt) = rx.try_recv(Box::new([0u8; PACKET_BUFFER_SIZE])) {
+            let base = zdp::ZdpBaseHeader::read_from_buf(&mut pkt).unwrap();
+            if base.packet_type != zdp::ZdpPacketType::AcquireZprAddress {
+                continue;
+            }
+            let _mgmt = zdp::ZdpMgmtHeader::read_from_buf(&mut pkt).unwrap();
+            let acq = zdp::ZdpAcquireZprAddressHeader::read_from_buf(&mut pkt).unwrap();
+            let blob_len = acq.blob_len.get() as usize;
+            let blob_bytes = pkt.copy_to_bytes(blob_len);
+            out.push(String::from_utf8(blob_bytes.into()).unwrap());
+        }
+        out
+    }
+
+    /// Sleep in small steps until `cond` holds or `max_ms` elapses.
+    async fn wait_for(max_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..(max_ms / 10) {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    /// The bridge must not stay blocked on a getOidcCredential call whose
+    /// requester has gone away (link timed out): the abandoned call is
+    /// cancelled and the next queued request still reaches the agent.
+    #[tokio::test(start_paused = true)]
+    async fn test_bridge_abandons_call_when_requester_goes_away() {
+        LocalSet::new()
+            .run_until(async {
+                let pending = Rc::new(RefCell::new(Vec::new()));
+                let client: cli::auth_agent::Client = capnp_rpc::new_client(GatedAuthAgent {
+                    id_token: "SECOND.JWT.TOKEN".to_string(),
+                    pending: pending.clone(),
+                });
+                let handle = spawn_auth_agent_bridge(client);
+
+                // Request 1: the requester stops waiting (link timeout).
+                let (tx1, rx1) = tokio::sync::oneshot::channel();
+                handle
+                    .send(OidcCredentialRequest {
+                        idp: test_idp(),
+                        nonce: "nonce-1".to_string(),
+                        interactive: true,
+                        reply: tx1,
+                    })
+                    .unwrap();
+                assert!(
+                    wait_for(2_000, || pending.borrow().len() == 1).await,
+                    "agent never saw request 1"
+                );
+                drop(rx1); // the requester gave up; the bridge must notice
+
+                // Request 2 must still be serviced.
+                let (tx2, rx2) = tokio::sync::oneshot::channel();
+                handle
+                    .send(OidcCredentialRequest {
+                        idp: test_idp(),
+                        nonce: "nonce-2".to_string(),
+                        interactive: true,
+                        reply: tx2,
+                    })
+                    .unwrap();
+                assert!(
+                    wait_for(5_000, || pending.borrow().len() == 2).await,
+                    "request 2 is stuck behind the abandoned request 1"
+                );
+                let release = pending.borrow_mut()[1].1.take().unwrap();
+                let _ = release.send(());
+
+                let outcome = tokio::time::timeout(Duration::from_secs(5), rx2)
+                    .await
+                    .expect("bridge never answered request 2")
+                    .expect("bridge dropped request 2's reply");
+                assert_eq!(outcome, Ok("SECOND.JWT.TOKEN".to_string()));
+            })
+            .await
+    }
+
+    /// After WaitForUserAuth times out with the agent call still pending,
+    /// a fresh authentication attempt on the same link (same registered
+    /// AuthAgent, as after the auto-close/restart path) must reach the
+    /// agent and succeed — it must not queue forever behind the abandoned
+    /// first call.
+    #[tokio::test(start_paused = true)]
+    async fn test_timed_out_agent_call_is_abandoned_and_retry_proceeds() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut eg_rx, link_id) = oidc_test_assembly();
+
+                let pending = Rc::new(RefCell::new(Vec::new()));
+                let client: cli::auth_agent::Client = capnp_rpc::new_client(GatedAuthAgent {
+                    id_token: "RETRY.JWT.TOKEN".to_string(),
+                    pending: pending.clone(),
+                });
+                let handle = spawn_auth_agent_bridge(client);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
+                    peer.link_state_machine.set_auth_agent(handle);
+                }
+
+                // Attempt 1: the user never completes the login.
+                let payload_a = challenge_payload(1);
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((false, Some(payload_a))),
+                )
+                .unwrap();
+                assert!(
+                    wait_for(2_000, || pending.borrow().len() == 1).await,
+                    "agent never saw attempt 1's call"
+                );
+
+                // Let the interaction timeout fire and the link close.
+                tokio::time::sleep(config::OIDC_USER_INTERACTION_TIMEOUT).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    assert_eq!(
+                        peer.link_state_machine.get_last_auth_failure(),
+                        Some(AuthFailureReason::InteractionTimeout)
+                    );
+                    // The restart path preserves LinkData (and thus the
+                    // AuthAgent handle); model it by rewinding the FSM.
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                }
+                // Ignore attempt 1's close traffic.
+                let _ = drain_acquire_blob_strs(&mut eg_rx);
+
+                // Attempt 2: a new challenge, and this time the user logs in.
+                let payload_b = challenge_payload(2);
+                let challenge_b = challenge_bytes(&payload_b);
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((false, Some(payload_b))),
+                )
+                .unwrap();
+                assert!(
+                    wait_for(5_000, || pending.borrow().len() == 2).await,
+                    "attempt 2's call is stuck behind the abandoned attempt-1 call"
+                );
+                let release = pending.borrow_mut()[1].1.take().unwrap();
+                let _ = release.send(());
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                // The retry proceeded: an acquire carrying attempt 2's
+                // challenge egressed and the link is waiting for the grant.
+                let blob_strs = drain_acquire_blob_strs(&mut eg_rx);
+                assert_eq!(blob_strs.len(), 1, "expected one acquire, got {blob_strs:?}");
+                let blobs = auth::decode_blobs(&blob_strs[0]).unwrap();
+                let AuthBlob::Oidc(ref oidc) = blobs[0] else {
+                    panic!("expected OIDC blob, got {:?}", blobs[0]);
+                };
+                assert_eq!(oidc.id_token, "RETRY.JWT.TOKEN");
+                let decoded = BASE64_STANDARD.decode(&oidc.challenge).unwrap();
+                assert_eq!(decoded, challenge_b);
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::RegisterAA
+                );
+            })
+            .await
+    }
+
+    /// A very late completion of attempt 1's agent call (after its
+    /// WaitForUserAuth timed out and a NEW attempt with a new challenge is
+    /// underway) must be discarded, not consumed by the new attempt: the
+    /// old token is bound to the old challenge/nonce.
+    #[tokio::test(start_paused = true)]
+    async fn test_stale_completion_from_prior_attempt_is_discarded() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut eg_rx, link_id) = oidc_test_assembly();
+
+                let pending = Rc::new(RefCell::new(Vec::new()));
+                let client: cli::auth_agent::Client = capnp_rpc::new_client(GatedAuthAgent {
+                    id_token: "STALE.JWT.TOKEN".to_string(),
+                    pending: pending.clone(),
+                });
+                let handle = spawn_auth_agent_bridge(client);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
+                    peer.link_state_machine.set_auth_agent(handle);
+                }
+
+                // Attempt 1 (challenge A): times out.
+                let payload_a = challenge_payload(1);
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((false, Some(payload_a))),
+                )
+                .unwrap();
+                assert!(
+                    wait_for(2_000, || pending.borrow().len() == 1).await,
+                    "agent never saw attempt 1's call"
+                );
+                tokio::time::sleep(config::OIDC_USER_INTERACTION_TIMEOUT).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    assert_eq!(
+                        peer.link_state_machine.get_last_auth_failure(),
+                        Some(AuthFailureReason::InteractionTimeout)
+                    );
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                }
+                let _ = drain_acquire_blob_strs(&mut eg_rx);
+
+                // Attempt 2 (challenge B) is now waiting for the user.
+                let payload_b = challenge_payload(2);
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((false, Some(payload_b))),
+                )
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::WaitForUserAuth
+                );
+
+                // Attempt 1's call completes very late. If it was cancelled,
+                // this release is a no-op; either way its token must not be
+                // consumed by attempt 2.
+                let release = pending.borrow_mut()[0].1.take().unwrap();
+                let _ = release.send(());
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                let blob_strs = drain_acquire_blob_strs(&mut eg_rx);
+                assert!(
+                    blob_strs.is_empty(),
+                    "stale attempt-1 completion produced an acquire: {blob_strs:?}"
+                );
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::WaitForUserAuth,
+                    "stale attempt-1 completion moved the FSM off attempt 2"
+                );
+            })
+            .await
+    }
+
     /// In-process fake AuthAgent: returns a fixed ID token and records the
     /// nonce it was asked to bind into it.
     struct FakeAuthAgent {
