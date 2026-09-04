@@ -5,7 +5,9 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
-use crate::link_state::{LinkEvent, LinkState};
+use crate::link_state::{
+    AuthAgentHandle, AuthFailureReason, LinkEvent, LinkState, OidcCredentialRequest,
+};
 use crate::logging;
 use crate::logging::{levels, targets};
 use crate::prelude::*;
@@ -374,6 +376,21 @@ impl svc::Server for AdminServiceImpl {
         let id = params.get()?.get_id();
         debug!(target: RPC, "Start {} requested", self.asm.formatted_link_id(id));
 
+        // An AuthAgent capability is optional: a null (absent) agent means a
+        // device-only link, which behaves exactly as before OIDC. When one is
+        // supplied, hold it on the link for the link's lifetime so the FSM
+        // can request user credentials out of band.
+        if params.get()?.has_auth_agent() {
+            let agent_client = params.get()?.get_auth_agent()?;
+            if let Some(peer) = self.asm.peer_table.get(id) {
+                peer.link_state_machine
+                    .set_auth_agent(spawn_auth_agent_bridge(agent_client));
+                debug!(target: RPC, "AuthAgent registered for {}", self.asm.formatted_link_id(id));
+            } else {
+                warn!(target: RPC, "startLink: no such link {id}, cannot register AuthAgent");
+            }
+        }
+
         let results_builder = results.get().init_result();
 
         match self.asm.process_link_state_event(id, LinkEvent::Start) {
@@ -713,6 +730,98 @@ async fn set_capture_file(asm: &Assembly, ancillary: SocketAncillary<'_>) -> Str
     }
 }
 
+/// Bridge a Cap'n Proto [cli::auth_agent::Client] onto the channel-based
+/// [AuthAgentHandle] the link state machine consumes.
+///
+/// Cap'n Proto clients are !Send and bound to this RPC task's LocalSet, so
+/// the FSM cannot hold one directly; instead it sends
+/// [OidcCredentialRequest]s down an unbounded channel and this task performs
+/// the actual getOidcCredential calls, mapping errors onto
+/// [AuthFailureReason]. The task ends when the last sender is dropped (link
+/// gone) or the RPC connection dies.
+fn spawn_auth_agent_bridge(agent: cli::auth_agent::Client) -> AuthAgentHandle {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OidcCredentialRequest>();
+
+    tokio::task::spawn_local(async move {
+        while let Some(req) = rx.recv().await {
+            let mut request = agent.get_oidc_credential_request();
+            {
+                let mut rb = request.get();
+                rb.set_issuer(&req.idp.issuer[..]);
+                rb.set_client_id(&req.idp.client_id[..]);
+                rb.set_client_secret(req.idp.client_secret.as_deref().unwrap_or(""));
+                let mut scopes = rb.reborrow().init_scopes(req.idp.scopes.len() as u32);
+                for (i, scope) in req.idp.scopes.iter().enumerate() {
+                    scopes.set(i as u32, &scope[..]);
+                }
+                rb.set_allow_offline_access(req.idp.allow_offline_access);
+                rb.set_nonce(&req.nonce[..]);
+                rb.set_interactive(req.interactive);
+            }
+
+            let outcome = match request.send().promise.await {
+                Ok(response) => match parse_agent_response(response) {
+                    Ok(id_token) => Ok(id_token),
+                    Err(reason) => Err(reason),
+                },
+                Err(e) => {
+                    warn!(target: RPC, "AuthAgent call failed: {e}");
+                    Err(AuthFailureReason::AgentError(e.to_string()))
+                }
+            };
+            // The receiver may be gone (e.g. the link timed out); that is fine.
+            let _ = req.reply.send(outcome);
+        }
+        debug!(target: RPC, "AuthAgent bridge shutting down");
+    });
+
+    tx
+}
+
+/// Decode a getOidcCredential response into the ID token or a failure reason.
+/// The agent reports "access_denied" for a user refusal per the spec's error
+/// taxonomy; anything else in the error text is an agent-side failure.
+fn parse_agent_response(
+    response: capnp::capability::Response<cli::auth_agent::get_oidc_credential_results::Owned>,
+) -> Result<String, AuthFailureReason> {
+    let results = response
+        .get()
+        .map_err(|e| AuthFailureReason::AgentError(e.to_string()))?;
+    let result = results
+        .get_result()
+        .map_err(|e| AuthFailureReason::AgentError(e.to_string()))?;
+    match result
+        .which()
+        .map_err(|e| AuthFailureReason::AgentError(e.to_string()))?
+    {
+        cli::success_or_error::Which::Success(_) => {
+            let id_token = results
+                .get_id_token()
+                .and_then(|t| t.to_str().map_err(|e| capnp::Error::failed(e.to_string())))
+                .map_err(|e| AuthFailureReason::AgentError(e.to_string()))?
+                .to_string();
+            if id_token.is_empty() {
+                return Err(AuthFailureReason::AgentError(
+                    "agent returned an empty id_token".to_string(),
+                ));
+            }
+            Ok(id_token)
+        }
+        cli::success_or_error::Which::Error(e) => {
+            let txt = e
+                .and_then(|ev| ev.get_txt())
+                .and_then(|t| t.to_str().map_err(|e| capnp::Error::failed(e.to_string())))
+                .unwrap_or("unknown agent error")
+                .to_string();
+            if txt.contains("access_denied") {
+                Err(AuthFailureReason::UserDeclined)
+            } else {
+                Err(AuthFailureReason::AgentError(txt))
+            }
+        }
+    }
+}
+
 // Helper for show_link_summary
 fn get_link_summary(asm: &Arc<Assembly>, link_id: LinkId) -> String {
     match asm.peer_table.get(link_id) {
@@ -785,8 +894,7 @@ mod test {
                 keypath.push("tests");
                 keypath.push("data");
                 keypath.push("rsa-key.pem");
-                cfg.bootstrap =
-                    Some(auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap());
+                cfg.bootstrap = Some(auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap());
                 builder.config = Some(rcu::RcuBox::new(cfg));
 
                 let asm = Arc::new(create_assembly(builder));

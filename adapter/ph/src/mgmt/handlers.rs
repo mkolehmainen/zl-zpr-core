@@ -246,17 +246,32 @@ pub async fn handle_hello_request(asm: &Arc<Assembly>, mut pkt: Packet) -> Handl
 }
 
 pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
-    let Ok(hdr) = zdp::ZdpHelloResponseHeader::read_from_buf(&mut pkt) else {
+    let link_id = pkt.metadata().ingress_link_id;
+    let event = parse_hello_response(asm, link_id, &mut pkt)?;
+    asm.process_link_state_event(link_id, event)?;
+    Ok(())
+}
+
+/// Parse a HelloResponse body into the [LinkEvent::ReceivedHelloResponse] to
+/// raise: status code, optional AAA address, ASA addresses, and any
+/// advertised OIDC identity providers (OIDC_IDP TLVs, JSON [auth::OidcIdpInfo]
+/// each; a TLV with bad JSON is warned about and skipped, like the ASA arm's
+/// per-entry tolerance).
+fn parse_hello_response(
+    asm: &Arc<Assembly>,
+    link_id: LinkId,
+    pkt: &mut Packet,
+) -> Result<LinkEvent, HandleMgmtError> {
+    let Ok(hdr) = zdp::ZdpHelloResponseHeader::read_from_buf(pkt) else {
         return Err(HandleMgmtError::BadStructure);
     };
 
-    let link_id = pkt.metadata().ingress_link_id;
     let status = hdr.status;
     debug!(target: ZDP, "{}: received HelloResponse, status: {status:?}", asm.formatted_link_id(link_id));
 
     // Following status are the TLVs.
     // A tlv has a type (number) and a value.
-    let tlv_data = match tlv::parse_from_buf(&mut pkt) {
+    let tlv_data = match tlv::parse_from_buf(pkt) {
         Ok(data) => data,
         Err(e) => {
             error!(target: ZDP, "{}: HelloResponse - failed to parse TLVs: {:?}", asm.formatted_link_id(link_id), e);
@@ -267,6 +282,7 @@ pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Hand
     // ASA = Authentication Service Address (will have a port too)
     let mut asa_addresses = Vec::<SocketAddr>::new();
     let mut aaa_address: Option<IpAddress> = None;
+    let mut oidc_idps = Vec::<auth::OidcIdpInfo>::new();
 
     for (tlv_type, tlv_value) in &tlv_data {
         match tlv_type {
@@ -315,6 +331,29 @@ pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Hand
                     }
                 }
             }
+            &tlv::DataType::OIDC_IDP => {
+                for idp_entry in tlv_value {
+                    match idp_entry {
+                        tlv::TlvValue::Str(json) => {
+                            match serde_json::from_str::<auth::OidcIdpInfo>(json) {
+                                Ok(idp) => {
+                                    info!(target: ZDP, "{}: HelloResponse includes OIDC IdP: {}", asm.formatted_link_id(link_id), idp.issuer);
+                                    oidc_idps.push(idp);
+                                }
+                                Err(e) => {
+                                    // Tolerate a bad advertisement rather than
+                                    // failing the whole hello.
+                                    warn!(target: ZDP, "{}: HelloResponse OIDC_IDP has invalid JSON, skipping: {e}", asm.formatted_link_id(link_id));
+                                }
+                            }
+                        }
+                        _ => {
+                            warn!(target: ZDP, "{}: HelloResponse OIDC_IDP value type is wrong: {idp_entry:?}", asm.formatted_link_id(link_id));
+                            return Err(HandleMgmtError::BadStructure);
+                        }
+                    }
+                }
+            }
             _ => {
                 info!(target: ZDP, "{}: HelloResponse includes ignored TLV type: {tlv_type}, continuing", asm.formatted_link_id(link_id));
             }
@@ -334,12 +373,18 @@ pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Hand
         Some(asa_addresses)
     };
 
-    asm.process_link_state_event(
-        link_id,
-        LinkEvent::ReceivedHelloResponse(status, aaa_address, maybe_asa_addrs),
-    )?;
+    let maybe_oidc_idps = if oidc_idps.is_empty() {
+        None
+    } else {
+        Some(oidc_idps)
+    };
 
-    Ok(())
+    Ok(LinkEvent::ReceivedHelloResponse(
+        status,
+        aaa_address,
+        maybe_asa_addrs,
+        maybe_oidc_idps,
+    ))
 }
 
 fn process_window_size_tlv(
@@ -458,12 +503,14 @@ pub async fn handle_grant_zpr_address_request(
             } else {
                 info!(target: ZDP,
                     "Received Grant Zpr Address Request for {} with addresses {:?}", asm.formatted_link_id(ingress_link_id), actor_addresses);
-                grant_event_payload = Some(actor_addresses);
+                grant_event_payload = Ok(actor_addresses);
             }
         }
         Ok(Err(c)) => {
+            // Non-success: keep the code so the link can record WHY the
+            // grant failed (policy denied vs auth failed vs unavailable).
             info!(target: ZDP, "Grant request indicates non-success; code: {:?}", c);
-            grant_event_payload = None;
+            grant_event_payload = Err(c);
         }
         Err(_) => {
             error!(target: ZDP, "Failed to parse Grant Zpr Address Request message, grant fails.");
