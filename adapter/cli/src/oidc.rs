@@ -16,8 +16,10 @@
 //!   request, and validates the `state` parameter before releasing the code.
 
 use std::process::Command;
+use std::rc::Rc;
 use std::time::Duration;
 
+use admin_api::v1 as cli;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngCore;
@@ -25,6 +27,12 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use url::Url;
+
+/// How long the user has to complete the interactive login. Matches ph's
+/// `OIDC_USER_INTERACTION_TIMEOUT` (adapter/ph/src/config.rs), deliberately
+/// under the node's 330 s `ACTOR_AUTHENTICATION_TIMEOUT` so the CLI side
+/// gives up before the node does.
+pub const OIDC_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Errors from the OIDC relying-party flow.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +47,8 @@ pub enum OidcCliError {
     Discovery(String),
     #[error("state parameter mismatch in authorization redirect")]
     StateMismatch,
+    #[error("authorization failed: {0}")]
+    AuthorizationDenied(String),
     #[error("timed out waiting for the authorization callback")]
     Timeout,
     #[error("malformed authorization callback: {0}")]
@@ -157,10 +167,12 @@ pub async fn await_callback(
             .map_err(|e| OidcCliError::BadCallback(e.to_string()))?;
         let mut code = None;
         let mut state = None;
+        let mut error = None;
         for (k, v) in parsed.query_pairs() {
             match k.as_ref() {
                 "code" => code = Some(v.into_owned()),
                 "state" => state = Some(v.into_owned()),
+                "error" => error = Some(v.into_owned()),
                 _ => {}
             }
         }
@@ -173,6 +185,18 @@ pub async fn await_callback(
             )
             .await;
             return Err(OidcCliError::StateMismatch);
+        }
+        if let Some(error) = error {
+            // The IdP reported a failure (e.g. `access_denied`: the user
+            // refused the login). Tell the browser, surface the error code.
+            let _ = write_http_response(
+                &mut stream,
+                "200 OK",
+                "text/html",
+                "<html><body><p>Authentication failed. You can close this window.</p></body></html>",
+            )
+            .await;
+            return Err(OidcCliError::AuthorizationDenied(error));
         }
         let code =
             code.ok_or_else(|| OidcCliError::BadCallback("missing `code` parameter".to_string()))?;
@@ -261,6 +285,83 @@ pub async fn get_oidc_credential(
         return Err(OidcCliError::NonInteractiveUnsupported);
     }
     login(idp, nonce, open_browser, timeout).await
+}
+
+/// The CLI-side implementation of the packet handler's `AuthAgent`
+/// capability (Contract 6): ph calls `getOidcCredential` back over the RPC
+/// connection `connect`/`auth-agent` keep open, and this server runs the
+/// interactive relying-party flow to satisfy it.
+///
+/// Progress goes to stderr by default; tests inject a channel via `progress`
+/// to capture every message and assert no secret material leaks.
+pub struct CliAuthAgent {
+    /// `false` prints the authorization URL instead of launching a browser
+    /// (`--no-browser`).
+    pub open_browser: bool,
+    /// Progress sink override for tests; `None` means stderr.
+    pub progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+}
+
+impl cli::auth_agent::Server for CliAuthAgent {
+    async fn get_oidc_credential(
+        self: Rc<Self>,
+        params: cli::auth_agent::GetOidcCredentialParams,
+        mut results: cli::auth_agent::GetOidcCredentialResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let client_secret = params.get_client_secret()?.to_string()?;
+        let mut scopes = Vec::new();
+        for scope in params.get_scopes()? {
+            scopes.push(scope?.to_string()?);
+        }
+        let idp = OidcIdpInfo {
+            issuer: params.get_issuer()?.to_string()?,
+            client_id: params.get_client_id()?.to_string()?,
+            client_secret: (!client_secret.is_empty()).then_some(client_secret),
+            scopes,
+            allow_offline_access: params.get_allow_offline_access(),
+        };
+        let nonce = params.get_nonce()?.to_string()?;
+        let interactive = params.get_interactive();
+
+        let outcome = if !interactive {
+            // Never open a browser (or even bind the listener) on a
+            // non-interactive request; stored-credential support is a
+            // follow-up issue.
+            Err(OidcCliError::NonInteractiveUnsupported)
+        } else {
+            let progress_tx = self.progress.clone();
+            let mut sink = move |msg: &str| match &progress_tx {
+                Some(tx) => {
+                    let _ = tx.send(msg.to_string());
+                }
+                None => eprintln!("{msg}"),
+            };
+            login_with_progress(
+                &idp,
+                &nonce,
+                self.open_browser,
+                OIDC_LOGIN_TIMEOUT,
+                &mut sink,
+            )
+            .await
+        };
+
+        let mut rb = results.get();
+        match outcome {
+            Ok(id_token) => {
+                rb.set_id_token(&id_token[..]);
+                rb.init_result().init_success().set_none(());
+            }
+            Err(err) => {
+                rb.set_id_token("");
+                // The error text is what ph's reason-parser classifies;
+                // it must carry "access_denied" verbatim for a user refusal.
+                rb.init_result().init_error().set_txt(err.to_string());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// [`login`] with an explicit progress sink so tests can capture every
@@ -364,6 +465,7 @@ pub fn exit_code_for_link_error(msg: &str) -> i32 {
 /// same exit-code contract.
 pub fn exit_code_for_oidc_error(err: &OidcCliError) -> i32 {
     match err {
+        OidcCliError::AuthorizationDenied(_) => 2,
         OidcCliError::Timeout => 3,
         OidcCliError::Http(_) | OidcCliError::Discovery(_) => 4,
         OidcCliError::TokenExchange(_) => 5,
@@ -622,6 +724,12 @@ mod tests {
     /// endpoint that 302-redirects back with a fixed code and the caller's
     /// `state`, and a `/token` endpoint returning a fixed `id_token`.
     async fn run_fake_idp(listener: TcpListener, seen: Arc<Mutex<IdpSeen>>) {
+        run_fake_idp_mode(listener, seen, false).await
+    }
+
+    /// [run_fake_idp], but with `deny = true` the `/auth` endpoint redirects
+    /// back with `error=access_denied` instead of a code (the user refused).
+    async fn run_fake_idp_mode(listener: TcpListener, seen: Arc<Mutex<IdpSeen>>, deny: bool) {
         let base = format!("http://{}", listener.local_addr().unwrap());
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
@@ -647,7 +755,11 @@ mod tests {
                         _ => {}
                     }
                 }
-                let location = format!("{redirect_uri}?code={FAKE_CODE}&state={state}");
+                let location = if deny {
+                    format!("{redirect_uri}?error=access_denied&state={state}")
+                } else {
+                    format!("{redirect_uri}?code={FAKE_CODE}&state={state}")
+                };
                 let response = format!(
                     "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 );
@@ -774,5 +886,181 @@ mod tests {
             5
         );
         assert_eq!(exit_code_for_oidc_error(&OidcCliError::StateMismatch), 1);
+    }
+
+    /// Build an in-process Cap'n Proto client for [CliAuthAgent] with a
+    /// captured progress channel. Must run inside a LocalSet (capnp clients
+    /// are !Send).
+    fn new_cli_auth_agent(
+        open_browser: bool,
+    ) -> (
+        cli::auth_agent::Client,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let client = capnp_rpc::new_client(CliAuthAgent {
+            open_browser,
+            progress: Some(tx),
+        });
+        (client, rx)
+    }
+
+    /// Issue a getOidcCredential call against `agent` for the fake IdP at
+    /// `idp_addr` and return the in-flight call handle.
+    fn send_get_oidc_credential(
+        agent: &cli::auth_agent::Client,
+        issuer: String,
+        interactive: bool,
+    ) -> capnp::capability::RemotePromise<cli::auth_agent::get_oidc_credential_results::Owned> {
+        let mut request = agent.get_oidc_credential_request();
+        {
+            let mut rb = request.get();
+            rb.set_issuer(&issuer[..]);
+            rb.set_client_id("client-1");
+            rb.set_client_secret("");
+            rb.reborrow().init_scopes(1).set(0, "openid");
+            rb.set_allow_offline_access(false);
+            rb.set_nonce("nonce-agent");
+            rb.set_interactive(interactive);
+        }
+        request.send()
+    }
+
+    /// Play the browser against the flow driven by `progress`: wait for the
+    /// "Open this URL" message, GET the auth URL without following
+    /// redirects, then follow the Location header to the loopback callback.
+    async fn play_browser(progress: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let auth_url = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), progress.recv())
+                .await
+                .expect("no progress message")
+                .expect("progress channel closed");
+            if msg.contains("Open this URL") {
+                break msg.split_whitespace().last().unwrap().to_string();
+            }
+        };
+        let browser = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let auth_resp = browser.get(&auth_url).send().await.unwrap();
+        assert_eq!(auth_resp.status().as_u16(), 302);
+        let location = auth_resp.headers()["location"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        browser.get(&location).send().await.unwrap();
+    }
+
+    /// The Cap'n Proto AuthAgent server wraps the login flow: an interactive
+    /// getOidcCredential call against the fake IdP returns its id_token,
+    /// forwards the nonce to `/auth`, and leaks no secret into progress.
+    #[tokio::test]
+    async fn test_auth_agent_server_returns_token_via_fake_idp() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let idp_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let idp_addr = idp_listener.local_addr().unwrap();
+                let seen = Arc::new(Mutex::new(IdpSeen::default()));
+                tokio::spawn(run_fake_idp(idp_listener, seen.clone()));
+
+                let (agent, mut progress) = new_cli_auth_agent(false);
+                let call = send_get_oidc_credential(&agent, format!("http://{idp_addr}"), true);
+                let call = tokio::task::spawn_local(call.promise);
+
+                play_browser(&mut progress).await;
+
+                let response = call.await.unwrap().unwrap();
+                let results = response.get().unwrap();
+                assert!(matches!(
+                    results.get_result().unwrap().which().unwrap(),
+                    cli::success_or_error::Which::Success(_)
+                ));
+                assert_eq!(
+                    results.get_id_token().unwrap().to_str().unwrap(),
+                    FAKE_ID_TOKEN
+                );
+                assert_eq!(
+                    seen.lock().unwrap().auth_nonce.as_deref(),
+                    Some("nonce-agent")
+                );
+
+                // No progress message may carry the code or the token.
+                while let Ok(msg) = progress.try_recv() {
+                    assert!(!msg.contains(FAKE_ID_TOKEN), "id_token leaked: {msg}");
+                    assert!(!msg.contains(FAKE_CODE), "authorization code leaked: {msg}");
+                }
+            })
+            .await;
+    }
+
+    /// `interactive = false` must come back as the error arm with an empty
+    /// idToken — and the flow must never start (no browser, no listener,
+    /// hence no progress message at all).
+    #[tokio::test]
+    async fn test_auth_agent_server_noninteractive_is_error() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (agent, mut progress) = new_cli_auth_agent(true);
+                let call =
+                    send_get_oidc_credential(&agent, "http://127.0.0.1:1/".to_string(), false);
+                let response = call.promise.await.unwrap();
+                let results = response.get().unwrap();
+                match results.get_result().unwrap().which().unwrap() {
+                    cli::success_or_error::Which::Error(e) => {
+                        let txt = e.unwrap().get_txt().unwrap().to_str().unwrap().to_string();
+                        assert!(
+                            txt.contains("non-interactive"),
+                            "unexpected error text: {txt}"
+                        );
+                    }
+                    cli::success_or_error::Which::Success(_) => {
+                        panic!("non-interactive request unexpectedly succeeded")
+                    }
+                }
+                assert_eq!(results.get_id_token().unwrap().to_str().unwrap(), "");
+                assert!(
+                    progress.try_recv().is_err(),
+                    "flow started on a non-interactive request"
+                );
+            })
+            .await;
+    }
+
+    /// A user refusal at the IdP (`error=access_denied` on the redirect)
+    /// comes back as the error arm with text ph's reason-parser classifies
+    /// as UserDeclined (it looks for "access_denied").
+    #[tokio::test]
+    async fn test_auth_agent_server_maps_login_failure_to_error_text() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let idp_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let idp_addr = idp_listener.local_addr().unwrap();
+                let seen = Arc::new(Mutex::new(IdpSeen::default()));
+                tokio::spawn(run_fake_idp_mode(idp_listener, seen.clone(), true));
+
+                let (agent, mut progress) = new_cli_auth_agent(false);
+                let call = send_get_oidc_credential(&agent, format!("http://{idp_addr}"), true);
+                let call = tokio::task::spawn_local(call.promise);
+
+                play_browser(&mut progress).await;
+
+                let response = call.await.unwrap().unwrap();
+                let results = response.get().unwrap();
+                match results.get_result().unwrap().which().unwrap() {
+                    cli::success_or_error::Which::Error(e) => {
+                        let txt = e.unwrap().get_txt().unwrap().to_str().unwrap().to_string();
+                        assert!(
+                            txt.contains("access_denied"),
+                            "error text not classifiable as UserDeclined: {txt}"
+                        );
+                    }
+                    cli::success_or_error::Which::Success(_) => {
+                        panic!("denied login unexpectedly succeeded")
+                    }
+                }
+                assert_eq!(results.get_id_token().unwrap().to_str().unwrap(), "");
+            })
+            .await;
     }
 }
