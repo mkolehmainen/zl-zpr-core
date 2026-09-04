@@ -354,12 +354,48 @@ impl cli::auth_agent::Server for CliAuthAgent {
             }
             Err(err) => {
                 rb.set_id_token("");
-                // The error text is what ph's reason-parser classifies;
-                // it must carry "access_denied" verbatim for a user refusal.
-                rb.init_result().init_error().set_txt(err.to_string());
+                // Tagged with a stable class token so ph's reason-parser can
+                // map the failure onto the right AuthFailureReason (and
+                // `connect` onto its advertised exit code) — see
+                // [rpc_error_text].
+                rb.init_result().init_error().set_txt(rpc_error_text(&err));
             }
         }
         Ok(())
+    }
+}
+
+/// Render an [`OidcCliError`] as the error text sent back over the AuthAgent
+/// RPC (`getOidcCredential`'s error arm).
+///
+/// ph's `classify_agent_error` (adapter/ph/src/admin_worker.rs) parses a
+/// leading `[class:<token>]` prefix into the matching `AuthFailureReason`,
+/// which is what `connect`'s exit-code contract keys on; text without a
+/// recognized token falls back to `AgentError` (exit 1). The two sides must
+/// agree on these tokens:
+///
+/// - `user_declined`      -> the IdP reported `access_denied` (the display
+///   text also carries "access_denied" verbatim, keeping the legacy
+///   spelling-based classification working).
+/// - `interaction_timeout`-> the user did not complete the login in time.
+/// - `idp_unreachable`    -> discovery / HTTP transport / token-endpoint
+///   failure ("not an auth problem" per the taxonomy — the token endpoint
+///   answering with an error is still an IdP-side failure from ZPR's view).
+///
+/// Everything else (state mismatch, bad callback, browser launch, I/O) is a
+/// genuine agent-side failure and is sent untagged.
+pub fn rpc_error_text(err: &OidcCliError) -> String {
+    let class = match err {
+        OidcCliError::AuthorizationDenied(_) => Some("user_declined"),
+        OidcCliError::Timeout => Some("interaction_timeout"),
+        OidcCliError::Http(_) | OidcCliError::Discovery(_) | OidcCliError::TokenExchange(_) => {
+            Some("idp_unreachable")
+        }
+        _ => None,
+    };
+    match class {
+        Some(class) => format!("[class:{class}] {err}"),
+        None => err.to_string(),
     }
 }
 
@@ -970,6 +1006,40 @@ mod tests {
             5
         );
         assert_eq!(exit_code_for_oidc_error(&OidcCliError::StateMismatch), 1);
+    }
+
+    /// The error text sent over the AuthAgent RPC must carry a stable class
+    /// token so ph's `classify_agent_error` (admin_worker.rs) can map it to
+    /// the right `AuthFailureReason` — and thus `connect` to its advertised
+    /// exit codes — instead of collapsing everything but access_denied into
+    /// AgentError/exit 1.
+    #[test]
+    fn test_rpc_error_text_carries_class_token() {
+        assert_eq!(
+            rpc_error_text(&OidcCliError::AuthorizationDenied("access_denied".into())),
+            "[class:user_declined] authorization failed: access_denied"
+        );
+        assert_eq!(
+            rpc_error_text(&OidcCliError::Timeout),
+            "[class:interaction_timeout] timed out waiting for the authorization callback"
+        );
+        // Discovery, HTTP transport, and token-endpoint failures are all
+        // IdP-side ("discovery/token endpoint failure (not an auth
+        // problem)" per the AuthFailureReason taxonomy).
+        assert_eq!(
+            rpc_error_text(&OidcCliError::Discovery("missing `token_endpoint`".into())),
+            "[class:idp_unreachable] OIDC discovery failed: missing `token_endpoint`"
+        );
+        assert_eq!(
+            rpc_error_text(&OidcCliError::TokenExchange("HTTP 400 Bad Request".into())),
+            "[class:idp_unreachable] token exchange failed: HTTP 400 Bad Request"
+        );
+        // Anything else is an agent-side failure: no class token, so ph
+        // falls back to AgentError (exit 1), as before.
+        assert_eq!(
+            rpc_error_text(&OidcCliError::StateMismatch),
+            "state parameter mismatch in authorization redirect"
+        );
     }
 
     /// `auth-agent` registers by calling startLink; on an already-started
