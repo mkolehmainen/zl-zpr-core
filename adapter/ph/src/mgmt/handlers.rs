@@ -981,8 +981,41 @@ fn peer_type_by_id(asm: &Assembly, link_id: NonZero<LinkId>) -> PeerType {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
     use crate::mgmt::core;
     use zpr_ext::zerocopy::IntoBytesExt;
+
+    /// A HelloResponse carrying an OIDC_IDP TLV must yield a
+    /// ReceivedHelloResponse event with the decoded IdP list in its fourth slot.
+    #[tokio::test]
+    async fn test_hello_response_parses_oidc_idp_tlv() {
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+
+        let idp = auth::OidcIdpInfo {
+            issuer: "https://idp.test".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string(), "email".to_string()],
+            allow_offline_access: true,
+        };
+
+        // Build the HelloResponse body: header, then the OIDC_IDP TLV.
+        let mut pkt = core::new_heap_packet();
+        let hdr = zdp::ZdpHelloResponseHeader {
+            status: zdp::ResponseCode::Success,
+        };
+        hdr.write_to_buf(&mut pkt).unwrap();
+        tlv::TlvEncoding::new_oidc_idp(&idp).unwrap().put(&mut pkt);
+
+        let event = parse_hello_response(&asm, 7, &mut pkt).unwrap();
+        match event {
+            LinkEvent::ReceivedHelloResponse(code, _aaa, _asa, oidc_idps) => {
+                assert_eq!(code, zdp::ResponseCode::Success);
+                assert_eq!(oidc_idps, Some(vec![idp]));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 
     /// A ~3 KB blob (JWT plus a self-signed blob in a JSON array) must fit
     /// through a management packet built the way

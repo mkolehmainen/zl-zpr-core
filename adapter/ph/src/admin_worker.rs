@@ -724,3 +724,168 @@ fn get_link_summary(asm: &Arc<Assembly>, link_id: LinkId) -> String {
         None => format!("Unconfigured"),
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+    use crate::auth::{self, AuthBlob};
+    use crate::config::PACKET_BUFFER_SIZE;
+    use crate::link_state::LinkType;
+    use crate::packet_queue;
+    use crate::peer_table;
+    use crate::queues::MgmtSubstrateEgress;
+    use crate::zdp;
+    use base64::prelude::*;
+    use std::cell::RefCell;
+    use std::net::Ipv4Addr;
+    use tokio::task::LocalSet;
+    use zpr_ext::zerocopy::FromBytesExt;
+    use zpr_utils::net_defs;
+
+    /// In-process fake AuthAgent: returns a fixed ID token and records the
+    /// nonce it was asked to bind into it.
+    struct FakeAuthAgent {
+        id_token: String,
+        seen_nonce: Rc<RefCell<Option<String>>>,
+    }
+
+    impl cli::auth_agent::Server for FakeAuthAgent {
+        async fn get_oidc_credential(
+            self: Rc<Self>,
+            params: cli::auth_agent::GetOidcCredentialParams,
+            mut results: cli::auth_agent::GetOidcCredentialResults,
+        ) -> Result<(), capnp::Error> {
+            let nonce = params.get()?.get_nonce()?.to_str()?.to_string();
+            *self.seen_nonce.borrow_mut() = Some(nonce);
+            let mut rb = results.get();
+            rb.set_id_token(&self.id_token[..]);
+            rb.init_result().init_success().set_none(());
+            Ok(())
+        }
+    }
+
+    /// Full OIDC callback flow against a fake in-process `AuthAgent`:
+    /// InitAuth with a known challenge must produce an AcquireZprAddress
+    /// packet whose blob array carries both the SS (bootstrap) and OIDC
+    /// blobs, with the OIDC blob's challenge equal to the InitAuth payload
+    /// and the agent called with `oidc_nonce_for_challenge(&challenge)`.
+    #[tokio::test(start_paused = true)]
+    async fn test_agent_token_becomes_oidc_blob_with_challenge_nonce() {
+        LocalSet::new()
+            .run_until(async {
+                // Egress queue we can read the AcquireZprAddress packet back from.
+                let (eg_tx, mut eg_rx) = packet_queue::packet_queue::<PACKET_BUFFER_SIZE>(8);
+                let mut builder = TestAssemblyBuilder::new();
+                builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(eg_tx));
+
+                // Bootstrap key configured, so an SS blob is produced alongside OIDC.
+                let mut cfg = <config::Config as std::default::Default>::default();
+                let mut keypath = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                keypath.push("tests");
+                keypath.push("data");
+                keypath.push("rsa-key.pem");
+                cfg.bootstrap =
+                    Some(auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap());
+                builder.config = Some(rcu::RcuBox::new(cfg));
+
+                let asm = Arc::new(create_assembly(builder));
+
+                // Insert an adapter-side peer.
+                let entry = asm.peer_table.vacant_entry().unwrap();
+                let link_id = entry.key();
+                let ps = peer_table::test::create_dummy_peer_state(
+                    link_id,
+                    LinkType::AdapterToNode,
+                    SubstrateAddr::from(([127, 0, 0, 1], 9000)),
+                    net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 2).into()),
+                );
+                let link_id = entry.insert(ps).get();
+
+                // Fake agent, bridged the same way start_link registers a real one.
+                let seen_nonce = Rc::new(RefCell::new(None));
+                let client: cli::auth_agent::Client = capnp_rpc::new_client(FakeAuthAgent {
+                    id_token: "FAKE.JWT.TOKEN".to_string(),
+                    seen_nonce: seen_nonce.clone(),
+                });
+                let agent_handle = spawn_auth_agent_bridge(client);
+
+                let idp = auth::OidcIdpInfo {
+                    issuer: "https://idp.test".to_string(),
+                    client_id: "test-client".to_string(),
+                    client_secret: None,
+                    scopes: vec!["openid".to_string()],
+                    allow_offline_access: false,
+                };
+
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(crate::link_state::LinkState::WaitForInitAuth);
+                    peer.link_state_machine.test_set_oidc_idps(vec![idp]);
+                    peer.link_state_machine.set_auth_agent(agent_handle);
+                }
+
+                // Known 48-byte challenge: nonce || ctime || hmac.
+                let payload = auth::ZdpInitAuthenticationPayload {
+                    nonce: [5u8; 8],
+                    ctime: 777777u64.into(),
+                    hmac: [6u8; 32],
+                };
+                let mut challenge = [0u8; 48];
+                challenge[0..8].copy_from_slice(&payload.nonce);
+                challenge[8..16].copy_from_slice(&payload.ctime.to_bytes());
+                challenge[16..48].copy_from_slice(&payload.hmac);
+
+                asm.process_link_state_event(
+                    link_id,
+                    crate::link_state::LinkEvent::ReceivedInitAuth((true, Some(payload))),
+                )
+                .unwrap();
+
+                // Wait for the agent round trip and the acquire to egress.
+                let mut pkt = None;
+                for _ in 0..200 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    match eg_rx.try_recv(Box::new([0u8; PACKET_BUFFER_SIZE])) {
+                        Ok(p) => {
+                            pkt = Some(p);
+                            break;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                let mut pkt = pkt.expect("no packet egressed after agent replied");
+
+                // Parse: base header, mgmt header, acquire header, blob.
+                let base = zdp::ZdpBaseHeader::read_from_buf(&mut pkt).unwrap();
+                assert_eq!(base.packet_type, zdp::ZdpPacketType::AcquireZprAddress);
+                let _mgmt = zdp::ZdpMgmtHeader::read_from_buf(&mut pkt).unwrap();
+                let acq = zdp::ZdpAcquireZprAddressHeader::read_from_buf(&mut pkt).unwrap();
+                let blob_len = acq.blob_len.get() as usize;
+                assert!(blob_len > 0);
+                let blob_bytes = pkt.copy_to_bytes(blob_len);
+                let blob_str = String::from_utf8(blob_bytes.into()).unwrap();
+
+                let blobs = auth::decode_blobs(&blob_str).unwrap();
+                assert_eq!(blobs.len(), 2, "expected SS + OIDC blobs, got {blobs:?}");
+                assert!(matches!(blobs[0], AuthBlob::SelfSigned(_)));
+                let AuthBlob::Oidc(ref oidc) = blobs[1] else {
+                    panic!("expected OIDC blob second, got {:?}", blobs[1]);
+                };
+                assert_eq!(oidc.id_token, "FAKE.JWT.TOKEN");
+                assert_eq!(oidc.issuer, "https://idp.test");
+
+                // The OIDC blob's challenge round-trips against the InitAuth payload.
+                let decoded = BASE64_STANDARD.decode(&oidc.challenge).unwrap();
+                assert_eq!(decoded, challenge);
+
+                // The agent was called with the nonce derived from that challenge.
+                assert_eq!(
+                    seen_nonce.borrow().as_deref(),
+                    Some(auth::oidc_nonce_for_challenge(&challenge).as_str())
+                );
+            })
+            .await
+    }
+}

@@ -2085,11 +2085,187 @@ impl Display for LinkData {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkState, LinkStateMachine};
+    use super::{AuthFailureReason, LinkEvent, LinkState, LinkStateMachine, LinkType};
+    use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+    use crate::auth;
+    use crate::peer_table;
+    use crate::prelude::*;
+    use crate::zdp::ResponseCode;
+    use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
+    use zpr_utils::net_defs;
+
+    /// Insert an adapter-side (AdapterToNode) peer into the table and return its link id.
+    fn add_adapter_peer(asm: &Arc<Assembly>) -> LinkId {
+        let entry = asm.peer_table.vacant_entry().unwrap();
+        let link_id = entry.key();
+        let ps = peer_table::test::create_dummy_peer_state(
+            link_id,
+            LinkType::AdapterToNode,
+            SubstrateAddr::from(([127, 0, 0, 1], 9000)),
+            net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 2).into()),
+        );
+        entry.insert(ps).get()
+    }
+
+    /// A fixed InitAuth challenge payload. The adapter side does not verify
+    /// the HMAC (the node minted it), so arbitrary bytes are fine.
+    fn test_challenge_payload() -> auth::ZdpInitAuthenticationPayload {
+        auth::ZdpInitAuthenticationPayload {
+            nonce: [7u8; 8],
+            ctime: 424242u64.into(),
+            hmac: [9u8; 32],
+        }
+    }
+
+    /// A minimal advertised OIDC identity provider.
+    fn test_idp() -> auth::OidcIdpInfo {
+        auth::OidcIdpInfo {
+            issuer: "https://idp.test".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string()],
+            allow_offline_access: false,
+        }
+    }
+
+    /// WaitForUserAuth with an agent that never replies must fail with
+    /// `AuthFailureReason::InteractionTimeout` once
+    /// `OIDC_USER_INTERACTION_TIMEOUT` (300 s) elapses. The Error state is
+    /// transient — the same callback initiates the close — so the state
+    /// assertion accepts the close already being underway.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_user_auth_times_out_with_interaction_timeout() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+
+                // Agent that accepts requests but never answers them.
+                let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
+                    peer.link_state_machine.set_auth_agent(agent_tx);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((false, Some(test_challenge_payload()))),
+                )
+                .unwrap();
+
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::WaitForUserAuth
+                );
+
+                tokio::time::sleep(
+                    config::OIDC_USER_INTERACTION_TIMEOUT + Duration::from_millis(100),
+                )
+                .await;
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let state = peer.link_state_machine.get_state();
+                assert!(
+                    matches!(state, LinkState::Error | LinkState::Closing),
+                    "expected Error (or the close it initiates), got {state:?}"
+                );
+                assert_eq!(
+                    peer.link_state_machine.get_last_auth_failure(),
+                    Some(AuthFailureReason::InteractionTimeout)
+                );
+            })
+            .await
+    }
+
+    /// An advertised IdP with no registered agent and no bootstrap key must
+    /// fail authentication with `AuthFailureReason::NoAgent`.
+    #[tokio::test(start_paused = true)]
+    async fn test_no_agent_with_idp_and_no_bootstrap_fails_with_no_agent() {
+        LocalSet::new()
+            .run_until(async {
+                // Default config: no bootstrap key.
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
+                    // no auth agent registered
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((true, Some(test_challenge_payload()))),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let state = peer.link_state_machine.get_state();
+                assert!(
+                    matches!(state, LinkState::Error | LinkState::Closing),
+                    "expected Error (or the close it initiates), got {state:?}"
+                );
+                assert_eq!(
+                    peer.link_state_machine.get_last_auth_failure(),
+                    Some(AuthFailureReason::NoAgent)
+                );
+            })
+            .await
+    }
+
+    /// A failed grant carries the node's ResponseCode; the link must record
+    /// the corresponding `AuthFailureReason`.
+    #[tokio::test(start_paused = true)]
+    async fn test_grant_failure_code_maps_to_reason() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+
+                for (code, expect_policy_denied, expect_unavailable) in [
+                    (ResponseCode::PolicyDenied, true, false),
+                    (ResponseCode::AuthFailed, false, false),
+                    (ResponseCode::AuthUnavailable, false, true),
+                ] {
+                    let link_id = add_adapter_peer(&asm);
+                    {
+                        let peer = asm.peer_table.get(link_id).unwrap();
+                        peer.link_state_machine.test_set_state(LinkState::RegisterAA);
+                    }
+
+                    asm.process_link_state_event(
+                        link_id,
+                        LinkEvent::ReceivedGrantZprAddressRequest(Err(code)),
+                    )
+                    .unwrap();
+
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    let reason = peer.link_state_machine.get_last_auth_failure();
+                    if expect_policy_denied {
+                        assert_eq!(reason, Some(AuthFailureReason::PolicyDenied));
+                    } else if expect_unavailable {
+                        assert_eq!(reason, Some(AuthFailureReason::AuthUnavailable));
+                    } else {
+                        assert!(
+                            matches!(reason, Some(AuthFailureReason::VisaServiceRejected(_))),
+                            "expected VisaServiceRejected, got {reason:?}"
+                        );
+                    }
+                }
+            })
+            .await
+    }
 
     #[tokio::test(start_paused = true)]
     async fn timeout_test() {
