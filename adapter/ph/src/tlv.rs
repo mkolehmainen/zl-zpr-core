@@ -1,13 +1,11 @@
 use bytes::Buf;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use zpr::write_to::WriteTo as _;
 use zpr_utils::net_defs::IpAddress;
 
-const SOCKADDR_LEN_V4: u8 = 6; // 4 bytes for IPv4 + 2 bytes for port
-const SOCKADDR_LEN_V6: u8 = 18; // 16 bytes for IPv6 + 2 bytes for port
 const X25519_KEY_LEN: u8 = 32; // 32 bytes for X25519 key
 
 #[derive(Debug, Error)]
@@ -29,7 +27,9 @@ impl DataType {
     pub const POLICY_ID: TlvType = 1;
     pub const VERSION: TlvType = 2;
     pub const AAA: TlvType = 3; // Actor Authentication Address - temporary address actor may use for authentication
-    pub const ASA: TlvType = 4; // Authentication Service SocketAddress
+    // TlvType 4 was ASA (Authentication Service SocketAddress), removed with
+    // the legacy BAS/OAuthRsa client (zipline#15); unknown TLVs are skipped by
+    // the parser, so older peers that still send it remain compatible.
     pub const STATIC_ADDR: TlvType = 5; // Static Address - used for static address requests from an adapter
     pub const WINDOW_SIZE: TlvType = 6;
     pub const A2A_DH_PUBKEY: TlvType = 7; // Actor to Actor Diffie-Hellman Public Key
@@ -94,14 +94,6 @@ impl TlvEncoding {
         }
     }
 
-    /// Authentication Service Address
-    pub fn new_asa(sock_addr: SocketAddr) -> TlvEncoding {
-        TlvEncoding {
-            tlv_type: DataType::ASA,
-            value: TlvValue::SocketAddr(sock_addr),
-        }
-    }
-
     pub fn new_window_size(window_size: u16) -> TlvEncoding {
         TlvEncoding {
             tlv_type: DataType::WINDOW_SIZE,
@@ -148,7 +140,6 @@ impl TlvEncoding {
             TlvValue::Str(v) => put_str(buf, self.tlv_type, v),
             TlvValue::Ipv6Addr(v) => put_ipv6addr(buf, self.tlv_type, v),
             TlvValue::Ipv4Addr(v) => put_ipv4addr(buf, self.tlv_type, v),
-            TlvValue::SocketAddr(v) => put_socketaddr(buf, self.tlv_type, v),
             TlvValue::X25519PubKey(v) => put_x25519_pubkey(buf, self.tlv_type, v),
             TlvValue::Visa(v) => put_visa(buf, self.tlv_type, v),
         }
@@ -164,8 +155,6 @@ impl TlvEncoding {
             TlvValue::Str(v) => v.len().min(u8::MAX as usize),
             TlvValue::Ipv6Addr(_) => 16,
             TlvValue::Ipv4Addr(_) => 4,
-            TlvValue::SocketAddr(SocketAddr::V4(_)) => SOCKADDR_LEN_V4 as usize,
-            TlvValue::SocketAddr(SocketAddr::V6(_)) => SOCKADDR_LEN_V6 as usize,
             TlvValue::X25519PubKey(_) => X25519_KEY_LEN as usize,
             TlvValue::Visa(_) => {
                 unimplemented!("encoded_len is not implemented for Visa TLVs")
@@ -182,7 +171,6 @@ pub enum TlvValue {
     Str(String),
     Ipv6Addr(Ipv6Addr),
     Ipv4Addr(Ipv4Addr),
-    SocketAddr(SocketAddr),
     X25519PubKey(x25519_dalek::PublicKey),
     Visa(zpr::vsapi_types::Visa),
 }
@@ -195,7 +183,6 @@ impl std::fmt::Display for TlvValue {
             TlvValue::Str(v) => write!(f, "{v}"),
             TlvValue::Ipv6Addr(v) => write!(f, "{v}"),
             TlvValue::Ipv4Addr(v) => write!(f, "{v}"),
-            TlvValue::SocketAddr(v) => write!(f, "{v}"),
             TlvValue::X25519PubKey(v) => write!(f, "{v:?}"),
             TlvValue::Visa(v) => write!(f, "{v:?}"),
         }
@@ -275,33 +262,6 @@ fn put_x25519_pubkey(
     buf.put_slice(value.as_bytes());
 }
 
-fn put_socketaddr(
-    buf: &mut dyn bytes::BufMut,
-    tlv_type: TlvType,
-    sock_addr: &std::net::SocketAddr,
-) {
-    match sock_addr {
-        std::net::SocketAddr::V4(v4) => {
-            let hdr = TLVHdr {
-                tlv_type,
-                tlv_length: SOCKADDR_LEN_V4,
-            };
-            buf.put_slice(&hdr.as_bytes());
-            buf.put_slice(&v4.ip().octets());
-            buf.put_u16(v4.port());
-        }
-        std::net::SocketAddr::V6(v6) => {
-            let hdr = TLVHdr {
-                tlv_type,
-                tlv_length: SOCKADDR_LEN_V6, // 16 bytes for IPv6 + 2 bytes for port
-            };
-            buf.put_slice(&hdr.as_bytes());
-            buf.put_slice(&v6.ip().octets());
-            buf.put_u16(v6.port());
-        }
-    }
-}
-
 fn put_visa(buf: &mut dyn bytes::BufMut, tlv_type: TlvType, visa: &zpr::vsapi_types::Visa) {
     let mut builder = capnp::message::TypedBuilder::<zpr::vsapi::v1::visa::Owned>::new_default();
     let mut builder_root = builder.init_root();
@@ -367,35 +327,6 @@ pub fn parse_from_buf(
                     .entry(tlv_type)
                     .or_insert_with(Vec::new)
                     .push(addr_val);
-            }
-            DataType::ASA => {
-                // Parse a socket addr. Which in memory is the IPv4 or IPv6 address followed by a 16bit port number.
-                match tlv_length {
-                    6 => {
-                        let ipv4u32 = buf.get_u32();
-                        let port = buf.get_u16();
-                        let ipv4_addr = Ipv4Addr::from(ipv4u32.to_be_bytes());
-                        tlv_map.entry(tlv_type).or_insert_with(Vec::new).push(
-                            TlvValue::SocketAddr(SocketAddr::V4(std::net::SocketAddrV4::new(
-                                ipv4_addr, port,
-                            ))),
-                        );
-                    }
-                    18 => {
-                        let mut addr_buf = [0u8; 16];
-                        buf.copy_to_slice(&mut addr_buf); // Read 16 bytes for IPv6 address
-                        let port = buf.get_u16();
-                        let ipv6_addr = Ipv6Addr::from(addr_buf);
-                        tlv_map.entry(tlv_type).or_insert_with(Vec::new).push(
-                            TlvValue::SocketAddr(SocketAddr::V6(std::net::SocketAddrV6::new(
-                                ipv6_addr, port, 0, 0,
-                            ))),
-                        );
-                    }
-                    _ => {
-                        return Err(TlvError::BadStructure); // Invalid length for ASA
-                    }
-                }
             }
             DataType::A2A_DH_PUBKEY => {
                 if tlv_length != X25519_KEY_LEN {
@@ -653,7 +584,7 @@ mod tests {
         assert_eq!(values.len(), 1);
         match &values[0] {
             TlvValue::Ipv4Addr(addr) => assert_eq!(*addr, test_addr),
-            _ => panic!("Expected Ipv4Addr value for ASA"),
+            _ => panic!("Expected Ipv4Addr value for AAA"),
         }
     }
 
@@ -680,7 +611,7 @@ mod tests {
         assert_eq!(values.len(), 1);
         match &values[0] {
             TlvValue::Ipv4Addr(addr) => assert_eq!(*addr, test_addr),
-            _ => panic!("Expected Ipv4Addr value for ASA"),
+            _ => panic!("Expected Ipv4Addr value for AAA"),
         }
     }
 
@@ -913,60 +844,6 @@ mod tests {
     }
 
     #[test]
-    fn test_put_and_parse_sockaddr_v4() {
-        let mut buf = BytesMut::new();
-        let test_addr = SocketAddr::V4(std::net::SocketAddrV4::new(
-            Ipv4Addr::new(192, 168, 1, 100),
-            8080,
-        ));
-
-        // Write the TLV
-        put_socketaddr(&mut buf, DataType::ASA, &test_addr);
-
-        // Parse it back
-        let mut buf_reader = buf.as_ref();
-        let result = parse_from_buf(&mut buf_reader).unwrap();
-
-        // Verify the result
-        assert_eq!(result.len(), 1);
-        let values = result.get(&DataType::ASA).unwrap();
-        assert_eq!(values.len(), 1);
-        match &values[0] {
-            TlvValue::SocketAddr(addr) => assert_eq!(*addr, test_addr),
-            _ => panic!("Expected SocketAddr value for ASA"),
-        }
-    }
-
-    #[test]
-    fn test_put_and_parse_sockaddr_v6() {
-        let mut buf = BytesMut::new();
-        let test_addr = SocketAddr::V6(std::net::SocketAddrV6::new(
-            Ipv6Addr::new(
-                0x2001, 0x0db8, 0x85a3, 0x0000, 0x0000, 0x8a2e, 0x0370, 0x7334,
-            ),
-            9090,
-            0,
-            0,
-        ));
-
-        // Write the TLV
-        put_socketaddr(&mut buf, DataType::ASA, &test_addr);
-
-        // Parse it back
-        let mut buf_reader = buf.as_ref();
-        let result = parse_from_buf(&mut buf_reader).unwrap();
-
-        // Verify the result
-        assert_eq!(result.len(), 1);
-        let values = result.get(&DataType::ASA).unwrap();
-        assert_eq!(values.len(), 1);
-        match &values[0] {
-            TlvValue::SocketAddr(addr) => assert_eq!(*addr, test_addr),
-            _ => panic!("Expected SocketAddr value for ASA"),
-        }
-    }
-
-    #[test]
     fn test_put_and_parse_x25519_pubkey() {
         let mut buf = BytesMut::new();
         let secret = x25519_dalek::ReusableSecret::random();
@@ -991,189 +868,6 @@ mod tests {
             TlvValue::X25519PubKey(key) => assert_eq!(*key, test_key),
             _ => panic!("Expected X25519PubKey value for A2A_DH_PUBKEY"),
         }
-    }
-
-    #[test]
-    fn test_parse_multiple_sockaddrs() {
-        let mut buf = BytesMut::new();
-        let addr_v4_1 = SocketAddr::V4(std::net::SocketAddrV4::new(
-            Ipv4Addr::new(10, 0, 0, 1),
-            3000,
-        ));
-        let addr_v4_2 = SocketAddr::V4(std::net::SocketAddrV4::new(
-            Ipv4Addr::new(172, 16, 0, 1),
-            4000,
-        ));
-        let addr_v6 = SocketAddr::V6(std::net::SocketAddrV6::new(
-            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
-            5000,
-            0,
-            0,
-        ));
-
-        // Write multiple ASA TLVs with different socket addresses
-        put_socketaddr(&mut buf, DataType::ASA, &addr_v4_1);
-        put_socketaddr(&mut buf, DataType::ASA, &addr_v4_2);
-        put_socketaddr(&mut buf, DataType::ASA, &addr_v6);
-
-        // Parse them back
-        let mut buf_reader = buf.as_ref();
-        let result = parse_from_buf(&mut buf_reader).unwrap();
-
-        // Verify all values
-        assert_eq!(result.len(), 1); // Only one TLV type (ASA)
-        let asa_values = result.get(&DataType::ASA).unwrap();
-        assert_eq!(asa_values.len(), 3); // Three socket addresses
-
-        match &asa_values[0] {
-            TlvValue::SocketAddr(addr) => assert_eq!(*addr, addr_v4_1),
-            _ => panic!("Expected SocketAddr value for ASA[0]"),
-        }
-        match &asa_values[1] {
-            TlvValue::SocketAddr(addr) => assert_eq!(*addr, addr_v4_2),
-            _ => panic!("Expected SocketAddr value for ASA[1]"),
-        }
-        match &asa_values[2] {
-            TlvValue::SocketAddr(addr) => assert_eq!(*addr, addr_v6),
-            _ => panic!("Expected SocketAddr value for ASA[2]"),
-        }
-    }
-
-    #[test]
-    fn test_sockaddr_tlv_structure() {
-        let mut buf = BytesMut::new();
-        let test_addr_v4 = SocketAddr::V4(std::net::SocketAddrV4::new(
-            Ipv4Addr::new(127, 0, 0, 1),
-            8443,
-        ));
-
-        // Write the TLV
-        put_socketaddr(&mut buf, DataType::ASA, &test_addr_v4);
-
-        // Verify the buffer structure manually
-        let bytes = buf.as_ref();
-
-        // Check header
-        assert_eq!(bytes[0], DataType::ASA); // TLV type
-        assert_eq!(bytes[1], SOCKADDR_LEN_V4); // TLV length (6 bytes for IPv4 + port)
-
-        // Check IPv4 address bytes (127.0.0.1)
-        assert_eq!(bytes[2], 127);
-        assert_eq!(bytes[3], 0);
-        assert_eq!(bytes[4], 0);
-        assert_eq!(bytes[5], 1);
-
-        // Check port bytes (8443 in big-endian)
-        let port_bytes = &bytes[6..8];
-        let port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
-        assert_eq!(port, 8443);
-    }
-
-    #[test]
-    fn test_sockaddr_v6_tlv_structure() {
-        let mut buf = BytesMut::new();
-        let test_addr_v6 = SocketAddr::V6(std::net::SocketAddrV6::new(
-            Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
-            443,
-            0,
-            0,
-        ));
-
-        // Write the TLV
-        put_socketaddr(&mut buf, DataType::ASA, &test_addr_v6);
-
-        // Verify the buffer structure manually
-        let bytes = buf.as_ref();
-
-        // Check header
-        assert_eq!(bytes[0], DataType::ASA); // TLV type
-        assert_eq!(bytes[1], SOCKADDR_LEN_V6); // TLV length (18 bytes for IPv6 + port)
-
-        // Check first few bytes of IPv6 address (2001:db8::1)
-        assert_eq!(bytes[2], 0x20);
-        assert_eq!(bytes[3], 0x01);
-        assert_eq!(bytes[4], 0x0d);
-        assert_eq!(bytes[5], 0xb8);
-
-        // Check port bytes at the end (443 in big-endian)
-        let port_bytes = &bytes[18..20];
-        let port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
-        assert_eq!(port, 443);
-    }
-
-    #[test]
-    fn test_parse_bad_asa_length() {
-        let mut buf = BytesMut::new();
-
-        // Add an ASA TLV with invalid length (not 6 or 18)
-        buf.put_u8(DataType::ASA);
-        buf.put_u8(8); // Invalid length for ASA (should be 6 for IPv4 or 18 for IPv6)
-        buf.put_u64(0x0123456789abcdef);
-
-        let mut buf_reader = buf.as_ref();
-        let result = parse_from_buf(&mut buf_reader);
-
-        assert!(matches!(result, Err(TlvError::BadStructure)));
-    }
-
-    #[test]
-    fn test_mixed_asa_and_aaa() {
-        let mut buf = BytesMut::new();
-
-        // Add an AAA (plain IP address)
-        let ipv4_addr = Ipv4Addr::new(10, 0, 0, 1);
-        put_ipv4addr(&mut buf, DataType::AAA, &ipv4_addr);
-
-        // Add an ASA (socket address)
-        let socket_addr = SocketAddr::V4(std::net::SocketAddrV4::new(
-            Ipv4Addr::new(10, 0, 0, 2),
-            8080,
-        ));
-        put_socketaddr(&mut buf, DataType::ASA, &socket_addr);
-
-        // Parse them back
-        let mut buf_reader = buf.as_ref();
-        let result = parse_from_buf(&mut buf_reader).unwrap();
-
-        // Verify we have 2 different TLV types
-        assert_eq!(result.len(), 2);
-
-        // Check AAA (plain IP address)
-        let aaa_values = result.get(&DataType::AAA).unwrap();
-        assert_eq!(aaa_values.len(), 1);
-        match &aaa_values[0] {
-            TlvValue::Ipv4Addr(addr) => assert_eq!(*addr, ipv4_addr),
-            _ => panic!("Expected Ipv4Addr value for AAA"),
-        }
-
-        // Check ASA (socket address)
-        let asa_values = result.get(&DataType::ASA).unwrap();
-        assert_eq!(asa_values.len(), 1);
-        match &asa_values[0] {
-            TlvValue::SocketAddr(addr) => assert_eq!(*addr, socket_addr),
-            _ => panic!("Expected SocketAddr value for ASA"),
-        }
-    }
-
-    #[test]
-    fn test_tlv_value_display_sockaddr() {
-        let addr_v4 = SocketAddr::V4(std::net::SocketAddrV4::new(
-            Ipv4Addr::new(192, 168, 1, 1),
-            8080,
-        ));
-        let addr_v6 = SocketAddr::V6(std::net::SocketAddrV6::new(
-            Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
-            443,
-            0,
-            0,
-        ));
-
-        let tlv_v4 = TlvValue::SocketAddr(addr_v4);
-        let tlv_v6 = TlvValue::SocketAddr(addr_v6);
-
-        // Test that Display formatting works correctly
-        assert_eq!(format!("{}", tlv_v4), "192.168.1.1:8080");
-        assert_eq!(format!("{}", tlv_v6), "[2001:db8::1]:443");
     }
 
     #[test]

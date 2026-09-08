@@ -3,16 +3,14 @@
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{self, Path, PathBuf};
-use std::sync::Arc;
 use zpr::packet_info::{KM_ID_NOISE, KM_ID_NULL, KmId};
 
 use admin_api::get_data_home;
 use base64::prelude::*;
 use serde::Deserialize;
-use zpr_utils::rsa_sign::load_rsa_key;
 
 use crate::assembly::PhMode;
-use crate::auth::{OAuthRsa, RsaBootstrapAuth};
+use crate::auth::RsaBootstrapAuth;
 use crate::batch_io;
 use crate::pki::{NOISE_KEY_LEN, common_name, load_cert, load_noise_private_key};
 
@@ -178,14 +176,8 @@ pub struct Config {
     /// Ignored for node, optional for adapter - Only set if the adapter is configured for bootstrap authentication.
     pub bootstrap: Option<RsaBootstrapAuth>,
 
-    /// If present this has key material for use during a zpr-oauthrsa authentication.
-    pub rsaoauth: Option<OAuthRsa>,
-
     /// Resolved path to the bootstrap RSA key file; used by finalize() to construct `bootstrap`.
     pub bootstrap_key_path: Option<PathBuf>,
-
-    /// Resolved path to the BAS RSA key file; used by finalize() to construct `rsaoauth`.
-    pub bas_key_path: Option<PathBuf>,
 
     /// The batch I/O engine to use.
     pub batch_io_engine: String,
@@ -294,24 +286,6 @@ impl Config {
         if let Some(path) = self.bootstrap_key_path.clone() {
             let cn = self.get_noise_cn()?;
             self.bootstrap = Some(RsaBootstrapAuth::new(&cn, &path)?);
-        }
-        if let Some(path) = self.bas_key_path.clone() {
-            let cn = self.get_noise_cn()?;
-            let pemdata = fs::read_to_string(&path).map_err(|e| {
-                ArgsError::PathError(format!(
-                    "failed to read bas_key file {}: {:?}",
-                    path.display(),
-                    e
-                ))
-            })?;
-            let priv_key = load_rsa_key(pemdata.as_bytes()).map_err(|e| {
-                ArgsError::ParseError(format!(
-                    "failed to parse bas_key file {}: {:?}",
-                    path.display(),
-                    e
-                ))
-            })?;
-            self.rsaoauth = Some(OAuthRsa::new(&cn, Arc::new(priv_key)));
         }
         Ok(())
     }
@@ -477,13 +451,6 @@ impl Config {
         base_dir: &Path,
     ) -> Result<(), ArgsError> {
         if let Some(config) = config {
-            if let Some(bas_key) = &config.bas_key {
-                if bas_key.is_relative() {
-                    self.bas_key_path = Some(base_dir.join(bas_key));
-                } else {
-                    self.bas_key_path = Some(bas_key.clone());
-                }
-            }
             if let Some(auth_private_key) = &config.auth_private_key {
                 let keyfile = if auth_private_key.is_relative() {
                     base_dir.join(auth_private_key)
@@ -617,9 +584,7 @@ impl Default for Config {
             node_addr: None,
             zpr_addr: Vec::new(),
             bootstrap: None,
-            rsaoauth: None,
             bootstrap_key_path: None,
-            bas_key_path: None,
             batch_io_engine: batch_io::AUTO_ENGINE_NAME.to_owned(),
             km_impl: KM_ID_NOISE,
         }
@@ -682,7 +647,6 @@ pub struct AdapterConfigSection {
 #[derive(Deserialize, Debug, Clone)]
 pub struct AuthenticationConfigSection {
     // TODO move this here: pub bootstrap_key: Option<PathBuf>,
-    bas_key: Option<PathBuf>,
     auth_private_key: Option<PathBuf>,
 }
 
