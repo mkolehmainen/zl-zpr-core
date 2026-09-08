@@ -155,15 +155,6 @@ fn build_connect_request_from_parts(
                 timestamp: ss.ts,
                 signature: BASE64_STANDARD.decode(&ss.sig).unwrap_or_default(),
             }),
-            AuthBlob::AuthCode(ac) => vsapi_types::AuthBlob::AC(vsapi_types::AuthCodeBlob {
-                asa_addr: ac
-                    .asa
-                    .parse()
-                    .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-                code: ac.code.clone(),
-                pkce: ac.pkce.clone(),
-                client_id: ac.client_id.clone(),
-            }),
             AuthBlob::Oidc(oidc) => {
                 // The nonce claim expected in the ID token is derived from the
                 // link challenge. The caller has already verified the
@@ -195,8 +186,8 @@ fn build_connect_request_from_parts(
     // SA cert: the SA cert only validates the node-adapter link, while the
     // AuthBlob cert authenticates an actor to the VS (and multiple actors may
     // sit behind one adapter, so the two CNs must be independent). Only a
-    // SelfSigned blob carries a CN; OIDC identity comes from the ID token and
-    // AuthCode blobs have no AuthBlob cert, so neither contributes a CN claim.
+    // SelfSigned blob carries a CN; OIDC identity comes from the ID token, so
+    // it contributes no CN claim.
     if let Some(ss) = blobs.iter().find_map(|blob| match blob {
         AuthBlob::SelfSigned(ss) => Some(ss),
         _ => None,

@@ -14,7 +14,6 @@ use crate::prelude::*;
 use crate::tc;
 use crate::tlv;
 use crate::zdp;
-use std::net::SocketAddr;
 use std::num::NonZero;
 use thiserror::Error;
 use zpr::packet_info::DOCK_LINK_ID;
@@ -253,10 +252,9 @@ pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Hand
 }
 
 /// Parse a HelloResponse body into the [LinkEvent::ReceivedHelloResponse] to
-/// raise: status code, optional AAA address, ASA addresses, and any
-/// advertised OIDC identity providers (OIDC_IDP TLVs, JSON [auth::OidcIdpInfo]
-/// each; a TLV with bad JSON is warned about and skipped, like the ASA arm's
-/// per-entry tolerance).
+/// raise: status code, optional AAA address, and any advertised OIDC identity
+/// providers (OIDC_IDP TLVs, JSON [auth::OidcIdpInfo] each; a TLV with bad
+/// JSON is warned about and skipped).
 fn parse_hello_response(
     asm: &Arc<Assembly>,
     link_id: LinkId,
@@ -279,8 +277,6 @@ fn parse_hello_response(
         }
     };
 
-    // ASA = Authentication Service Address (will have a port too)
-    let mut asa_addresses = Vec::<SocketAddr>::new();
     let mut aaa_address: Option<IpAddress> = None;
     let mut oidc_idps = Vec::<auth::OidcIdpInfo>::new();
 
@@ -294,20 +290,6 @@ fn parse_hello_response(
             }
             &tlv::DataType::POLICY_ID => {
                 info!(target: ZDP, "{}: HelloResponse - peer policy ID is : {}", asm.formatted_link_id(link_id), tlv_value[0]);
-            }
-            &tlv::DataType::ASA => {
-                for asa_entry in tlv_value {
-                    match asa_entry {
-                        tlv::TlvValue::SocketAddr(sa) => {
-                            info!(target: ZDP, "{}: HelloResponse includes ASA address:{sa}", asm.formatted_link_id(link_id));
-                            asa_addresses.push(sa.clone());
-                        }
-                        _ => {
-                            warn!(target: ZDP, "{}: HelloResponse ASA value type is wrong: {asa_entry:?}", asm.formatted_link_id(link_id));
-                            return Err(HandleMgmtError::BadStructure);
-                        }
-                    }
-                }
             }
             &tlv::DataType::AAA => {
                 for aaa_entry in tlv_value {
@@ -366,13 +348,6 @@ fn parse_hello_response(
         warn!(target: ZDP, "{}: HelloResponse did not include AAA", asm.formatted_link_id(link_id));
     }
 
-    let maybe_asa_addrs = if asa_addresses.is_empty() {
-        warn!(target: ZDP, "{}: HelloResponse did not include ASA", asm.formatted_link_id(link_id));
-        None
-    } else {
-        Some(asa_addresses)
-    };
-
     let maybe_oidc_idps = if oidc_idps.is_empty() {
         None
     } else {
@@ -382,7 +357,6 @@ fn parse_hello_response(
     Ok(LinkEvent::ReceivedHelloResponse(
         status,
         aaa_address,
-        maybe_asa_addrs,
         maybe_oidc_idps,
     ))
 }
@@ -1033,7 +1007,7 @@ mod test {
     use zpr_ext::zerocopy::IntoBytesExt;
 
     /// A HelloResponse carrying an OIDC_IDP TLV must yield a
-    /// ReceivedHelloResponse event with the decoded IdP list in its fourth slot.
+    /// ReceivedHelloResponse event with the decoded IdP list in its third slot.
     #[tokio::test]
     async fn test_hello_response_parses_oidc_idp_tlv() {
         let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
@@ -1056,7 +1030,7 @@ mod test {
 
         let event = parse_hello_response(&asm, 7, &mut pkt).unwrap();
         match event {
-            LinkEvent::ReceivedHelloResponse(code, _aaa, _asa, oidc_idps) => {
+            LinkEvent::ReceivedHelloResponse(code, _aaa, oidc_idps) => {
                 assert_eq!(code, zdp::ResponseCode::Success);
                 assert_eq!(oidc_idps, Some(vec![idp]));
             }

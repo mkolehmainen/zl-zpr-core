@@ -14,7 +14,7 @@ use crate::zdp::{self, ResponseCode, TerminateReason};
 
 use base64::prelude::*;
 use std::fmt::{Display, Formatter};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -190,9 +190,8 @@ pub enum LinkEvent {
     ReceivedHelloResponse(
         ResponseCode,
         Option<IpAddress>,
-        Option<Vec<SocketAddr>>,
         Option<Vec<auth::OidcIdpInfo>>,
-    ), // (response code, AAA address, ASA addresses, advertised OIDC IdPs)
+    ), // (response code, AAA address, advertised OIDC IdPs)
 
     ReceivedInitAuth((bool, Option<auth::ZdpInitAuthenticationPayload>)), // (bootstrap_flag, challenge)
     ReceivedInitAuthAck,
@@ -256,8 +255,7 @@ pub struct LinkData {
     // For now, keep-alives are attempted every 3 seconds
     // Assuming no loss, 100 samples will store 5 minutes of latency data
     latency_data: SampleRing<Duration, 100>,
-    asa_addresses: Option<Vec<SocketAddr>>, // Addresses of ASA servers told to us by our peer, if any
-    aaa_address: Option<IpAddress>,         // AAA address assigned this link (if any)
+    aaa_address: Option<IpAddress>, // AAA address assigned this link (if any)
     /// OIDC identity providers advertised by our peer in HelloResponse, if any.
     oidc_idps: Option<Vec<auth::OidcIdpInfo>>,
     /// The out-of-band AuthAgent registered for this link via startLink, if any.
@@ -272,7 +270,6 @@ impl LinkData {
             echo_success: 0,
             echo_timeout: 0,
             latency_data: SampleRing::new(Duration::ZERO),
-            asa_addresses: None,
             aaa_address: None,
             oidc_idps: None,
             auth_agent: None,
@@ -570,8 +567,8 @@ impl LinkStateWrapper {
             LinkEvent::KeyingDone => self.process_keying_done(asm),
             LinkEvent::ReceivedHelloRequest => self.process_hello_request(asm),
             LinkEvent::AssignedAAA(addr) => self.process_assigned_aaa(asm, addr),
-            LinkEvent::ReceivedHelloResponse(code, aaa_addr, maybe_asa_addrs, maybe_oidc_idps) => {
-                self.process_hello_response(asm, code, aaa_addr, maybe_asa_addrs, maybe_oidc_idps)
+            LinkEvent::ReceivedHelloResponse(code, aaa_addr, maybe_oidc_idps) => {
+                self.process_hello_response(asm, code, aaa_addr, maybe_oidc_idps)
             }
 
             LinkEvent::ReceivedAcquireZprAddressRequest(addrs, blob) => {
@@ -806,14 +803,12 @@ impl LinkStateWrapper {
                 }
 
                 let policy_id: i64 = 0; // TODO: We get policy ID from visa service. Record that somewhere, access it here.
-                let asa_addresses = get_available_asa_addresses(&asm, link_id);
                 let oidc_idps = get_available_oidc_idps(&asm, link_id);
 
                 mgmt::requests::send_hello_success_response(
                     &asm,
                     link_id,
                     policy_id,
-                    &asa_addresses,
                     &oidc_idps,
                     maybe_aaa_address,
                 )
@@ -871,7 +866,6 @@ impl LinkStateWrapper {
         asm: &Arc<Assembly>,
         code: ResponseCode,
         maybe_aaa_addr: Option<IpAddress>,
-        maybe_asa_addrs: Option<Vec<SocketAddr>>,
         maybe_oidc_idps: Option<Vec<auth::OidcIdpInfo>>,
     ) -> Result<(), LinkStateError> {
         if code == ResponseCode::Other {
@@ -885,7 +879,6 @@ impl LinkStateWrapper {
         match (self.link_type, locked_fsm.state) {
             (LinkType::AdapterToNode, LinkState::Helloing) => {
                 let mut link_data = self.locked_data.lock().unwrap();
-                link_data.asa_addresses = maybe_asa_addrs.clone();
                 link_data.oidc_idps = maybe_oidc_idps;
 
                 // On the node side, the aaa_address link_data field is used to keep track of the
@@ -913,9 +906,6 @@ impl LinkStateWrapper {
                 }
             }
             (LinkType::NodeToNode, LinkState::Helloing) => {
-                let mut link_data = self.locked_data.lock().unwrap();
-                link_data.asa_addresses = maybe_asa_addrs.clone();
-                drop(link_data);
                 locked_fsm.set_state(LinkState::Active);
                 debug!(target: LINK_STATE, "{} finished helloing.  Becoming active", asm.formatted_link_id(link_id));
                 Ok(())
@@ -1000,7 +990,6 @@ impl LinkStateWrapper {
 
         for d_blob in &d_blobs {
             match d_blob {
-                AuthBlob::AuthCode(_) => {} // passthrough: the VS checks the code
                 AuthBlob::SelfSigned(ss_blob) => {
                     if !self.check_self_signed_blob(asm, link_id, ss_blob) {
                         drop(locked_fsm);
@@ -1316,10 +1305,8 @@ impl LinkStateWrapper {
     ) -> Result<(), LinkStateError> {
         let link_id = self.id;
 
-        // Grab a copy of our ASA, AAA addresses plus what we know about OIDC.
+        // Grab a copy of what we know about OIDC from the hello exchange.
         let data = self.locked_data.lock().unwrap();
-        let asa_addrs = data.asa_addresses.clone();
-        let aaa_addr = data.aaa_address.clone();
         let oidc_idps = data.oidc_idps.clone().unwrap_or_default();
         let auth_agent = data.auth_agent.clone();
         drop(data);
@@ -1433,55 +1420,14 @@ impl LinkStateWrapper {
                         }
                     }
                 } else {
-                    // Bootstrap not allowed or not configured.
-                    locked_fsm.set_state(LinkState::RegisterAA);
-                    info!(target: LINK_STATE, "{} received init auth, time to talk to authentication service", asm.formatted_link_id(link_id));
-
-                    // In order to authenticate, we need an ASA address to talk to and an
-                    // AAA address to talk from.
-                    if aaa_addr.is_none() {
-                        error!(target: LINK_STATE, "{} unable to perform auth: no AAA address configured", asm.formatted_link_id(link_id));
-                        locked_fsm.set_state(LinkState::Error);
-                        drop(locked_fsm);
-                        return self.initiate_close(asm, TerminateReason::Other);
-                    }
-                    if asa_addrs.is_none() {
-                        error!(target: LINK_STATE, "{} unable to perform auth: no ASA address configured", asm.formatted_link_id(link_id));
-                        locked_fsm.set_state(LinkState::Error);
-                        drop(locked_fsm);
-                        return self.initiate_close(asm, TerminateReason::Other);
-                    }
-                    if asm.config.get().rsaoauth.is_none() {
-                        error!(target: LINK_STATE, "{} unable to perform auth: no RSA external auth service configured", asm.formatted_link_id(link_id));
-                        locked_fsm.set_state(LinkState::Error);
-                        drop(locked_fsm);
-                        return self.initiate_close(asm, TerminateReason::Other);
-                    }
-                    // ELSE we are good to go!
+                    // Bootstrap not allowed or not configured, and no OIDC IdP
+                    // was advertised: there is no way to authenticate this
+                    // link. The legacy BAS/OAuthRsa fallback that used to live
+                    // here was removed (zipline#15).
+                    warn!(target: LINK_STATE, "{} received init auth but no authentication method is available (no OIDC IdP advertised, no bootstrap key)", asm.formatted_link_id(link_id));
                     drop(locked_fsm);
-
-                    // If we have not configured our TUN interface with our AAA address or if the
-                    // TUN has the wrong address on it, we fix that up now.
-                    //
-                    // TODO: If we are re-authenticating would we need to use an AAA address? We would already
-                    //       have a ZPR address.
-                    //
-                    // TODO: We get the ZPR address of the auth services (ASA) from our node. What about the cert?
-                    //
-                    // TODO: deal with the potential i/o blocking here ( https://github.com/org-zpr/zpr-core/issues/938 )
-                    match asm
-                        .tun_ctl
-                        .add_address(aaa_addr.unwrap().into(), ZPRNET_PREFIX_LEN)
-                    {
-                        Ok(_) => {
-                            asm.tun_ctl.set_carrier(true).unwrap();
-                            self.do_https_authenticate(asm, asa_addrs.unwrap());
-                        }
-                        Err(e) => {
-                            error!(target: LINK_STATE, "{} failed to configure TUN with AAA address: {e}", asm.formatted_link_id(link_id));
-                            return self.initiate_close(asm, TerminateReason::Other);
-                        }
-                    }
+                    return self
+                        .process_authentication_failure(asm, AuthFailureReason::AuthUnavailable);
                 }
             }
             (LinkType::AdapterToNode, LinkState::Helloing) => {
@@ -1716,61 +1662,6 @@ impl LinkStateWrapper {
                 Err(_) => LinkEvent::AuthenticationFailure(AuthFailureReason::AgentError(
                     "AuthAgent dropped the request".to_string(),
                 )),
-            };
-            if let Err(e) = task_asm.process_link_state_event(link_id, event) {
-                error!(target: LINK_STATE, "{}: event handling error {e}", task_asm.formatted_link_id(link_id));
-            }
-        });
-    }
-
-    /// Run the HTTPS authentication process in a tokio task.
-    /// - [LinkEvent::AuthenticationSuccess] on success
-    /// - [LinkEvent::AuthenticationFailure] on failure
-    ///
-    /// TODO: Figure out what it means if there are multiple ASA addresses.
-    /// For now this uses the first address in the list.
-    fn do_https_authenticate(&self, asm: &Arc<Assembly>, asa_addrs: Vec<SocketAddr>) {
-        let link_id = self.id;
-
-        if asa_addrs.is_empty() {
-            error!(target: LINK_STATE, "{}: no ASA addresses provided for authentication", asm.formatted_link_id(link_id));
-            if let Err(e) = asm.process_link_state_event(
-                link_id,
-                LinkEvent::AuthenticationFailure(AuthFailureReason::IdpUnreachable(
-                    "no ASA addresses provided".to_string(),
-                )),
-            ) {
-                error!(target: LINK_STATE, "{}: event handling error {e}", asm.formatted_link_id(link_id));
-            }
-            return;
-        }
-        let service_addr = asa_addrs[0];
-
-        let tls_cert = pki::from_pem(auth::HARD_CODED_BAS_TLS_CERT_PEM.as_bytes()).unwrap();
-        let task_asm = asm.clone();
-
-        tokio::task::spawn_local(async move {
-            let binding = task_asm.config.get();
-            let Some(rsauth) = binding.rsaoauth.as_ref() else {
-                error!(target: LINK_STATE, "{}: auth requested but no auth service configured", task_asm.formatted_link_id(link_id));
-                if let Err(e) = task_asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::AuthenticationFailure(AuthFailureReason::IdpUnreachable(
-                        "no auth service configured".to_string(),
-                    )),
-                ) {
-                    error!(target: LINK_STATE, "{}: event handling error {e}", task_asm.formatted_link_id(link_id));
-                }
-                return;
-            };
-            let event = match rsauth.authenticate(service_addr, tls_cert).await {
-                Ok(blob) => LinkEvent::AuthenticationSuccess(vec![AuthBlob::AuthCode(blob)]),
-                Err(e) => {
-                    error!(target: LINK_STATE, "{}: failed to authenticate with auth service: {e:?}", task_asm.formatted_link_id(link_id));
-                    LinkEvent::AuthenticationFailure(AuthFailureReason::IdpUnreachable(format!(
-                        "{e:?}"
-                    )))
-                }
             };
             if let Err(e) = task_asm.process_link_state_event(link_id, event) {
                 error!(target: LINK_STATE, "{}: event handling error {e}", task_asm.formatted_link_id(link_id));
@@ -2281,31 +2172,6 @@ impl LinkStateWrapper {
 
         Ok(())
     }
-}
-
-fn get_available_asa_addresses(asm: &Assembly, link_id: LinkId) -> Vec<SocketAddr> {
-    let mut asa_addresses = Vec::new();
-
-    let svclist = asm.vs_auth_services.read().unwrap();
-    if svclist.is_valid() {
-        // If we have a list of services, include them in the response.
-        // TODO: The ASA is set as a SocketAddr which doesn't feel quite right.  Maybe should be a URI.
-        // Only on-net ActorAuthentication services carry a ZPR socket address;
-        // `get_socket_addr()` returns `None` for off-net OidcAuthentication
-        // descriptors, which are advertised separately via OIDC_IDP TLVs.
-        for authservice in &svclist.services {
-            if let Some(sa) = authservice.get_socket_addr() {
-                debug!(target: LINK_STATE, "{}: HelloResponse - adding ASA address: {sa}", asm.formatted_link_id(link_id));
-                asa_addresses.push(sa);
-            } else {
-                warn!(target: LINK_STATE, "{}: HelloResponse - service {} has no valid ASA address", asm.formatted_link_id(link_id), authservice.service_id);
-            }
-        }
-    } else {
-        warn!(target: LINK_STATE, "{}: HelloResponse - no valid auth services available", asm.formatted_link_id(link_id));
-    }
-
-    asa_addresses
 }
 
 /// Collect OIDC identity-provider advertisements from the auth-services list:

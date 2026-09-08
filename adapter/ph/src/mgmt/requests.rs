@@ -13,7 +13,7 @@ use crate::tlv;
 use crate::zdp;
 use crate::{assembly::Assembly, auth};
 use bytes::BufMut;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use zpr_ext::zerocopy::IntoBytesExt;
 use zpr_utils::net_defs::IpAddress;
 
@@ -71,7 +71,6 @@ pub fn send_hello_success_response<'a>(
     asm: &'a Assembly,
     link_id: LinkId,
     policy_id: i64,
-    asa_addresses: &[SocketAddr],
     oidc_idps: &[auth::OidcIdpInfo],
     aaa_address: Option<IpAddress>,
 ) -> Sent<'a> {
@@ -84,10 +83,6 @@ pub fn send_hello_success_response<'a>(
     tlv::TlvEncoding::new_version(assembly::VERSION).put(&mut pkt);
 
     super::helpers::put_window_size_tlv(&asm, link_id, &mut pkt);
-
-    for asa_address in asa_addresses {
-        tlv::TlvEncoding::new_asa(*asa_address).put(&mut pkt);
-    }
 
     // Tailroom the TLVs after the IdP list still need: an AAA TLV is at most
     // 2 + 16 bytes. Keep a little extra margin.

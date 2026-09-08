@@ -4,18 +4,12 @@
 
 use aws_lc_rs::signature::RsaKeyPair;
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zerocopy::byteorder::network_endian::*;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
-
-use reqwest::StatusCode;
-use reqwest::header;
-use reqwest::redirect::Policy;
-use reqwest::tls::Certificate;
 
 use base64::prelude::*;
 use thiserror::Error;
@@ -33,9 +27,6 @@ pub const AUTH_KEY_SIZE_BYTES: usize = 32; // blake3 256bit key
 /// "self signed" blob type
 pub const BLOB_TYPE_SS: &str = "SS";
 
-/// Auth Code blob type
-pub const BLOB_TYPE_AC: &str = "AC";
-
 /// OIDC blob type
 pub const BLOB_TYPE_OIDC: &str = "OIDC";
 
@@ -48,41 +39,6 @@ pub const MAX_BLOB_AGE_SECONDS: u64 = 120; // 2 minutes
 /// OIDC_USER_INTERACTION_TIMEOUT (300 s, D2); this bound must cover that plus
 /// margin, consistent with ACTOR_AUTHENTICATION_TIMEOUT (330 s).
 pub const MAX_OIDC_BLOB_AGE_SECONDS: u64 = 330;
-
-// TODO: Not sure how we get these out or if we need them.
-pub const HARD_CODED_BAS_TLS_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
-MIIFmzCCA4OgAwIBAgIUJSg4OHOfPqY+lD7ymZy6akX/ZZ8wDQYJKoZIhvcNAQEL
-BQAwXTELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAktZMRMwEQYDVQQHDApMb3Vpc3Zp
-bGxlMQswCQYDVQQKDAJBSTEMMAoGA1UECwwDWlBSMREwDwYDVQQDDAhhdXRoLnpw
-cjAeFw0yNTA0MTYxOTQ4MjRaFw0yNjA0MTYxOTQ4MjRaMF0xCzAJBgNVBAYTAlVT
-MQswCQYDVQQIDAJLWTETMBEGA1UEBwwKTG91aXN2aWxsZTELMAkGA1UECgwCQUkx
-DDAKBgNVBAsMA1pQUjERMA8GA1UEAwwIYXV0aC56cHIwggIiMA0GCSqGSIb3DQEB
-AQUAA4ICDwAwggIKAoICAQDl6DwVoQJsWAOTK4JWZYp3YL7b647ypIadVioKaGAk
-1Fk4FwogcZG/tBqsxCCW+pv7FXfjbwp6ChrxUGaTZUGzF5ft5L7q4oqSKOHvL1i9
-DiyU3xwk/biMiPTyuB8YYIiwQDiHAtYncJVMGMJPefDTl8OPNsjGQyJI+xuoBP/n
-PhbNIgn6E8YxrNl0/u+xWHjM6iOe5bZhXH1nkJQ+hviTxAtRDfayGM0nXrkEzdkC
-Aav95Kgp91cIa2lgoPpHm+HwQANp8jEPvsTVFMbwlPuFx9nopyXLzAdkgv9Z3+S3
-W9ISFWdaAQ4TJDrWfAQyPgPy8UPLOzoK/TC9qbRx2QLQaY3v6+hurnWUm0cHAZ5n
-zs8KflWXfRR+DA3Vc4aDF5vhT0IBDxs5rGu3/gtlJKwfwzMGDtprtuAXpXyZ48yM
-f17WymXsamWDIN58cHjPWgLYoUsr87HtRFGVmlqvCBzaQf4zGCOoW5LWSlkzD2da
-6ak3xBbogGExSk7RAhi9XLCl0LKfjTRsEGuAKpbGvt4h8i2Bq5YLmrzrqzI5XDYt
-u3W1hWwSwwAzK6SHvYLyOMTI75UMy9Zsh4VoUJUNkYm4XgO0WFaA9bs5Cq73d1zY
-i70s8jccheYhoAVXOWLDBQxCu2beHR7tkNXwyZ/RBhL/4/tyc+FKzF6C9sE9f6hv
-EQIDAQABo1MwUTAdBgNVHQ4EFgQU+bscgkfPxWQLdX4AypBqXnzmvxwwHwYDVR0j
-BBgwFoAU+bscgkfPxWQLdX4AypBqXnzmvxwwDwYDVR0TAQH/BAUwAwEB/zANBgkq
-hkiG9w0BAQsFAAOCAgEASZvKIbzeXKd1WuMmZT7kCywYqmWfgo7O51VNWni3FLdQ
-5De44BGIOVUFn+0vC0xQQbQ4iM9yTMb27AQJGm9Aor92w9G7LvR6Mp5py16eJb+F
-MSMZwN7PqK/QdnbIwiUGplDkKndd1dA/ZcHg5oJdE1areX0Zw8ZZ5yZoO12xnhc4
-AK2Mop897EGSYHyrxidYbocPj5Bn7m3mVC7U2quh1HwnZzbWfpx9g8Ry4T8kUco3
-dwZa2RHWhy2yrky2t3pg5tqaw79f/pXoTkcxvRSwZU3EcY23rq5OYQc7SLBIMm/a
-n8ZSJIduRRTLNE7T6Y7o43jDU8u+tcfB5ZE9ytuJA/NgtIYeEiNHMRepYNI2pffj
-MGELMS4xR3NIEyA6ZGVRBnI4dDr/3AmliOKKSt77iueSYCaPDBaxbbwcvEBBJtB0
-TPzKFsY5IH5ve5pZu7IhHIbE/yrAicbNtfX487WQTZfY+Qo8bf+XbdQIcRzkD+Q4
-VAvgJld9s5RI6x8CocU/PQvtQcWPFj//SbnnaMv2TTMLYgP+XWFwD1K1WQFpx2PK
-YM6AGtFc6p9klbags4r80QK+yEwYiBaNjDKmiNfQ1J38HCmd9lnMbzt9p7T838fP
-FiCJxns37RAqhGyryo9L0cryIEPwerjtNoLxmg94rfdovRmY+pm+HokRbD4Vycw=
------END CERTIFICATE-----
-"#;
 
 /// This is the data payload in a [zdp::PacketType::InitAuthenticationRequest] packet.
 #[derive(Clone, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Default)]
@@ -137,20 +93,6 @@ pub struct ZdpSelfSignedBlob {
     pub sig: String,       // byte buffer, base64 encoded
 }
 
-/// The "Auth Code" authentication BLOB which originates on an adatper and is
-/// passed to a node via a [zdp::PacketType::AcquireZprAddressRequest]
-/// message.
-///
-/// Note that this passed around as JSON text encoded in base64.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ZdpAuthCodeBlob {
-    pub blob_type: String, // "AC"
-    pub code: String,
-    pub pkce: String,
-    pub client_id: String,
-    pub asa: String,
-}
-
 /// The OIDC authentication BLOB which originates on an adapter and is passed
 /// to a node via a [zdp::PacketType::AcquireZprAddressRequest] message.
 ///
@@ -174,7 +116,6 @@ pub struct ZdpOidcBlob {
 #[derive(Debug, Clone)]
 pub enum AuthBlob {
     SelfSigned(ZdpSelfSignedBlob),
-    AuthCode(ZdpAuthCodeBlob),
     Oidc(ZdpOidcBlob),
 }
 
@@ -222,22 +163,6 @@ pub enum AuthError {
 pub struct RsaBootstrapAuth {
     pkey: Arc<RsaKeyPair>,
     cn: String,
-}
-
-/// OAuthRsa holds small amount of state needed to talk to a
-/// zpr-oauthrsa authentication service.
-#[derive(Debug, Clone)]
-pub struct OAuthRsa {
-    client_id: String,
-    private_key: Arc<RsaKeyPair>,
-}
-
-impl ZdpAuthCodeBlob {
-    /// Gets the "encoded" form of the blob: base64 encoded JSON.
-    pub fn encode(&self) -> String {
-        let json_txt = serde_json::to_string(self).unwrap();
-        BASE64_STANDARD.encode(&json_txt)
-    }
 }
 
 impl ZdpSelfSignedBlob {
@@ -400,10 +325,6 @@ fn decode_blob_value(jobj: &Value) -> Result<AuthBlob, AuthError> {
             let ss_blob = serde_json::from_value::<ZdpSelfSignedBlob>(jobj.clone())?;
             Ok(AuthBlob::SelfSigned(ss_blob))
         }
-        Some(BLOB_TYPE_AC) => {
-            let ac_blob = serde_json::from_value::<ZdpAuthCodeBlob>(jobj.clone())?;
-            Ok(AuthBlob::AuthCode(ac_blob))
-        }
         Some(BLOB_TYPE_OIDC) => {
             let oidc_blob = serde_json::from_value::<ZdpOidcBlob>(jobj.clone())?;
             Ok(AuthBlob::Oidc(oidc_blob))
@@ -445,7 +366,6 @@ pub fn encode_blobs(blobs: &[AuthBlob]) -> String {
         .iter()
         .map(|blob| match blob {
             AuthBlob::SelfSigned(ss) => serde_json::to_value(ss).unwrap(),
-            AuthBlob::AuthCode(ac) => serde_json::to_value(ac).unwrap(),
             AuthBlob::Oidc(oidc) => serde_json::to_value(oidc).unwrap(),
         })
         .collect();
@@ -528,186 +448,6 @@ impl RsaBootstrapAuth {
     }
 }
 
-/// Response json object to initial auth request from an actor
-/// from a zpr-oauthrsa authentication service.
-#[derive(Deserialize, Debug)]
-struct PreauthResp {
-    nonce: String,
-}
-
-/// Request json object from an actor to a zpr-oauthrsa authentication service.
-/// Includes the nonce from preauth step and the payload which is the RSA
-/// signature of the nonce.  The `client_id` must match one known to the
-/// authentication service (for now we are using CNs here).
-#[derive(Serialize, Debug)]
-struct AuthReq {
-    client_id: String,
-    nonce: String,
-    payload: String,
-}
-
-/// Implements the ZPR oauthrsa protocol.
-///
-/// Works like this:
-/// - Adapter sends a GET request to /preauthorize with form encoded params in query string
-///   of (response_type, client_id, scope, state).
-/// - Service returns json object with a "nonce" field, a base64 encoded byte buffer.
-/// - Adapter sends a POST to /authorize with a json object having fields: (client_id, nonce, payload).
-///   `nonce` is copied from the service response.  `payload` is the base64 encoded signature of
-///   the nonce using the adapters private RSA key.  The `client_id` (in the case of BAS) is
-///   the CN of the adapter.
-/// - The service response with an auth-code which will be part of a redirect `location` header.
-///   The format is `https://auth.zpr?code=<CODE>`).
-///
-/// Once we have an auth-code back from the authentication service we can construct the
-/// auth-code blob as:
-/// - blob_type: "AC"
-/// - code: "<CODE>" (the auth-code)
-/// - pkce: empty for now
-/// - client_id: the CN of the adapter
-/// - asa: The ZPR address of the authentication service
-///
-/// The blob should be passed to the Node which will forward it to the visa service.
-impl OAuthRsa {
-    /// Create a new OAuthRsa object.
-    /// - `client_id` is the adapter CN
-    /// - `private_key` is the RSA private key used to sign the nonce
-    pub fn new(client_id: &str, private_key: Arc<RsaKeyPair>) -> Self {
-        OAuthRsa {
-            client_id: client_id.to_string(),
-            private_key,
-        }
-    }
-
-    /// Performs the two calls to the authentication service and the signing of the nonce.
-    /// On success returns the auth-code blob.
-    /// - `service_addr` is the address of the authentication service
-    /// - `tls_cert` is the TLS certificate used by the authentication service
-    pub async fn authenticate(
-        &self,
-        service_addr: SocketAddr,
-        tls_cert: X509Certificate,
-    ) -> Result<ZdpAuthCodeBlob, AuthError> {
-        let der = pki::to_der(&tls_cert)
-            .map_err(|e| AuthError::FormatError(format!("cannot encode TLS certificate: {e}")))?;
-        let tls_cert = Certificate::from_der(&der).unwrap();
-
-        let nonce_buf = self.preauthorize(service_addr, &tls_cert).await?;
-
-        let signature = sign_rsa_key(&self.private_key, &nonce_buf);
-
-        let auth_code = self
-            .authorize(service_addr, &tls_cert, &nonce_buf, &signature)
-            .await?;
-
-        Ok(ZdpAuthCodeBlob {
-            blob_type: BLOB_TYPE_AC.to_string(),
-            code: auth_code,
-            pkce: String::new(),
-            client_id: self.client_id.clone(),
-            asa: service_addr.to_string(),
-        })
-    }
-
-    /// Call preauthorize function on authentication service.
-    /// Returns the nonce.
-    async fn preauthorize(
-        &self,
-        service_addr: SocketAddr,
-        tls_cert: &Certificate,
-    ) -> Result<Vec<u8>, AuthError> {
-        // See https://github.com/org-zpr/zpr-core/issues/861
-        let cb = reqwest::ClientBuilder::new()
-            .add_root_certificate(tls_cert.clone())
-            .danger_accept_invalid_certs(true) // TODO: Figure this TLS stuff out and get rid of this
-            .timeout(std::time::Duration::from_secs(10));
-        let client = cb.build().unwrap();
-
-        let resp = client
-            .get(format!("https://{}/preauthorize", service_addr))
-            .query(&[("response_type", "code"), ("client_id", &self.client_id)])
-            .send()
-            .await
-            .map_err(|e| AuthError::AuthError(format!("failed to send request: {}", e)))?;
-
-        let pa_resp: PreauthResp = resp
-            .json()
-            .await
-            .map_err(|e| AuthError::AuthError(format!("failed to parse response: {}", e)))?;
-
-        Ok(BASE64_STANDARD.decode(pa_resp.nonce.as_bytes())?)
-    }
-
-    /// Call the authorize function on the authentication service.
-    /// Returns the auth-code.
-    async fn authorize(
-        &self,
-        service_addr: SocketAddr,
-        tls_cert: &Certificate,
-        nonce: &[u8],
-        payload: &[u8],
-    ) -> Result<String, AuthError> {
-        let authreq = AuthReq {
-            client_id: self.client_id.clone(),
-            nonce: BASE64_STANDARD.encode(nonce),
-            payload: BASE64_STANDARD.encode(payload),
-        };
-
-        // Note client set to NOT follow redirects since that is how we get our response.
-        let cb = reqwest::ClientBuilder::new()
-            .add_root_certificate(tls_cert.clone())
-            .danger_accept_invalid_certs(true) // TODO: Figure this TLS stuff out and get rid of this
-            .redirect(Policy::none())
-            .timeout(std::time::Duration::from_secs(10));
-        let client = cb.build().unwrap();
-
-        let resp = client
-            .post(format!("https://{}/authorize", service_addr))
-            .json(&authreq)
-            .send()
-            .await
-            .map_err(|e| AuthError::AuthError(format!("failed to send POST request: {}", e)))?;
-
-        // Expect status code FOUND
-        if resp.status() != StatusCode::FOUND {
-            return Err(AuthError::AuthError(format!(
-                "failed to authorize: {}",
-                resp.status()
-            )));
-        }
-
-        // Now extract the auth-code from the location header.
-        if let Some(loc) = resp.headers().get(header::LOCATION) {
-            if let Ok(loc_str) = loc.to_str() {
-                if loc_str.contains("error") {
-                    // TODO: We could parse this URL and get error & error_description
-                    return Err(AuthError::AuthError(format!(
-                        "failed to authorize: {}",
-                        loc_str
-                    )));
-                }
-                if let Some(code) = loc_str.split("code=").nth(1) {
-                    return Ok(code.to_string());
-                } else {
-                    return Err(AuthError::AuthError(format!(
-                        "failed to find code in location header: {}",
-                        loc_str
-                    )));
-                }
-            } else {
-                return Err(AuthError::AuthError(format!(
-                    "failed to parse location header: {}",
-                    loc.to_str().unwrap_or("invalid utf8")
-                )));
-            }
-        } else {
-            return Err(AuthError::AuthError(
-                "failed to find location header in response".to_string(),
-            ));
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -764,6 +504,18 @@ mod test {
                 assert_eq!(oidc.id_token, "eyJ.header.payload");
             }
             other => panic!("expected Oidc second, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_blobs_rejects_ac_type() {
+        // The legacy BAS/OAuthRsa "AC" (auth-code) blob type was removed in
+        // zipline#15; an AC blob must now fail decode like any unknown type.
+        let json = r#"[{"blob_type": "AC", "code": "c", "pkce": "", "client_id": "cn", "asa": "1.2.3.4:443"}]"#;
+        let encoded = BASE64_STANDARD.encode(json);
+        match decode_blobs(&encoded) {
+            Err(AuthError::FormatError(_)) => {}
+            other => panic!("expected FormatError for AC blob, got {other:?}"),
         }
     }
 
