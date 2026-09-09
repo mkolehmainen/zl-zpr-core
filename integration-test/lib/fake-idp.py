@@ -8,11 +8,19 @@ browser:
 
   GET  /.well-known/openid-configuration  discovery document
   GET  /auth                              302 to redirect_uri with code+state
-                                          (no UI; the nonce is remembered,
-                                          keyed by the minted code)
+                                          (no UI; nonce, client_id,
+                                          redirect_uri and the PKCE challenge
+                                          are remembered, keyed by the code)
   POST /token                             JSON with an RS256 id_token minted
                                           from a checked-in test key, echoing
-                                          the nonce stored for the code
+                                          the nonce stored for the code —
+                                          after checking that client_id and
+                                          redirect_uri match what /auth saw
+                                          and that the S256 hash of
+                                          code_verifier matches the stored
+                                          code_challenge, so a relying-party
+                                          regression in any of those is
+                                          rejected here just as Google would
   GET  /jwks                              JWKS for the currently active key,
                                           with a kid
 
@@ -119,8 +127,10 @@ class IdpState:
         self.email = args.email
         self.hd = args.hd
         self.state_dir = Path(args.state_dir)
-        # code -> nonce, remembered by /auth for /token. Codes are single use.
-        self.codes: dict[str, str] = {}
+        # code -> the authorization request's bindings (nonce, client_id,
+        # redirect_uri, PKCE challenge), remembered by /auth so /token can
+        # reject an exchange that does not match them. Codes are single use.
+        self.codes: dict[str, dict] = {}
 
     def active_key(self) -> SigningKey:
         """The currently active signing key, re-read from the rotation file
@@ -208,13 +218,27 @@ class IdpHandler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(url.query)
             state = query.get("state", [None])[0]
             nonce = query.get("nonce", [""])[0]
+            client_id = query.get("client_id", [None])[0]
             redirect_uri = query.get("redirect_uri", [None])[0]
-            if not state or not redirect_uri:
+            code_challenge = query.get("code_challenge", [None])[0]
+            code_challenge_method = query.get("code_challenge_method", [None])[0]
+            if not state or not redirect_uri or not client_id:
                 self._json(400, {"error": "invalid_request"})
                 return
-            # No UI: authorize immediately. Remember the nonce for /token.
+            # Only S256 is advertised in discovery; reject anything else so a
+            # client silently downgrading PKCE fails loudly here.
+            if code_challenge and code_challenge_method != "S256":
+                self._json(400, {"error": "invalid_request"})
+                return
+            # No UI: authorize immediately. Remember the request's bindings
+            # so /token can check the exchange against them.
             code = secrets.token_urlsafe(24)
-            idp.codes[code] = nonce
+            idp.codes[code] = {
+                "nonce": nonce,
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": code_challenge,
+            }
             sep = "&" if "?" in redirect_uri else "?"
             location = (
                 f"{redirect_uri}{sep}code={urllib.parse.quote(code)}"
@@ -243,14 +267,36 @@ class IdpHandler(BaseHTTPRequestHandler):
             return
         # Codes are single use: pop, so a replay is rejected.
         try:
-            nonce = idp.codes.pop(code)
+            granted = idp.codes.pop(code)
         except KeyError:
             self._json(400, {"error": "invalid_grant"})
             return
+        # The exchange must match the authorization request's bindings
+        # (RFC 6749 §4.1.3): same client_id, same redirect_uri. A ph-cli
+        # regression sending the wrong values fails here, as Google would
+        # fail it.
+        if form.get("client_id", [None])[0] != granted["client_id"]:
+            self._json(400, {"error": "invalid_client"})
+            return
+        if form.get("redirect_uri", [None])[0] != granted["redirect_uri"]:
+            self._json(400, {"error": "invalid_grant"})
+            return
+        # PKCE (RFC 7636 §4.6): when the authorization request carried a
+        # code_challenge, the token request's code_verifier must S256-hash
+        # to it.
+        if granted["code_challenge"] is not None:
+            verifier = form.get("code_verifier", [None])[0]
+            if verifier is None:
+                self._json(400, {"error": "invalid_grant"})
+                return
+            digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+            if b64url(digest) != granted["code_challenge"]:
+                self._json(400, {"error": "invalid_grant"})
+                return
         self._json(
             200,
             {
-                "id_token": idp.mint_id_token(nonce),
+                "id_token": idp.mint_id_token(granted["nonce"]),
                 "token_type": "Bearer",
                 "expires_in": 3600,
             },

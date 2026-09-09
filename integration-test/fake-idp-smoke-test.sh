@@ -6,8 +6,12 @@
 #   1. the discovery document carries the four endpoint URLs,
 #   2. /auth 302-redirects with the caller's `state` and a fresh `code`,
 #   3. /token returns a three-part RS256 JWT whose header `kid` matches the
-#      current /jwks key and whose claims echo the /auth `nonce`,
-#   4. after --rotate, /jwks serves the second `kid` and newly minted tokens
+#      current /jwks key and whose claims echo the /auth `nonce` — using a
+#      genuine PKCE S256 challenge/verifier pair,
+#   4. /token rejects a wrong client_id, a wrong redirect_uri, and a
+#      code_verifier that does not hash to the stored code_challenge
+#      (the code bindings a ph-cli regression would get wrong),
+#   5. after --rotate, /jwks serves the second `kid` and newly minted tokens
 #      are signed with it.
 #
 # Needs no root and no network namespaces: everything binds 127.0.0.1.
@@ -99,8 +103,15 @@ JWKS_EP=$(jq -r .jwks_uri <<< "$DISCO")
 STATE="smoke-state-$$"
 NONCE="smoke-nonce-$$"
 REDIRECT="http://127.0.0.1:19999/callback"
+
+# Genuine PKCE S256 pair (RFC 7636): challenge = b64url(sha256(verifier)),
+# exactly what ph-cli computes. /token must verify this binding.
+VERIFIER="smoke-verifier-$$-0123456789abcdefghijklmnopqrstuv"
+CHALLENGE=$(printf '%s' "$VERIFIER" | openssl dgst -sha256 -binary \
+  | base64 | tr '+/' '-_' | tr -d '=')
+
 LOCATION=$("${CURL[@]}" --output /dev/null --write-out '%{redirect_url}' \
-  "$AUTH_EP?response_type=code&client_id=zpr-test-client&redirect_uri=$REDIRECT&scope=openid&state=$STATE&nonce=$NONCE&code_challenge=x&code_challenge_method=S256")
+  "$AUTH_EP?response_type=code&client_id=zpr-test-client&redirect_uri=$REDIRECT&scope=openid&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256")
 echo "auth redirect: $LOCATION"
 case "$LOCATION" in
   "$REDIRECT"*) : ;;
@@ -114,7 +125,7 @@ test -n "$CODE" || fail "/auth redirect carries no code"
 # 3. /token: three-part JWT, header kid matches /jwks, nonce echoed
 #
 TOKEN_RESP=$("${CURL[@]}" --data \
-  "grant_type=authorization_code&code=$CODE&redirect_uri=$REDIRECT&client_id=zpr-test-client&code_verifier=x" \
+  "grant_type=authorization_code&code=$CODE&redirect_uri=$REDIRECT&client_id=zpr-test-client&code_verifier=$VERIFIER" \
   "$TOKEN_EP")
 ID_TOKEN=$(jq -r .id_token <<< "$TOKEN_RESP")
 test "$(awk -F. '{print NF}' <<< "$ID_TOKEN")" = 3 \
@@ -146,12 +157,52 @@ test "$(jq -r .hd <<< "$CLAIMS")" = "example.com" || fail "hd mismatch"
 
 # A code is single use.
 SECOND=$("${CURL[@]}" --output /dev/null --write-out '%{http_code}' --data \
-  "grant_type=authorization_code&code=$CODE&redirect_uri=$REDIRECT&client_id=zpr-test-client&code_verifier=x" \
+  "grant_type=authorization_code&code=$CODE&redirect_uri=$REDIRECT&client_id=zpr-test-client&code_verifier=$VERIFIER" \
   "$TOKEN_EP")
 test "$SECOND" = "400" || fail "reused code was not rejected (HTTP $SECOND)"
 
 #
-# 4. --rotate: /jwks switches kid; new tokens are signed with the new key
+# 4. /token rejects an exchange that does not match the code's bindings.
+# Each case gets its own fresh code (codes are single use, even on failure).
+#
+
+# Fetch a fresh authorization code bound to $CHALLENGE.
+new_code() {
+  local LOC
+  LOC=$("${CURL[@]}" --output /dev/null --write-out '%{redirect_url}' \
+    "$AUTH_EP?response_type=code&client_id=zpr-test-client&redirect_uri=$REDIRECT&scope=openid&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256")
+  sed -n 's/.*[?&]code=\([^&]*\).*/\1/p' <<< "$LOC"
+}
+
+# POST to /token, print the HTTP status. $1 = form body.
+token_status() {
+  "${CURL[@]}" --output /dev/null --write-out '%{http_code}' \
+    --data "$1" "$TOKEN_EP"
+}
+
+C=$(new_code)
+RC=$(token_status "grant_type=authorization_code&code=$C&redirect_uri=$REDIRECT&client_id=wrong-client&code_verifier=$VERIFIER")
+test "$RC" = "400" || fail "wrong client_id was not rejected (HTTP $RC)"
+
+C=$(new_code)
+RC=$(token_status "grant_type=authorization_code&code=$C&redirect_uri=http://127.0.0.1:19999/other&client_id=zpr-test-client&code_verifier=$VERIFIER")
+test "$RC" = "400" || fail "wrong redirect_uri was not rejected (HTTP $RC)"
+
+C=$(new_code)
+RC=$(token_status "grant_type=authorization_code&code=$C&redirect_uri=$REDIRECT&client_id=zpr-test-client&code_verifier=not-the-verifier")
+test "$RC" = "400" || fail "wrong code_verifier was not rejected (HTTP $RC)"
+
+C=$(new_code)
+RC=$(token_status "grant_type=authorization_code&code=$C&redirect_uri=$REDIRECT&client_id=zpr-test-client")
+test "$RC" = "400" || fail "missing code_verifier was not rejected (HTTP $RC)"
+
+# /auth advertises S256 only: a plain-method challenge must be refused.
+RC=$("${CURL[@]}" --output /dev/null --write-out '%{http_code}' \
+  "$AUTH_EP?response_type=code&client_id=zpr-test-client&redirect_uri=$REDIRECT&scope=openid&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=plain")
+test "$RC" = "400" || fail "/auth accepted a non-S256 code_challenge_method (HTTP $RC)"
+
+#
+# 5. --rotate: /jwks switches kid; new tokens are signed with the new key
 #
 python3 "$FAKE_IDP" --state-dir "$TMPDIR" --rotate
 
@@ -161,10 +212,10 @@ echo "rotated kid: $KID -> $KID2"
 test "$KID2" != "$KID" || fail "/jwks kid did not change after --rotate"
 
 LOCATION=$("${CURL[@]}" --output /dev/null --write-out '%{redirect_url}' \
-  "$AUTH_EP?response_type=code&client_id=zpr-test-client&redirect_uri=$REDIRECT&scope=openid&state=$STATE&nonce=$NONCE")
+  "$AUTH_EP?response_type=code&client_id=zpr-test-client&redirect_uri=$REDIRECT&scope=openid&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256")
 CODE=$(sed -n 's/.*[?&]code=\([^&]*\).*/\1/p' <<< "$LOCATION")
 TOKEN_RESP=$("${CURL[@]}" --data \
-  "grant_type=authorization_code&code=$CODE&redirect_uri=$REDIRECT&client_id=zpr-test-client&code_verifier=x" \
+  "grant_type=authorization_code&code=$CODE&redirect_uri=$REDIRECT&client_id=zpr-test-client&code_verifier=$VERIFIER" \
   "$TOKEN_EP")
 ID_TOKEN=$(jq -r .id_token <<< "$TOKEN_RESP")
 HEADER=$(b64d "$(cut -d. -f1 <<< "$ID_TOKEN")")
