@@ -438,10 +438,24 @@ else
 
   echo "Logging in adapter1 again (rotated key)"
   # Bounded retry: the first attempt races the visa service's JWKS refresh
-  # (unknown-kid fetches are coalesced and rate-limited).
+  # (unknown-kid fetches are coalesced and rate-limited). Before retrying,
+  # wait for the link to return to Inactive rather than sleeping a fixed
+  # 5 s: after a rejected attempt ph auto-restarts the link after a 5 s
+  # holddown (DEFAULT_LINK_RESTART_HOLDDOWN, adapter/ph/src/config.rs), and
+  # if that automatic Start won the race the retry's startLink would return
+  # UnexpectedTransition, which `connect` treats as fatal. Polling for
+  # Inactive means the retry's Start lands at the beginning of a fresh
+  # holddown window instead of racing the end of one. (If the automatic
+  # restart is mid-attempt when we look, it fails fast — adapter1 has no
+  # bootstrap key and no registered agent — and the link closes back to
+  # Inactive, so the poll converges.)
+  function check_link1_inactive() {
+    "$PH_DEBUG_BIN" -p "$ADAPTER1_SOCK" link show 1 | grep -q 'State: Inactive'
+  }
   if ! oidc_login zpr-a "$ADAPTER1_SOCK" login3.log; then
     echo "Retrying post-rotation login"
-    sleep 5
+    wait_for 30 check_link1_inactive \
+      || echo "WARNING: link 1 did not return to Inactive; retrying anyway"
     oidc_login zpr-a "$ADAPTER1_SOCK" login3.log || PASS=1
   fi
 
