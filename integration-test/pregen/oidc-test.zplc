@@ -1,0 +1,75 @@
+# -*- mode: toml -*-
+# OIDC integration-test fixture config (zipline#16, plan D5).
+#
+# Topology matches v6-1node-2actor-ping.zplc; the fake-idp trusted service
+# follows docs/OIDC.md "ZPLC configuration" with the issuer pinned to the
+# fake IdP the test runs on each namespace's loopback. `service` (the JWKS
+# CONNECT proxy) is deliberately omitted — there is no proxy in the test and
+# the visa service fetches the JWKS directly — so zplc emits a warning;
+# expected, per OIDC.md (omission is not silent, --Werror would make it
+# fatal for deployments that care).
+
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"n0.zpr" = "fd5a:5052::2"
+"n0.overlay" = "10.0.0.1"
+
+[nodes."node"]
+provider = [ [ "device.zpr.adapter.cn", "node" ] ]
+zpr_address = "n0.zpr"
+interfaces = ["in1"]
+in1.netaddr = "n0.overlay:12345"
+
+[trusted_services.default]
+cert_path = "ca-cert.pem"
+
+[trusted_services.fake-idp]
+api             = "oidc"
+issuer          = "https://127.0.0.1:9000"
+jwks_uri        = "https://127.0.0.1:9000/jwks"
+client_id       = "zpr-test-client"
+scopes          = ["openid", "email", "profile"]
+allowed_domains = ["example.com"]
+# Seed carries only the first fake-idp key; the rotation leg's second key
+# must be discovered via a live JWKS refresh (the stale-cache path).
+seed_jwks       = "oidc-test-seed-jwks.json"
+
+expiration_seconds   = 43200
+max_auth_age_seconds = 86400
+allow_offline_access = false
+
+returns_attributes = [
+  "sub   -> user.oidc-subject",
+  "email -> user.email",
+  "hd    -> user.domain",
+]
+identity_attributes = ["sub"]
+
+[visa_service]
+dock_node = "node"
+
+# adapter1 is deliberately absent: it authenticates user-only through the
+# fake IdP and never presents a bootstrap (device) key.
+[bootstrap]
+"node" = "node-rsa-pubkey.pem"
+"vs.zpr" = "actorvs.pem"
+"adapter2" = "actor2.pem"
+
+[protocols.ping]
+l4protocol = "iana.ICMP6"
+icmp_type = "request-response"
+icmp_codes = [ 128, 129 ]
+
+[services.A1Svc]
+protocol = "ping"
+
+[services.A2Svc]
+protocol = "ping"
+
+[services.PingableVs]
+protocol = "ping"
+
+[services.PingableNode]
+protocol = "ping"

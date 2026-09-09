@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "fake-idp-23deaf5cc8f972f4",
+      "use": "sig",
+      "alg": "RS256",
+      "n": "rDMwl7JTa2Gw36dhnKLxTje487-V9UGdZQ4Dg_hBTDkjliAs_IdMdwhz7ceNig2DcYChdO461BqP4oZ4rKl1orVJqmX0_fNmOq7KZ52GLRHr-mvwjyCWwR-wjdo02c6uxcV1nRYZ09_9HWRffVD2OGbwzokIgdG69_Y6Dy2N5SrGm6_Zcoxo0gxiDd-c967JX1L5WnzQDjcbxN2srM-p52inoN_KriVEY8cu6SvxGLhOs-69WB1-Ol1Pu5tElhNwvL4dwMzjf1zXLYeaWkl8l4lnqtkEH0U7Bt_vnmwvpbmjHMMSo8trfgxRpqnZDktieeeRVQbVt3BhbrZVHLtVwQ",
+      "e": "AQAB"
+    }
+  ]
+}
