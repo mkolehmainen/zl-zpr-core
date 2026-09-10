@@ -186,3 +186,30 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
         _ => Err(format!("Invalid key-value pair")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `auth-agent <id> --no-browser` must parse (zipline#20).
+    #[test]
+    fn auth_agent_accepts_no_browser_flag() {
+        let parsed = CmdlineArgs::try_parse_from(["ph-cli", "auth-agent", "1", "--no-browser"]);
+        assert!(
+            parsed.is_ok(),
+            "auth-agent should accept --no-browser: {:?}",
+            parsed.err()
+        );
+    }
+
+    /// Without the flag, `auth-agent <id>` still parses (default off).
+    #[test]
+    fn auth_agent_parses_without_no_browser_flag() {
+        let parsed = CmdlineArgs::try_parse_from(["ph-cli", "auth-agent", "1"]);
+        assert!(
+            parsed.is_ok(),
+            "auth-agent without --no-browser should parse: {:?}",
+            parsed.err()
+        );
+    }
+}
