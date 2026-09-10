@@ -993,6 +993,84 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
     Ok(())
 }
 
+/// handle a Stream ID Withdrawal message (ZdpPacketType 5)
+///
+/// Sent by a node whose visa was revoked: "the stream id you send with has
+/// been withdrawn; drop your egress binding" (zipline#21). On the adapter
+/// side the withdrawn id is the tether id held in the *outbound* ELT, so
+/// the ELT entry is removed by tether id; the next outbound packet for that
+/// flow then misses the ELT and triggers a fresh visa request.
+pub async fn handle_stream_id_withdrawal(asm: &Arc<Assembly>, pkt: Packet) -> HandleMgmtResult {
+    let Some(ingress_link_id) = NonZero::new(pkt.metadata().ingress_link_id) else {
+        // who sent this??
+        error!(target: FLOW_MGMT, "coding error: stray packet from unknown source; dropping");
+        return Ok(());
+    };
+
+    let link_type = match asm.peer_table.get(ingress_link_id.get()) {
+        Some(peer_state) => peer_state.link_state_machine.get_link_type(),
+        None => {
+            return Err(HandleMgmtError::LinkClosed);
+        }
+    };
+
+    match (link_type, ingress_link_id.get()) {
+        (LinkType::AdapterToNode, _) | (LinkType::Internal, DOCK_LINK_ID) => {
+            // We are the adapter: our node withdrew a stream id we send with.
+            let stream_id = pkt.metadata().ingress_stream_id;
+            debug!(
+                target: ZDP,
+                "{}: stream id withdrawal, node -> adapter",
+                asm.formatted_link_id(ingress_link_id.get())
+            );
+            // Remove the outbound (ELT) entry bound to that tether id.
+            match asm.elt.remove_by_tether_id(stream_id) {
+                Some(five_tuple) => {
+                    debug!(
+                        target: FLOW_MGMT,
+                        "{}: withdrew stream {stream_id}, removed ELT entry for {five_tuple}",
+                        asm.formatted_link_id(ingress_link_id.get())
+                    );
+                }
+                None => {
+                    warn!(
+                        target: FLOW_MGMT,
+                        "{}: stream id withdrawal for {stream_id} matched no ELT entry",
+                        asm.formatted_link_id(ingress_link_id.get())
+                    );
+                }
+            }
+        }
+        (LinkType::NodeToAdapter, _) | (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
+            // We are the node; adapters do not withdraw stream ids from us.
+            debug!(
+                target: ZDP,
+                "{}: adapter -> node not permitted",
+                asm.formatted_link_id(ingress_link_id.get())
+            );
+            return Err(HandleMgmtError::MessageNotPermitted);
+        }
+        (LinkType::NodeToNode, _) => {
+            debug!(
+                target: ZDP,
+                "{}: node -> node UNIMPLEMENTED",
+                asm.formatted_link_id(ingress_link_id.get())
+            );
+            return Err(HandleMgmtError::MessageNotPermitted);
+        }
+        (LinkType::Internal, _) => {
+            error!(
+                target: ZDP,
+                "{}: internal",
+                asm.formatted_link_id(ingress_link_id.get())
+            );
+            return Err(HandleMgmtError::MessageNotPermitted);
+        }
+    }
+
+    Ok(())
+}
+
 fn peer_type_by_id(asm: &Assembly, link_id: NonZero<LinkId>) -> PeerType {
     asm.peer_table
         .inspect(link_id.get(), |ps| ps.peer_type())

@@ -310,15 +310,19 @@ impl Assembly {
             // Withdraw each revoked stream from the *surviving* peers so
             // they drop their egress bindings and re-request visas instead
             // of blackholing traffic on dead streams (zipline#21). The
-            // dying link's own entries are skipped — that peer is gone.
+            // message is StreamIdWithdrawal — "the stream id YOU send with
+            // has been withdrawn" — because entry.1 is the tether id the
+            // surviving adapter holds in its *outbound* ELT, not an id in
+            // its inbound DLT (which is what UnbindEgressStreamIndication's
+            // handler removes from). The dying link's own entries are
+            // skipped — that peer is gone.
             // Note the expiry path (`VisaTable::handle_expirations`)
             // deliberately does not notify: both ends share the visa expiry
             // and eject on their own clocks, and a peer that sends early
             // gets UnknownStreamId and re-requests.
             for entry in withdrawn {
                 if entry.0 != link_id {
-                    mgmt::requests::send_unbind_egress_stream_request(self, entry.0, entry.1)
-                        .enqueue();
+                    mgmt::requests::send_stream_id_withdrawal(self, entry.0, entry.1).enqueue();
                 }
             }
         }

@@ -195,6 +195,23 @@ impl EndpointLookupTable {
 
         Ok(entry)
     }
+
+    /// Remove the Active entry whose tether id matches `tether_id`, if any,
+    /// returning its five-tuple. Used when a peer withdraws a stream id
+    /// (`StreamIdWithdrawal`): the withdrawn id is the tether id we send
+    /// with, so it identifies an *outbound* (ELT) entry, keyed here by
+    /// five-tuple rather than by id. Pending entries have no tether id yet
+    /// and never match (zipline#21).
+    pub fn remove_by_tether_id(&self, tether_id: StreamId) -> Option<FiveTuple> {
+        // Find the key first and drop the iterator before removing:
+        // removing while holding a DashMap ref deadlocks.
+        let five_tuple = self.table.iter().find_map(|entry| match entry.value() {
+            EltEntry::Active(pep) if pep.tether_id == tether_id => Some(*entry.key()),
+            _ => None,
+        })?;
+
+        self.remove(&five_tuple).ok().map(|_| five_tuple)
+    }
 }
 
 pub struct DltPep {
