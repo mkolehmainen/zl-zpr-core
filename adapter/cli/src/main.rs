@@ -276,7 +276,9 @@ async fn process_command(
                 Commands::Connect { id, no_browser } => {
                     connect_task(service, id, no_browser).await?
                 }
-                Commands::AuthAgent { id } => auth_agent_task(service, id).await?,
+                Commands::AuthAgent { id, no_browser } => {
+                    auth_agent_task(service, id, no_browser).await?
+                }
                 Commands::OidcLogin { .. } => unreachable!("handled before connecting"),
                 Commands::Quit => return Ok(true), // Will never reach here
             }
@@ -336,10 +338,7 @@ async fn connect_task(service: svc::Client, id: u32, no_browser: bool) -> Result
     // since the issuer is not known until then.
     request
         .get()
-        .set_auth_agent(capnp_rpc::new_client(oidc::CliAuthAgent {
-            open_browser: !no_browser,
-            progress: None,
-        }));
+        .set_auth_agent(capnp_rpc::new_client(interactive_auth_agent(no_browser)));
 
     let response = request.send().promise.await?;
     let results = response.get()?;
@@ -381,6 +380,16 @@ async fn connect_task(service: svc::Client, id: u32, no_browser: bool) -> Result
     }
 }
 
+/// Build the interactive [`oidc::CliAuthAgent`] shared by `connect` and
+/// `auth-agent`: `--no-browser` prints authorization URLs through the
+/// progress path instead of launching a browser.
+fn interactive_auth_agent(no_browser: bool) -> oidc::CliAuthAgent {
+    oidc::CliAuthAgent {
+        open_browser: !no_browser,
+        progress: None,
+    }
+}
+
 /// `auth-agent`: register as the authentication agent for a link and serve
 /// interactive OIDC requests until SIGINT.
 ///
@@ -388,15 +397,12 @@ async fn connect_task(service: svc::Client, id: u32, no_browser: bool) -> Result
 /// registers the agent before firing the Start event, so on a link that is
 /// already started the resulting `UnexpectedTransition` error is benign and
 /// tolerated (see [oidc::start_link_error_is_fatal]).
-async fn auth_agent_task(service: svc::Client, id: u32) -> Result<(), CliError> {
+async fn auth_agent_task(service: svc::Client, id: u32, no_browser: bool) -> Result<(), CliError> {
     let mut request = service.start_link_request();
     request.get().set_id(id);
     request
         .get()
-        .set_auth_agent(capnp_rpc::new_client(oidc::CliAuthAgent {
-            open_browser: true,
-            progress: None,
-        }));
+        .set_auth_agent(capnp_rpc::new_client(interactive_auth_agent(no_browser)));
 
     let response = request.send().promise.await?;
     let results = response.get()?;
@@ -924,5 +930,27 @@ impl CtrlcHandle {
         let wait = *guard;
         *guard = true;
         wait
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shared constructor maps `--no-browser` onto
+    /// `CliAuthAgent::open_browser` for both `connect` and `auth-agent`
+    /// (zipline#20).
+    #[test]
+    fn interactive_auth_agent_maps_no_browser_to_open_browser() {
+        let agent = interactive_auth_agent(true);
+        assert!(
+            !agent.open_browser,
+            "no_browser: true → open_browser: false"
+        );
+        assert!(agent.progress.is_none());
+
+        let agent = interactive_auth_agent(false);
+        assert!(agent.open_browser, "no_browser: false → open_browser: true");
+        assert!(agent.progress.is_none());
     }
 }

@@ -91,6 +91,9 @@ pub enum Commands {
         #[arg(required = true)]
         /// Link id to serve as authentication agent for
         id: u32,
+        /// Print authentication URLs instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Debug: run the OIDC relying-party login flow standalone and print the
     /// resulting id_token to stdout
@@ -191,25 +194,37 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
 mod tests {
     use super::*;
 
-    /// `auth-agent <id> --no-browser` must parse (zipline#20).
+    /// `auth-agent <id> --no-browser` must parse, setting the flag
+    /// (zipline#20).
     #[test]
     fn auth_agent_accepts_no_browser_flag() {
         let parsed = CmdlineArgs::try_parse_from(["ph-cli", "auth-agent", "1", "--no-browser"]);
-        assert!(
-            parsed.is_ok(),
-            "auth-agent should accept --no-browser: {:?}",
-            parsed.err()
-        );
+        match parsed {
+            Ok(CmdlineArgs {
+                command: Some(Commands::AuthAgent { id, no_browser }),
+                ..
+            }) => {
+                assert_eq!(id, 1);
+                assert!(no_browser);
+            }
+            other => panic!("auth-agent should accept --no-browser: {other:?}"),
+        }
     }
 
-    /// Without the flag, `auth-agent <id>` still parses (default off).
+    /// Without the flag, `auth-agent <id>` still parses with the flag
+    /// defaulting off.
     #[test]
     fn auth_agent_parses_without_no_browser_flag() {
         let parsed = CmdlineArgs::try_parse_from(["ph-cli", "auth-agent", "1"]);
-        assert!(
-            parsed.is_ok(),
-            "auth-agent without --no-browser should parse: {:?}",
-            parsed.err()
-        );
+        match parsed {
+            Ok(CmdlineArgs {
+                command: Some(Commands::AuthAgent { id, no_browser }),
+                ..
+            }) => {
+                assert_eq!(id, 1);
+                assert!(!no_browser, "--no-browser must default off");
+            }
+            other => panic!("auth-agent without --no-browser should parse: {other:?}"),
+        }
     }
 }
