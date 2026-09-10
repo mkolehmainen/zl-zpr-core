@@ -561,4 +561,195 @@ pub mod test {
             reload_handle,
         }
     }
+
+    mod drop_peer_notify {
+        //! Tests for zipline#21: revoking visas for a dying link must
+        //! withdraw the streams from *surviving* peers by sending them an
+        //! `UnbindEgressStreamIndication`; expiry deliberately does not.
+
+        use super::*;
+        use crate::forwarding_tables::PftPep;
+        use crate::packet_queue;
+        use crate::peer_table::test::create_dummy_peer_state;
+        use crate::visa_table::VisaTable;
+        use crate::visa_table::tests::new_vsapi_visa_tcp_default;
+        use crate::zdp;
+        use chrono::{DateTime, Utc};
+        use std::net::Ipv4Addr;
+        use zpr_utils::net_defs;
+
+        /// Build a Node-mode assembly whose mgmt substrate egress queue we
+        /// can read back, plus two dummy peers, and one visa (id >=
+        /// MIN_VISA_ID) with forwarding entries on both links.
+        ///
+        /// Returns (asm, egress queue receiver, link_a, link_b, tether_a, tether_b).
+        fn setup_two_link_visa() -> (
+            Arc<Assembly>,
+            packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+            LinkId,
+            LinkId,
+            StreamId,
+            StreamId,
+        ) {
+            let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
+
+            let mut builder = TestAssemblyBuilder::new();
+            builder.ph_mode = Some(PhMode::Node);
+            builder.visa_table = Some(VisaTable::new());
+            builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
+            let asm = Arc::new(create_assembly(builder));
+
+            let entry_a = asm.peer_table.vacant_entry().unwrap();
+            let key_a = entry_a.key();
+            let link_a = entry_a
+                .insert(create_dummy_peer_state(
+                    key_a,
+                    LinkType::Internal,
+                    SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
+                    net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
+                ))
+                .get();
+
+            let entry_b = asm.peer_table.vacant_entry().unwrap();
+            let key_b = entry_b.key();
+            let link_b = entry_b
+                .insert(create_dummy_peer_state(
+                    key_b,
+                    LinkType::Internal,
+                    SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(2, 2, 3, 4)), 443),
+                    net_defs::ScopedIpAddr::V4(Ipv4Addr::new(2, 2, 3, 5)),
+                ))
+                .get();
+
+            let visa_id = 3000;
+            let mut visa_table = asm.visa_table.write().unwrap();
+            let v = new_vsapi_visa_tcp_default(visa_id as u64, DateTime::<Utc>::MAX_UTC.into());
+            let _ = visa_table.insert_visa(v);
+
+            let peer_a = asm.peer_table.get(link_a).unwrap();
+            let tether_a = peer_a
+                .pft
+                .insert(PftPep {
+                    next_hop: ForwardingEntry(link_a, 1),
+                    visa_id,
+                })
+                .unwrap();
+            visa_table
+                .link_forwarding_entry(visa_id, ForwardingEntry(link_a, tether_a))
+                .unwrap();
+
+            let peer_b = asm.peer_table.get(link_b).unwrap();
+            let tether_b = peer_b
+                .pft
+                .insert(PftPep {
+                    next_hop: ForwardingEntry(link_b, 1),
+                    visa_id,
+                })
+                .unwrap();
+            visa_table
+                .link_forwarding_entry(visa_id, ForwardingEntry(link_b, tether_b))
+                .unwrap();
+
+            drop(visa_table);
+            drop(peer_a);
+            drop(peer_b);
+
+            (asm, egress_rx, link_a, link_b, tether_a, tether_b)
+        }
+
+        fn try_recv_packet(
+            rx: &mut packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+        ) -> Option<crate::packet::Packet> {
+            let buf = vec![0u8; config::PACKET_BUFFER_SIZE].into_boxed_slice();
+            match rx.try_recv(buf) {
+                Ok(pkt) => Some(pkt),
+                Err(packet_queue::TryRecvError::Empty(_)) => None,
+                Err(err) => panic!("unexpected queue error: {err:?}"),
+            }
+        }
+
+        /// Dropping a peer must send `UnbindEgressStreamIndication` for each
+        /// withdrawn forwarding entry on a *surviving* link — naming the
+        /// stream id that surviving peer bound — and nothing for entries on
+        /// the dying link itself.
+        #[tokio::test]
+        async fn test_drop_peer_sends_unbind_to_surviving_peer() {
+            let (asm, mut egress_rx, link_a, link_b, _tether_a, tether_b) = setup_two_link_visa();
+
+            asm.drop_peer(link_a);
+
+            let pkt = try_recv_packet(&mut egress_rx)
+                .expect("expected an UnbindEgressStreamIndication for the surviving peer");
+            assert_eq!(pkt.metadata().egress_link_id, link_b);
+
+            let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+            let packet_type = base_hdr.packet_type;
+            assert_eq!(packet_type, zdp::ZdpPacketType::UnbindEgressStreamIndication);
+
+            let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
+            let (per_flow_hdr, _rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();
+            let stream_id: u32 = per_flow_hdr.stream_id.into();
+            assert_eq!(stream_id, tether_b);
+
+            // Exactly one indication: the entry on the dying link must NOT
+            // produce a send (that peer is gone).
+            assert!(
+                try_recv_packet(&mut egress_rx).is_none(),
+                "no indication may be sent for the dying link's own entry"
+            );
+        }
+
+        /// Visa expiry must NOT notify peers: both ends hold the same expiry
+        /// and eject on their own clocks; an early-sending peer gets
+        /// UnknownStreamId and re-requests, unlike the revocation case.
+        #[tokio::test]
+        async fn test_handle_expirations_does_not_notify_peers() {
+            let (egress_tx, mut egress_rx) = packet_queue::packet_queue(8);
+
+            let mut builder = TestAssemblyBuilder::new();
+            builder.ph_mode = Some(PhMode::Node);
+            builder.visa_table = Some(VisaTable::new());
+            builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
+            let asm = Arc::new(create_assembly(builder));
+
+            let entry = asm.peer_table.vacant_entry().unwrap();
+            let key = entry.key();
+            let link_id = entry
+                .insert(create_dummy_peer_state(
+                    key,
+                    LinkType::Internal,
+                    SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
+                    net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
+                ))
+                .get();
+
+            let visa_id = 3000;
+            let mut visa_table = asm.visa_table.write().unwrap();
+            // Already expired
+            let v = new_vsapi_visa_tcp_default(visa_id as u64, DateTime::<Utc>::MIN_UTC.into());
+            let _ = visa_table.insert_visa(v);
+
+            let peer = asm.peer_table.get(link_id).unwrap();
+            let tether_id = peer
+                .pft
+                .insert(PftPep {
+                    next_hop: ForwardingEntry(link_id, 1),
+                    visa_id,
+                })
+                .unwrap();
+            visa_table
+                .link_forwarding_entry(visa_id, ForwardingEntry(link_id, tether_id))
+                .unwrap();
+
+            visa_table.handle_expirations(&asm.peer_table);
+            assert!(!visa_table.table.contains_key(&visa_id));
+            assert_eq!(peer.pft.len(), 0);
+            drop(visa_table);
+
+            assert!(
+                try_recv_packet(&mut egress_rx).is_none(),
+                "expiry must not emit any unbind indication"
+            );
+        }
+    }
 }

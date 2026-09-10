@@ -439,7 +439,7 @@ fn make_tcp_visa(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
@@ -730,6 +730,72 @@ mod tests {
         assert!(!visa_table.table.contains_key(&visa_id));
         assert_eq!(peer_a.pft.len(), 0);
         assert_eq!(peer_b.pft.len(), 0);
+    }
+
+    /// Revoking for a link must hand back every withdrawn forwarding entry —
+    /// including those on *surviving* links — so the caller can notify those
+    /// peers (zipline#21). The caller filters out the dying link's own entry.
+    #[tokio::test]
+    async fn test_revoke_for_link_returns_surviving_link_entries() {
+        let mut builder = TestAssemblyBuilder::new();
+        builder.visa_table = Some(VisaTable::new());
+        let asm = Arc::new(create_assembly(builder));
+
+        let entry_a = asm.peer_table.vacant_entry().unwrap();
+        let key_a = entry_a.key();
+        let link_a = entry_a
+            .insert(create_dummy_peer_state(
+                key_a,
+                LinkType::Internal,
+                SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
+                net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
+            ))
+            .get();
+
+        let entry_b = asm.peer_table.vacant_entry().unwrap();
+        let key_b = entry_b.key();
+        let link_b = entry_b
+            .insert(create_dummy_peer_state(
+                key_b,
+                LinkType::Internal,
+                SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(2, 2, 3, 4)), 443),
+                net_defs::ScopedIpAddr::V4(Ipv4Addr::new(2, 2, 3, 5)),
+            ))
+            .get();
+
+        let visa_id = 3000;
+        let mut visa_table = asm.visa_table.write().unwrap();
+        let v = new_vsapi_visa_tcp_default(visa_id as u64, DateTime::<Utc>::MAX_UTC.into());
+        let _ = visa_table.insert_visa(v);
+
+        let peer_a = asm.peer_table.get(link_a).unwrap();
+        let pep_a = PftPep {
+            next_hop: ForwardingEntry(link_a, 1),
+            visa_id,
+        };
+        let tether_a = peer_a.pft.insert(pep_a).unwrap();
+        visa_table
+            .link_forwarding_entry(visa_id, ForwardingEntry(link_a, tether_a))
+            .unwrap();
+
+        let peer_b = asm.peer_table.get(link_b).unwrap();
+        let pep_b = PftPep {
+            next_hop: ForwardingEntry(link_b, 1),
+            visa_id,
+        };
+        let tether_b = peer_b.pft.insert(pep_b).unwrap();
+        visa_table
+            .link_forwarding_entry(visa_id, ForwardingEntry(link_b, tether_b))
+            .unwrap();
+
+        let withdrawn = visa_table.revoke_for_link(link_a, &asm.peer_table);
+
+        assert_eq!(withdrawn.len(), 2);
+        assert!(withdrawn.contains(&ForwardingEntry(link_a, tether_a)));
+        assert!(
+            withdrawn.contains(&ForwardingEntry(link_b, tether_b)),
+            "the surviving link's entry must be returned so its peer can be notified"
+        );
     }
 
     #[tokio::test]
