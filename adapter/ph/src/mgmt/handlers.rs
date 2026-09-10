@@ -1059,4 +1059,63 @@ mod test {
         assert!(addrs.is_none());
         assert_eq!(parsed_blob, blob);
     }
+
+    /// A StreamIdWithdrawal received by the adapter (over its node link)
+    /// must remove the ELT entry whose tether id matches the withdrawn
+    /// stream id, so the next outbound packet misses the ELT and triggers a
+    /// fresh visa request instead of sending on the revoked stream
+    /// (zipline#21).
+    #[tokio::test]
+    async fn test_handle_stream_id_withdrawal_removes_elt_entry_by_tether_id() {
+        use crate::adapter_tables::EltPep;
+        use crate::defs::FiveTuple;
+        use crate::mgmt::txn_mgr::TxnMgr;
+        use crate::peer_table::test::create_dummy_peer_state;
+        use std::net::{IpAddr, Ipv4Addr};
+        use zpr::packet_info::{CompressionMode, SubstrateAddr};
+        use zpr_utils::net_defs;
+
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+
+        // A peer that looks like our node (adapter -> node link).
+        let entry = asm.peer_table.vacant_entry().unwrap();
+        let key = entry.key();
+        let link_id = entry
+            .insert(create_dummy_peer_state(
+                key,
+                LinkType::AdapterToNode,
+                SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
+                net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
+            ))
+            .get();
+
+        // An Active ELT entry bound to tether id 42.
+        let five_tuple = FiveTuple {
+            src_port: 4242,
+            ..FiveTuple::default()
+        };
+        let txn_mgr = Arc::new(TxnMgr::new());
+        let txn = txn_mgr.try_open().unwrap();
+        asm.elt
+            .insert_pending(five_tuple, core::new_heap_packet(), &txn)
+            .unwrap();
+        asm.elt
+            .set_active(
+                &five_tuple,
+                EltPep::new(CompressionMode::default(), 42, None),
+            )
+            .unwrap();
+
+        // A withdrawal for stream id 42 arriving on that link.
+        let mut pkt = core::new_heap_packet();
+        pkt.metadata_mut().ingress_link_id = link_id;
+        pkt.metadata_mut().ingress_stream_id = 42;
+
+        handle_stream_id_withdrawal(&asm, pkt).await.unwrap();
+
+        assert!(
+            asm.elt.get(&five_tuple).is_none(),
+            "stale ELT entry must be removed"
+        );
+    }
 }

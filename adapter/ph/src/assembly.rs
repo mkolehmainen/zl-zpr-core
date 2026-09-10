@@ -690,26 +690,26 @@ pub mod test {
             }
         }
 
-        /// Dropping a peer must send `UnbindEgressStreamIndication` for each
-        /// withdrawn forwarding entry on a *surviving* link — naming the
-        /// stream id that surviving peer bound — and nothing for entries on
-        /// the dying link itself.
+        /// Dropping a peer must send `StreamIdWithdrawal` for each withdrawn
+        /// forwarding entry on a *surviving* link — naming the stream id
+        /// (PFT tether id) that surviving peer sends with — and nothing for
+        /// entries on the dying link itself. StreamIdWithdrawal (not
+        /// UnbindEgressStreamIndication) because the id lives in the
+        /// receiving adapter's *outbound* ELT, keyed by tether id, not in
+        /// its inbound DLT (zipline#21).
         #[tokio::test]
-        async fn test_drop_peer_sends_unbind_to_surviving_peer() {
+        async fn test_drop_peer_sends_stream_id_withdrawal_to_surviving_peer() {
             let (asm, mut egress_rx, link_a, link_b, _tether_a, tether_b) = setup_two_link_visa();
 
             asm.drop_peer(link_a);
 
             let pkt = try_recv_packet(&mut egress_rx)
-                .expect("expected an UnbindEgressStreamIndication for the surviving peer");
+                .expect("expected a StreamIdWithdrawal for the surviving peer");
             assert_eq!(pkt.metadata().egress_link_id, link_b);
 
             let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
             let packet_type = base_hdr.packet_type;
-            assert_eq!(
-                packet_type,
-                zdp::ZdpPacketType::UnbindEgressStreamIndication
-            );
+            assert_eq!(packet_type, zdp::ZdpPacketType::StreamIdWithdrawal);
 
             let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
             let (per_flow_hdr, _rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();

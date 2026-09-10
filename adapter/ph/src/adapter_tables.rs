@@ -266,3 +266,80 @@ impl DockLookupTable {
         self.reader.write(new_reader);
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::mgmt::core::new_heap_packet;
+    use crate::mgmt::txn_mgr::TxnMgr;
+    use std::sync::Arc;
+
+    /// A five-tuple distinguished by source port (everything else default).
+    fn five_tuple(src_port: u16) -> FiveTuple {
+        FiveTuple {
+            src_port,
+            ..FiveTuple::default()
+        }
+    }
+
+    /// Insert an Active ELT entry for `five_tuple` bound to `tether_id`,
+    /// going through the real Pending -> Active lifecycle.
+    fn insert_active(
+        elt: &EndpointLookupTable,
+        txn_mgr: &Arc<TxnMgr>,
+        five_tuple: FiveTuple,
+        tether_id: StreamId,
+    ) {
+        let txn = txn_mgr.try_open().unwrap();
+        elt.insert_pending(five_tuple, new_heap_packet(), &txn)
+            .unwrap();
+        elt.set_active(
+            &five_tuple,
+            EltPep::new(CompressionMode::default(), tether_id, None),
+        )
+        .unwrap();
+    }
+
+    /// Removing by tether id must remove exactly the Active entry bound to
+    /// that tether, return its five-tuple, and leave other entries alone
+    /// (zipline#21).
+    #[test]
+    fn test_remove_by_tether_id_removes_matching_active_entry() {
+        let elt = EndpointLookupTable::new();
+        let txn_mgr = Arc::new(TxnMgr::new());
+        let ft_a = five_tuple(1000);
+        let ft_b = five_tuple(2000);
+        insert_active(&elt, &txn_mgr, ft_a, 10);
+        insert_active(&elt, &txn_mgr, ft_b, 20);
+
+        assert_eq!(elt.remove_by_tether_id(10), Some(ft_a));
+        assert!(elt.get(&ft_a).is_none(), "matched entry must be removed");
+        assert!(elt.get(&ft_b).is_some(), "other entries must survive");
+    }
+
+    /// An unknown tether id must remove nothing and return None.
+    #[test]
+    fn test_remove_by_tether_id_returns_none_on_miss() {
+        let elt = EndpointLookupTable::new();
+        let txn_mgr = Arc::new(TxnMgr::new());
+        let ft = five_tuple(1000);
+        insert_active(&elt, &txn_mgr, ft, 10);
+
+        assert_eq!(elt.remove_by_tether_id(99), None);
+        assert!(elt.get(&ft).is_some(), "non-matching entry must survive");
+    }
+
+    /// Pending entries have no tether id yet and must never match — even if
+    /// a numeric value collides with an unrelated id.
+    #[test]
+    fn test_remove_by_tether_id_ignores_pending_entries() {
+        let elt = EndpointLookupTable::new();
+        let txn_mgr = Arc::new(TxnMgr::new());
+        let ft = five_tuple(1000);
+        let txn = txn_mgr.try_open().unwrap();
+        elt.insert_pending(ft, new_heap_packet(), &txn).unwrap();
+
+        assert_eq!(elt.remove_by_tether_id(10), None);
+        assert!(elt.get(&ft).is_some(), "pending entry must survive");
+    }
+}
