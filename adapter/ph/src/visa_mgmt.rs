@@ -269,10 +269,14 @@ pub fn handle_revocation(
     asm: &Assembly,
     visa_id: VisaId,
 ) -> Result<(), visa_table::VisaTableError> {
+    // NOTE: the withdrawn forwarding entries are dropped here — VS-initiated
+    // revocation does not (yet) notify bound peers. Link-removal revocation
+    // does; see `Assembly::drop_peer` (zipline#21).
     asm.visa_table
         .write()
         .unwrap()
         .revoke(&asm.peer_table, visa_id)
+        .map(|_| ())
 }
 
 #[cfg(test)]

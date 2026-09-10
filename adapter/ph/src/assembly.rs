@@ -7,6 +7,7 @@ use crate::km_cert_exchange::KmCertExchange;
 use crate::km_multiplexor::KmState;
 use crate::km_noise;
 use crate::link_state::{LinkEvent, LinkStateError, LinkType};
+use crate::mgmt;
 use crate::mgmt_processor_worker;
 use crate::peer_table;
 use crate::peer_table::PeerInsertError;
@@ -295,10 +296,31 @@ impl Assembly {
             debug!(target: PEER_MGMT, "Removing peer {}", self.formatted_link_id(link_id));
         }
         if self.ph_mode == PhMode::Node {
-            self.visa_table
+            // Revoke visas under the write lock, but hold the withdrawn
+            // entries until the lock is released: the send path takes the
+            // peer's `zdpr_send` mutex, which must never nest under the
+            // visa-table lock (and `unbind_stream` itself re-acquires the
+            // visa-table lock, which is why it is not usable here).
+            let withdrawn = self
+                .visa_table
                 .write()
                 .unwrap()
                 .revoke_for_link(link_id, &self.peer_table);
+
+            // Withdraw each revoked stream from the *surviving* peers so
+            // they drop their egress bindings and re-request visas instead
+            // of blackholing traffic on dead streams (zipline#21). The
+            // dying link's own entries are skipped — that peer is gone.
+            // Note the expiry path (`VisaTable::handle_expirations`)
+            // deliberately does not notify: both ends share the visa expiry
+            // and eject on their own clocks, and a peer that sends early
+            // gets UnknownStreamId and re-requests.
+            for entry in withdrawn {
+                if entry.0 != link_id {
+                    mgmt::requests::send_unbind_egress_stream_request(self, entry.0, entry.1)
+                        .enqueue();
+                }
+            }
         }
         self.peer_table.remove(link_id);
         info!(target: PEER_MGMT, "Removed peer {}", self.formatted_link_id(link_id));
@@ -684,7 +706,10 @@ pub mod test {
 
             let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
             let packet_type = base_hdr.packet_type;
-            assert_eq!(packet_type, zdp::ZdpPacketType::UnbindEgressStreamIndication);
+            assert_eq!(
+                packet_type,
+                zdp::ZdpPacketType::UnbindEgressStreamIndication
+            );
 
             let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
             let (per_flow_hdr, _rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();
