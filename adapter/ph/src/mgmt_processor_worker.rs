@@ -150,6 +150,10 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
                 handlers::handle_unbind_indication(asm, pkt).await
             }
 
+            ZdpPacketType::StreamIdWithdrawal => {
+                handlers::handle_stream_id_withdrawal(asm, pkt).await
+            }
+
             packet_type => Err(HandleMgmtError::UnknownType(packet_type.0)),
         }
     } else {

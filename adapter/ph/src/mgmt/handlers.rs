@@ -993,6 +993,84 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
     Ok(())
 }
 
+/// handle a Stream ID Withdrawal message (ZdpPacketType 5)
+///
+/// Sent by a node whose visa was revoked: "the stream id you send with has
+/// been withdrawn; drop your egress binding" (zipline#21). On the adapter
+/// side the withdrawn id is the tether id held in the *outbound* ELT, so
+/// the ELT entry is removed by tether id; the next outbound packet for that
+/// flow then misses the ELT and triggers a fresh visa request.
+pub async fn handle_stream_id_withdrawal(asm: &Arc<Assembly>, pkt: Packet) -> HandleMgmtResult {
+    let Some(ingress_link_id) = NonZero::new(pkt.metadata().ingress_link_id) else {
+        // who sent this??
+        error!(target: FLOW_MGMT, "coding error: stray packet from unknown source; dropping");
+        return Ok(());
+    };
+
+    let link_type = match asm.peer_table.get(ingress_link_id.get()) {
+        Some(peer_state) => peer_state.link_state_machine.get_link_type(),
+        None => {
+            return Err(HandleMgmtError::LinkClosed);
+        }
+    };
+
+    match (link_type, ingress_link_id.get()) {
+        (LinkType::AdapterToNode, _) | (LinkType::Internal, DOCK_LINK_ID) => {
+            // We are the adapter: our node withdrew a stream id we send with.
+            let stream_id = pkt.metadata().ingress_stream_id;
+            debug!(
+                target: ZDP,
+                "{}: stream id withdrawal, node -> adapter",
+                asm.formatted_link_id(ingress_link_id.get())
+            );
+            // Remove the outbound (ELT) entry bound to that tether id.
+            match asm.elt.remove_by_tether_id(stream_id) {
+                Some(five_tuple) => {
+                    debug!(
+                        target: FLOW_MGMT,
+                        "{}: withdrew stream {stream_id}, removed ELT entry for {five_tuple}",
+                        asm.formatted_link_id(ingress_link_id.get())
+                    );
+                }
+                None => {
+                    warn!(
+                        target: FLOW_MGMT,
+                        "{}: stream id withdrawal for {stream_id} matched no ELT entry",
+                        asm.formatted_link_id(ingress_link_id.get())
+                    );
+                }
+            }
+        }
+        (LinkType::NodeToAdapter, _) | (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
+            // We are the node; adapters do not withdraw stream ids from us.
+            debug!(
+                target: ZDP,
+                "{}: adapter -> node not permitted",
+                asm.formatted_link_id(ingress_link_id.get())
+            );
+            return Err(HandleMgmtError::MessageNotPermitted);
+        }
+        (LinkType::NodeToNode, _) => {
+            debug!(
+                target: ZDP,
+                "{}: node -> node UNIMPLEMENTED",
+                asm.formatted_link_id(ingress_link_id.get())
+            );
+            return Err(HandleMgmtError::MessageNotPermitted);
+        }
+        (LinkType::Internal, _) => {
+            error!(
+                target: ZDP,
+                "{}: internal",
+                asm.formatted_link_id(ingress_link_id.get())
+            );
+            return Err(HandleMgmtError::MessageNotPermitted);
+        }
+    }
+
+    Ok(())
+}
+
 fn peer_type_by_id(asm: &Assembly, link_id: NonZero<LinkId>) -> PeerType {
     asm.peer_table
         .inspect(link_id.get(), |ps| ps.peer_type())
@@ -1058,5 +1136,64 @@ mod test {
         let (addrs, parsed_blob) = parse_acquire_zpr_address_request(&mut req).unwrap();
         assert!(addrs.is_none());
         assert_eq!(parsed_blob, blob);
+    }
+
+    /// A StreamIdWithdrawal received by the adapter (over its node link)
+    /// must remove the ELT entry whose tether id matches the withdrawn
+    /// stream id, so the next outbound packet misses the ELT and triggers a
+    /// fresh visa request instead of sending on the revoked stream
+    /// (zipline#21).
+    #[tokio::test]
+    async fn test_handle_stream_id_withdrawal_removes_elt_entry_by_tether_id() {
+        use crate::adapter_tables::EltPep;
+        use crate::defs::FiveTuple;
+        use crate::mgmt::txn_mgr::TxnMgr;
+        use crate::peer_table::test::create_dummy_peer_state;
+        use std::net::{IpAddr, Ipv4Addr};
+        use zpr::packet_info::{CompressionMode, SubstrateAddr};
+        use zpr_utils::net_defs;
+
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+
+        // A peer that looks like our node (adapter -> node link).
+        let entry = asm.peer_table.vacant_entry().unwrap();
+        let key = entry.key();
+        let link_id = entry
+            .insert(create_dummy_peer_state(
+                key,
+                LinkType::AdapterToNode,
+                SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
+                net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
+            ))
+            .get();
+
+        // An Active ELT entry bound to tether id 42.
+        let five_tuple = FiveTuple {
+            src_port: 4242,
+            ..FiveTuple::default()
+        };
+        let txn_mgr = Arc::new(TxnMgr::new());
+        let txn = txn_mgr.try_open().unwrap();
+        asm.elt
+            .insert_pending(five_tuple, core::new_heap_packet(), &txn)
+            .unwrap();
+        asm.elt
+            .set_active(
+                &five_tuple,
+                EltPep::new(CompressionMode::default(), 42, None),
+            )
+            .unwrap();
+
+        // A withdrawal for stream id 42 arriving on that link.
+        let mut pkt = core::new_heap_packet();
+        pkt.metadata_mut().ingress_link_id = link_id;
+        pkt.metadata_mut().ingress_stream_id = 42;
+
+        handle_stream_id_withdrawal(&asm, pkt).await.unwrap();
+
+        assert!(
+            asm.elt.get(&five_tuple).is_none(),
+            "stale ELT entry must be removed"
+        );
     }
 }

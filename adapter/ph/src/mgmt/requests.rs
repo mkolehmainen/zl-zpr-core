@@ -581,3 +581,26 @@ pub fn send_unbind_egress_stream_request<'a>(
         req,
     )
 }
+
+/// send a Stream ID Withdrawal message (ZdpPacketType 5)
+///
+/// Node -> peer adapter, per-flow: "the stream id you send with has been
+/// withdrawn; drop your egress binding". `stream_id` is the tether id the
+/// receiving adapter holds in its outbound ELT (zipline#21).
+pub fn send_stream_id_withdrawal<'a>(
+    asm: &'a Assembly,
+    link_id: LinkId,
+    stream_id: StreamId,
+) -> Sent<'a> {
+    debug!(target: ZDP, "{}: sending StreamIdWithdrawal", asm.formatted_link_id(link_id));
+
+    let req = core::new_heap_packet();
+
+    core::send_per_flow_mgmt(
+        asm,
+        link_id,
+        zdp::ZdpPacketType::StreamIdWithdrawal,
+        stream_id,
+        req,
+    )
+}

@@ -485,6 +485,17 @@ do
 	fi
 done
 
+# zipline#21: restarting adapter1 revokes its visas on the node; the node must
+# withdraw the streams from the surviving adapter2 (UnbindEgressStreamIndication)
+# so it re-requests a visa instead of blackholing on the dead stream. If the
+# node dropped any packet as Unknown Stream ID, that withdrawal did not happen.
+USID=$(counters "$NODE_SOCK" | awk -F': ' '$1 == "Unknown Stream ID" { usid += $2 } END { print usid+0 }')
+if (( USID != 0 ))
+then
+	echo "$(basename "$NODE_SOCK"): ERROR: node dropped $USID packet(s) as Unknown Stream ID (stale peer stream binding after revocation)"
+	PASS=1
+fi
+
 
 #
 # Cleanup
