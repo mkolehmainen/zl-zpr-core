@@ -390,12 +390,20 @@ impl Assembly {
         }
     }
 
-    /// Add a tether to the peer table
+    /// Add a tether to the peer table.
+    ///
+    /// `auto_start` controls whether the link starts (fires
+    /// `LinkEvent::Start`, Inactive -> Keying) immediately. Adapters started
+    /// with `--auto-connect=false` pass `false` (zipline#28): the peer is
+    /// still created — so ph-cli has a link to target — but it idles in
+    /// Inactive until a `startLink` RPC wakes it. Everything else passes
+    /// `true`, today's behaviour.
     pub fn start_tether(
         self: &Arc<Self>,
         adapter_addr: &SubstrateAddr,
         interface_addr: &ScopedIpAddr,
         link_type: LinkType,
+        auto_start: bool,
     ) -> Result<NonZero<LinkId>, PeerInsertError> {
         assert!(matches!(
             link_type,
@@ -408,6 +416,11 @@ impl Assembly {
             // Peer is gone already
             return Ok(peer_id);
         };
+
+        if !auto_start {
+            info!(target: PEER_MGMT, "Tether with {adapter_addr} created idle (auto-connect off).  Assigned ID {}", self.formatted_link_id(peer_id.get()));
+            return Ok(peer_id);
+        }
 
         if let Err(e) = peer
             .link_state_machine
@@ -610,6 +623,91 @@ pub mod test {
         pub fn new() -> Self {
             Self::default()
         }
+    }
+
+    /// Test assembly able to key an AdapterToNode link: `process_start`
+    /// hands the link to the key manager, which needs a noise keypair and a
+    /// certificate exchange.
+    fn keyable_adapter_assembly() -> Arc<Assembly> {
+        let mut builder = TestAssemblyBuilder::new();
+        builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+        builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+        Arc::new(create_assembly(builder))
+    }
+
+    fn tether_addrs() -> (SubstrateAddr, ScopedIpAddr) {
+        (
+            SubstrateAddr::from(([127, 0, 0, 1], 9000)),
+            ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2).into()),
+        )
+    }
+
+    /// `start_tether` with `auto_start = false` (zipline#28: adapter started
+    /// with `--auto-connect=false`) must create the tether peer — so ph-cli
+    /// has a link to target — but leave it Inactive: no keying, no auth
+    /// attempt. The `LinkEvent::Start` that the `startLink` RPC fires must
+    /// then wake it into Keying, exactly like a restarted link.
+    #[tokio::test]
+    async fn test_start_tether_without_auto_start_idles_until_start_event() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let asm = keyable_adapter_assembly();
+                // Mirror main.rs adapter startup: local actor peer first, so
+                // the tether lands at DOCK_LINK_ID.
+                assert_eq!(
+                    asm.peer_table.insert_internal_peer().get(),
+                    zpr::packet_info::LOCAL_ACTOR_LINK_ID
+                );
+                let (peer_sa, if_addr) = tether_addrs();
+                let dsid = asm
+                    .start_tether(&peer_sa, &if_addr, LinkType::AdapterToNode, false)
+                    .unwrap();
+                assert_eq!(dsid.get(), zpr::packet_info::DOCK_LINK_ID);
+
+                let peer = asm.peer_table.get(dsid.get()).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_state(),
+                    crate::link_state::LinkState::Inactive,
+                    "idle-mode tether must stay Inactive at startup"
+                );
+
+                // What admin_worker::start_link fires on `ph-cli connect`.
+                asm.process_link_state_event(dsid.get(), LinkEvent::Start)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(dsid.get())
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    crate::link_state::LinkState::Keying,
+                    "startLink must wake the idle tether"
+                );
+            })
+            .await
+    }
+
+    /// `auto_start = true` is today's behaviour: the tether starts keying
+    /// immediately.
+    #[tokio::test]
+    async fn test_start_tether_with_auto_start_keys_immediately() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let asm = keyable_adapter_assembly();
+                let (peer_sa, if_addr) = tether_addrs();
+                let dsid = asm
+                    .start_tether(&peer_sa, &if_addr, LinkType::AdapterToNode, true)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(dsid.get())
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    crate::link_state::LinkState::Keying
+                );
+            })
+            .await
     }
 
     pub fn create_assembly(builder: TestAssemblyBuilder) -> Assembly {

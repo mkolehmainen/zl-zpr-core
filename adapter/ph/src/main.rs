@@ -601,11 +601,13 @@ fn main() -> ExitCode {
             );
 
             // instantiate tether
+            let auto_connect = asm.config.get().auto_connect;
             let dsid = asm
                 .start_tether(
                     asm.config.get().node_addr.as_ref().unwrap(),
                     &asm.config.get().self_addr.scoped_ip(),
                     link_state::LinkType::AdapterToNode,
+                    auto_connect,
                 )
                 .unwrap();
 
