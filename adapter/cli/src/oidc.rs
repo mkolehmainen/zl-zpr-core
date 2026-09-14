@@ -1209,6 +1209,24 @@ mod tests {
         );
     }
 
+    /// With auto-connect off, ph records `LinkFailed(..)` when a manually
+    /// started link dies before authentication (e.g. a Helloing timeout), so
+    /// the permanently Inactive link reads as this attempt's terminal
+    /// failure — not Pending, which would leave `connect` polling a link
+    /// that will never recover. Exit code is the generic 1.
+    #[test]
+    fn test_parse_show_link_state_manual_pre_auth_failure_is_terminal() {
+        let reason =
+            "LinkFailed(\"link failed before authentication completed (RequestTimedOut)\")";
+        assert_eq!(
+            parse_show_link_state(&format!(
+                "  State: Inactive (for 3ms)\n  Last auth failure: {reason}\n"
+            )),
+            LinkOutcome::Failed(reason.to_string())
+        );
+        assert_eq!(exit_code_for_auth_failure(reason), 1);
+    }
+
     /// Build an in-process Cap'n Proto client for [CliAuthAgent] with a
     /// captured progress channel. Must run inside a LocalSet (capnp clients
     /// are !Send).
