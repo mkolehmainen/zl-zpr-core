@@ -17,6 +17,13 @@ pub trait TunCtl: Sync {
 
     /// Clear an IP address from the TUN device.  Does not error if address is not set to begin with.
     fn clear_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()>;
+
+    /// Reports whether `addr` is currently configured on the TUN device.
+    ///
+    /// Returns an `Unsupported` error for addresses the platform cannot
+    /// inspect (currently IPv4 on both Linux and macOS), which callers must
+    /// distinguish from a definite "not present".
+    fn has_address(&self, addr: IpAddr) -> Result<bool>;
 }
 
 /// Canonical implementation of the `TunCtl` interface, just a thin wrapper
@@ -40,5 +47,8 @@ impl TunCtl for TunCtlImpl {
     }
     fn clear_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()> {
         self.tun.clear_address(addr, prefix_len)
+    }
+    fn has_address(&self, addr: IpAddr) -> Result<bool> {
+        self.tun.has_address(addr)
     }
 }

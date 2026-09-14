@@ -78,7 +78,7 @@ impl ZprTun {
             .mtx
             .lock()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Mutex lock failed"))?;
-        if self.has_address(addr)? {
+        if self.has_address_locked(addr)? {
             return Ok(());
         }
         let mut c = Command::new(COMMAND_IP);
@@ -126,7 +126,7 @@ impl ZprTun {
             .lock()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Mutex lock failed"))?;
 
-        if !self.has_address(addr)? {
+        if !self.has_address_locked(addr)? {
             return Ok(());
         }
 
@@ -153,8 +153,22 @@ impl ZprTun {
         Ok(())
     }
 
+    /// Reports whether `addr` is currently configured on this TUN device.
+    ///
+    /// Takes the device mutex, so callers must not already hold it; the
+    /// address-mutating operations use [`Self::has_address_locked`] instead.
+    pub fn has_address(&self, addr: IpAddr) -> std::io::Result<bool> {
+        let mtx = self
+            .mtx
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Mutex lock failed"))?;
+        let result = self.has_address_locked(addr);
+        drop(mtx);
+        result
+    }
+
     // Should be called while holding the mutex.
-    fn has_address(&self, addr: IpAddr) -> std::io::Result<bool> {
+    fn has_address_locked(&self, addr: IpAddr) -> std::io::Result<bool> {
         if addr.is_ipv4() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,

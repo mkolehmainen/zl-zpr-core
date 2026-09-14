@@ -636,6 +636,17 @@ impl LinkStateWrapper {
         // against the new attempt.
         self.locked_data.lock().unwrap().last_auth_failure = None;
 
+        // A Start also begins a fresh ZDP-R session.  An adapter keeps one
+        // peer table entry per link for the life of the process, but the
+        // node it docks with allocates a new link -- and so a new ZDP-R
+        // session, restarting at sequence number 0 -- for every attempt.
+        // Carrying the previous attempt's sequence numbers and receive
+        // window into this one would have each side silently discard the
+        // other's traffic.
+        if let Some(peer) = asm.peer_table.get(link_id) {
+            peer.reset_zdpr_session();
+        }
+
         info!(target: LINK_STATE, "{} started.  Keying in progress", asm.formatted_link_id(link_id));
 
         match self.link_type {
@@ -2461,6 +2472,66 @@ mod tests {
                     peer.link_state_machine.get_last_auth_failure(),
                     None,
                     "stale auth failure survived into the new attempt"
+                );
+            })
+            .await
+    }
+
+    /// A `Start` begins a fresh ZDP-R session, so it must reset the link's
+    /// sender and receiver.
+    ///
+    /// An adapter keeps one peer table entry (and so one ZDP-R session) per
+    /// link for the life of the process, but the node it re-docks with
+    /// allocates a brand new link -- and so a brand new sender -- for every
+    /// dock attempt, restarting its sequence numbers at 0.  An adapter that
+    /// carried the previous attempt's receive window into the restart would
+    /// classify every packet of the new session as an already-seen
+    /// duplicate: dropped without processing but still acknowledged, so the
+    /// node never retransmits and the link never gets past Helloing.
+    #[tokio::test(start_paused = true)]
+    async fn test_start_resets_zdpr_session() {
+        LocalSet::new()
+            .run_until(async {
+                // process_start (AdapterToNode) keys the link, which needs a
+                // noise keypair and a certificate exchange on the assembly.
+                let mut builder = TestAssemblyBuilder::new();
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+
+                // A previous dock attempt received the peer's first two
+                // management packets, then the link was torn down.
+                let generation_before = {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    let mut recv = peer.zdpr_recv.lock().unwrap();
+                    assert!(recv.should_process_packet(0));
+                    recv.process_packet(0);
+                    recv.process_packet(1);
+                    assert!(
+                        !recv.should_process_packet(0),
+                        "test precondition: sequence number 0 is now a duplicate"
+                    );
+                    drop(recv);
+                    peer.link_state_machine.test_set_state(LinkState::Inactive);
+                    peer.zdpr_generation()
+                };
+
+                asm.process_link_state_event(link_id, LinkEvent::Start)
+                    .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(peer.link_state_machine.get_state(), LinkState::Keying);
+                assert!(
+                    peer.zdpr_recv.lock().unwrap().should_process_packet(0),
+                    "stale receive window survived into the new session: the \
+                     peer's restarted sequence numbers would be discarded as \
+                     duplicates"
+                );
+                assert_ne!(
+                    peer.zdpr_generation(),
+                    generation_before,
+                    "the new session must be distinguishable from the old one"
                 );
             })
             .await

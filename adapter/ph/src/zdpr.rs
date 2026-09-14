@@ -414,6 +414,24 @@ impl<Pkt> Sender<Pkt> {
         }
     }
 
+    /// Reset the sender to its initial state, beginning a fresh ZDP-R
+    /// session on this link.
+    ///
+    /// A link restart is a new session: the peer restarts its receiver at
+    /// the same time (a node allocates a whole new link for a re-docking
+    /// adapter), and a fresh receiver only accepts sequence numbers within
+    /// one window of the start of the sequence space, so our sequence
+    /// numbers must start over too.
+    ///
+    /// Queued and unacknowledged packets belong to the previous session and
+    /// are dropped; their waiters are woken and must not go on to poll for a
+    /// packet of the old session (see `PeerState::reset_zdpr_session`).
+    pub fn reset(&mut self) {
+        // Dropping the old sender wakes its waiters and disposes of its
+        // packets; see the `Drop` impl.
+        *self = Self::new();
+    }
+
     /// Adjust the window size the sender will use.
     ///
     /// If adjusted down, outstanding unacknowledged packets outside the
@@ -1175,6 +1193,19 @@ impl Receiver {
             canceled: WindowBitset::MAX,
             stats: Default::default(),
         }
+    }
+
+    /// Reset the receiver to its initial state, beginning a fresh ZDP-R
+    /// session on this link.  The configured window size is retained.
+    ///
+    /// A link restart is a new session: the peer restarts its sender at the
+    /// same time, so it sends sequence number 0 again.  A receiver still
+    /// carrying the previous session's window would classify those as
+    /// already-seen duplicates and return `AckDoNotProcess` -- dropping each
+    /// packet but still acknowledging it, so the peer never retransmits and
+    /// the link cannot come up.
+    pub fn reset(&mut self) {
+        *self = Self::new(self.window_size);
     }
 
     fn oldest_unrecvd_offset(&self) -> i64 {
@@ -1990,6 +2021,30 @@ mod sender_tests {
 
         assert_quiesced(&send);
     }
+
+    /// A link restart begins a fresh ZDP-R session, so `reset()` must hand
+    /// out sequence numbers from 0 again: the peer restarts its receiver at
+    /// the same time, and a fresh receiver only accepts sequence numbers
+    /// within one window of the start of the sequence space.  The previous
+    /// session's packets are discarded and their waiters woken.
+    #[test]
+    fn test_reset_restarts_session() {
+        let mut send: Sender<_> = Sender::new();
+        send.adjust_window_size(3);
+
+        let tw = TestWaker::new();
+        let wk = tw.clone().into();
+        let mut cx = Context::from_waker(&wk);
+        enqueue_packet_expect_sent_with_sn(&mut send, (), 0);
+        let (sn1, _) = enqueue_packet_expect_sent(&mut send, ());
+        assert!(send.poll_ack(&mut cx, sn1).is_pending());
+
+        send.reset();
+
+        assert!(tw.woken(), "reset must wake the old session's waiters");
+        assert_quiesced(&send);
+        enqueue_packet_expect_sent_with_sn(&mut send, (), 0);
+    }
 }
 
 #[cfg(test)]
@@ -2065,5 +2120,26 @@ mod receiver_tests {
         assert!(matches!(recv.process_packet(2), AckAndProcess));
         assert!(matches!(recv.process_cancel(0), AckDoNotProcess));
         assert!(matches!(recv.process_packet(1), AckCancelDoNotProcess));
+    }
+
+    /// A link restart begins a fresh ZDP-R session: the peer starts over at
+    /// sequence number 0, every packet of which a receiver still carrying
+    /// the previous session's window classifies as an already-seen
+    /// duplicate -- dropped without processing but still acknowledged, so
+    /// the peer never retransmits.  `reset()` must clear that window while
+    /// keeping the negotiated window size.
+    #[test]
+    fn test_reset_accepts_restarted_sequence_numbers() {
+        let mut recv = Receiver::new(3);
+        assert!(matches!(recv.process_packet(0), AckAndProcess));
+        assert!(matches!(recv.process_packet(1), AckAndProcess));
+        assert!(matches!(recv.process_packet(0), AckDoNotProcess));
+
+        recv.reset();
+
+        assert_eq!(recv.window_size(), 3);
+        assert!(recv.should_process_packet(0));
+        assert!(matches!(recv.process_packet(0), AckAndProcess));
+        assert!(matches!(recv.process_packet(1), AckAndProcess));
     }
 }

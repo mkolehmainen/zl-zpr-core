@@ -42,6 +42,9 @@ pub struct PeerState {
     pub a2a_dh_pubkey: RcuBox<Option<x25519_dalek::PublicKey>>,
     pub zdpr_send: Mutex<zdpr::Sender<crate::packet::Packet>>,
     pub zdpr_recv: Mutex<zdpr::Receiver>,
+    /// Which ZDP-R session `zdpr_send` / `zdpr_recv` currently represent.
+    /// Incremented by [PeerState::reset_zdpr_session].
+    zdpr_generation: atomic::AtomicU64,
     pub zdpr_retry_timer_reset: Notify,
     pub txn_mgr: Arc<txn_mgr::TxnMgr>,
     km_state: PeerKmState,
@@ -120,10 +123,37 @@ impl PeerState {
             zdpr_recv: Mutex::new(zdpr::Receiver::new(
                 config::DEFAULT_ZDPR_RECEIVE_WINDOW_SIZE,
             )),
+            zdpr_generation: atomic::AtomicU64::new(0),
             zdpr_retry_timer_reset: Notify::new(),
             txn_mgr: Arc::new(txn_mgr::TxnMgr::new()),
             km_state: PeerKmState::new(),
         }
+    }
+
+    /// Begin a fresh ZDP-R session on this link, discarding the previous
+    /// session's sender and receiver state.
+    ///
+    /// Called whenever the link starts.  A peer treats every link bringup as
+    /// a new session -- a node allocates a whole new link, and so a whole new
+    /// ZDP-R session, for a re-docking adapter -- and restarts its sequence
+    /// numbers at 0.  An endpoint that instead carried its previous session
+    /// forward would silently discard the new session's traffic: inbound
+    /// packets as already-seen duplicates, and its own outbound packets
+    /// would fall outside the peer's fresh receive window.
+    ///
+    /// The generation counter this bumps lets send futures left over from
+    /// the previous session recognize that their packet is gone rather than
+    /// polling for a sequence number the new sender knows nothing about
+    /// (see `mgmt::core::Sent`).
+    pub fn reset_zdpr_session(&self) {
+        self.zdpr_send.lock().unwrap().reset();
+        self.zdpr_recv.lock().unwrap().reset();
+        self.zdpr_generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// The current ZDP-R session generation.  Changes on every link start.
+    pub fn zdpr_generation(&self) -> u64 {
+        self.zdpr_generation.load(Ordering::Acquire)
     }
 
     /// Return a reference to the transport SA if there is an SA on the link, and if it is established.
@@ -551,6 +581,7 @@ pub mod test {
             zdpr_recv: Mutex::new(zdpr::Receiver::new(
                 config::DEFAULT_ZDPR_RECEIVE_WINDOW_SIZE,
             )),
+            zdpr_generation: atomic::AtomicU64::new(0),
             zdpr_retry_timer_reset: Notify::new(),
             txn_mgr: Arc::new(txn_mgr::TxnMgr::new()),
             km_state: PeerKmState::new(),

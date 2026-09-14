@@ -249,6 +249,41 @@ impl Assembly {
         }
     }
 
+    /// Returns the local ZPR addresses which we believe we own but which are
+    /// *not* actually configured on the TUN device.  An empty vector means the
+    /// TUN device agrees with us.
+    ///
+    /// ph does not always own the addressing of its TUN device: on Linux an
+    /// IPv6 ZPR address cannot be set at device-creation time, so a node's
+    /// address is configured out of band and `zpr_addr` merely asserts what is
+    /// expected to be there.  When the two disagree nothing fails directly --
+    /// the node instead binds services to an address it does not have and
+    /// emits packets from a source address it has not claimed -- so callers
+    /// use this to turn that silent misconfiguration into a loud one.
+    ///
+    /// This deliberately reads the *current* address set via
+    /// [`Self::get_local_zpr_addrs_std`] rather than the startup
+    /// configuration, so it remains correct for an address that is assigned or
+    /// reassigned at run time (as an adapter's is today, via
+    /// [`Self::set_local_zpr_addrs`]).  Re-run it after any such change.
+    ///
+    /// Addresses the platform cannot inspect are reported as present: a check
+    /// that cannot see the truth must not manufacture a failure.  The same
+    /// applies to an unexpected error, which is logged and skipped.
+    pub fn local_zpr_addrs_missing_from_tun(&self) -> Vec<IpAddr> {
+        self.get_local_zpr_addrs_std()
+            .into_iter()
+            .filter(|addr| match self.tun_ctl.has_address(*addr) {
+                Ok(present) => !present,
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => false,
+                Err(e) => {
+                    warn!(target: NET_OS, "cannot determine whether {addr} is configured on the TUN device: {e}");
+                    false
+                }
+            })
+            .collect()
+    }
+
     pub fn process_link_state_event(
         self: &Arc<Self>,
         id: LinkId,
@@ -484,6 +519,91 @@ pub mod test {
         fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
         }
+        fn has_address(&self, _addr: IpAddr) -> std::io::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// A `TunCtl` which reports exactly the addresses it was constructed with,
+    /// so tests can model a TUN device that disagrees with our configuration.
+    struct FakeTunCtl {
+        addresses: Vec<IpAddr>,
+    }
+
+    impl TunCtl for FakeTunCtl {
+        fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn add_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn has_address(&self, addr: IpAddr) -> std::io::Result<bool> {
+            Ok(self.addresses.contains(&addr))
+        }
+    }
+
+    /// Builds a test assembly whose local ZPR addresses are `zpr_addr` and
+    /// whose TUN device carries `on_tun`.
+    fn assembly_with_addrs(zpr_addr: &[&str], on_tun: &[&str]) -> Assembly {
+        let parse = |v: &[&str]| -> Vec<IpAddr> { v.iter().map(|a| a.parse().unwrap()).collect() };
+        let config = config::Config {
+            zpr_addr: parse(zpr_addr),
+            ..Default::default()
+        };
+        create_assembly(TestAssemblyBuilder {
+            ph_mode: Some(PhMode::Node),
+            config: Some(rcu::RcuBox::new(config)),
+            tun_ctl: Some(Box::new(FakeTunCtl {
+                addresses: parse(on_tun),
+            })),
+            ..Default::default()
+        })
+    }
+
+    /// Regression test for a node configured with `fd5a:5052:90de::1` while its
+    /// TUN device actually carried `fd5a:5052:90de::2`.  The node bound its VSS
+    /// listener to an address it did not have and sourced visa-service traffic
+    /// from an address it had not claimed, which its own bind check then denied
+    /// -- with no indication of why.
+    #[test]
+    fn detects_local_zpr_addr_absent_from_tun() {
+        let asm = assembly_with_addrs(&["fd5a:5052:90de::1"], &["fd5a:5052:90de::2"]);
+        assert_eq!(
+            asm.local_zpr_addrs_missing_from_tun(),
+            vec!["fd5a:5052:90de::1".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    /// A TUN device carrying the configured address (among others) is not a
+    /// mismatch.
+    #[test]
+    fn accepts_local_zpr_addr_present_on_tun() {
+        let asm = assembly_with_addrs(&["fd5a:5052:90de::1"], &["fd5a:5052:90de::1", "fe80::1"]);
+        assert!(asm.local_zpr_addrs_missing_from_tun().is_empty());
+    }
+
+    /// Every configured address must be present, not just the first.
+    #[test]
+    fn detects_partially_configured_local_zpr_addrs() {
+        let asm = assembly_with_addrs(
+            &["fd5a:5052:90de::1", "fd5a:5052:90de::7"],
+            &["fd5a:5052:90de::1"],
+        );
+        assert_eq!(
+            asm.local_zpr_addrs_missing_from_tun(),
+            vec!["fd5a:5052:90de::7".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    /// An adapter which has not yet been granted an address has nothing to
+    /// check, and must not be reported as misconfigured.
+    #[test]
+    fn no_local_zpr_addrs_is_not_a_mismatch() {
+        let asm = assembly_with_addrs(&[], &["fd5a:5052:90de::2"]);
+        assert!(asm.local_zpr_addrs_missing_from_tun().is_empty());
     }
 
     impl TestAssemblyBuilder {

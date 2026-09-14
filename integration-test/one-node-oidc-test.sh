@@ -5,11 +5,14 @@
 # local fake IdP (lib/fake-idp.py) with no Google and no browser:
 #
 #   - adapter1 has NO --bootstrap-key: user-only, forced through OIDC.
-#   - adapter2 keeps its bootstrap key AND logs in: both blobs.
+#   - adapter2 keeps its bootstrap key AND logs in: both blobs. Its link is
+#     stopped first, because a bootstrap key alone brings it up device-only at
+#     startup and both blobs only go out together on an authentication that
+#     runs with an AuthAgent registered.
 #     (Device-only is already covered by one-node-v6-test.sh.)
-#   - Logins run `ph-cli connect 1 --no-browser`; the printed authorization
-#     URL is fetched with `curl -L --cacert` inside the adapter's netns,
-#     driving the 302 to ph-cli's loopback callback listener.
+#   - Logins run `ph-cli connect $DOCK_LINK --no-browser`; the printed
+#     authorization URL is fetched with `curl -L --cacert` inside the
+#     adapter's netns, driving the 302 to ph-cli's loopback callback listener.
 #   - Key-rotation leg: `fake-idp.py --rotate`, restart adapter1, re-login;
 #     the visa service sees an unknown kid and refreshes from the live JWKS
 #     (the seed fixture deliberately carries only the first key).
@@ -69,6 +72,13 @@ B_ZPR_ADDR=fd00:1:2::1
 C_ZPR_ADDR=fd00:1:3::1
 ZPR_SUBNET=fd00:1::0/32
 POLICY_BIN=oidc-test.bin2
+
+# The link an adapter authenticates: its tether to the node. Adapter link IDs
+# are fixed (LOCAL_ACTOR_LINK_ID / DOCK_LINK_ID in
+# zl-zpr-common/src/packet_info.rs): 1 is the internal local-actor link, which
+# is Active from startup, so starting it answers UnexpectedTransition(Active,
+# "Start") and an AuthAgent handed to it never reaches the authenticating link.
+DOCK_LINK=2
 
 # The issuer the pregen policy pins; each relevant netns runs an IdP
 # instance answering it on its own loopback.
@@ -168,9 +178,10 @@ function launch_adapter1() {
     --zpr-addr "$A_ZPR_ADDR" 2>&1 | tee -a adapter1.log | prefix_log zpr-a &
 }
 
-# Interactive OIDC login with no browser: run `ph-cli connect 1 --no-browser`
-# inside the adapter's netns, scrape the printed authorization URL, and fetch
-# it with curl (following the 302 to ph-cli's loopback callback listener).
+# Interactive OIDC login with no browser: run `ph-cli connect $DOCK_LINK
+# --no-browser` inside the adapter's netns, scrape the printed authorization
+# URL, and fetch it with curl (following the 302 to ph-cli's loopback
+# callback listener).
 # connect exits 0 once the link is Active.
 #
 # $1 = netns, $2 = control socket, $3 = log file
@@ -182,7 +193,7 @@ function oidc_login() {
   rm -f "$LOGIN_LOG"
   sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" \
     env -u BROWSER SSL_CERT_FILE="$PWD/ca.crt" \
-    "$PH_DEBUG_BIN" -p "$SOCK" connect 1 --no-browser \
+    "$PH_DEBUG_BIN" -p "$SOCK" connect "$DOCK_LINK" --no-browser \
     > "$LOGIN_LOG" 2>&1 &
   CONNECT_PID=$!
 
@@ -210,6 +221,15 @@ function oidc_login() {
     cat "$LOGIN_LOG"
     return 1
   fi
+}
+
+
+# The dock link is down and startable: `connect`/`link start` may fire Start
+# without answering UnexpectedTransition.
+#
+# $1 = control socket
+function check_dock_link_inactive() {
+  "$PH_DEBUG_BIN" -p "$1" link show "$DOCK_LINK" | grep -q 'State: Inactive'
 }
 
 
@@ -308,7 +328,7 @@ echo "Launching Node"
 
 sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
   node \
-  --logging "$DEBUG_TARGETS" \
+  --logging "$DEBUG_TARGETS vss_rpc=DEBUG" \
   --control-path "$NODE_SOCK" \
   --capture-path "$NODE_CAP_SOCK" \
   --advertised-substrate-addr "$NODE_SUBSTRATE_ADDR_VS":5000 \
@@ -340,7 +360,22 @@ sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$PH_BIN" \
   --node-addr "$NODE_SUBSTRATE_ADDR_VS" \
   --zpr-addr "$VS_ZPR_ADDR" 2>&1 | tee adapter-vs.log | prefix_log zpr-vs &
 
-sleep 5
+# The node only advertises the policy's OIDC IdP to a docking adapter once the
+# visa service has pushed the auth-services list to it over VSS (SetServices,
+# adapter/ph/src/vss_worker.rs; get_available_oidc_idps reads that list when
+# building the HelloResponse). That push is the first thing a VSS session does,
+# but the session itself only comes up after the visa service's own adapter has
+# docked and the node has registered its VSS endpoint — several seconds after
+# the node starts. An adapter that hellos before then is told nothing about any
+# IdP and, with no bootstrap key, fails immediately with AuthUnavailable, so
+# wait for the push rather than sleeping and hoping.
+function check_node_has_auth_services() {
+  grep -q "received services update with [1-9]" node.log
+}
+wait_for 30 check_node_has_auth_services || {
+  echo "ERROR: node never received the auth-services list from the visa service"
+  exit 1
+}
 
 # adapter1: user-only (no bootstrap key).
 launch_adapter1
@@ -374,6 +409,21 @@ oidc_login zpr-a "$ADAPTER1_SOCK" login1.log || PASS=1
 
 if [[ "$PASS" == 0 ]] then
 echo "Logging in adapter2 (device + user)"
+# adapter2 has a bootstrap key, so when the node advertised the IdP with no
+# AuthAgent registered yet, ph took the device-only fallthrough
+# (adapter/ph/src/link_state.rs process_init_auth) and the dock link has been
+# Active since startup — `connect` on it would answer
+# UnexpectedTransition(Active, "Start"). Both blobs only go out together on an
+# authentication that runs with the agent already registered, so take the link
+# down and let connect bring it back up: ph then signs the bootstrap (SS) blob
+# alongside the OIDC one, which is the case this adapter exists to cover.
+#
+# ph auto-restarts a closed link after DEFAULT_LINK_RESTART_HOLDDOWN (5 s) and
+# that automatic Start would re-authenticate device-only, so connect has to win
+# the race; polling for Inactive puts its Start ~1 s into the 5 s window.
+"$PH_DEBUG_BIN" -p "$ADAPTER2_SOCK" link stop "$DOCK_LINK"
+wait_for 15 check_dock_link_inactive "$ADAPTER2_SOCK" \
+  || echo "WARNING: adapter2 dock link did not return to Inactive; connecting anyway"
 oidc_login zpr-b "$ADAPTER2_SOCK" login2.log || PASS=1
 fi
 
@@ -449,13 +499,10 @@ else
   # restart is mid-attempt when we look, it fails fast — adapter1 has no
   # bootstrap key and no registered agent — and the link closes back to
   # Inactive, so the poll converges.)
-  function check_link1_inactive() {
-    "$PH_DEBUG_BIN" -p "$ADAPTER1_SOCK" link show 1 | grep -q 'State: Inactive'
-  }
   if ! oidc_login zpr-a "$ADAPTER1_SOCK" login3.log; then
     echo "Retrying post-rotation login"
-    wait_for 30 check_link1_inactive \
-      || echo "WARNING: link 1 did not return to Inactive; retrying anyway"
+    wait_for 30 check_dock_link_inactive "$ADAPTER1_SOCK" \
+      || echo "WARNING: dock link did not return to Inactive; retrying anyway"
     oidc_login zpr-a "$ADAPTER1_SOCK" login3.log || PASS=1
   fi
 

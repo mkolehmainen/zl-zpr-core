@@ -4,6 +4,7 @@
 //! functions in `requests` instead.
 
 use crate::counters::ManagementCounterType;
+use crate::peer_table;
 use crate::prelude::*;
 use crate::zdp;
 use crate::zdpr;
@@ -152,11 +153,33 @@ pub struct Sent<'a> {
     asm: &'a Assembly,
     link_id: LinkId,
     packet_id: PacketId,
+    /// The ZDP-R session this packet was sent on.  A link restart begins a
+    /// new session and discards this packet along with the rest of the old
+    /// one; see `Self::peer_state()`.
+    generation: u64,
     // NOTE: if we add anything without a trivial destructor,
     // modify `enqueue()` appropriately!
 }
 
 impl<'a> Sent<'a> {
+    /// The peer state for this link, but only while this packet's ZDP-R
+    /// session is still the live one.
+    ///
+    /// Restarting a link resets its session (`PeerState::reset_zdpr_session`)
+    /// and discards every packet of the previous session, so from this
+    /// packet's point of view a restart is indistinguishable from the link
+    /// having gone away: the packet was not delivered and never will be.
+    /// Returning `None` in both cases keeps callers on the one code path,
+    /// and -- crucially -- stops them polling the new session's sender for a
+    /// sequence number it never issued.
+    fn peer_state(&self) -> Option<peer_table::PeerTableEntryGuard<'a>> {
+        // Bind the assembly at its own lifetime so the returned guard does
+        // not borrow `self`: callers mutate `self.packet_id` while holding it.
+        let asm: &'a Assembly = self.asm;
+        let peer_state = asm.peer_table.get(self.link_id)?;
+        (peer_state.zdpr_generation() == self.generation).then_some(peer_state)
+    }
+
     /// If sending would block, queue this packet instead.
     pub fn enqueue(self) {
         // Note that in fact, if we are blocked, we already are in the
@@ -177,7 +200,7 @@ impl<'a> Sent<'a> {
             return true;
         };
 
-        let Some(peer_state) = self.asm.peer_table.get(self.link_id) else {
+        let Some(peer_state) = self.peer_state() else {
             // We don't know whether the packet got sent before the link was dropped,
             // but `true` is compatible with the packet having been sent then dropped.
             return true;
@@ -202,7 +225,7 @@ impl<'a> Sent<'a> {
             return Err(());
         };
 
-        let Some(peer_state) = self.asm.peer_table.get(self.link_id) else {
+        let Some(peer_state) = self.peer_state() else {
             return Err(());
         };
 
@@ -247,8 +270,8 @@ impl<'a> Sent<'a> {
             return;
         }
 
-        let Some(peer_state) = self.asm.peer_table.get(self.link_id) else {
-            // no more link
+        let Some(peer_state) = self.peer_state() else {
+            // no more link, or no more session
             return;
         };
 
@@ -300,8 +323,8 @@ impl<'a> Sent<'a> {
             return;
         }
 
-        let Some(peer_state) = self.asm.peer_table.get(self.link_id) else {
-            // no more link
+        let Some(peer_state) = self.peer_state() else {
+            // no more link, or no more session
             return;
         };
 
@@ -334,7 +357,7 @@ impl<'a> std::future::Future for Sent<'a> {
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.packet_id {
             PacketId::Queued(packet_id) => {
-                let Some(peer_state) = self.asm.peer_table.get(self.link_id) else {
+                let Some(peer_state) = self.peer_state() else {
                     return Poll::Ready(Err(MgmtSendError::LinkClosed));
                 };
 
@@ -345,6 +368,7 @@ impl<'a> std::future::Future for Sent<'a> {
                     asm: self.asm,
                     link_id: self.link_id,
                     packet_id: self.packet_id,
+                    generation: self.generation,
                 })))
             }
 
@@ -352,6 +376,7 @@ impl<'a> std::future::Future for Sent<'a> {
                 asm: self.asm,
                 link_id: self.link_id,
                 packet_id,
+                generation: self.generation,
             }))),
         }
     }
@@ -397,7 +422,7 @@ impl<'a> std::future::Future for Acked<'a> {
             return Poll::Ready(Ok(()));
         }
 
-        let Some(peer_state) = self.0.asm.peer_table.get(self.0.link_id) else {
+        let Some(peer_state) = self.0.peer_state() else {
             return Poll::Ready(Err(MgmtSendError::LinkClosed));
         };
 
@@ -474,7 +499,7 @@ impl<'a> AckedOrCanceled<'a> {
             return;
         };
 
-        let Some(peer_state) = self.0.asm.peer_table.get(self.0.link_id) else {
+        let Some(peer_state) = self.0.peer_state() else {
             return;
         };
 
@@ -497,7 +522,7 @@ impl<'a> std::future::Future for AckedOrCanceled<'a> {
             _ => (),
         }
 
-        let Some(peer_state) = self.0.asm.peer_table.get(self.0.link_id) else {
+        let Some(peer_state) = self.0.peer_state() else {
             return Poll::Ready(Err(MgmtSendError::LinkClosed));
         };
 
@@ -575,8 +600,10 @@ fn send_mgmt_helper(
             asm,
             link_id: LINK_ID_UNKNOWN,
             packet_id: PacketId::Queued(0), // will not be used due to unknown link ID
+            generation: 0,
         };
     };
+    let generation = peer_state.zdpr_generation();
     let mut zdpr_send = peer_state.zdpr_send.lock().unwrap();
 
     let old_retry_needed = zdpr_send.retry_needed();
@@ -598,6 +625,7 @@ fn send_mgmt_helper(
                 asm,
                 link_id,
                 packet_id: PacketId::Sent(seq_num),
+                generation,
             }
         }
 
@@ -605,6 +633,7 @@ fn send_mgmt_helper(
             asm,
             link_id,
             packet_id: PacketId::Queued(packet_id),
+            generation,
         },
     }
 }

@@ -64,16 +64,24 @@ function create_network() {
   sudo ip link add netns zpr-b type veth peer veth-zpr-b netns zpr-node  # zpr-b:veth0 / zpr-node:veth-zpr-b
   sudo ip link add netns zpr-c type veth peer veth-zpr-c netns zpr-node  # zpr-c:veth0 / zpr-node:veth-zpr-c
 
-  sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_VS" peer "$VS_SUBSTRATE_ADDR" dev veth-zpr-vs
-  sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_A" peer "$A_SUBSTRATE_ADDR" dev veth-zpr-a
-  sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_B" peer "$B_SUBSTRATE_ADDR" dev veth-zpr-b
+  # Each substrate link gets a /24 rather than a point-to-point
+  # "addr add ADDR peer PEER" pair.  Peer addressing is tempting here -- every
+  # link really does have exactly two endpoints -- but the local address it
+  # produces is a /32, and the kernel does not answer ARP requests for such an
+  # address on an ARP-capable device like veth.  The neighbour entry then stays
+  # INCOMPLETE forever, so no substrate packet ever reaches the far end, and
+  # every adapter fails to dock.  (tun0 below is a different case: a TUN device
+  # is NOARP, so peer addressing works there and is used.)
+  sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_VS/24" dev veth-zpr-vs
+  sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_A/24" dev veth-zpr-a
+  sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_B/24" dev veth-zpr-b
   sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_C/24" dev veth-zpr-c
   if [ -n "${NODE_SUBSTRATE_ADDR_C_ALT-}" ]
   then sudo ip -n zpr-node addr add "$NODE_SUBSTRATE_ADDR_C_ALT/24" dev veth-zpr-c  # Used for testing routing.
   fi
-  sudo ip -n zpr-vs addr add "$VS_SUBSTRATE_ADDR" peer "$NODE_SUBSTRATE_ADDR_VS" dev veth0
-  sudo ip -n zpr-a addr add "$A_SUBSTRATE_ADDR" peer "$NODE_SUBSTRATE_ADDR_A" dev veth0
-  sudo ip -n zpr-b addr add "$B_SUBSTRATE_ADDR" peer "$NODE_SUBSTRATE_ADDR_B" dev veth0
+  sudo ip -n zpr-vs addr add "$VS_SUBSTRATE_ADDR/24" dev veth0
+  sudo ip -n zpr-a addr add "$A_SUBSTRATE_ADDR/24" dev veth0
+  sudo ip -n zpr-b addr add "$B_SUBSTRATE_ADDR/24" dev veth0
   sudo ip -n zpr-c addr add "$C_SUBSTRATE_ADDR/24" dev veth0
 
   sudo ip -n zpr-node link set veth-zpr-vs up
@@ -233,8 +241,12 @@ function cleanup() {
 
   if [ "$SHOW_LOGS" != "no" ]
      then
+         emitlog "valkey.log"
          emitlog "node.log"
          emitlog "vs.log"
+         # The VS's own adapter has to dock before the node can reach the visa
+         # service at all, so its log is emitted with the rest of them.
+         emitlog "adapter-vs.log"
          emitlog "adapter1.log"
          emitlog "adapter2.log"
          emitlog "adapter3.log"

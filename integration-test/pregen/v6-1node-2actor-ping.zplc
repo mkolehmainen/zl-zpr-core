@@ -10,8 +10,9 @@ order = ["hosts", "dns"]
 [nodes."node"]
 provider = [ [ "device.zpr.adapter.cn", "node" ] ]
 zpr_address = "n0.zpr"
-interfaces = ["in1"]
-in1.netaddr = "n0.overlay:12345"
+
+[nodes."node".substrate_addrs]
+in1 = "n0.overlay:12345"
 
 [trusted_services.default]
 cert_path = "ca-cert.pem"

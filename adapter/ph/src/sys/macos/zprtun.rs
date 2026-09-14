@@ -137,7 +137,11 @@ impl ZprTun {
         Ok(())
     }
 
-    fn has_address(&self, addr: IpAddr) -> std::io::Result<bool> {
+    /// Reports whether `addr` is currently configured on this TUN device.
+    ///
+    /// Does not take the device mutex, so it is safe to call either with or
+    /// without it held.
+    pub fn has_address(&self, addr: IpAddr) -> std::io::Result<bool> {
         if addr.is_ipv4() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,

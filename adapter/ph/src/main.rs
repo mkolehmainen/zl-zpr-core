@@ -91,6 +91,7 @@ use zpr_utils::net_defs::SocketAddrExt;
 
 use zpr::addrs::{
     DEFAULT_TETHER_PORT, VISA_SERVICE_ADDR, VISA_SERVICE_PORT, ZPR_TEMP_LOCAL_ADDRESS,
+    ZPRNET_PREFIX_LEN,
 };
 use zpr::packet_info::{DOCK_LINK_ID, LOCAL_ACTOR_LINK_ID};
 use zpr::vsapi_types::AuthServicesList;
@@ -637,6 +638,32 @@ fn main() -> ExitCode {
                     .unwrap()
                     .link_state_machine
                     .add_internal_actor_address(addr.into());
+            }
+
+            // Those are the only source addresses the node will accept from
+            // itself, and the addresses it binds its own services to -- but on
+            // Linux the TUN device is addressed out of band (see the TUN setup
+            // above), so nothing has confirmed the device actually has them.
+            // If it does not, the node cannot reach the visa service and every
+            // symptom of that appears somewhere other than here, so refuse to
+            // start rather than fail quietly for the lifetime of the process.
+            let missing = asm.local_zpr_addrs_missing_from_tun();
+            if !missing.is_empty() {
+                let ifname = asm
+                    .config
+                    .get()
+                    .tun_if
+                    .clone()
+                    .unwrap_or_else(|| "<TUN device>".to_string());
+                for addr in &missing {
+                    error!(
+                        target: STARTUP,
+                        "node ZPR address {addr} is not configured on {ifname}; \
+                         configure it with: \
+                         ip -6 addr add {addr}/{ZPRNET_PREFIX_LEN} dev {ifname}"
+                    );
+                }
+                return ExitCode::FAILURE;
             }
         }
     }
