@@ -454,6 +454,12 @@ impl LinkStateWrapper {
         self.locked_data.lock().unwrap().last_auth_failure = Some(reason);
     }
 
+    /// Test-only: whether an AuthAgent handle is registered on this link.
+    #[cfg(test)]
+    pub fn test_has_auth_agent(&self) -> bool {
+        self.locked_data.lock().unwrap().auth_agent.is_some()
+    }
+
     /// Test-only: force the FSM into a state without walking the transitions.
     #[cfg(test)]
     pub fn test_set_state(&self, state: LinkState) {
@@ -2044,9 +2050,7 @@ impl LinkStateWrapper {
                     // tether does not restart itself: it stays Inactive
                     // until the next startLink RPC (ph-cli connect / link
                     // start). Every connect is operator-initiated.
-                    if self.link_type == LinkType::AdapterToNode
-                        && !asm.config.get().auto_connect
-                    {
+                    if self.link_type == LinkType::AdapterToNode && !asm.config.get().auto_connect {
                         info!(target: LINK_STATE, "{} idle (auto-connect off); waiting for startLink", asm.formatted_link_id(link_id));
                     } else {
                         self.setup_restart(asm);
@@ -2375,10 +2379,8 @@ mod tests {
                 );
 
                 // Advance well past the restart holddown: still Inactive.
-                tokio::time::sleep(
-                    config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1),
-                )
-                .await;
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
+                    .await;
                 assert_eq!(
                     asm.peer_table
                         .get(link_id)
@@ -2419,10 +2421,8 @@ mod tests {
                     LinkState::Inactive
                 );
 
-                tokio::time::sleep(
-                    config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1),
-                )
-                .await;
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
+                    .await;
                 assert_eq!(
                     asm.peer_table
                         .get(link_id)

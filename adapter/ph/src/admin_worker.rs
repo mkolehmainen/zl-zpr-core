@@ -1450,4 +1450,73 @@ mod test {
             })
             .await
     }
+
+    /// ph-cli trigger end-to-end at the RPC layer (zipline#28): `startLink`
+    /// on an idle Inactive AdapterToNode tether — the state an adapter
+    /// started with `--auto-connect=false` parks in — must register the
+    /// supplied AuthAgent on the link and start it (Inactive -> Keying),
+    /// exactly as on a restarted link today.
+    #[tokio::test(start_paused = true)]
+    async fn test_start_link_rpc_wakes_idle_tether_and_registers_agent() {
+        LocalSet::new()
+            .run_until(async {
+                // Keyable assembly: process_start hands the link to the key
+                // manager, which needs a noise keypair and a cert exchange.
+                let mut builder = TestAssemblyBuilder::new();
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                let mut cfg = <config::Config as std::default::Default>::default();
+                cfg.auto_connect = false;
+                builder.config = Some(rcu::RcuBox::new(cfg));
+                let asm = Arc::new(create_assembly(builder));
+
+                // Idle tether, as created by start_tether(auto_start=false).
+                let entry = asm.peer_table.vacant_entry().unwrap();
+                let link_id = entry.key();
+                let ps = peer_table::test::create_dummy_peer_state(
+                    link_id,
+                    LinkType::AdapterToNode,
+                    SubstrateAddr::from(([127, 0, 0, 1], 9000)),
+                    net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 2).into()),
+                );
+                let link_id = entry.insert(ps).get();
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    assert_eq!(peer.link_state_machine.get_state(), LinkState::Inactive);
+                    assert!(!peer.link_state_machine.test_has_auth_agent());
+                }
+
+                // Call the admin service the way ph-cli connect does.
+                let service: svc::Client =
+                    capnp_rpc::new_client(AdminServiceImpl { asm: asm.clone() });
+                let agent: cli::auth_agent::Client = capnp_rpc::new_client(FakeAuthAgent {
+                    id_token: "FAKE.JWT.TOKEN".to_string(),
+                    seen_nonce: Rc::new(RefCell::new(None)),
+                });
+                let mut request = service.start_link_request();
+                request.get().set_id(link_id);
+                request.get().set_auth_agent(agent);
+                let response = request.send().promise.await.unwrap();
+                let results = response.get().unwrap();
+                assert!(
+                    matches!(
+                        results.get_result().unwrap().which().unwrap(),
+                        cli::success_or_error::Which::Success(_)
+                    ),
+                    "startLink on an idle tether must succeed"
+                );
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_state(),
+                    LinkState::Keying,
+                    "startLink must wake the idle tether"
+                );
+                assert!(
+                    peer.link_state_machine.test_has_auth_agent(),
+                    "startLink must register the supplied AuthAgent on the link"
+                );
+            })
+            .await
+    }
 }
