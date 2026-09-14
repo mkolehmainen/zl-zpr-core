@@ -216,6 +216,18 @@ pub async fn await_callback(
     }
 }
 
+/// Sanitise the `error` field of an RFC 6749 section 5.2 token-error
+/// response before it reaches a log or the user's terminal. A conforming IdP
+/// sends one of a fixed set of codes, but nothing stops a hostile or broken
+/// one from returning arbitrary text there, so keep only the ASCII shape the
+/// RFC allows (`%x20-21 / %x23-5B / %x5D-7E`) and cap the length.
+fn oauth_error_code(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| matches!(c, ' '..='!' | '#'..='[' | ']'..='~'))
+        .take(64)
+        .collect()
+}
+
 /// Exchange the authorization code for an `id_token` at the token endpoint
 /// (RFC 6749 section 4.1.3 + RFC 7636 section 4.5). `client_secret` is sent
 /// only when the client is confidential.
@@ -241,8 +253,21 @@ pub async fn exchange_code(
     let resp = http.post(token_endpoint.clone()).form(&form).send().await?;
     let status = resp.status();
     if !status.is_success() {
-        // Deliberately do not include the response body: it could echo the code.
-        return Err(OidcCliError::TokenExchange(format!("HTTP {status}")));
+        // The body is deliberately NOT included: `error_description` and any
+        // other field is free text from the IdP and could echo the
+        // authorization code. The `error` field alone is safe -- RFC 6749
+        // section 5.2 fixes it to a small enum of codes ("invalid_grant",
+        // "invalid_client", "invalid_request", ...) -- and it is the only
+        // part that says why the exchange failed, so extract just that.
+        let oauth_error = resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|body| body.get("error")?.as_str().map(oauth_error_code));
+        return Err(OidcCliError::TokenExchange(match oauth_error {
+            Some(code) => format!("HTTP {status} ({code})"),
+            None => format!("HTTP {status}"),
+        }));
     }
     let body: serde_json::Value = resp.json().await?;
     body.get("id_token")
@@ -774,6 +799,55 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A failed token exchange must surface the IdP's RFC 6749 section 5.2
+    /// `error` code, which is what actually says *why* it failed
+    /// (`invalid_request` for a missing `client_secret`, `invalid_grant` for
+    /// a stale code). The code is drawn from a fixed enum, so unlike
+    /// `error_description` and the rest of the body it cannot echo the
+    /// authorization code or any other secret.
+    #[tokio::test]
+    async fn test_exchange_code_surfaces_oauth_error_code_but_not_body() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await.unwrap();
+            write_http_response(
+                &mut stream,
+                "400 Bad Request",
+                "application/json",
+                // `error_description` deliberately echoes the code, to prove
+                // the body never reaches the error text.
+                "{\"error\":\"invalid_request\",\
+                  \"error_description\":\"client_secret is missing, code=code-abc\"}",
+            )
+            .await
+            .unwrap();
+        });
+        let err = exchange_code(
+            &Url::parse(&format!("http://{addr}/token")).unwrap(),
+            "client-1",
+            None,
+            "code-abc",
+            "verifier-xyz",
+            &Url::parse("http://127.0.0.1:12345/callback").unwrap(),
+            &reqwest::Client::new(),
+        )
+        .await
+        .expect_err("400 must be an error");
+
+        let text = err.to_string();
+        assert!(text.contains("400"), "status missing from {text:?}");
+        assert!(
+            text.contains("invalid_request"),
+            "OAuth error code missing from {text:?}"
+        );
+        assert!(
+            !text.contains("code-abc"),
+            "response body leaked into {text:?}"
+        );
     }
 
     /// Run a one-shot token-endpoint stub, call `exchange_code` against it,
