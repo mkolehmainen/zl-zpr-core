@@ -159,6 +159,13 @@ pub enum AuthFailureReason {
     /// ResponseCode::AuthUnavailable.
     AuthUnavailable,
     DeviceBlobRejected,
+    /// The link failed before (or without) an authentication verdict — e.g.
+    /// a handshake timeout in Helloing — and, with auto-connect off, no
+    /// restart is coming (zipline#28). Recorded on the close path so ph-cli
+    /// `connect` sees the permanently Inactive link as this attempt's
+    /// terminal outcome instead of polling it as Pending forever. Carries
+    /// the TerminateReason's Debug spelling.
+    LinkFailed(String),
 }
 
 /// A single credential request forwarded to the out-of-band AuthAgent
@@ -454,10 +461,23 @@ impl LinkStateWrapper {
         self.locked_data.lock().unwrap().last_auth_failure = Some(reason);
     }
 
+    /// Test-only: whether an AuthAgent handle is registered on this link.
+    #[cfg(test)]
+    pub fn test_has_auth_agent(&self) -> bool {
+        self.locked_data.lock().unwrap().auth_agent.is_some()
+    }
+
     /// Test-only: force the FSM into a state without walking the transitions.
     #[cfg(test)]
     pub fn test_set_state(&self, state: LinkState) {
         self.locked_fsm.lock().unwrap().set_state(state);
+    }
+
+    /// Test-only: the FSM's current logical clock, for synthesizing a
+    /// `LinkEvent::Timeout` that `process_timeout` accepts as current.
+    #[cfg(test)]
+    pub fn test_logical_clock(&self) -> u64 {
+        self.locked_fsm.lock().unwrap().logical_clock
     }
 
     /// Test-only: pretend a HelloResponse advertised these IdPs.
@@ -1914,6 +1934,24 @@ impl LinkStateWrapper {
         let link_id = self.id;
         info!(target: LINK_STATE,"Initiating shutdown on {}", asm.formatted_link_id(link_id));
 
+        // With auto-connect off (zipline#28) a completed close is terminal:
+        // the tether stays Inactive until the next startLink RPC. Every
+        // failure path parks the FSM in Error before initiating the close,
+        // while an operator stop arrives from a running state — so an Error
+        // entry with no recorded auth failure (e.g. a Helloing timeout,
+        // which fails before authentication) must record one here, or
+        // ph-cli's `connect` poll reads the permanently Inactive link as
+        // "Pending: restart forthcoming" and hangs until its deadline.
+        if self.link_type == LinkType::AdapterToNode
+            && !asm.config.get().auto_connect
+            && self.get_state() == LinkState::Error
+            && self.get_last_auth_failure().is_none()
+        {
+            self.record_auth_failure(AuthFailureReason::LinkFailed(format!(
+                "link failed before authentication completed ({reason:?})"
+            )));
+        }
+
         self.maybe_disconnect_visa_service_client(asm, true, reason)
     }
 
@@ -2040,7 +2078,15 @@ impl LinkStateWrapper {
                 info!(target: LINK_STATE, "{} has fully shut down", asm.formatted_link_id(link_id));
                 if !locked_fsm.shutting_down {
                     drop(locked_fsm);
-                    self.setup_restart(asm);
+                    // With auto-connect off (zipline#28) the AdapterToNode
+                    // tether does not restart itself: it stays Inactive
+                    // until the next startLink RPC (ph-cli connect / link
+                    // start). Every connect is operator-initiated.
+                    if self.link_type == LinkType::AdapterToNode && !asm.config.get().auto_connect {
+                        info!(target: LINK_STATE, "{} idle (auto-connect off); waiting for startLink", asm.formatted_link_id(link_id));
+                    } else {
+                        self.setup_restart(asm);
+                    }
                 } else {
                     drop(locked_fsm);
                     asm.drop_peer(link_id); // buh bye!
@@ -2329,6 +2375,156 @@ mod tests {
             scopes: vec!["openid".to_string()],
             allow_offline_access: false,
         }
+    }
+
+    /// With `auto_connect = false` (zipline#28), a dropped AdapterToNode
+    /// tether must NOT auto-restart: `complete_close` leaves it Inactive
+    /// and no holddown timer re-fires `Start`. The next `startLink` RPC is
+    /// the only way back up.
+    #[tokio::test(start_paused = true)]
+    async fn test_no_restart_after_close_when_auto_connect_disabled() {
+        LocalSet::new()
+            .run_until(async {
+                let mut builder = TestAssemblyBuilder::new();
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                let mut cfg = <crate::config::Config as std::default::Default>::default();
+                cfg.auto_connect = false;
+                builder.config = Some(rcu::RcuBox::new(cfg));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+
+                // The link is closing (e.g. auth failed); the close completes.
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine.test_set_state(LinkState::Closing);
+                }
+                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive
+                );
+
+                // Advance well past the restart holddown: still Inactive.
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
+                    .await;
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive,
+                    "auto_connect=false link must wait for startLink, not self-restart"
+                );
+            })
+            .await
+    }
+
+    /// With `auto_connect = false`, a manually started link that fails
+    /// BEFORE authentication (here: the Helloing timeout in
+    /// `process_timeout`, which records no `AuthFailureReason`) ends up
+    /// permanently Inactive — terminal, since no restart is coming. The
+    /// terminal state must carry a recorded failure reason: ph-cli's
+    /// `connect` poll classifies a teardown state *without* a
+    /// `Last auth failure:` line as Pending (restart forthcoming) and
+    /// would otherwise wait forever on a link that will never recover.
+    #[tokio::test(start_paused = true)]
+    async fn test_manual_mode_pre_auth_failure_is_terminal_not_pending() {
+        LocalSet::new()
+            .run_until(async {
+                let mut builder = TestAssemblyBuilder::new();
+                let mut cfg = <crate::config::Config as std::default::Default>::default();
+                cfg.auto_connect = false;
+                builder.config = Some(rcu::RcuBox::new(cfg));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+
+                // A manually started attempt is stuck in Helloing; its
+                // timeout fires (process_timeout gives up on the link).
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine.test_set_state(LinkState::Helloing);
+                }
+                let logical_clock = asm
+                    .peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .link_state_machine
+                    .test_logical_clock();
+                asm.process_link_state_event(link_id, LinkEvent::Timeout { logical_clock })
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Closing,
+                    "test precondition: the Helloing timeout initiates the close"
+                );
+
+                // The terminate handshake completes and the close finishes.
+                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+                    .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(peer.link_state_machine.get_state(), LinkState::Inactive);
+                assert!(
+                    peer.link_state_machine.get_last_auth_failure().is_some(),
+                    "terminal idle after a pre-auth failure must carry a recorded \
+                     failure reason, or ph-cli connect classifies the permanently \
+                     Inactive link as Pending and hangs until its deadline"
+                );
+            })
+            .await
+    }
+
+    /// Companion: with the default config (`auto_connect = true`) the
+    /// holddown restart still happens — today's behaviour is preserved.
+    #[tokio::test(start_paused = true)]
+    async fn test_restart_after_close_with_default_auto_connect() {
+        LocalSet::new()
+            .run_until(async {
+                let mut builder = TestAssemblyBuilder::new();
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine.test_set_state(LinkState::Closing);
+                }
+                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive
+                );
+
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
+                    .await;
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Keying,
+                    "default config must keep the automatic holddown restart"
+                );
+            })
+            .await
     }
 
     /// WaitForUserAuth with an agent that never replies must fail with

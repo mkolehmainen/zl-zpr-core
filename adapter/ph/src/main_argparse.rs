@@ -40,6 +40,7 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
             common,
             node_addr,
             bootstrap_key,
+            auto_connect,
         } => {
             ph_mode = PhMode::Adapter;
             let config_file: Option<AdapterConfig> = match config_file {
@@ -76,6 +77,11 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
                         e
                     )))
                 })?);
+            }
+            // Command line overrides the config file; an omitted flag
+            // preserves the config file value (or the default, true).
+            if let Some(auto_connect) = auto_connect {
+                config.auto_connect = auto_connect;
             }
         }
 
@@ -597,6 +603,83 @@ mod test {
         assert_eq!(
             config.zpr_addr,
             Vec::from([IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))])
+        );
+    }
+
+    /// `--auto-connect` precedence (zipline#28): an explicitly passed value
+    /// overrides the config file; an omitted flag preserves the config file's
+    /// value; omitted everywhere defaults to `true` (today's behaviour).
+    #[test]
+    #[parallel(env)]
+    fn test_main_args_argparse_adapter_auto_connect() {
+        let base_toml = r#"
+        [global]
+        ca_file = "$CAFILE"
+        certificate_file = "$CERTFILE"
+        private_key_file = "$PKFILE"
+        control_path = "/tmp/control.sock"
+        capture_path = "/tmp/capture.sock"
+        zpr_addr = [ "10.0.0.1" ]
+
+        [adapter]
+        node_addr = "192.168.0.2:5000"
+        "#;
+
+        let ca_file = TempFile::touch();
+        let cert_file = TempFile::touch();
+        let pk_file = TempFile::touch();
+
+        let fill = |toml: &str| -> String {
+            toml.replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
+                .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
+                .replace("$CAFILE", ca_file.get_path().to_str().unwrap())
+        };
+
+        // No key in the file, no flag: default true.
+        let plain = TempFile::new_toml(&fill(base_toml));
+        let args = vec!["ph", "adapter", "-c", plain.get_path().to_str().unwrap()];
+        let (_, config) = argparse(Some(args)).unwrap();
+        assert!(config.auto_connect, "default must be auto-connect");
+
+        // No key in the file, --auto-connect=false: flag wins.
+        let args = vec![
+            "ph",
+            "adapter",
+            "-c",
+            plain.get_path().to_str().unwrap(),
+            "--auto-connect=false",
+        ];
+        let (_, config) = argparse(Some(args)).unwrap();
+        assert!(!config.auto_connect, "--auto-connect=false must override");
+
+        // Key false in the file, no flag: config value preserved.
+        let false_toml = fill(&format!("{base_toml}\n        auto_connect = false\n"));
+        let cfg_false = TempFile::new_toml(&false_toml);
+        let args = vec![
+            "ph",
+            "adapter",
+            "-c",
+            cfg_false.get_path().to_str().unwrap(),
+        ];
+        let (_, config) = argparse(Some(args)).unwrap();
+        assert!(
+            !config.auto_connect,
+            "omitted flag must preserve the config file value"
+        );
+
+        // Key false in the file, --auto-connect=true: flag wins over a
+        // contradicting config file.
+        let args = vec![
+            "ph",
+            "adapter",
+            "-c",
+            cfg_false.get_path().to_str().unwrap(),
+            "--auto-connect=true",
+        ];
+        let (_, config) = argparse(Some(args)).unwrap();
+        assert!(
+            config.auto_connect,
+            "--auto-connect=true must override a config file that says false"
         );
     }
 

@@ -184,6 +184,14 @@ pub struct Config {
 
     /// Type of key manager implementation
     pub km_impl: KmId,
+
+    /// Adapter only - whether the tether link connects (and reconnects) on
+    /// its own. `true` (the default) is today's behaviour: start keying at
+    /// startup and restart after the holddown when the link drops. `false`
+    /// leaves the link Inactive until a `startLink` RPC (ph-cli connect /
+    /// link start) wakes it, and a drop returns it to Inactive with no
+    /// automatic restart (zipline#28).
+    pub auto_connect: bool,
 }
 
 impl Config {
@@ -442,6 +450,9 @@ impl Config {
                 self.bootstrap_key_path = Some(bootstrap_key_file.clone());
             }
         }
+        if let Some(auto_connect) = config.auto_connect {
+            self.auto_connect = auto_connect;
+        }
         Ok(())
     }
 
@@ -587,6 +598,7 @@ impl Default for Config {
             bootstrap_key_path: None,
             batch_io_engine: batch_io::AUTO_ENGINE_NAME.to_owned(),
             km_impl: KM_ID_NOISE,
+            auto_connect: true,
         }
     }
 }
@@ -642,6 +654,7 @@ pub struct AdapterConfigSection {
     pub name: Option<String>,
     pub node_addr: Option<SocketAddr>,
     pub bootstrap_key: Option<PathBuf>,
+    pub auto_connect: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -758,6 +771,55 @@ mod test {
             bootstrap_key = "rsa_key.pem"
             "#;
         let _config: AdapterConfigSection = toml::from_str(toml_str).unwrap();
+    }
+
+    /// `auto_connect = false` under `[adapter]` must deserialize, and an
+    /// omitted key must stay `None` so the built-in default applies.
+    #[test]
+    fn test_deserialize_adapter_config_auto_connect() {
+        let toml_str = r#"
+            node_addr = "10.0.0.1:5000"
+            auto_connect = false
+            "#;
+        let config: AdapterConfigSection = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.auto_connect, Some(false));
+
+        let toml_str = r#"
+            node_addr = "10.0.0.1:5000"
+            "#;
+        let config: AdapterConfigSection = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.auto_connect, None);
+    }
+
+    /// The default is auto-connect (today's behaviour): a default `Config`
+    /// has `auto_connect = true`, and `set_from_adapter` only overrides it
+    /// when the config file actually carries the key.
+    #[test]
+    fn test_set_from_adapter_auto_connect() {
+        // Default: on.
+        let config = Config::default();
+        assert!(config.auto_connect, "auto_connect must default to true");
+
+        // Config file says off.
+        let section: AdapterConfigSection = toml::from_str(
+            r#"
+            auto_connect = false
+            "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config
+            .set_from_adapter(&section, Path::new("/tmp"))
+            .unwrap();
+        assert!(!config.auto_connect);
+
+        // Config file silent: default preserved.
+        let section: AdapterConfigSection = toml::from_str("").unwrap();
+        let mut config = Config::default();
+        config
+            .set_from_adapter(&section, Path::new("/tmp"))
+            .unwrap();
+        assert!(config.auto_connect);
     }
 
     #[test]
