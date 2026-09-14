@@ -147,6 +147,15 @@ pub enum Command {
         /// PEM file holding the boostrap RSA private key
         #[arg(long, value_name = "PATH")]
         bootstrap_key: Option<PathBuf>,
+
+        /// Whether the adapter connects its tether on its own. The default
+        /// (true) is to start connecting at startup and to reconnect after a
+        /// drop. With --auto-connect=false the adapter idles until a
+        /// `ph-cli connect` (or `ph-cli link start`) starts the link, and a
+        /// dropped link waits for the next one instead of reconnecting.
+        /// Overrides the `auto_connect` key in the config file.
+        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+        auto_connect: Option<bool>,
     },
     /// Start the handler in node mode
     #[command(verbatim_doc_comment)]
