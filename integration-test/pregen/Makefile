@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2
+OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-file-interplay.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
@@ -39,6 +39,17 @@ v6-1node-3actor-ping.bin2: v6-1node-3actor-ping.zplc v4-1node-3actor-ping.zpl
 # warning — expected, do not add --Werror here.
 oidc-test.bin2: oidc-test.zpl oidc-test.zplc oidc-test-seed-jwks.json
 	$(ZPLC) -c oidc-test.zplc -k $(KEY) -f v2 -o $@ oidc-test.zpl
+
+# oidc + file interplay fixture (zipline#27). Same fake-IdP pinning as
+# oidc-test, plus the happyfile file store from the trusted-service
+# interplay plan. Compiling this is itself an acceptance check: the
+# `google` service is referenced by no ZPL statement and must survive by
+# the identity-vendor retention rule (zipline#23) — zplc >= 0.17.0 with
+# that rule prints "trusted service `google` retained: vends identity
+# attributes"; an older zplc silently prunes it and the test's zpdump
+# check catches the difference.
+oidc-file-interplay.bin2: oidc-file-interplay.zpl oidc-file-interplay.zplc oidc-test-seed-jwks.json
+	$(ZPLC) -c oidc-file-interplay.zplc -k $(KEY) -f v2 -o $@ oidc-file-interplay.zpl
 
 # Fake-IdP signing keys (checked in; test-only, no secrecy requirement) and
 # the seed JWKS derived from key 1 only via --print-jwks, which reuses the
