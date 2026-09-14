@@ -2040,7 +2040,17 @@ impl LinkStateWrapper {
                 info!(target: LINK_STATE, "{} has fully shut down", asm.formatted_link_id(link_id));
                 if !locked_fsm.shutting_down {
                     drop(locked_fsm);
-                    self.setup_restart(asm);
+                    // With auto-connect off (zipline#28) the AdapterToNode
+                    // tether does not restart itself: it stays Inactive
+                    // until the next startLink RPC (ph-cli connect / link
+                    // start). Every connect is operator-initiated.
+                    if self.link_type == LinkType::AdapterToNode
+                        && !asm.config.get().auto_connect
+                    {
+                        info!(target: LINK_STATE, "{} idle (auto-connect off); waiting for startLink", asm.formatted_link_id(link_id));
+                    } else {
+                        self.setup_restart(asm);
+                    }
                 } else {
                     drop(locked_fsm);
                     asm.drop_peer(link_id); // buh bye!
@@ -2329,6 +2339,101 @@ mod tests {
             scopes: vec!["openid".to_string()],
             allow_offline_access: false,
         }
+    }
+
+    /// With `auto_connect = false` (zipline#28), a dropped AdapterToNode
+    /// tether must NOT auto-restart: `complete_close` leaves it Inactive
+    /// and no holddown timer re-fires `Start`. The next `startLink` RPC is
+    /// the only way back up.
+    #[tokio::test(start_paused = true)]
+    async fn test_no_restart_after_close_when_auto_connect_disabled() {
+        LocalSet::new()
+            .run_until(async {
+                let mut builder = TestAssemblyBuilder::new();
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                let mut cfg = <crate::config::Config as std::default::Default>::default();
+                cfg.auto_connect = false;
+                builder.config = Some(rcu::RcuBox::new(cfg));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+
+                // The link is closing (e.g. auth failed); the close completes.
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine.test_set_state(LinkState::Closing);
+                }
+                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive
+                );
+
+                // Advance well past the restart holddown: still Inactive.
+                tokio::time::sleep(
+                    config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1),
+                )
+                .await;
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive,
+                    "auto_connect=false link must wait for startLink, not self-restart"
+                );
+            })
+            .await
+    }
+
+    /// Companion: with the default config (`auto_connect = true`) the
+    /// holddown restart still happens — today's behaviour is preserved.
+    #[tokio::test(start_paused = true)]
+    async fn test_restart_after_close_with_default_auto_connect() {
+        LocalSet::new()
+            .run_until(async {
+                let mut builder = TestAssemblyBuilder::new();
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine.test_set_state(LinkState::Closing);
+                }
+                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive
+                );
+
+                tokio::time::sleep(
+                    config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1),
+                )
+                .await;
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Keying,
+                    "default config must keep the automatic holddown restart"
+                );
+            })
+            .await
     }
 
     /// WaitForUserAuth with an agent that never replies must fail with
