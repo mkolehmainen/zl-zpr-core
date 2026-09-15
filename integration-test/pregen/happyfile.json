@@ -1,0 +1,8 @@
+{
+  "user.sub": {
+    "user-a": {
+      "hair_color": ["brown"],
+      "lazy": ["yes"]
+    }
+  }
+}

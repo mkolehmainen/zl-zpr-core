@@ -1,0 +1,81 @@
+# -*- mode: toml -*-
+# oidc + file interplay integration-test fixture config (zipline#27).
+#
+# oidc-test.zplc's one-node topology and fake-IdP pinning, plus the two
+# trusted services from the master plan's Background
+# (zl-zpr-dev-context/docs/plans/2026-09-14-trusted-service-interplay.md):
+#   - `google` (api = "oidc") is the compiler fixture
+#     test-oidc-file-interplay.zplc's service re-pinned to the fake IdP the
+#     test runs on each namespace's loopback (issuer, client_id, seed JWKS).
+#   - `happyfile` (api = "file") decorates on google's identity attribute;
+#     the vs loads its data from file_ts_dir/happyfile.json keyed on
+#     user.sub. expiration_seconds = 90 deliberately exceeds the vs's 60 s
+#     MIN_ATTRIBUTE_TTL while keeping the test's refresh leg short.
+#
+# `service` (the JWKS CONNECT proxy) is deliberately omitted — the visa
+# service fetches the JWKS directly — so zplc emits a warning; expected.
+
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"n0.zpr" = "fd5a:5052::2"
+"n0.overlay" = "10.0.0.1"
+
+[nodes."node"]
+provider = [ [ "device.zpr.adapter.cn", "node" ] ]
+zpr_address = "n0.zpr"
+
+[nodes."node".substrate_addrs]
+in1 = "n0.overlay:12345"
+
+[trusted_services.default]
+cert_path = "ca-cert.pem"
+
+[trusted_services.happyfile]
+api = "file"
+returns_attributes = ["hair_color -> user.hair_color", "lazy -> #user.lazy"]
+expiration_seconds = 90
+
+[trusted_services.google]
+api             = "oidc"
+issuer          = "https://127.0.0.1:9000"
+jwks_uri        = "https://127.0.0.1:9000/jwks"
+client_id       = "zpr-test-client"
+scopes          = ["openid", "email", "profile"]
+allowed_domains = ["example.com"]
+seed_jwks       = "oidc-test-seed-jwks.json"
+
+expiration_seconds   = 43200
+max_auth_age_seconds = 86400
+allow_offline_access = false
+
+returns_attributes = [
+  "sub   -> user.sub",
+  "email -> user.email",
+]
+identity_attributes = ["sub"]
+
+[visa_service]
+dock_node = "node"
+
+# adapter1 is deliberately absent: it authenticates user-only through the
+# fake IdP and never presents a bootstrap (device) key.
+[bootstrap]
+"node" = "node-rsa-pubkey.pem"
+"vs.zpr" = "actorvs.pem"
+"adapter2" = "actor2.pem"
+
+[protocols.ping]
+l4protocol = "iana.ICMP6"
+icmp_type = "request-response"
+icmp_codes = [ 128, 129 ]
+
+[services.Web]
+protocol = "ping"
+
+[services.PingableVs]
+protocol = "ping"
+
+[services.PingableNode]
+protocol = "ping"
