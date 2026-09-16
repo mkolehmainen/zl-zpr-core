@@ -9,5 +9,5 @@ pub mod socket_owner;
 pub use data_home::get_data_home;
 pub use socket_owner::{
     SocketOwner, capture_socket_path, choose_socket_path, control_socket_path, owner_socket_dir,
-    resolve_socket_owner,
+    resolve_socket_owner, socket_is_live,
 };

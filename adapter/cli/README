@@ -12,7 +12,10 @@ control socket in this order (zipline#39):
    systemd-started ph puts it; if the host has a "zpr" group the socket is
    group zpr, mode 0660, so group members can use ph-cli directly.
 
-If neither exists, ph-cli fails with an error naming both paths it tried.
+If neither answers, ph-cli fails with an error naming both paths it tried.
+A candidate is selected by probe-connecting to it, not by checking the
+pathname exists, so a stale socket file left by a dead ph never shadows a
+live server at the other path.
 An explicit -p (control socket) or -c (capture socket) always wins and
 short-circuits the search. The default capture socket is capture.sock in
 the same directory as the control socket that was found.

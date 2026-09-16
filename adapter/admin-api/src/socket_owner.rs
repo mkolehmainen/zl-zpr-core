@@ -108,9 +108,7 @@ fn socket_path(owner_uid: Option<u32>, name: &str) -> PathBuf {
 /// shared path. This is the predicate `ph-cli` injects into
 /// [choose_socket_path] — a probe connect, not an `exists()` check.
 pub fn socket_is_live(path: &std::path::Path) -> bool {
-    // UNIMPLEMENTED (zipline#39 review): liveness probe
-    let _ = path;
-    unimplemented!("zipline#39 review")
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 /// Which socket path a client (`ph-cli`) should use, given an optional
@@ -118,10 +116,10 @@ pub fn socket_is_live(path: &std::path::Path) -> bool {
 /// (see [socket_is_live]).
 ///
 /// * An explicit path short-circuits everything — it is used whether or not
-///   it exists, so error reporting stays at the connect site.
+///   it is usable, so error reporting stays at the connect site.
 /// * Otherwise the per-uid path for the caller's euid is preferred when it
-///   exists, then the shared path when it exists.
-/// * When neither exists the result is an error naming both paths tried.
+///   is usable, then the shared path when it is usable.
+/// * When neither is usable the result is an error naming both paths tried.
 pub fn choose_socket_path<F>(
     explicit: Option<PathBuf>,
     per_uid: PathBuf,
@@ -141,7 +139,7 @@ where
         return Ok(shared);
     }
     Err(format!(
-        "no packet handler socket found (tried {} and {}); is ph running? Use -p/-c to point at an explicit socket path",
+        "no live packet handler socket (tried {} and {}); is ph running? Use -p/-c to point at an explicit socket path",
         per_uid.display(),
         shared.display()
     ))

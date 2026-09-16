@@ -343,9 +343,12 @@ sockets are left exactly as before (root-only) and `ph` logs one warning —
 creating the group is a packaging/admin choice, never a hard runtime
 dependency.
 
-`ph-cli`'s default search order is: the per-user socket for your uid if it
-exists, then the shared socket if it exists; if neither exists it fails with
-an error naming both paths tried. An explicit `-p` (control) or `-c`
+`ph-cli`'s default search order is: the per-user socket for your uid, then
+the shared socket. A candidate is chosen by actually connecting to it, not
+by checking the pathname exists — a stale socket file left behind by a dead
+`ph` (nothing unlinks it on a crash) never shadows a live server at the
+other path. If neither answers, `ph-cli` fails with an error naming both
+paths tried. An explicit `-p` (control) or `-c`
 (capture) always wins, on both `ph` and `ph-cli`, as does an explicit
 `control_path`/`capture_path` in the config file — so multi-adapter and test
 setups keep full control.

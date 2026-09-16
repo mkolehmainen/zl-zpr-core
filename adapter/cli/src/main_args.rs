@@ -10,7 +10,8 @@ pub struct CmdlineArgs {
     pub command: Option<Commands>,
 
     /// Path to the Packet Handler's management socket. Default: the per-user
-    /// socket for your uid if it exists, else the shared socket (zipline#39).
+    /// socket for your uid when a server answers there, else the shared
+    /// socket (zipline#39).
     #[arg(long, short = 'p')]
     pub socket: Option<PathBuf>,
 
@@ -22,9 +23,11 @@ pub struct CmdlineArgs {
 /// Resolve the control and capture socket paths for this invocation
 /// (zipline#39). Explicit `-p`/`-c` short-circuit. Otherwise the control
 /// socket is searched: per-uid path for the caller's euid first, then the
-/// shared path; when neither exists the error names both. The capture socket
-/// follows the resolved control socket's directory, so the pair always
-/// belongs to the same adapter.
+/// shared path; when neither answers the error names both. A candidate is
+/// selected by a probe connect, not by pathname existence — a stale socket
+/// file left by a dead ph must not shadow a live server at the other path.
+/// The capture socket follows the resolved control socket's directory, so
+/// the pair always belongs to the same adapter.
 pub fn resolve_sockets(
     explicit_control: Option<PathBuf>,
     explicit_capture: Option<PathBuf>,
@@ -33,11 +36,11 @@ pub fn resolve_sockets(
         explicit_control,
         explicit_capture,
         nix::unistd::geteuid().as_raw(),
-        |p| p.exists(),
+        admin_api::socket_is_live,
     )
 }
 
-/// Testable core of [resolve_sockets]: euid and existence predicate injected.
+/// Testable core of [resolve_sockets]: euid and liveness predicate injected.
 pub fn resolve_sockets_with<F>(
     explicit_control: Option<PathBuf>,
     explicit_capture: Option<PathBuf>,
