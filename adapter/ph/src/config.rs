@@ -5,7 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{self, Path, PathBuf};
 use zpr::packet_info::{KM_ID_NOISE, KM_ID_NULL, KmId};
 
-use admin_api::get_data_home;
+use admin_api::{SocketOwner, capture_socket_path, control_socket_path};
 use base64::prelude::*;
 use serde::Deserialize;
 
@@ -192,6 +192,23 @@ pub struct Config {
     /// link start) wakes it, and a drop returns it to Inactive with no
     /// automatic restart (zipline#28).
     pub auto_connect: bool,
+
+    /// The user the control/capture sockets should belong to, resolved from
+    /// `SUDO_UID`/`SUDO_GID`/`PKEXEC_UID` by [Config::apply_socket_owner].
+    /// `None` when ph was started with no recoverable invoking user (e.g.
+    /// under systemd), in which case main falls back to the `zpr` group
+    /// (zipline#39).
+    pub socket_owner: Option<SocketOwner>,
+
+    /// True while `control_path` is still the derived default — no config
+    /// file or command line override. Only a derived path follows the
+    /// resolved owner into its per-uid directory, and only a derived path's
+    /// parent directory is auto-created; an explicit path keeps today's
+    /// "parent must already exist" contract (zipline#39).
+    pub(crate) control_path_derived: bool,
+
+    /// Same as `control_path_derived`, for `capture_path`.
+    pub(crate) capture_path_derived: bool,
 }
 
 impl Config {
@@ -298,6 +315,26 @@ impl Config {
         Ok(())
     }
 
+    /// Fold the resolved socket owner into the config (zipline#39): socket
+    /// paths that are still the derived default move into the owner's
+    /// per-uid directory, so ph and a same-user ph-cli agree on the path.
+    /// Explicitly configured paths (config file or command line) always win
+    /// and are left untouched.
+    pub fn apply_socket_owner(&mut self, owner: Option<SocketOwner>) {
+        // UNIMPLEMENTED (zipline#39)
+        let _ = owner;
+        unimplemented!("zipline#39")
+    }
+
+    /// Create the per-owner socket directory (mode 0700, chowned to the
+    /// owner) for each still-derived socket path, so `check_valid`'s
+    /// parent-directory check passes without pre-provisioning (zipline#39).
+    /// Explicit paths keep today's contract: their parent must already exist.
+    pub fn prepare_socket_dirs(&self) -> Result<(), ArgsError> {
+        // UNIMPLEMENTED (zipline#39)
+        unimplemented!("zipline#39")
+    }
+
     // Check that the required bits are present based on mode.
     // Also checks that the various files exist.
     pub fn check_valid(&self, mode: PhMode) -> Result<(), ArgsError> {
@@ -382,6 +419,7 @@ impl Config {
             } else {
                 self.control_path = control_path.clone();
             }
+            self.control_path_derived = false;
         }
         if let Some(capture_path) = &config.capture_path {
             if capture_path.is_relative() {
@@ -389,6 +427,7 @@ impl Config {
             } else {
                 self.capture_path = capture_path.clone();
             }
+            self.capture_path_derived = false;
         }
         if let Some(self_addr) = &config.self_addr {
             self.self_addr = *self_addr;
@@ -502,6 +541,7 @@ impl Config {
                     e
                 )))
             })?;
+            self.control_path_derived = false;
         }
         if let Some(capture_path) = &common.capture_path {
             let cp = PathBuf::from(capture_path);
@@ -511,6 +551,7 @@ impl Config {
                     e
                 )))
             })?;
+            self.capture_path_derived = false;
         }
         if let Some(self_addr) = &common.self_addr {
             self.self_addr = *self_addr;
@@ -581,8 +622,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             name: String::new(),
-            control_path: get_data_home().join("control.sock"),
-            capture_path: get_data_home().join("capture.sock"),
+            control_path: control_socket_path(None),
+            capture_path: capture_socket_path(None),
             self_addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0),
             ca_file: None,
             certificate_file: None,
@@ -599,6 +640,9 @@ impl Default for Config {
             batch_io_engine: batch_io::AUTO_ENGINE_NAME.to_owned(),
             km_impl: KM_ID_NOISE,
             auto_connect: true,
+            socket_owner: None,
+            control_path_derived: true,
+            capture_path_derived: true,
         }
     }
 }
@@ -763,6 +807,7 @@ pub fn get_noise_cn(certificate_file: &Path) -> Result<String, ArgsError> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_deserialize_adapter_config() {
@@ -893,5 +938,141 @@ mod test {
         // Garbage rejected.
         assert!(resolve_advertised_addr("not an address").is_err());
         assert!(resolve_advertised_addr("203.0.113.7").is_err());
+    }
+
+    /// With a resolved owner and derived (default) socket paths, both paths
+    /// move into the owner's per-uid directory and match what admin-api
+    /// derives — the ph / ph-cli agreement this issue exists for (zipline#39).
+    #[test]
+    fn test_apply_socket_owner_moves_derived_paths() {
+        let mut config = Config::default();
+        config.apply_socket_owner(Some(SocketOwner {
+            uid: 1234,
+            gid: Some(1234),
+        }));
+        assert_eq!(config.control_path, control_socket_path(Some(1234)));
+        assert_eq!(config.capture_path, capture_socket_path(Some(1234)));
+        assert_eq!(
+            config.socket_owner,
+            Some(SocketOwner {
+                uid: 1234,
+                gid: Some(1234)
+            })
+        );
+    }
+
+    /// No owner: the derived paths stay at today's shared location.
+    #[test]
+    fn test_apply_socket_owner_none_keeps_shared_paths() {
+        let mut config = Config::default();
+        config.apply_socket_owner(None);
+        assert_eq!(config.control_path, control_socket_path(None));
+        assert_eq!(config.capture_path, capture_socket_path(None));
+        assert_eq!(config.socket_owner, None);
+    }
+
+    /// Explicitly configured socket paths win over the owner-derived
+    /// default — the override contract that keeps multi-adapter and test
+    /// setups working (zipline#39).
+    #[test]
+    fn test_apply_socket_owner_respects_explicit_paths() {
+        let section: GlobalConfigSection = toml::from_str(
+            r#"
+            control_path = "/explicit/control.sock"
+            capture_path = "/explicit/capture.sock"
+            "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.set_from_globals(&section, Path::new("/tmp")).unwrap();
+        config.apply_socket_owner(Some(SocketOwner {
+            uid: 1234,
+            gid: Some(1234),
+        }));
+        assert_eq!(config.control_path, PathBuf::from("/explicit/control.sock"));
+        assert_eq!(config.capture_path, PathBuf::from("/explicit/capture.sock"));
+        // The owner is still recorded for the post-bind chown.
+        assert_eq!(
+            config.socket_owner,
+            Some(SocketOwner {
+                uid: 1234,
+                gid: Some(1234)
+            })
+        );
+    }
+
+    /// `prepare_socket_dirs` creates the per-owner directory for derived
+    /// paths, so config validation passes even though the parent did not
+    /// pre-exist (zipline#39). Uses the current euid so the chown is a no-op
+    /// permitted without root.
+    #[test]
+    fn test_prepare_socket_dirs_creates_derived_parent() {
+        let tstamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("zpr_test_sockdir_{tstamp}"));
+
+        let mut config = Config::default();
+        // Simulate the derived per-uid layout under a temp data home; keep
+        // the derived flags true so prepare_socket_dirs owns the parents.
+        let uid = nix::unistd::geteuid().as_raw();
+        let gid = nix::unistd::getegid().as_raw();
+        config.socket_owner = Some(SocketOwner {
+            uid,
+            gid: Some(gid),
+        });
+        config.control_path = base.join(uid.to_string()).join("control.sock");
+        config.capture_path = base.join(uid.to_string()).join("capture.sock");
+
+        let parent = config.control_path.parent().unwrap().to_path_buf();
+        assert!(!parent.exists(), "parent must not pre-exist for this test");
+
+        config.prepare_socket_dirs().unwrap();
+
+        assert!(parent.exists(), "prepare_socket_dirs must create the parent");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&parent).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o700, "per-owner dir must be mode 0700");
+
+        // And the config now passes the parent-directory validation.
+        if let Some(parent) = config.control_path.parent() {
+            assert!(fs::exists(parent).unwrap());
+        }
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Explicit socket paths are left alone by `prepare_socket_dirs`: a
+    /// missing parent stays missing and still fails validation, exactly as
+    /// today (zipline#39).
+    #[test]
+    fn test_prepare_socket_dirs_leaves_explicit_paths_alone() {
+        let tstamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("zpr_test_sockdir_expl_{tstamp}"));
+
+        let section: GlobalConfigSection = toml::from_str(&format!(
+            r#"
+            control_path = "{base}/nosuchdir/control.sock"
+            capture_path = "{base}/nosuchdir/capture.sock"
+            "#,
+            base = base.display()
+        ))
+        .unwrap();
+        let mut config = Config::default();
+        config.set_from_globals(&section, Path::new("/tmp")).unwrap();
+        config.socket_owner = Some(SocketOwner {
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: None,
+        });
+
+        config.prepare_socket_dirs().unwrap();
+        assert!(
+            !config.control_path.parent().unwrap().exists(),
+            "explicit path parents must not be auto-created"
+        );
     }
 }
