@@ -322,8 +322,12 @@ socket path and permissions follow from that. There are two modes:
 `SUDO_UID`/`SUDO_GID` (or `PKEXEC_UID`) and puts the sockets in a per-user
 directory, chowned to that user with mode `0600`:
 
-    <data_home>/zpr/<uid>/control.sock
-    <data_home>/zpr/<uid>/capture.sock
+    /var/run/zpr/<uid>/control.sock
+    /var/run/zpr/<uid>/capture.sock
+
+The per-user base is fixed at `/var/run/zpr` — deliberately not derived
+from `HOME`/`XDG_DATA_HOME`, since `ph` runs in root's environment and
+`ph-cli` in the user's, and the two must agree on the path.
 
 `ph-cli`, run as that same user with no `sudo` and no `-p`, looks in the
 per-user directory for its own uid first and connects directly. Because each

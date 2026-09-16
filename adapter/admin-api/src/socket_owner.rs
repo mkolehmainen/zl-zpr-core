@@ -5,9 +5,10 @@
 //! capture sockets and, from that, where the sockets live:
 //!
 //! * Owner known (`ph` started via `sudo` or `pkexec`): the sockets live in a
-//!   per-uid directory `<data_home>/<uid>/` and are chowned to that user.
+//!   per-uid directory `/var/run/zpr/<uid>/` and are chowned to that user.
 //!   `ph-cli`, running as that user, derives the identical path from its own
-//!   effective uid.
+//!   effective uid. The base is fixed, never environment-derived — see
+//!   [PER_UID_SOCKET_BASE].
 //! * Owner unknown (systemd, direct root login): the sockets live at the
 //!   shared `<data_home>/` path as before; `ph` falls back to the `zpr` group
 //!   for access control.
@@ -62,9 +63,22 @@ where
     None
 }
 
-/// The directory holding a known owner's sockets: `<data_home>/<uid>/`.
+/// Fixed base directory for per-uid socket directories.
+///
+/// Deliberately NOT derived from `HOME`/`XDG_DATA_HOME` (unlike the shared
+/// path, which keeps its historical `get_data_home` derivation): `ph`
+/// computes this path in root's environment while `ph-cli` computes it in
+/// the invoking user's, so an environment-derived base makes the two sides
+/// disagree for the same uid and the sudo-to-unprivileged workflow cannot
+/// connect. `/var/run/zpr` is `get_data_home`'s own no-environment fallback,
+/// is root-writable (ph creates `<base>/<uid>` chowned to the owner), and
+/// being tmpfs-backed on modern hosts clears stale sockets on reboot.
+pub const PER_UID_SOCKET_BASE: &str = "/var/run/zpr";
+
+/// The directory holding a known owner's sockets:
+/// [`PER_UID_SOCKET_BASE`]`/<uid>/`.
 pub fn owner_socket_dir(uid: u32) -> PathBuf {
-    get_data_home().join(uid.to_string())
+    PathBuf::from(PER_UID_SOCKET_BASE).join(uid.to_string())
 }
 
 /// Default control socket path for the given owner: per-uid when the owner
@@ -253,6 +267,7 @@ mod test {
     #[test]
     fn per_uid_base_is_environment_independent() {
         assert_eq!(owner_socket_dir(1000), Path::new("/var/run/zpr/1000"));
+        assert_eq!(PER_UID_SOCKET_BASE, "/var/run/zpr");
     }
 
     /// The drift regression this issue exists to prevent: the path `ph`

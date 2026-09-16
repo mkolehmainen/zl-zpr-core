@@ -3,9 +3,11 @@ Which socket does ph-cli talk to?
 ph-cli needs no sudo. By default it searches for the packet handler's
 control socket in this order (zipline#39):
 
-1. The per-user socket for your uid: <data_home>/zpr/<uid>/control.sock.
+1. The per-user socket for your uid: /var/run/zpr/<uid>/control.sock.
    This is where a sudo- or pkexec-started ph puts it, owned by the user
-   who ran sudo, mode 0600.
+   who ran sudo, mode 0600. The base /var/run/zpr is fixed (never derived
+   from HOME/XDG_DATA_HOME) so ph and ph-cli agree across the sudo
+   privilege boundary.
 2. The shared socket: <data_home>/zpr/control.sock. This is where a
    systemd-started ph puts it; if the host has a "zpr" group the socket is
    group zpr, mode 0660, so group members can use ph-cli directly.
