@@ -26,8 +26,10 @@ pub struct CmdlineArgs {
 /// shared path; when neither answers the error names both. A candidate is
 /// selected by a probe connect, not by pathname existence — a stale socket
 /// file left by a dead ph must not shadow a live server at the other path.
-/// The capture socket follows the resolved control socket's directory, so
-/// the pair always belongs to the same adapter.
+/// The capture socket follows the resolved control socket's directory when
+/// the control socket also came from the default search; with an explicit
+/// `-p` the derived capture candidates are searched by liveness first and
+/// colocation is only the last-resort fallback.
 pub fn resolve_sockets(
     explicit_control: Option<PathBuf>,
     explicit_capture: Option<PathBuf>,
@@ -50,6 +52,7 @@ pub fn resolve_sockets_with<F>(
 where
     F: Fn(&Path) -> bool,
 {
+    let explicit_control_given = explicit_control.is_some();
     let control = choose_socket_path(
         explicit_control,
         control_socket_path(Some(euid)),
@@ -58,13 +61,37 @@ where
     )?;
     let capture = match explicit_capture {
         Some(path) => path,
-        // The capture socket lives beside the control socket ph bound.
-        None => match control.parent() {
-            Some(dir) => dir.join("capture.sock"),
-            None => capture_socket_path(None),
-        },
+        // Explicit -p, no -c: the control path says nothing about where ph
+        // derived its capture socket (ph given only --control-path keeps
+        // capture at the derived default). Search the derived candidates by
+        // liveness first; colocation beside the explicit control path is
+        // only the last-resort guess (ph configured with both explicit
+        // paths side by side), never an error — commands that do not touch
+        // the capture socket must still run (zipline#39 review).
+        None if explicit_control_given => {
+            let per_uid = capture_socket_path(Some(euid));
+            let shared = capture_socket_path(None);
+            if exists(&per_uid) {
+                per_uid
+            } else if exists(&shared) {
+                shared
+            } else {
+                colocated_capture(&control)
+            }
+        }
+        // Control came from the default search: capture.sock beside it
+        // belongs to the same adapter by construction.
+        None => colocated_capture(&control),
     };
     Ok((control, capture))
+}
+
+// The capture socket beside a control socket: `<dir>/capture.sock`.
+fn colocated_capture(control: &Path) -> PathBuf {
+    match control.parent() {
+        Some(dir) => dir.join("capture.sock"),
+        None => capture_socket_path(None),
+    }
 }
 
 #[derive(Parser, Debug)]
