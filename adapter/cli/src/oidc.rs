@@ -568,10 +568,21 @@ impl cli::auth_agent::Server for CliAuthAgent {
                 // Keep the refresh token (when the IdP granted one) in
                 // memory, keyed by issuer, so later `interactive: false`
                 // requests can be satisfied silently. It goes nowhere else.
-                if let Some(refresh_token) = tokens.refresh_token {
-                    self.refresh_tokens
-                        .borrow_mut()
-                        .insert(idp.issuer.clone(), refresh_token);
+                // A successful login WITHOUT a refresh token supersedes any
+                // previously cached one for the issuer: the user may have
+                // switched accounts or offline authorization may have been
+                // withdrawn, so replaying the old token would silently
+                // refresh the OLD session and hand back the previous
+                // identity's id_token.
+                match tokens.refresh_token {
+                    Some(refresh_token) => {
+                        self.refresh_tokens
+                            .borrow_mut()
+                            .insert(idp.issuer.clone(), refresh_token);
+                    }
+                    None => {
+                        self.refresh_tokens.borrow_mut().remove(&idp.issuer);
+                    }
                 }
                 tokens.id_token
             })
@@ -1724,6 +1735,10 @@ mod tests {
         auth_hits: usize,
         /// Raw form bodies of `grant_type=refresh_token` POSTs to `/token`.
         refresh_bodies: Vec<String>,
+        /// When set, the authorization-code exchange answers WITHOUT a
+        /// `refresh_token` (an IdP may withhold one, e.g. when offline
+        /// authorization was withdrawn). Defaults to granting one.
+        withhold_refresh_token: bool,
     }
 
     /// `/token` behaviour for refresh grants in [run_fake_idp_offline].
@@ -1816,9 +1831,14 @@ mod tests {
                         }
                     }
                 } else {
-                    let body = format!(
-                        "{{\"id_token\":\"{FAKE_ID_TOKEN}\",\"refresh_token\":\"{FAKE_REFRESH_TOKEN}\"}}"
-                    );
+                    let withhold = seen.lock().unwrap().withhold_refresh_token;
+                    let body = if withhold {
+                        format!("{{\"id_token\":\"{FAKE_ID_TOKEN}\"}}")
+                    } else {
+                        format!(
+                            "{{\"id_token\":\"{FAKE_ID_TOKEN}\",\"refresh_token\":\"{FAKE_REFRESH_TOKEN}\"}}"
+                        )
+                    };
                     let _ =
                         write_http_response(&mut stream, "200 OK", "application/json", &body).await;
                 }
@@ -2172,6 +2192,67 @@ mod tests {
                     // endpoint again instead of failing fast.
                     assert_eq!(seen.lock().unwrap().refresh_bodies.len(), attempt);
                 }
+            })
+            .await;
+    }
+
+    /// A successful interactive login that grants NO refresh token
+    /// supersedes any previously cached one for that issuer: the stale
+    /// token is dropped, so a later `interactive: false` request fails with
+    /// the no-token error instead of silently refreshing the OLD session
+    /// (wrong identity / withdrawn offline authorization). No refresh grant
+    /// ever reaches the IdP after the tokenless login.
+    #[tokio::test]
+    async fn test_auth_agent_tokenless_interactive_login_drops_cached_refresh_token() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let idp_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let idp_addr = idp_listener.local_addr().unwrap();
+                let seen = Arc::new(Mutex::new(OfflineIdpSeen::default()));
+                tokio::spawn(run_fake_idp_offline(
+                    idp_listener,
+                    seen.clone(),
+                    RefreshMode::Ok,
+                ));
+
+                let (agent, mut progress) = new_cli_auth_agent(false);
+
+                // (a) First interactive login: the IdP grants a refresh
+                // token, which the agent caches.
+                interactive_login_via_agent(&agent, &mut progress, format!("http://{idp_addr}"))
+                    .await;
+
+                // (b) Second interactive login for the SAME issuer, but the
+                // IdP grants no refresh token this time.
+                seen.lock().unwrap().withhold_refresh_token = true;
+                interactive_login_via_agent(&agent, &mut progress, format!("http://{idp_addr}"))
+                    .await;
+
+                // (c) Non-interactive request: the stale token from (a) must
+                // be gone, so this fails fast with the no-token error.
+                let call = send_get_oidc_credential_offline(
+                    &agent,
+                    format!("http://{idp_addr}"),
+                    false,
+                    true,
+                );
+                let response = call.promise.await.unwrap();
+                let results = response.get().unwrap();
+                match results.get_result().unwrap().which().unwrap() {
+                    cli::success_or_error::Which::Error(e) => {
+                        let txt = e.unwrap().get_txt().unwrap().to_str().unwrap().to_string();
+                        assert!(txt.contains("non-interactive"), "unexpected error: {txt}");
+                    }
+                    cli::success_or_error::Which::Success(_) => {
+                        panic!("stale refresh token was replayed after a tokenless login")
+                    }
+                }
+                // The stub never saw a refresh grant after (b).
+                assert_eq!(
+                    seen.lock().unwrap().refresh_bodies.len(),
+                    0,
+                    "stale refresh token reached the IdP"
+                );
             })
             .await;
     }
