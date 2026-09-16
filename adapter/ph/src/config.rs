@@ -321,9 +321,15 @@ impl Config {
     /// Explicitly configured paths (config file or command line) always win
     /// and are left untouched.
     pub fn apply_socket_owner(&mut self, owner: Option<SocketOwner>) {
-        // UNIMPLEMENTED (zipline#39)
-        let _ = owner;
-        unimplemented!("zipline#39")
+        if let Some(ref owner) = owner {
+            if self.control_path_derived {
+                self.control_path = control_socket_path(Some(owner.uid));
+            }
+            if self.capture_path_derived {
+                self.capture_path = capture_socket_path(Some(owner.uid));
+            }
+        }
+        self.socket_owner = owner;
     }
 
     /// Create the per-owner socket directory (mode 0700, chowned to the
@@ -331,8 +337,50 @@ impl Config {
     /// parent-directory check passes without pre-provisioning (zipline#39).
     /// Explicit paths keep today's contract: their parent must already exist.
     pub fn prepare_socket_dirs(&self) -> Result<(), ArgsError> {
-        // UNIMPLEMENTED (zipline#39)
-        unimplemented!("zipline#39")
+        use std::os::unix::fs::PermissionsExt;
+        for (path, derived) in [
+            (&self.control_path, self.control_path_derived),
+            (&self.capture_path, self.capture_path_derived),
+        ] {
+            // Explicit paths keep the parent-must-exist contract; only the
+            // derived per-owner directory is created here. socket_owner
+            // presence gates it too: without an owner the derived path is
+            // the shared data home, which stays a packaging concern.
+            if !derived {
+                continue;
+            }
+            let Some(ref owner) = self.socket_owner else {
+                continue;
+            };
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            if fs::exists(parent).unwrap_or(false) {
+                continue;
+            }
+            fs::create_dir_all(parent).map_err(|e| {
+                ArgsError::PathError(format!(
+                    "failed to create socket directory {parent:?}: {e:?}"
+                ))
+            })?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|e| {
+                ArgsError::PathError(format!(
+                    "failed to set mode 0700 on socket directory {parent:?}: {e:?}"
+                ))
+            })?;
+            nix::unistd::chown(
+                parent,
+                Some(nix::unistd::Uid::from_raw(owner.uid)),
+                owner.gid.map(nix::unistd::Gid::from_raw),
+            )
+            .map_err(|e| {
+                ArgsError::PathError(format!(
+                    "failed to chown socket directory {parent:?} to uid {}: {e:?}",
+                    owner.uid
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     // Check that the required bits are present based on mode.

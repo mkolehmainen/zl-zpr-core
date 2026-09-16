@@ -52,9 +52,21 @@ where
     U: Fn(u32) -> Option<u32>,
     G: Fn(&str) -> Option<u32>,
 {
-    // UNIMPLEMENTED (zipline#39): access decision
-    let _ = (owner, user_primary_gid, group_gid);
-    unimplemented!("zipline#39")
+    match owner {
+        Some(owner) => {
+            // SUDO_GID gave us the gid directly; a PKEXEC_UID-only owner
+            // needs the user's primary group resolved here.
+            let gid = owner.gid.or_else(|| user_primary_gid(owner.uid));
+            SocketAccess::OwnerOnly {
+                uid: owner.uid,
+                gid,
+            }
+        }
+        None => match group_gid(FALLBACK_GROUP) {
+            Some(gid) => SocketAccess::GroupShared { gid },
+            None => SocketAccess::Unchanged,
+        },
+    }
 }
 
 /// Apply the plan to a bound socket path. Thin syscall wrapper; the decision
