@@ -346,4 +346,61 @@ mod tests {
         assert_eq!(control, shared);
         assert_eq!(capture, PathBuf::from("/y/capture.sock"));
     }
+
+    /// ph started with only `--control-path /tmp/control.sock` keeps its
+    /// capture path derived (per-uid for a sudo start). `ph-cli -p` with no
+    /// `-c` must find that live derived capture socket instead of assuming
+    /// `/tmp/capture.sock` (zipline#39 review).
+    #[test]
+    fn explicit_control_searches_capture_per_uid() {
+        let cap = capture_socket_path(Some(1000));
+        let (control, capture) = resolve_sockets_with(
+            Some(PathBuf::from("/x/control.sock")),
+            None,
+            1000,
+            |p: &Path| p == cap.as_path(),
+        )
+        .unwrap();
+        assert_eq!(control, PathBuf::from("/x/control.sock"));
+        assert_eq!(
+            capture, cap,
+            "capture must be searched independently when -p is explicit"
+        );
+    }
+
+    /// Same as above with the derived capture socket at the shared path
+    /// (systemd-started ph given only an explicit control path).
+    #[test]
+    fn explicit_control_searches_capture_shared() {
+        let cap = capture_socket_path(None);
+        let (control, capture) = resolve_sockets_with(
+            Some(PathBuf::from("/x/control.sock")),
+            None,
+            1000,
+            |p: &Path| p == cap.as_path(),
+        )
+        .unwrap();
+        assert_eq!(control, PathBuf::from("/x/control.sock"));
+        assert_eq!(
+            capture, cap,
+            "capture must fall back to the shared derived path"
+        );
+    }
+
+    /// Explicit `-p` with no live derived capture socket anywhere: fall back
+    /// to the colocation guess (ph configured with both paths explicit puts
+    /// them side by side), never a hard error — commands that do not touch
+    /// the capture socket must still run (zipline#39 review).
+    #[test]
+    fn explicit_control_capture_colocation_fallback() {
+        let (control, capture) = resolve_sockets_with(
+            Some(PathBuf::from("/x/control.sock")),
+            None,
+            1000,
+            |_: &Path| false,
+        )
+        .unwrap();
+        assert_eq!(control, PathBuf::from("/x/control.sock"));
+        assert_eq!(capture, PathBuf::from("/x/capture.sock"));
+    }
 }
