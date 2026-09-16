@@ -400,10 +400,7 @@ async fn connect_task(service: svc::Client, id: u32, no_browser: bool) -> Result
 /// `auth-agent`: `--no-browser` prints authorization URLs through the
 /// progress path instead of launching a browser.
 fn interactive_auth_agent(no_browser: bool) -> oidc::CliAuthAgent {
-    oidc::CliAuthAgent {
-        open_browser: !no_browser,
-        progress: None,
-    }
+    oidc::CliAuthAgent::new(!no_browser, None)
 }
 
 /// `auth-agent`: register as the authentication agent for a link and serve

@@ -15,6 +15,8 @@
 //! - The redirect listener binds 127.0.0.1 only, accepts exactly one
 //!   request, and validates the `state` parameter before releasing the code.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::process::Command;
 use std::rc::Rc;
 use std::time::Duration;
@@ -33,6 +35,17 @@ use url::Url;
 /// under the node's 330 s `ACTOR_AUTHENTICATION_TIMEOUT` so the CLI side
 /// gives up before the node does.
 pub const OIDC_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Fixed `max_age` (seconds, one year) sent on offline-capable authorization
+/// requests. The parameter exists only because OIDC Core section 3.1.2.1
+/// obliges the IdP to include the `auth_time` claim in the `id_token`
+/// whenever the request carries `max_age` — Google omits `auth_time`
+/// otherwise, and the visa service requires the claim to anchor
+/// renewable-session lifetimes (zipline#42). Enforcement of any
+/// authentication-age ceiling happens at the visa service, not here, and the
+/// IdP clamps the value per its own policy, so the specific number is
+/// irrelevant — it only has to be present.
+pub const OFFLINE_MAX_AGE_SECONDS: u64 = 31_536_000;
 
 /// Errors from the OIDC relying-party flow.
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +72,17 @@ pub enum OidcCliError {
     Browser(String),
     #[error("non-interactive OIDC login is not supported yet")]
     NonInteractiveUnsupported,
+}
+
+impl OidcCliError {
+    /// True when a token-endpoint call was rejected with RFC 6749 section
+    /// 5.2 `invalid_grant`: the grant (for us, a stored refresh token) is
+    /// dead — revoked, expired, or never valid — and must not be replayed.
+    /// Keys on the `({code})` suffix [parse_token_response] builds, which is
+    /// the only producer of [OidcCliError::TokenExchange] texts with codes.
+    pub fn is_invalid_grant(&self) -> bool {
+        false
+    }
 }
 
 /// Description of an OIDC identity provider a link may authenticate against.
@@ -228,9 +252,37 @@ fn oauth_error_code(raw: &str) -> String {
         .collect()
 }
 
-/// Exchange the authorization code for an `id_token` at the token endpoint
-/// (RFC 6749 section 4.1.3 + RFC 7636 section 4.5). `client_secret` is sent
-/// only when the client is confidential.
+/// What the token endpoint hands back that the CLI keeps: the `id_token`
+/// (the credential ph asked for) and, when the IdP granted offline access,
+/// a `refresh_token`. The refresh token is secret material: it is held in
+/// memory only, never logged, never written to disk, and never sent over
+/// the AuthAgent RPC.
+pub struct TokenResponse {
+    pub id_token: String,
+    pub refresh_token: Option<String>,
+}
+
+// Manual Debug: the refresh token is secret material and must never reach a
+// log or panic message, so only its presence is shown.
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("id_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                if self.refresh_token.is_some() {
+                    &"Some(<redacted>)"
+                } else {
+                    &"None"
+                },
+            )
+            .finish()
+    }
+}
+
+/// Exchange the authorization code for the token response at the token
+/// endpoint (RFC 6749 section 4.1.3 + RFC 7636 section 4.5).
+/// `client_secret` is sent only when the client is confidential.
 pub async fn exchange_code(
     token_endpoint: &Url,
     client_id: &str,
@@ -239,7 +291,7 @@ pub async fn exchange_code(
     verifier: &str,
     redirect_uri: &Url,
     http: &reqwest::Client,
-) -> Result<String, OidcCliError> {
+) -> Result<TokenResponse, OidcCliError> {
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -270,13 +322,24 @@ pub async fn exchange_code(
         }));
     }
     let body: serde_json::Value = resp.json().await?;
-    body.get("id_token")
+    let id_token = body
+        .get("id_token")
         .and_then(|v| v.as_str())
         .map(str::to_owned)
-        .ok_or_else(|| OidcCliError::TokenExchange("response has no `id_token`".to_string()))
+        .ok_or_else(|| OidcCliError::TokenExchange("response has no `id_token`".to_string()))?;
+    let refresh_token = body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    Ok(TokenResponse {
+        id_token,
+        refresh_token,
+    })
 }
 
 /// Run the whole relying-party flow against `idp` and return the `id_token`.
+/// (The refresh token, if the IdP granted one, is dropped here: stateful
+/// reuse belongs to [`CliAuthAgent`], which serves the packet handler.)
 ///
 /// `open_browser = false` prints the authorization URL instead of launching a
 /// browser (CI / `--no-browser`). Progress goes to stderr.
@@ -290,13 +353,17 @@ pub async fn login(
         eprintln!("{msg}")
     })
     .await
+    .map(|tokens| tokens.id_token)
 }
 
-/// Wrapper matching the `getOidcCredential` contract semantics: the
-/// non-interactive path (refresh tokens / `offline_access` / keyring) is a
-/// follow-up issue, so `interactive = false` is rejected.
-// [CliAuthAgent] inlines the same logic to thread its progress sink; this
-// stays as the plain-function form of the contract, exercised by tests.
+/// Wrapper matching the `getOidcCredential` contract semantics, stateless
+/// form: `interactive = false` cannot be satisfied without a stored refresh
+/// token, and this free function holds none, so it is rejected. The
+/// stateful path — refresh-token reuse across calls — lives on
+/// [`CliAuthAgent`], which serves ph over the RPC.
+// [CliAuthAgent] inlines the same logic to thread its progress sink and
+// token store; this stays as the plain-function form of the contract,
+// exercised by tests.
 #[allow(dead_code)]
 pub async fn get_oidc_credential(
     idp: &OidcIdpInfo,
@@ -311,10 +378,68 @@ pub async fn get_oidc_credential(
     login(idp, nonce, open_browser, timeout).await
 }
 
+/// One `grant_type=refresh_token` POST to the token endpoint (RFC 6749
+/// section 6) and the resulting fresh [`TokenResponse`]. `client_secret` is
+/// sent only for a confidential client, mirroring [`exchange_code`] — as is
+/// the error discipline: the response body is never echoed, only the RFC
+/// 6749 section 5.2 `error` code is extracted. The refresh token itself
+/// appears in the outbound form and nowhere else.
+pub async fn refresh_grant(
+    token_endpoint: &Url,
+    client_id: &str,
+    client_secret: Option<&str>,
+    refresh_token: &str,
+    http: &reqwest::Client,
+) -> Result<TokenResponse, OidcCliError> {
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+    ];
+    if let Some(secret) = client_secret {
+        form.push(("client_secret", secret));
+    }
+    let resp = http.post(token_endpoint.clone()).form(&form).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        // Same discipline as [exchange_code]: the body is free text from
+        // the IdP and could echo the refresh token, so only the fixed-enum
+        // `error` code is extracted.
+        let oauth_error = resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|body| body.get("error")?.as_str().map(oauth_error_code));
+        return Err(OidcCliError::TokenExchange(match oauth_error {
+            Some(code) => format!("HTTP {status} ({code})"),
+            None => format!("HTTP {status}"),
+        }));
+    }
+    let body: serde_json::Value = resp.json().await?;
+    // A refresh response without an id_token is an error, and the caller
+    // keeps its stored refresh token: the grant itself was accepted (this
+    // was not `invalid_grant`), the response is just unusable for ZPR.
+    let id_token = body
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| OidcCliError::TokenExchange("response has no `id_token`".to_string()))?;
+    // RFC 6749 section 6 allows rotating the refresh token on use.
+    let refresh_token = body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    Ok(TokenResponse {
+        id_token,
+        refresh_token,
+    })
+}
+
 /// The CLI-side implementation of the packet handler's `AuthAgent`
 /// capability (Contract 6): ph calls `getOidcCredential` back over the RPC
 /// connection `connect`/`auth-agent` keep open, and this server runs the
-/// interactive relying-party flow to satisfy it.
+/// interactive relying-party flow to satisfy it — or, for `interactive =
+/// false`, a silent refresh grant from the in-memory token store.
 ///
 /// Progress goes to stderr by default; tests inject a channel via `progress`
 /// to capture every message and assert no secret material leaks.
@@ -324,6 +449,77 @@ pub struct CliAuthAgent {
     pub open_browser: bool,
     /// Progress sink override for tests; `None` means stderr.
     pub progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Refresh tokens from interactive logins, keyed by issuer, held in
+    /// memory for the life of the agent process only (master plan Decision
+    /// 2): never logged, never written to disk, never set on RPC results.
+    /// `RefCell` suffices — the capnp server runs single-threaded on a
+    /// LocalSet, same as the existing `Rc<Self>` receiver.
+    pub refresh_tokens: RefCell<HashMap<String, String>>,
+}
+
+impl CliAuthAgent {
+    /// An agent with an empty token store.
+    pub fn new(
+        open_browser: bool,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Self {
+        CliAuthAgent {
+            open_browser,
+            progress,
+            refresh_tokens: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Satisfy a non-interactive request from the stored refresh token for
+    /// `idp.issuer`, or fail with [`OidcCliError::NonInteractiveUnsupported`]
+    /// when none is held. Neither the browser nor the authorization endpoint
+    /// nor the loopback listener is ever touched on this path. An
+    /// `invalid_grant` answer drops the stored token — it is dead, and the
+    /// next attempt should fail fast instead of replaying it — while every
+    /// other failure keeps it.
+    async fn refresh_credential(&self, idp: &OidcIdpInfo) -> Result<String, OidcCliError> {
+        // Clone the token out rather than holding the RefCell borrow across
+        // an await.
+        let Some(refresh_token) = self.refresh_tokens.borrow().get(&idp.issuer).cloned() else {
+            return Err(OidcCliError::NonInteractiveUnsupported);
+        };
+        let issuer = Url::parse(&idp.issuer)?;
+        let http = reqwest::Client::new();
+        let discovery = discover(&issuer, &http).await?;
+        match refresh_grant(
+            &discovery.token_endpoint,
+            &idp.client_id,
+            idp.client_secret.as_deref(),
+            &refresh_token,
+            &http,
+        )
+        .await
+        {
+            Ok(tokens) => {
+                // The IdP may rotate the refresh token (RFC 6749 section 6);
+                // keep the newest one.
+                if let Some(rotated) = tokens.refresh_token {
+                    self.refresh_tokens
+                        .borrow_mut()
+                        .insert(idp.issuer.clone(), rotated);
+                }
+                Ok(tokens.id_token)
+            }
+            Err(err) => {
+                // `invalid_grant` == the token is expired or revoked
+                // (RFC 6749 section 5.2): drop it so the next attempt fails
+                // fast with the no-token error instead of replaying a dead
+                // credential. The error text carries only the code, never
+                // the token or the response body.
+                if let OidcCliError::TokenExchange(msg) = &err
+                    && msg.contains("invalid_grant")
+                {
+                    self.refresh_tokens.borrow_mut().remove(&idp.issuer);
+                }
+                Err(err)
+            }
+        }
+    }
 }
 
 impl cli::auth_agent::Server for CliAuthAgent {
@@ -350,9 +546,9 @@ impl cli::auth_agent::Server for CliAuthAgent {
 
         let outcome = if !interactive {
             // Never open a browser (or even bind the listener) on a
-            // non-interactive request; stored-credential support is a
-            // follow-up issue.
-            Err(OidcCliError::NonInteractiveUnsupported)
+            // non-interactive request: satisfy it from the stored refresh
+            // token, or fail with the no-token error.
+            self.refresh_credential(&idp).await
         } else {
             let progress_tx = self.progress.clone();
             let mut sink = move |msg: &str| match &progress_tx {
@@ -369,6 +565,17 @@ impl cli::auth_agent::Server for CliAuthAgent {
                 &mut sink,
             )
             .await
+            .map(|tokens| {
+                // Keep the refresh token (when the IdP granted one) in
+                // memory, keyed by issuer, so later `interactive: false`
+                // requests can be satisfied silently. It goes nowhere else.
+                if let Some(refresh_token) = tokens.refresh_token {
+                    self.refresh_tokens
+                        .borrow_mut()
+                        .insert(idp.issuer.clone(), refresh_token);
+                }
+                tokens.id_token
+            })
         };
 
         let mut rb = results.get();
@@ -425,14 +632,37 @@ pub fn rpc_error_text(err: &OidcCliError) -> String {
 }
 
 /// [`login`] with an explicit progress sink so tests can capture every
-/// message and assert no secret material leaks into it.
+/// message and assert no secret material leaks into it. Returns the whole
+/// [`TokenResponse`] so [`CliAuthAgent`] can keep the refresh token.
 pub async fn login_with_progress(
     idp: &OidcIdpInfo,
     nonce: &str,
     open_browser: bool,
     timeout: Duration,
     progress: &mut (dyn FnMut(&str) + Send),
-) -> Result<String, OidcCliError> {
+) -> Result<TokenResponse, OidcCliError> {
+    login_flow(
+        idp,
+        nonce,
+        open_browser,
+        browser_unavailable(),
+        timeout,
+        progress,
+    )
+    .await
+}
+
+/// The relying-party flow with the browser-availability verdict injected
+/// (tests force the headless leg without mutating process environment;
+/// [`login_with_progress`] passes the real [`browser_unavailable`] result).
+async fn login_flow(
+    idp: &OidcIdpInfo,
+    nonce: &str,
+    open_browser: bool,
+    browser_blocker: Option<&'static str>,
+    timeout: Duration,
+    progress: &mut (dyn FnMut(&str) + Send),
+) -> Result<TokenResponse, OidcCliError> {
     let issuer = Url::parse(&idp.issuer)?;
     let http = reqwest::Client::new();
     let discovery = discover(&issuer, &http).await?;
@@ -442,34 +672,70 @@ pub async fn login_with_progress(
     let state = URL_SAFE_NO_PAD.encode(state_bytes);
     let (listener, redirect_uri) = bind_loopback()?;
 
+    // `offline_access` is requested only when policy allows offline access
+    // (and only once, if the configured scopes already carry it).
+    let scope = if idp.allow_offline_access && !idp.scopes.iter().any(|s| s == "offline_access") {
+        let mut scopes = idp.scopes.clone();
+        scopes.push("offline_access".to_string());
+        scopes.join(" ")
+    } else {
+        idp.scopes.join(" ")
+    };
     let mut auth_url = discovery.authorization_endpoint.clone();
     auth_url
         .query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", &idp.client_id)
         .append_pair("redirect_uri", redirect_uri.as_str())
-        .append_pair("scope", &idp.scopes.join(" "))
+        .append_pair("scope", &scope)
         .append_pair("state", &state)
         .append_pair("nonce", nonce)
         .append_pair("code_challenge", &pkce.challenge)
         .append_pair("code_challenge_method", "S256");
+    if idp.allow_offline_access {
+        // `access_type=offline` + `prompt=consent` is Google's mechanism
+        // for minting a refresh token; RFC 6749 section 3.1 makes the
+        // parameters safe against IdPs that do not know them.
+        //
+        // `max_age` is NOT the session ceiling — the policy's
+        // `max_auth_age_seconds` is enforced by the visa service's dual
+        // clock (zipline#42), and an IdP clamps per its own rules. The
+        // parameter exists here purely because including it (any value)
+        // obliges the IdP to emit the `auth_time` claim in the id_token
+        // (OIDC Core sections 2 and 3.1.2.1), which the VS requires for
+        // offline-access providers; one year elicits the claim without
+        // forcing a re-login.
+        auth_url
+            .query_pairs_mut()
+            .append_pair("access_type", "offline")
+            .append_pair("prompt", "consent")
+            .append_pair("max_age", "31536000");
+    }
 
-    if open_browser {
+    if open_browser && browser_blocker.is_none() {
         progress(&format!(
             "Authentication with {} required. Opening browser…",
             idp.issuer
         ));
         open_in_browser(auth_url.as_str())?;
     } else {
+        // Either `--no-browser`, or launching cannot work here (root /
+        // headless): print the URL instead of hanging until the login
+        // timeout with no diagnostic. The URL carries the one-way S256
+        // challenge, never the verifier.
+        let reason = match browser_blocker {
+            Some(reason) if open_browser => format!("{reason}; not launching a browser. "),
+            _ => String::new(),
+        };
         progress(&format!(
-            "Authentication with {} required. Open this URL to continue: {}",
+            "{reason}Authentication with {} required. Open this URL to continue: {}",
             idp.issuer, auth_url
         ));
     }
 
     let code = await_callback(listener, &state, timeout).await?;
     progress("Authorization received; exchanging code for token…");
-    let id_token = exchange_code(
+    let tokens = exchange_code(
         &discovery.token_endpoint,
         &idp.client_id,
         idp.client_secret.as_deref(),
@@ -480,7 +746,33 @@ pub async fn login_with_progress(
     )
     .await?;
     progress("Authentication complete.");
-    Ok(id_token)
+    Ok(tokens)
+}
+
+/// Why launching a browser cannot work in this environment, or `None` when
+/// it can. Running as root, `xdg-open`'s `spawn()` succeeds and the failure
+/// happens inside the child, so [`OidcCliError::Browser`] never fires and
+/// the user would hang for the full login timeout with no diagnostic —
+/// hence this pre-flight check (zipline#46). macOS `open` talks to the
+/// window server directly, so the display-variable leg is Linux-only.
+fn browser_unavailable() -> Option<&'static str> {
+    browser_unavailable_for(
+        nix::unistd::geteuid().is_root(),
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some(),
+    )
+}
+
+/// The pure predicate behind [`browser_unavailable`], with the euid and
+/// display checks injected so tests cover both legs without running as root
+/// or mutating the process environment.
+fn browser_unavailable_for(is_root: bool, has_display: bool) -> Option<&'static str> {
+    if is_root {
+        Some("running as root")
+    } else if cfg!(target_os = "linux") && !has_display {
+        Some("no graphical session (neither DISPLAY nor WAYLAND_DISPLAY is set)")
+    } else {
+        None
+    }
 }
 
 /// Launch the platform browser on `url` (no external crate: `xdg-open` on
@@ -776,12 +1068,13 @@ mod tests {
         assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
     }
 
-    /// The token exchange must POST the PKCE verifier and send
-    /// `client_secret` only when the client is confidential.
+    /// The token exchange must POST the PKCE verifier, send `client_secret`
+    /// only when the client is confidential, and hand back the
+    /// `refresh_token` when the IdP grants one (`None` when it does not).
     #[tokio::test]
     async fn test_exchange_code_posts_verifier_and_optional_secret() {
-        for secret in [None, Some("s3cret")] {
-            let captured = run_token_stub_and_exchange(secret).await;
+        for (secret, stub_refresh) in [(None, None), (Some("s3cret"), Some("rt-granted"))] {
+            let (captured, tokens) = run_token_stub_and_exchange(secret, stub_refresh).await;
             let fields: std::collections::HashMap<String, String> =
                 url::form_urlencoded::parse(captured.as_bytes())
                     .into_owned()
@@ -798,6 +1091,8 @@ mod tests {
                     "client_secret sent for a public client"
                 ),
             }
+            assert_eq!(tokens.id_token, "tok");
+            assert_eq!(tokens.refresh_token.as_deref(), stub_refresh);
         }
     }
 
@@ -850,31 +1145,35 @@ mod tests {
         );
     }
 
-    /// Run a one-shot token-endpoint stub, call `exchange_code` against it,
-    /// and return the raw form body the stub captured.
-    async fn run_token_stub_and_exchange(secret: Option<&str>) -> String {
+    /// Run a one-shot token-endpoint stub — answering with an `id_token` and,
+    /// when `refresh` is set, a `refresh_token` — call `exchange_code`
+    /// against it, and return the raw form body the stub captured together
+    /// with the parsed [`TokenResponse`].
+    async fn run_token_stub_and_exchange(
+        secret: Option<&str>,
+        refresh: Option<&str>,
+    ) -> (String, TokenResponse) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let response_body = match refresh {
+            Some(rt) => format!("{{\"id_token\":\"tok\",\"refresh_token\":\"{rt}\"}}"),
+            None => "{\"id_token\":\"tok\"}".to_string(),
+        };
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let (method, target, body) = read_http_request(&mut stream).await.unwrap();
             assert_eq!(method, "POST");
             assert_eq!(target, "/token");
-            write_http_response(
-                &mut stream,
-                "200 OK",
-                "application/json",
-                "{\"id_token\":\"tok\"}",
-            )
-            .await
-            .unwrap();
+            write_http_response(&mut stream, "200 OK", "application/json", &response_body)
+                .await
+                .unwrap();
             tx.send(String::from_utf8(body).unwrap()).unwrap();
         });
         let token_endpoint = Url::parse(&format!("http://{addr}/token")).unwrap();
         let redirect_uri = Url::parse(&format!("http://127.0.0.1:{}/callback", 12345)).unwrap();
         let http = reqwest::Client::new();
-        let token = exchange_code(
+        let tokens = exchange_code(
             &token_endpoint,
             "client-1",
             secret,
@@ -885,8 +1184,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(token, "tok");
-        rx.await.unwrap()
+        (rx.await.unwrap(), tokens)
     }
 
     const FAKE_ID_TOKEN: &str = "fake.header.payload";
@@ -1007,7 +1305,7 @@ mod tests {
         let cb_resp = browser.get(&location).send().await.unwrap();
         assert!(cb_resp.status().is_success());
 
-        let id_token = login_task.await.unwrap().unwrap();
+        let id_token = login_task.await.unwrap().unwrap().id_token;
         assert_eq!(id_token, FAKE_ID_TOKEN);
         assert_eq!(
             seen.lock().unwrap().auth_nonce.as_deref(),
@@ -1237,10 +1535,7 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<String>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let client = capnp_rpc::new_client(CliAuthAgent {
-            open_browser,
-            progress: Some(tx),
-        });
+        let client = capnp_rpc::new_client(CliAuthAgent::new(open_browser, Some(tx)));
         (client, rx)
     }
 
@@ -1251,6 +1546,17 @@ mod tests {
         issuer: String,
         interactive: bool,
     ) -> capnp::capability::RemotePromise<cli::auth_agent::get_oidc_credential_results::Owned> {
+        send_get_oidc_credential_offline(agent, issuer, interactive, false)
+    }
+
+    /// [send_get_oidc_credential] with `allowOfflineAccess` under test
+    /// control.
+    fn send_get_oidc_credential_offline(
+        agent: &cli::auth_agent::Client,
+        issuer: String,
+        interactive: bool,
+        allow_offline_access: bool,
+    ) -> capnp::capability::RemotePromise<cli::auth_agent::get_oidc_credential_results::Owned> {
         let mut request = agent.get_oidc_credential_request();
         {
             let mut rb = request.get();
@@ -1258,7 +1564,7 @@ mod tests {
             rb.set_client_id("client-1");
             rb.set_client_secret("");
             rb.reborrow().init_scopes(1).set(0, "openid");
-            rb.set_allow_offline_access(false);
+            rb.set_allow_offline_access(allow_offline_access);
             rb.set_nonce("nonce-agent");
             rb.set_interactive(interactive);
         }
@@ -1401,5 +1707,571 @@ mod tests {
                 assert_eq!(results.get_id_token().unwrap().to_str().unwrap(), "");
             })
             .await;
+    }
+
+    // ------------------------------------------------------------------
+    // zipline#46: offline_access + in-memory refresh token + refresh grant
+    // + headless browser fallback.
+    // ------------------------------------------------------------------
+
+    const FAKE_REFRESH_TOKEN: &str = "refresh-token-1f2a";
+    const FRESH_ID_TOKEN: &str = "fresh.header.payload";
+
+    /// What the offline-capable fake IdP records.
+    #[derive(Default)]
+    struct OfflineIdpSeen {
+        /// How many times `/auth` was hit (a silent refresh must not add to
+        /// this).
+        auth_hits: usize,
+        /// Raw form bodies of `grant_type=refresh_token` POSTs to `/token`.
+        refresh_bodies: Vec<String>,
+    }
+
+    /// `/token` behaviour for refresh grants in [run_fake_idp_offline].
+    #[derive(Clone, Copy)]
+    enum RefreshMode {
+        /// 200 with a fresh id_token.
+        Ok,
+        /// 400 `{"error":"invalid_grant"}` — the token is revoked. The
+        /// `error_description` deliberately echoes the refresh token to
+        /// prove the body never reaches the error text.
+        InvalidGrant,
+        /// 200 but without an `id_token` field (legal per RFC 6749).
+        NoIdToken,
+    }
+
+    /// [run_fake_idp] extended for offline access: the code exchange
+    /// response carries a `refresh_token`, and `/token` answers
+    /// `grant_type=refresh_token` POSTs per `refresh_mode`, recording them.
+    async fn run_fake_idp_offline(
+        listener: TcpListener,
+        seen: Arc<Mutex<OfflineIdpSeen>>,
+        refresh_mode: RefreshMode,
+    ) {
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok((_method, target, body)) = read_http_request(&mut stream).await else {
+                continue;
+            };
+            if target.starts_with("/.well-known/openid-configuration") {
+                let body = format!(
+                    "{{\"authorization_endpoint\":\"{base}/auth\",\"token_endpoint\":\"{base}/token\"}}"
+                );
+                let _ = write_http_response(&mut stream, "200 OK", "application/json", &body).await;
+            } else if target.starts_with("/auth") {
+                seen.lock().unwrap().auth_hits += 1;
+                let parsed = Url::parse(&format!("http://localhost{target}")).unwrap();
+                let mut state = String::new();
+                let mut redirect_uri = String::new();
+                for (k, v) in parsed.query_pairs() {
+                    match k.as_ref() {
+                        "state" => state = v.into_owned(),
+                        "redirect_uri" => redirect_uri = v.into_owned(),
+                        _ => {}
+                    }
+                }
+                let location = format!("{redirect_uri}?code={FAKE_CODE}&state={state}");
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            } else if target.starts_with("/token") {
+                let form = String::from_utf8_lossy(&body).into_owned();
+                if form.contains("grant_type=refresh_token") {
+                    seen.lock().unwrap().refresh_bodies.push(form);
+                    match refresh_mode {
+                        RefreshMode::Ok => {
+                            let body = format!("{{\"id_token\":\"{FRESH_ID_TOKEN}\"}}");
+                            let _ = write_http_response(
+                                &mut stream,
+                                "200 OK",
+                                "application/json",
+                                &body,
+                            )
+                            .await;
+                        }
+                        RefreshMode::InvalidGrant => {
+                            let body = format!(
+                                "{{\"error\":\"invalid_grant\",\
+                                  \"error_description\":\"token revoked, rt={FAKE_REFRESH_TOKEN}\"}}"
+                            );
+                            let _ = write_http_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                "application/json",
+                                &body,
+                            )
+                            .await;
+                        }
+                        RefreshMode::NoIdToken => {
+                            let _ = write_http_response(
+                                &mut stream,
+                                "200 OK",
+                                "application/json",
+                                "{\"token_type\":\"Bearer\"}",
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    let body = format!(
+                        "{{\"id_token\":\"{FAKE_ID_TOKEN}\",\"refresh_token\":\"{FAKE_REFRESH_TOKEN}\"}}"
+                    );
+                    let _ =
+                        write_http_response(&mut stream, "200 OK", "application/json", &body).await;
+                }
+            } else {
+                let _ = write_http_response(&mut stream, "404 Not Found", "text/plain", "no").await;
+            }
+        }
+    }
+
+    /// Capture the authorization URL the login flow would send the user to,
+    /// for an IdP with `allow_offline_access` as given; the flow is aborted
+    /// after the URL is captured (the callback never fires).
+    async fn capture_auth_url(allow_offline_access: bool, scopes: Vec<String>) -> Url {
+        let idp_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let idp_addr = idp_listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(OfflineIdpSeen::default()));
+        tokio::spawn(run_fake_idp_offline(idp_listener, seen, RefreshMode::Ok));
+
+        let idp = OidcIdpInfo {
+            issuer: format!("http://{idp_addr}"),
+            client_id: "client-1".to_string(),
+            client_secret: None,
+            scopes,
+            allow_offline_access,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let login_task = tokio::spawn(async move {
+            let mut sink = move |m: &str| {
+                let _ = tx.send(m.to_string());
+            };
+            login_with_progress(&idp, "nonce-o", false, Duration::from_secs(10), &mut sink).await
+        });
+        let auth_url = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no progress message")
+                .expect("progress channel closed");
+            if msg.contains("Open this URL") {
+                break msg.split_whitespace().last().unwrap().to_string();
+            }
+        };
+        login_task.abort();
+        Url::parse(&auth_url).unwrap()
+    }
+
+    /// When policy allows offline access, the authorization request carries
+    /// the `offline_access` scope, `access_type=offline`, `prompt=consent`
+    /// and the fixed `max_age=31536000` (which exists purely to elicit the
+    /// `auth_time` claim); when it does not, none of them. The scope is not
+    /// duplicated when already configured.
+    #[tokio::test]
+    async fn test_auth_url_offline_params_only_when_policy_allows() {
+        let url = capture_auth_url(true, vec!["openid".to_string()]).await;
+        let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert!(
+            params["scope"].split(' ').any(|s| s == "offline_access"),
+            "offline_access missing from scope: {:?}",
+            params["scope"]
+        );
+        assert_eq!(params["access_type"], "offline");
+        assert_eq!(params["prompt"], "consent");
+        assert_eq!(params["max_age"], "31536000");
+
+        let url = capture_auth_url(false, vec!["openid".to_string()]).await;
+        let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert!(
+            !params["scope"].contains("offline_access"),
+            "offline_access requested although policy forbids it"
+        );
+        for forbidden in ["access_type", "prompt", "max_age"] {
+            assert!(
+                !params.contains_key(forbidden),
+                "`{forbidden}` sent although policy forbids offline access"
+            );
+        }
+
+        // Already-configured scope is not duplicated.
+        let url = capture_auth_url(
+            true,
+            vec!["openid".to_string(), "offline_access".to_string()],
+        )
+        .await;
+        let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            params["scope"]
+                .split(' ')
+                .filter(|s| *s == "offline_access")
+                .count(),
+            1
+        );
+    }
+
+    /// The refresh grant POSTs `grant_type=refresh_token`, the token, and
+    /// `client_id`, with `client_secret` only for a confidential client —
+    /// and hands back the fresh id_token.
+    #[tokio::test]
+    async fn test_refresh_grant_posts_token_and_optional_secret() {
+        for secret in [None, Some("s3cret")] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (method, target, body) = read_http_request(&mut stream).await.unwrap();
+                assert_eq!(method, "POST");
+                assert_eq!(target, "/token");
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    "{\"id_token\":\"fresh-tok\"}",
+                )
+                .await
+                .unwrap();
+                tx.send(String::from_utf8(body).unwrap()).unwrap();
+            });
+            let tokens = refresh_grant(
+                &Url::parse(&format!("http://{addr}/token")).unwrap(),
+                "client-1",
+                secret,
+                "rt-abc",
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(tokens.id_token, "fresh-tok");
+            let fields: std::collections::HashMap<String, String> =
+                url::form_urlencoded::parse(rx.await.unwrap().as_bytes())
+                    .into_owned()
+                    .collect();
+            assert_eq!(fields["grant_type"], "refresh_token");
+            assert_eq!(fields["refresh_token"], "rt-abc");
+            assert_eq!(fields["client_id"], "client-1");
+            match secret {
+                Some(s) => assert_eq!(fields["client_secret"], s),
+                None => assert!(
+                    !fields.contains_key("client_secret"),
+                    "client_secret sent for a public client"
+                ),
+            }
+        }
+    }
+
+    /// Run an interactive login through `agent` against the offline fake
+    /// IdP, playing the browser, and assert it returned the fixed id_token.
+    async fn interactive_login_via_agent(
+        agent: &cli::auth_agent::Client,
+        progress: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        issuer: String,
+    ) {
+        let call = send_get_oidc_credential_offline(agent, issuer, true, true);
+        let call = tokio::task::spawn_local(call.promise);
+        play_browser(progress).await;
+        let response = call.await.unwrap().unwrap();
+        let results = response.get().unwrap();
+        assert!(matches!(
+            results.get_result().unwrap().which().unwrap(),
+            cli::success_or_error::Which::Success(_)
+        ));
+        assert_eq!(
+            results.get_id_token().unwrap().to_str().unwrap(),
+            FAKE_ID_TOKEN
+        );
+    }
+
+    /// After an interactive login stored the refresh token, an
+    /// `interactive: false` request is satisfied silently: fresh id_token
+    /// over the RPC, no authorization-endpoint contact, no browser, and the
+    /// refresh POST carries the stored token (no client_secret for a public
+    /// client). No progress message ever carries the refresh token.
+    #[tokio::test]
+    async fn test_auth_agent_noninteractive_refresh_succeeds_silently() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let idp_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let idp_addr = idp_listener.local_addr().unwrap();
+                let seen = Arc::new(Mutex::new(OfflineIdpSeen::default()));
+                tokio::spawn(run_fake_idp_offline(
+                    idp_listener,
+                    seen.clone(),
+                    RefreshMode::Ok,
+                ));
+
+                let (agent, mut progress) = new_cli_auth_agent(false);
+                interactive_login_via_agent(&agent, &mut progress, format!("http://{idp_addr}"))
+                    .await;
+                assert_eq!(seen.lock().unwrap().auth_hits, 1);
+
+                // Now non-interactive: must succeed via the refresh grant.
+                let call = send_get_oidc_credential_offline(
+                    &agent,
+                    format!("http://{idp_addr}"),
+                    false,
+                    true,
+                );
+                let response = call.promise.await.unwrap();
+                let results = response.get().unwrap();
+                assert!(matches!(
+                    results.get_result().unwrap().which().unwrap(),
+                    cli::success_or_error::Which::Success(_)
+                ));
+                assert_eq!(
+                    results.get_id_token().unwrap().to_str().unwrap(),
+                    FRESH_ID_TOKEN
+                );
+
+                // No second authorization-endpoint contact, exactly one
+                // refresh POST, carrying the stored token and no secret.
+                {
+                    let seen = seen.lock().unwrap();
+                    assert_eq!(seen.auth_hits, 1, "authorization endpoint contacted");
+                    assert_eq!(seen.refresh_bodies.len(), 1);
+                    let fields: HashMap<String, String> =
+                        url::form_urlencoded::parse(seen.refresh_bodies[0].as_bytes())
+                            .into_owned()
+                            .collect();
+                    assert_eq!(fields["grant_type"], "refresh_token");
+                    assert_eq!(fields["refresh_token"], FAKE_REFRESH_TOKEN);
+                    assert_eq!(fields["client_id"], "client-1");
+                    assert!(!fields.contains_key("client_secret"));
+                }
+
+                // The refresh path emits no progress, and nothing that was
+                // emitted carries the refresh token.
+                while let Ok(msg) = progress.try_recv() {
+                    assert!(
+                        !msg.contains(FAKE_REFRESH_TOKEN),
+                        "refresh token leaked: {msg}"
+                    );
+                    assert!(
+                        !msg.contains("Open this URL") || !msg.is_empty(),
+                        "unexpected interactive prompt: {msg}"
+                    );
+                }
+            })
+            .await;
+    }
+
+    /// `invalid_grant` on the refresh drops the stored token: the error text
+    /// carries the code but never the response body, and the next
+    /// non-interactive attempt fails fast with the no-token error without
+    /// replaying the dead credential.
+    #[tokio::test]
+    async fn test_auth_agent_invalid_grant_drops_stored_token() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let idp_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let idp_addr = idp_listener.local_addr().unwrap();
+                let seen = Arc::new(Mutex::new(OfflineIdpSeen::default()));
+                tokio::spawn(run_fake_idp_offline(
+                    idp_listener,
+                    seen.clone(),
+                    RefreshMode::InvalidGrant,
+                ));
+
+                let (agent, mut progress) = new_cli_auth_agent(false);
+                interactive_login_via_agent(&agent, &mut progress, format!("http://{idp_addr}"))
+                    .await;
+
+                // First non-interactive attempt: invalid_grant.
+                let call = send_get_oidc_credential_offline(
+                    &agent,
+                    format!("http://{idp_addr}"),
+                    false,
+                    true,
+                );
+                let response = call.promise.await.unwrap();
+                let results = response.get().unwrap();
+                match results.get_result().unwrap().which().unwrap() {
+                    cli::success_or_error::Which::Error(e) => {
+                        let txt = e.unwrap().get_txt().unwrap().to_str().unwrap().to_string();
+                        assert!(txt.contains("invalid_grant"), "code missing: {txt}");
+                        assert!(
+                            !txt.contains(FAKE_REFRESH_TOKEN),
+                            "response body (with token) leaked: {txt}"
+                        );
+                        assert!(!txt.contains("token revoked"), "body leaked: {txt}");
+                    }
+                    cli::success_or_error::Which::Success(_) => {
+                        panic!("invalid_grant refresh unexpectedly succeeded")
+                    }
+                }
+
+                // Second attempt: the token was dropped, so it fails fast
+                // with the no-token error and never reaches the endpoint.
+                let call = send_get_oidc_credential_offline(
+                    &agent,
+                    format!("http://{idp_addr}"),
+                    false,
+                    true,
+                );
+                let response = call.promise.await.unwrap();
+                let results = response.get().unwrap();
+                match results.get_result().unwrap().which().unwrap() {
+                    cli::success_or_error::Which::Error(e) => {
+                        let txt = e.unwrap().get_txt().unwrap().to_str().unwrap().to_string();
+                        assert!(txt.contains("non-interactive"), "unexpected error: {txt}");
+                    }
+                    cli::success_or_error::Which::Success(_) => {
+                        panic!("second attempt unexpectedly succeeded")
+                    }
+                }
+                assert_eq!(
+                    seen.lock().unwrap().refresh_bodies.len(),
+                    1,
+                    "dead refresh token was replayed"
+                );
+            })
+            .await;
+    }
+
+    /// A refresh response without an `id_token` is a TokenExchange error and
+    /// the stored refresh token is KEPT (it was not `invalid_grant`): the
+    /// next non-interactive attempt tries the token endpoint again.
+    #[tokio::test]
+    async fn test_auth_agent_refresh_without_id_token_keeps_stored_token() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let idp_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let idp_addr = idp_listener.local_addr().unwrap();
+                let seen = Arc::new(Mutex::new(OfflineIdpSeen::default()));
+                tokio::spawn(run_fake_idp_offline(
+                    idp_listener,
+                    seen.clone(),
+                    RefreshMode::NoIdToken,
+                ));
+
+                let (agent, mut progress) = new_cli_auth_agent(false);
+                interactive_login_via_agent(&agent, &mut progress, format!("http://{idp_addr}"))
+                    .await;
+
+                for attempt in 1..=2 {
+                    let call = send_get_oidc_credential_offline(
+                        &agent,
+                        format!("http://{idp_addr}"),
+                        false,
+                        true,
+                    );
+                    let response = call.promise.await.unwrap();
+                    let results = response.get().unwrap();
+                    match results.get_result().unwrap().which().unwrap() {
+                        cli::success_or_error::Which::Error(e) => {
+                            let txt = e.unwrap().get_txt().unwrap().to_str().unwrap().to_string();
+                            assert!(txt.contains("id_token"), "unexpected error: {txt}");
+                        }
+                        cli::success_or_error::Which::Success(_) => {
+                            panic!("id_token-less refresh unexpectedly succeeded")
+                        }
+                    }
+                    // The token was kept, so each attempt reaches the
+                    // endpoint again instead of failing fast.
+                    assert_eq!(seen.lock().unwrap().refresh_bodies.len(), attempt);
+                }
+            })
+            .await;
+    }
+
+    /// The pure browser-availability predicate: root and (on Linux) a
+    /// missing display each block the launch; otherwise it may proceed.
+    #[test]
+    fn test_browser_unavailable_predicate() {
+        assert_eq!(browser_unavailable_for(true, true), Some("running as root"));
+        assert_eq!(
+            browser_unavailable_for(true, false),
+            Some("running as root")
+        );
+        assert_eq!(browser_unavailable_for(false, true), None);
+        if cfg!(target_os = "linux") {
+            let reason = browser_unavailable_for(false, false).expect("headless must block");
+            assert!(reason.contains("DISPLAY"), "unhelpful reason: {reason}");
+        }
+    }
+
+    /// With `open_browser: true` but the browser blocked (root / headless),
+    /// the flow prints the URL with a one-line explanation instead of
+    /// spawning — and still completes when the user follows it by hand. The
+    /// printed URL carries the S256 challenge but never the verifier.
+    #[tokio::test]
+    async fn test_headless_fallback_prints_url_with_challenge_not_verifier() {
+        let idp_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let idp_addr = idp_listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(OfflineIdpSeen::default()));
+        tokio::spawn(run_fake_idp_offline(idp_listener, seen, RefreshMode::Ok));
+
+        let idp = OidcIdpInfo {
+            issuer: format!("http://{idp_addr}"),
+            client_id: "client-1".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string()],
+            allow_offline_access: false,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let blocker = browser_unavailable_for(false, false)
+            .expect("test forces the headless leg of the predicate");
+        let login_task = tokio::spawn(async move {
+            let mut sink = move |m: &str| {
+                let _ = tx.send(m.to_string());
+            };
+            // open_browser: true, but the injected blocker forces the
+            // print-the-URL fallback (same branch the env/euid checks pick).
+            login_flow(
+                &idp,
+                "nonce-h",
+                true,
+                Some(blocker),
+                Duration::from_secs(10),
+                &mut sink,
+            )
+            .await
+        });
+
+        let fallback_msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no progress message")
+            .expect("progress channel closed");
+        assert!(
+            fallback_msg.contains("Open this URL"),
+            "fallback did not print the URL: {fallback_msg}"
+        );
+        assert!(
+            fallback_msg.contains("DISPLAY"),
+            "fallback lacks the one-line explanation: {fallback_msg}"
+        );
+        let auth_url = fallback_msg.split_whitespace().last().unwrap().to_string();
+        let parsed = Url::parse(&auth_url).unwrap();
+        let params: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(params["code_challenge_method"], "S256");
+        assert!(params.contains_key("code_challenge"));
+        assert!(
+            !params.contains_key("code_verifier"),
+            "verifier leaked into the printed URL"
+        );
+
+        // Play the browser to prove the fallback flow still completes.
+        let browser = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let auth_resp = browser.get(&auth_url).send().await.unwrap();
+        assert_eq!(auth_resp.status().as_u16(), 302);
+        let location = auth_resp.headers()["location"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        browser.get(&location).send().await.unwrap();
+
+        let tokens = login_task.await.unwrap().unwrap();
+        assert_eq!(tokens.id_token, FAKE_ID_TOKEN);
+        // The challenge is one-way: the verifier cannot appear in any
+        // progress message (it exists only inside the flow).
+        while let Ok(msg) = rx.try_recv() {
+            assert!(!msg.contains("code_verifier"), "verifier leaked: {msg}");
+        }
     }
 }
