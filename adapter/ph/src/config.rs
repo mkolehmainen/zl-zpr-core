@@ -1032,7 +1032,9 @@ mod test {
         )
         .unwrap();
         let mut config = Config::default();
-        config.set_from_globals(&section, Path::new("/tmp")).unwrap();
+        config
+            .set_from_globals(&section, Path::new("/tmp"))
+            .unwrap();
         config.apply_socket_owner(Some(SocketOwner {
             uid: 1234,
             gid: Some(1234),
@@ -1078,7 +1080,10 @@ mod test {
 
         config.prepare_socket_dirs().unwrap();
 
-        assert!(parent.exists(), "prepare_socket_dirs must create the parent");
+        assert!(
+            parent.exists(),
+            "prepare_socket_dirs must create the parent"
+        );
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(&parent).unwrap().permissions().mode();
         assert_eq!(mode & 0o7777, 0o700, "per-owner dir must be mode 0700");
@@ -1111,7 +1116,9 @@ mod test {
         ))
         .unwrap();
         let mut config = Config::default();
-        config.set_from_globals(&section, Path::new("/tmp")).unwrap();
+        config
+            .set_from_globals(&section, Path::new("/tmp"))
+            .unwrap();
         config.socket_owner = Some(SocketOwner {
             uid: nix::unistd::geteuid().as_raw(),
             gid: None,
