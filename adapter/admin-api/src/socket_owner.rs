@@ -100,8 +100,22 @@ fn socket_path(owner_uid: Option<u32>, name: &str) -> PathBuf {
     }
 }
 
+/// Whether a live packet handler is accepting connections at `path`.
+///
+/// A socket pathname's existence is not proof of a live server: `ph` cannot
+/// reliably unlink its sockets on shutdown (SIGKILL, crash), so a stale
+/// file at the preferred per-uid path must not shadow a live server at the
+/// shared path. This is the predicate `ph-cli` injects into
+/// [choose_socket_path] — a probe connect, not an `exists()` check.
+pub fn socket_is_live(path: &std::path::Path) -> bool {
+    // UNIMPLEMENTED (zipline#39 review): liveness probe
+    let _ = path;
+    unimplemented!("zipline#39 review")
+}
+
 /// Which socket path a client (`ph-cli`) should use, given an optional
-/// explicit path (`-p` / `-c`) and an injected existence predicate.
+/// explicit path (`-p` / `-c`) and an injected usability predicate
+/// (see [socket_is_live]).
 ///
 /// * An explicit path short-circuits everything — it is used whether or not
 ///   it exists, so error reporting stays at the connect site.
@@ -335,5 +349,55 @@ mod test {
         .expect_err("no socket exists, the search must fail");
         assert!(err.contains("/per-uid/control.sock"), "err was: {err}");
         assert!(err.contains("/shared/control.sock"), "err was: {err}");
+    }
+
+    /// A socket path with a live listener probes as live (zipline#39
+    /// review: liveness, not existence, selects the socket).
+    #[test]
+    fn live_listener_probes_live() {
+        let dir = temp_dir("live");
+        let path = dir.join("control.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(socket_is_live(&path), "a bound listener must probe live");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stale socket file — left behind by a dead ph that never got to
+    /// unlink it — must NOT probe live, or it shadows a live server at the
+    /// fallback path (zipline#39 review).
+    #[test]
+    fn stale_socket_file_is_not_live() {
+        let dir = temp_dir("stale");
+        let path = dir.join("control.sock");
+        {
+            // Bind and drop: the listener dies, the pathname stays — exactly
+            // what a SIGKILLed ph leaves behind.
+            let _dead = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        }
+        assert!(path.exists(), "the stale pathname must still exist");
+        assert!(
+            !socket_is_live(&path),
+            "a dead server's socket file must not probe live"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A missing path is not live.
+    #[test]
+    fn missing_path_is_not_live() {
+        assert!(!socket_is_live(Path::new(
+            "/nonexistent/zpr-test/control.sock"
+        )));
+    }
+
+    // A unique temp dir for socket tests (paths must stay short: sun_path).
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("zpr_sock_{tag}_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
