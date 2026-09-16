@@ -326,6 +326,10 @@ impl FastpathWorker {
                 let a2a_said: A2aSaid = 0;
                 let a2a_mac_size = zdp::ZDP_A2A_MAC_SIZE; // TODO: may be smaller depending on A2A SAID
                 let mut a2a_mac = [0u8; zdp::ZDP_A2A_MAC_SIZE];
+
+                // Compute a2a_micv
+                // If the a2a_micv_key is present, use it to compute the keyed hash of the packet body
+                // If not present, use the unkeyed hash of the packet body
                 let a2a_micv = match pep.a2a_micv_key {
                     #[cfg(feature = "enable-security-testing")]
                     Some(_) if self.config.unkeyed_a2a_micv => blake3::hash(pkt.body()),
@@ -575,6 +579,9 @@ impl FastpathWorker {
 
         // check A2A MAC
         // TODO: use actual A2A SAID
+        // Compute a2a_micv
+        // If the a2a_micv_key is present, use it to compute the keyed hash of the packet body
+        // If not present, use the unkeyed hash of the packet body
         let a2a_micv = match pep.a2a_micv_key {
             #[cfg(feature = "enable-security-testing")]
             Some(_) if self.config.unkeyed_a2a_micv => blake3::hash(pkt.body()),
