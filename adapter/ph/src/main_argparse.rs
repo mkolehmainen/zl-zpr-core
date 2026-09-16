@@ -117,6 +117,14 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
         }
     }
     config.finalize()?;
+    // zipline#39: resolve the invoking user (sudo/pkexec), fold it into the
+    // config (derived socket paths become per-uid) and create the per-owner
+    // socket directories before validation, so check_valid's parent-directory
+    // check passes without pre-provisioning.
+    config.apply_socket_owner(admin_api::resolve_socket_owner(|key| {
+        std::env::var(key).ok()
+    }));
+    config.prepare_socket_dirs()?;
     if let Err(e) = config.check_valid(ph_mode) {
         return Err(e);
     }

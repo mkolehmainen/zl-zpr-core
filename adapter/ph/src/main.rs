@@ -55,6 +55,7 @@ mod sample_ring;
 #[cfg(not(feature = "capnp-ancillary"))]
 mod set_capture_file_worker;
 mod signal_worker;
+mod socket_access;
 mod special_peers;
 mod sys;
 mod tc;
@@ -254,6 +255,30 @@ fn main() -> ExitCode {
         UnixListener::bind(&config.control_path).expect("failed to bind to control socket");
     info!(target: STARTUP, "control socket bound to {:?}", config.control_path);
 
+    // zipline#39: hand the socket to whoever should drive ph-cli. Owner known
+    // (sudo/pkexec): chown to that user, mode 0600. Owner unknown (systemd):
+    // group "zpr" with mode 0660 when the group exists; otherwise leave the
+    // socket exactly as before and warn once.
+    let socket_plan = socket_access::plan_socket_access(
+        config.socket_owner.as_ref(),
+        socket_access::system_user_primary_gid,
+        socket_access::system_group_gid,
+    );
+    if socket_plan == socket_access::SocketAccess::Unchanged && config.socket_owner.is_none() {
+        warn!(
+            target: STARTUP,
+            "no invoking user resolved and no '{}' group on this host; control/capture sockets \
+             stay root-only (ph-cli will need sudo or an explicit -p)",
+            socket_access::FALLBACK_GROUP
+        );
+    }
+    if let Err(e) = socket_access::apply_socket_access(&config.control_path, &socket_plan) {
+        warn!(
+            target: STARTUP,
+            "failed to set ownership/mode on control socket {:?}: {e}", config.control_path
+        );
+    }
+
     #[cfg(not(feature = "capnp-ancillary"))]
     let capture_socket = {
         fs::remove_file(&config.capture_path)
@@ -269,6 +294,13 @@ fn main() -> ExitCode {
             UnixListener::bind(&config.capture_path).expect("failed to bind to capture socket"),
         );
         info!(target: STARTUP, "capture socket bound to {:?}", config.capture_path);
+        // zipline#39: same ownership/mode treatment as the control socket.
+        if let Err(e) = socket_access::apply_socket_access(&config.capture_path, &socket_plan) {
+            warn!(
+                target: STARTUP,
+                "failed to set ownership/mode on capture socket {:?}: {e}", config.capture_path
+            );
+        }
         capture_socket
     };
 

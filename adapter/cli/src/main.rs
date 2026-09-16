@@ -83,8 +83,24 @@ impl From<std::str::Utf8Error> for CliError {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), CliError> {
     let args = CmdlineArgs::parse();
-    let socket = args.socket.clone();
-    let cap_socket = args.cap_socket.clone();
+    // zipline#39: default socket search — per-uid path for our euid, then the
+    // shared path; explicit -p/-c short-circuit. Commands that never touch
+    // the packet handler socket must not fail when no socket exists.
+    let (socket, cap_socket) =
+        match main_args::resolve_sockets(args.socket.clone(), args.cap_socket.clone()) {
+            Ok(pair) => pair,
+            Err(msg) => {
+                if matches!(
+                    args.command,
+                    Some(Commands::Quit) | Some(Commands::OidcLogin { .. })
+                ) {
+                    (PathBuf::new(), PathBuf::new())
+                } else {
+                    eprintln!("{msg}");
+                    return Err(CliError::ParseError(msg));
+                }
+            }
+        };
 
     if let Some(command) = args.command {
         process_command(command, &socket, &cap_socket)

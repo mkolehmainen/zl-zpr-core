@@ -1,3 +1,36 @@
+Which socket does ph-cli talk to?
+
+ph-cli needs no sudo. By default it searches for the packet handler's
+control socket in this order (zipline#39):
+
+1. The per-user socket for your uid: /var/run/zpr/<uid>/control.sock.
+   This is where a sudo- or pkexec-started ph puts it, owned by the user
+   who ran sudo, mode 0600. The base /var/run/zpr is fixed (never derived
+   from HOME/XDG_DATA_HOME) so ph and ph-cli agree across the sudo
+   privilege boundary.
+2. The shared socket: <data_home>/zpr/control.sock. This is where a
+   systemd-started ph puts it; if the host has a "zpr" group the socket is
+   group zpr, mode 0660, so group members can use ph-cli directly.
+
+If neither answers, ph-cli fails with an error naming both paths it tried.
+A candidate is selected by probe-connecting to it, not by checking the
+pathname exists, so a stale socket file left by a dead ph never shadows a
+live server at the other path.
+An explicit -p (control socket) or -c (capture socket) always wins and
+short-circuits the search. When the control socket was found by the default
+search, the default capture socket is capture.sock in the same directory —
+the pair belongs to the same adapter by construction. With an explicit -p
+and no -c, the derived capture candidates (per-uid, then shared) are probed
+first, because a ph started with only --control-path keeps its capture
+socket at the derived default; capture.sock beside the explicit control
+path is the last-resort fallback.
+
+Security note: reaching the control socket means being able to start and
+stop links and register an AuthAgent — i.e. to supply and observe user
+credentials for this adapter, and to receive the IdP client_secret in a
+HelloResponse. Socket access is adapter control; the zpr group is not a
+low-privilege convenience.
+
 How to generate Bash completion script 
 
 Compile the program using cargo build

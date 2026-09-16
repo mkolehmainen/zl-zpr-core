@@ -30,7 +30,7 @@ ipnet = { workspace = true }
 itertools = "0.14"
 libc = { version = "0.2.183" }
 libnode = { package = "libnode2", path = "../../libnode2" }
-nix = { version = "0.29.0", features = ["fs", "ioctl", "net", "poll", "uio"] }
+nix = { version = "0.29.0", features = ["fs", "ioctl", "net", "poll", "uio", "user"] }
 open-enum = { version = "0.5.1" }
 pkcs8 = "0.11"
 rcu = { git = "https://github.com/mkolehmainen/zl-zpr-utils.git", tag = "rcu-v0.1.2", default-features = false }

@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use admin_api::get_data_home;
+use admin_api::{capture_socket_path, choose_socket_path, control_socket_path};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "This program controls the RPC calls to the ZPR Packet Handler\nRun without a command to enter CLI mode", long_about = None)]
@@ -9,13 +9,89 @@ pub struct CmdlineArgs {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Path to the Packet Handler's management socket
-    #[arg(long, short = 'p', default_value_os_t = get_data_home().join("control.sock"))]
-    pub socket: PathBuf,
+    /// Path to the Packet Handler's management socket. Default: the per-user
+    /// socket for your uid when a server answers there, else the shared
+    /// socket (zipline#39).
+    #[arg(long, short = 'p')]
+    pub socket: Option<PathBuf>,
 
     /// Path to the Packet Handler's capture socket, only necessary when performing Capture commands
-    #[arg(long, short = 'c', default_value_os_t = get_data_home().join("capture.sock"))]
-    pub cap_socket: PathBuf,
+    #[arg(long, short = 'c')]
+    pub cap_socket: Option<PathBuf>,
+}
+
+/// Resolve the control and capture socket paths for this invocation
+/// (zipline#39). Explicit `-p`/`-c` short-circuit. Otherwise the control
+/// socket is searched: per-uid path for the caller's euid first, then the
+/// shared path; when neither answers the error names both. A candidate is
+/// selected by a probe connect, not by pathname existence — a stale socket
+/// file left by a dead ph must not shadow a live server at the other path.
+/// The capture socket follows the resolved control socket's directory when
+/// the control socket also came from the default search; with an explicit
+/// `-p` the derived capture candidates are searched by liveness first and
+/// colocation is only the last-resort fallback.
+pub fn resolve_sockets(
+    explicit_control: Option<PathBuf>,
+    explicit_capture: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf), String> {
+    resolve_sockets_with(
+        explicit_control,
+        explicit_capture,
+        nix::unistd::geteuid().as_raw(),
+        admin_api::socket_is_live,
+    )
+}
+
+/// Testable core of [resolve_sockets]: euid and liveness predicate injected.
+pub fn resolve_sockets_with<F>(
+    explicit_control: Option<PathBuf>,
+    explicit_capture: Option<PathBuf>,
+    euid: u32,
+    exists: F,
+) -> Result<(PathBuf, PathBuf), String>
+where
+    F: Fn(&Path) -> bool,
+{
+    let explicit_control_given = explicit_control.is_some();
+    let control = choose_socket_path(
+        explicit_control,
+        control_socket_path(Some(euid)),
+        control_socket_path(None),
+        &exists,
+    )?;
+    let capture = match explicit_capture {
+        Some(path) => path,
+        // Explicit -p, no -c: the control path says nothing about where ph
+        // derived its capture socket (ph given only --control-path keeps
+        // capture at the derived default). Search the derived candidates by
+        // liveness first; colocation beside the explicit control path is
+        // only the last-resort guess (ph configured with both explicit
+        // paths side by side), never an error — commands that do not touch
+        // the capture socket must still run (zipline#39 review).
+        None if explicit_control_given => {
+            let per_uid = capture_socket_path(Some(euid));
+            let shared = capture_socket_path(None);
+            if exists(&per_uid) {
+                per_uid
+            } else if exists(&shared) {
+                shared
+            } else {
+                colocated_capture(&control)
+            }
+        }
+        // Control came from the default search: capture.sock beside it
+        // belongs to the same adapter by construction.
+        None => colocated_capture(&control),
+    };
+    Ok((control, capture))
+}
+
+// The capture socket beside a control socket: `<dir>/capture.sock`.
+fn colocated_capture(control: &Path) -> PathBuf {
+    match control.parent() {
+        Some(dir) => dir.join("capture.sock"),
+        None => capture_socket_path(None),
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -226,5 +302,132 @@ mod tests {
             }
             other => panic!("auth-agent without --no-browser should parse: {other:?}"),
         }
+    }
+
+    /// An explicit `-p`/`-c` short-circuits the socket search entirely, even
+    /// when the paths do not exist (zipline#39).
+    #[test]
+    fn explicit_sockets_short_circuit() {
+        let (control, capture) = resolve_sockets_with(
+            Some(PathBuf::from("/x/control.sock")),
+            Some(PathBuf::from("/y/capture.sock")),
+            1000,
+            |_: &Path| false,
+        )
+        .unwrap();
+        assert_eq!(control, PathBuf::from("/x/control.sock"));
+        assert_eq!(capture, PathBuf::from("/y/capture.sock"));
+    }
+
+    /// Default search prefers the per-uid socket for the caller's euid — the
+    /// path a sudo-started ph created for us — and the capture socket follows
+    /// the same directory (zipline#39).
+    #[test]
+    fn per_uid_socket_preferred() {
+        let per_uid = control_socket_path(Some(1000));
+        let (control, capture) =
+            resolve_sockets_with(None, None, 1000, |p: &Path| p == per_uid.as_path()).unwrap();
+        assert_eq!(control, per_uid);
+        assert_eq!(capture, per_uid.parent().unwrap().join("capture.sock"));
+    }
+
+    /// When there is no per-uid socket the shared path is used (systemd-run
+    /// ph), capture following along (zipline#39).
+    #[test]
+    fn shared_socket_fallback() {
+        let shared = control_socket_path(None);
+        let (control, capture) =
+            resolve_sockets_with(None, None, 1000, |p: &Path| p == shared.as_path()).unwrap();
+        assert_eq!(control, shared);
+        assert_eq!(capture, shared.parent().unwrap().join("capture.sock"));
+    }
+
+    /// With no socket anywhere the error names both paths tried (zipline#39).
+    #[test]
+    fn missing_sockets_error_names_paths() {
+        let err = resolve_sockets_with(None, None, 1000, |_: &Path| false)
+            .expect_err("no socket exists, resolution must fail");
+        let per_uid = control_socket_path(Some(1000));
+        let shared = control_socket_path(None);
+        assert!(
+            err.contains(per_uid.to_str().unwrap()),
+            "error must name the per-uid path: {err}"
+        );
+        assert!(
+            err.contains(shared.to_str().unwrap()),
+            "error must name the shared path: {err}"
+        );
+    }
+
+    /// An explicit `-c` wins even when `-p` is defaulted (zipline#39).
+    #[test]
+    fn explicit_capture_with_defaulted_control() {
+        let shared = control_socket_path(None);
+        let (control, capture) = resolve_sockets_with(
+            None,
+            Some(PathBuf::from("/y/capture.sock")),
+            1000,
+            |p: &Path| p == shared.as_path(),
+        )
+        .unwrap();
+        assert_eq!(control, shared);
+        assert_eq!(capture, PathBuf::from("/y/capture.sock"));
+    }
+
+    /// ph started with only `--control-path /tmp/control.sock` keeps its
+    /// capture path derived (per-uid for a sudo start). `ph-cli -p` with no
+    /// `-c` must find that live derived capture socket instead of assuming
+    /// `/tmp/capture.sock` (zipline#39 review).
+    #[test]
+    fn explicit_control_searches_capture_per_uid() {
+        let cap = capture_socket_path(Some(1000));
+        let (control, capture) = resolve_sockets_with(
+            Some(PathBuf::from("/x/control.sock")),
+            None,
+            1000,
+            |p: &Path| p == cap.as_path(),
+        )
+        .unwrap();
+        assert_eq!(control, PathBuf::from("/x/control.sock"));
+        assert_eq!(
+            capture, cap,
+            "capture must be searched independently when -p is explicit"
+        );
+    }
+
+    /// Same as above with the derived capture socket at the shared path
+    /// (systemd-started ph given only an explicit control path).
+    #[test]
+    fn explicit_control_searches_capture_shared() {
+        let cap = capture_socket_path(None);
+        let (control, capture) = resolve_sockets_with(
+            Some(PathBuf::from("/x/control.sock")),
+            None,
+            1000,
+            |p: &Path| p == cap.as_path(),
+        )
+        .unwrap();
+        assert_eq!(control, PathBuf::from("/x/control.sock"));
+        assert_eq!(
+            capture, cap,
+            "capture must fall back to the shared derived path"
+        );
+    }
+
+    /// Explicit `-p` with no live derived capture socket anywhere: fall back
+    /// to the colocation guess (ph configured with both paths explicit puts
+    /// them side by side), never a hard error — commands that do not touch
+    /// the capture socket must still run (zipline#39 review).
+    #[test]
+    fn explicit_control_capture_colocation_fallback() {
+        let (control, capture) = resolve_sockets_with(
+            Some(PathBuf::from("/x/control.sock")),
+            None,
+            1000,
+            |_: &Path| false,
+        )
+        .unwrap();
+        assert_eq!(control, PathBuf::from("/x/control.sock"));
+        assert_eq!(capture, PathBuf::from("/x/capture.sock"));
     }
 }
