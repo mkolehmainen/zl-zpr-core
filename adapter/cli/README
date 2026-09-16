@@ -1,3 +1,26 @@
+Which socket does ph-cli talk to?
+
+ph-cli needs no sudo. By default it searches for the packet handler's
+control socket in this order (zipline#39):
+
+1. The per-user socket for your uid: <data_home>/zpr/<uid>/control.sock.
+   This is where a sudo- or pkexec-started ph puts it, owned by the user
+   who ran sudo, mode 0600.
+2. The shared socket: <data_home>/zpr/control.sock. This is where a
+   systemd-started ph puts it; if the host has a "zpr" group the socket is
+   group zpr, mode 0660, so group members can use ph-cli directly.
+
+If neither exists, ph-cli fails with an error naming both paths it tried.
+An explicit -p (control socket) or -c (capture socket) always wins and
+short-circuits the search. The default capture socket is capture.sock in
+the same directory as the control socket that was found.
+
+Security note: reaching the control socket means being able to start and
+stop links and register an AuthAgent — i.e. to supply and observe user
+credentials for this adapter, and to receive the IdP client_secret in a
+HelloResponse. Socket access is adapter control; the zpr group is not a
+low-privilege convenience.
+
 How to generate Bash completion script 
 
 Compile the program using cargo build

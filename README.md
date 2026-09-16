@@ -311,6 +311,48 @@ Then you can start the node:
 
     ./ph node -c /path/to/node-conf.toml
 
+### Control socket ownership and `ph-cli` access
+
+`ph` needs root (it creates a TUN interface), but `ph-cli` should not.
+`ph` decides who owns its control and capture sockets at startup, and the
+socket path and permissions follow from that. There are two modes:
+
+**Sudo/pkexec-invoked (owner known).** When `ph` is started with
+`sudo ph ...` (or via `pkexec`), it recovers the invoking user from
+`SUDO_UID`/`SUDO_GID` (or `PKEXEC_UID`) and puts the sockets in a per-user
+directory, chowned to that user with mode `0600`:
+
+    <data_home>/zpr/<uid>/control.sock
+    <data_home>/zpr/<uid>/capture.sock
+
+`ph-cli`, run as that same user with no `sudo` and no `-p`, looks in the
+per-user directory for its own uid first and connects directly. Because each
+invoking user gets their own directory, two adapters started by two different
+users on one host do not collide.
+
+**systemd-started (owner unknown).** When `ph` is started by systemd, `su -`,
+or a direct root login, there is no invoking user to recover. The sockets
+stay at the shared path (`<data_home>/zpr/control.sock`), and if a group
+named `zpr` exists they are chgrp'd to it with mode `0660`, so members of the
+`zpr` group can use `ph-cli` without sudo. If no `zpr` group exists, the
+sockets are left exactly as before (root-only) and `ph` logs one warning —
+creating the group is a packaging/admin choice, never a hard runtime
+dependency.
+
+`ph-cli`'s default search order is: the per-user socket for your uid if it
+exists, then the shared socket if it exists; if neither exists it fails with
+an error naming both paths tried. An explicit `-p` (control) or `-c`
+(capture) always wins, on both `ph` and `ph-cli`, as does an explicit
+`control_path`/`capture_path` in the config file — so multi-adapter and test
+setups keep full control.
+
+**Security note.** Reaching the control socket means being able to start and
+stop links and register an `AuthAgent` — i.e. to supply and observe user
+credentials for this adapter, and to receive the IdP `client_secret` in a
+HelloResponse. Socket access is adapter control. Membership in the `zpr`
+group grants exactly that, so treat it accordingly: it is not a low-privilege
+convenience group.
+
 If the visa service is also running on linux as this guide assumes, then we
 need to configure its TUN interface similar to what we did for the node.
 
