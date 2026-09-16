@@ -227,21 +227,32 @@ mod test {
         assert_eq!(resolve_socket_owner(env_of(&[])), None);
     }
 
-    /// Owner known: per-uid path `<data_home>/<uid>/control.sock`.
+    /// Owner known: per-uid path `/var/run/zpr/<uid>/control.sock`.
     /// Owner unknown: today's shared `<data_home>/control.sock`.
     #[test]
     fn socket_paths_derive_from_owner() {
         let dh = get_data_home();
         assert_eq!(
             control_socket_path(Some(1000)),
-            dh.join("1000").join("control.sock")
+            Path::new("/var/run/zpr/1000/control.sock")
         );
         assert_eq!(control_socket_path(None), dh.join("control.sock"));
         assert_eq!(
             capture_socket_path(Some(1000)),
-            dh.join("1000").join("capture.sock")
+            Path::new("/var/run/zpr/1000/capture.sock")
         );
         assert_eq!(capture_socket_path(None), dh.join("capture.sock"));
+    }
+
+    /// The per-uid base is a fixed location, never derived from the process
+    /// environment: `ph` computes this path under root's `HOME`/
+    /// `XDG_DATA_HOME` while `ph-cli` computes it under the invoking user's,
+    /// so any environment-derived base makes the two sides disagree and the
+    /// advertised sudo-to-unprivileged workflow cannot connect (zipline#39
+    /// review).
+    #[test]
+    fn per_uid_base_is_environment_independent() {
+        assert_eq!(owner_socket_dir(1000), Path::new("/var/run/zpr/1000"));
     }
 
     /// The drift regression this issue exists to prevent: the path `ph`
