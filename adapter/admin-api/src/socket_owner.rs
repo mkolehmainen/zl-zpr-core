@@ -47,16 +47,24 @@ pub fn resolve_socket_owner<F>(env: F) -> Option<SocketOwner>
 where
     F: Fn(&str) -> Option<String>,
 {
-    // UNIMPLEMENTED (zipline#39): owner resolution
-    let _ = env;
-    unimplemented!("zipline#39")
+    if let Some(uid_str) = env("SUDO_UID") {
+        let uid = uid_str.parse::<u32>().ok()?;
+        let gid = env("SUDO_GID")?.parse::<u32>().ok()?;
+        return Some(SocketOwner {
+            uid,
+            gid: Some(gid),
+        });
+    }
+    if let Some(uid_str) = env("PKEXEC_UID") {
+        let uid = uid_str.parse::<u32>().ok()?;
+        return Some(SocketOwner { uid, gid: None });
+    }
+    None
 }
 
 /// The directory holding a known owner's sockets: `<data_home>/<uid>/`.
 pub fn owner_socket_dir(uid: u32) -> PathBuf {
-    // UNIMPLEMENTED (zipline#39): per-uid socket dir
-    let _ = uid;
-    unimplemented!("zipline#39")
+    get_data_home().join(uid.to_string())
 }
 
 /// Default control socket path for the given owner: per-uid when the owner
@@ -72,9 +80,10 @@ pub fn capture_socket_path(owner_uid: Option<u32>) -> PathBuf {
 
 // Shared derivation for both sockets.
 fn socket_path(owner_uid: Option<u32>, name: &str) -> PathBuf {
-    // UNIMPLEMENTED (zipline#39): derived socket path
-    let _ = (owner_uid, name);
-    unimplemented!("zipline#39")
+    match owner_uid {
+        Some(uid) => owner_socket_dir(uid).join(name),
+        None => get_data_home().join(name),
+    }
 }
 
 /// Which socket path a client (`ph-cli`) should use, given an optional
@@ -94,9 +103,20 @@ pub fn choose_socket_path<F>(
 where
     F: Fn(&std::path::Path) -> bool,
 {
-    // UNIMPLEMENTED (zipline#39): client-side socket search order
-    let _ = (explicit, per_uid, shared, exists);
-    unimplemented!("zipline#39")
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    if exists(&per_uid) {
+        return Ok(per_uid);
+    }
+    if exists(&shared) {
+        return Ok(shared);
+    }
+    Err(format!(
+        "no packet handler socket found (tried {} and {}); is ph running? Use -p/-c to point at an explicit socket path",
+        per_uid.display(),
+        shared.display()
+    ))
 }
 
 #[cfg(test)]
