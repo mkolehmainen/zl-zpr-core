@@ -78,10 +78,11 @@ impl OidcCliError {
     /// True when a token-endpoint call was rejected with RFC 6749 section
     /// 5.2 `invalid_grant`: the grant (for us, a stored refresh token) is
     /// dead — revoked, expired, or never valid — and must not be replayed.
-    /// Keys on the `({code})` suffix [parse_token_response] builds, which is
-    /// the only producer of [OidcCliError::TokenExchange] texts with codes.
+    /// Keys on the `({code})` suffix [exchange_code] and [refresh_grant]
+    /// build, which are the only producers of [OidcCliError::TokenExchange]
+    /// texts carrying codes.
     pub fn is_invalid_grant(&self) -> bool {
-        false
+        matches!(self, OidcCliError::TokenExchange(msg) if msg.contains("(invalid_grant)"))
     }
 }
 
@@ -511,9 +512,7 @@ impl CliAuthAgent {
                 // fast with the no-token error instead of replaying a dead
                 // credential. The error text carries only the code, never
                 // the token or the response body.
-                if let OidcCliError::TokenExchange(msg) = &err
-                    && msg.contains("invalid_grant")
-                {
+                if err.is_invalid_grant() {
                     self.refresh_tokens.borrow_mut().remove(&idp.issuer);
                 }
                 Err(err)
@@ -709,7 +708,7 @@ async fn login_flow(
             .query_pairs_mut()
             .append_pair("access_type", "offline")
             .append_pair("prompt", "consent")
-            .append_pair("max_age", "31536000");
+            .append_pair("max_age", &OFFLINE_MAX_AGE_SECONDS.to_string());
     }
 
     if open_browser && browser_blocker.is_none() {
