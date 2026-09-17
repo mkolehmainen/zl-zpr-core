@@ -17,7 +17,7 @@ use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use zpr::addrs::ZPRNET_PREFIX_LEN;
 use zpr_utils::net_defs::IpAddress;
@@ -187,6 +187,48 @@ pub struct OidcCredentialRequest {
 /// Handle to the AuthAgent registered for a link via startLink.
 pub type AuthAgentHandle = tokio::sync::mpsc::UnboundedSender<OidcCredentialRequest>;
 
+/// The identity a link's actor originally authenticated with, stashed at
+/// auth time so silent renewal (zipline#45) can re-prove against the SAME
+/// issuer. On renewal failure the adapter/user reconnects and re-picks from
+/// the then-advertised providers, so this is never updated in place.
+#[derive(Clone, Debug)]
+pub struct RenewalIdentity {
+    /// The advertised IdP (issuer, client config) the original OIDC blob
+    /// named. Resolved from the node's auth-services list at auth time.
+    pub idp: auth::OidcIdpInfo,
+    /// The challenge-derived OIDC nonce ([auth::oidc_nonce_for_challenge])
+    /// bound into the original credential. Reused verbatim on the renewal
+    /// blob: a refresh-grant id_token carries the ORIGINAL nonce (OIDC Core
+    /// §12.2), and the VS ignores the nonce on the reauthorize path — but
+    /// there is no empty-string special case on the wire.
+    pub nonce: String,
+}
+
+/// The effective renewal lead for a granted authentication lifetime:
+/// the configured lead clamped to half the lifetime, so short
+/// `expiration_seconds` values still renew ahead of expiry by a workable
+/// margin instead of the lead swallowing the whole window (zipline#45).
+pub fn renewal_lead(configured: Duration, granted_lifetime: Duration) -> Duration {
+    configured.min(granted_lifetime / 2)
+}
+
+/// The instant renewal becomes due for an authentication granted at
+/// `granted_at` and expiring at `auth_expires`:
+/// `auth_expires - renewal_lead(configured, lifetime)`.
+/// An already-past (or zero-length) expiry yields a deadline that is never
+/// in the future, so renewal is due immediately.
+pub fn renewal_deadline(
+    granted_at: SystemTime,
+    auth_expires: SystemTime,
+    configured_lead: Duration,
+) -> SystemTime {
+    let lifetime = auth_expires
+        .duration_since(granted_at)
+        .unwrap_or(Duration::ZERO);
+    let lead = renewal_lead(configured_lead, lifetime);
+    auth_expires.checked_sub(lead).unwrap_or(auth_expires)
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, strum::IntoStaticStr)]
 pub enum LinkEvent {
@@ -269,6 +311,22 @@ pub struct LinkData {
     auth_agent: Option<AuthAgentHandle>,
     /// The most recent out-of-band authentication failure, surfaced in showLink.
     last_auth_failure: Option<AuthFailureReason>,
+    /// Nodes only: when the docked actor's authentication expires, from the
+    /// VS `Connection` response (zipline#45). None until authorized.
+    auth_expires: Option<SystemTime>,
+    /// Nodes only: the precomputed instant renewal becomes due —
+    /// `auth_expires - min(configured lead, lifetime/2)`; see
+    /// [renewal_deadline].
+    auth_renewal_deadline: Option<SystemTime>,
+    /// Nodes only: the issuer/nonce identity the actor originally
+    /// authenticated with, for silent renewal. None on device-only links.
+    renewal_identity: Option<RenewalIdentity>,
+    /// Nodes only: a renewal attempt is underway; suppresses further
+    /// attempts until it completes (one attempt per due tick at most).
+    renewal_in_flight: bool,
+    /// Nodes only: the one-shot "renewal due but no AuthAgent registered"
+    /// warning has fired for the current authentication window.
+    renewal_no_agent_warned: bool,
 }
 
 impl LinkData {
@@ -281,6 +339,11 @@ impl LinkData {
             oidc_idps: None,
             auth_agent: None,
             last_auth_failure: None,
+            auth_expires: None,
+            auth_renewal_deadline: None,
+            renewal_identity: None,
+            renewal_in_flight: false,
+            renewal_no_agent_warned: false,
         }
     }
 }
@@ -459,6 +522,42 @@ impl LinkStateWrapper {
     /// Record why authentication failed, for showLink / ph-cli reporting.
     fn record_auth_failure(&self, reason: AuthFailureReason) {
         self.locked_data.lock().unwrap().last_auth_failure = Some(reason);
+    }
+
+    /// Record the actor's authentication expiry from a VS `Connection`
+    /// response and precompute the renewal deadline from the configured
+    /// lead (zipline#45). `granted_at` anchors the lifetime the `remaining/2`
+    /// clamp is computed against (normally "now", when the grant arrived).
+    /// Resets the per-window renewal bookkeeping so a fresh grant warns and
+    /// retries anew.
+    pub fn set_auth_expires(
+        &self,
+        granted_at: SystemTime,
+        auth_expires: SystemTime,
+        configured_lead: Duration,
+    ) {
+        let deadline = renewal_deadline(granted_at, auth_expires, configured_lead);
+        let mut data = self.locked_data.lock().unwrap();
+        data.auth_expires = Some(auth_expires);
+        data.auth_renewal_deadline = Some(deadline);
+        data.renewal_in_flight = false;
+        data.renewal_no_agent_warned = false;
+    }
+
+    /// The actor's authentication expiry, if the VS has reported one.
+    pub fn get_auth_expires(&self) -> Option<SystemTime> {
+        self.locked_data.lock().unwrap().auth_expires
+    }
+
+    /// Stash the issuer/nonce identity the actor originally authenticated
+    /// with, so silent renewal can re-prove against the same issuer.
+    pub fn set_renewal_identity(&self, identity: RenewalIdentity) {
+        self.locked_data.lock().unwrap().renewal_identity = Some(identity);
+    }
+
+    /// The stored renewal identity, if the actor authenticated via OIDC.
+    pub fn get_renewal_identity(&self) -> Option<RenewalIdentity> {
+        self.locked_data.lock().unwrap().renewal_identity.clone()
     }
 
     /// Test-only: whether an AuthAgent handle is registered on this link.
@@ -1036,6 +1135,17 @@ impl LinkStateWrapper {
             }
         }
 
+        // Stash the OIDC identity the actor is authenticating with so silent
+        // renewal (zipline#45) can re-prove against the SAME issuer later.
+        // The nonce is derived from the (verified) challenge exactly as
+        // build_connect_request derives the one sent to the VS.
+        if let Some(oidc_blob) = d_blobs.iter().find_map(|b| match b {
+            AuthBlob::Oidc(oidc) => Some(oidc),
+            _ => None,
+        }) {
+            self.stash_renewal_identity(asm, link_id, oidc_blob);
+        }
+
         locked_fsm.set_state(LinkState::RegisterAA);
 
         let is_vs_link = asm
@@ -1135,6 +1245,40 @@ impl LinkStateWrapper {
             return false;
         }
         true
+    }
+
+    /// Store the OIDC identity (issuer's advertised client config + the
+    /// challenge-derived nonce) this actor is authenticating with, so silent
+    /// renewal (zipline#45) re-proves against the SAME issuer. The issuer is
+    /// resolved from the node's auth-services list; a blob naming an issuer
+    /// the VS no longer advertises just means renewal will not be possible.
+    fn stash_renewal_identity(
+        &self,
+        asm: &Arc<Assembly>,
+        link_id: LinkId,
+        oidc_blob: &auth::ZdpOidcBlob,
+    ) {
+        let Some(idp) = get_available_oidc_idps(asm, link_id)
+            .into_iter()
+            .find(|idp| idp.issuer == oidc_blob.issuer)
+        else {
+            warn!(target: LINK_STATE,
+                "{}: OIDC issuer {} is not in the advertised auth services; silent renewal will not be available",
+                asm.formatted_link_id(link_id), oidc_blob.issuer);
+            return;
+        };
+
+        // Same derivation as build_connect_request: the nonce bound into the
+        // credential is SHA-256 of the (already HMAC-verified) challenge.
+        let challenge_bytes = BASE64_STANDARD
+            .decode(&oidc_blob.challenge)
+            .unwrap_or_default();
+        let mut challenge = [0u8; 48];
+        if challenge_bytes.len() == 48 {
+            challenge.copy_from_slice(&challenge_bytes);
+        }
+        let nonce = auth::oidc_nonce_for_challenge(&challenge);
+        self.set_renewal_identity(RenewalIdentity { idp, nonce });
     }
 
     /// Grant ZPR Address message is from a node to an adapter and includes the
@@ -2375,6 +2519,112 @@ mod tests {
             scopes: vec!["openid".to_string()],
             allow_offline_access: false,
         }
+    }
+
+    /// `renewal_lead` clamps the configured lead to half the granted
+    /// lifetime, so short `expiration_seconds` values still renew ahead of
+    /// expiry by a workable margin (zipline#45).
+    #[test]
+    fn test_renewal_lead_clamps_to_half_lifetime() {
+        let configured = Duration::from_secs(300);
+        // Long lifetime: the configured lead stands.
+        assert_eq!(
+            super::renewal_lead(configured, Duration::from_secs(3600)),
+            Duration::from_secs(300)
+        );
+        // Lifetime of exactly 2x the lead: still the configured lead.
+        assert_eq!(
+            super::renewal_lead(configured, Duration::from_secs(600)),
+            Duration::from_secs(300)
+        );
+        // Short lifetime: clamped to half.
+        assert_eq!(
+            super::renewal_lead(configured, Duration::from_secs(120)),
+            Duration::from_secs(60)
+        );
+        // Zero lifetime: zero lead (due at expiry, i.e. immediately).
+        assert_eq!(
+            super::renewal_lead(configured, Duration::ZERO),
+            Duration::ZERO
+        );
+    }
+
+    /// `renewal_deadline` is `auth_expires - effective lead`; an
+    /// already-past expiry is due immediately (deadline not in the future).
+    #[test]
+    fn test_renewal_deadline_including_past_expiry() {
+        use std::time::SystemTime;
+        let configured = Duration::from_secs(300);
+        let now = SystemTime::now();
+
+        // 1h lifetime: deadline is expiry minus the full 300s lead.
+        let expires = now + Duration::from_secs(3600);
+        assert_eq!(
+            super::renewal_deadline(now, expires, configured),
+            expires - Duration::from_secs(300)
+        );
+
+        // 120s lifetime: lead clamps to 60s.
+        let expires = now + Duration::from_secs(120);
+        assert_eq!(
+            super::renewal_deadline(now, expires, configured),
+            expires - Duration::from_secs(60)
+        );
+
+        // Expiry already in the past: lifetime saturates to zero, so the
+        // deadline equals the (past) expiry — renewal is due immediately.
+        let expires = now - Duration::from_secs(10);
+        let deadline = super::renewal_deadline(now, expires, configured);
+        assert_eq!(deadline, expires);
+        assert!(deadline <= now, "past expiry must be due immediately");
+    }
+
+    /// `auth_expires` round-trips through the LinkStateWrapper setter/getter
+    /// (zipline#45): unset until authorized, then reads back what was set.
+    #[tokio::test]
+    async fn test_link_data_auth_expires_round_trip() {
+        use std::time::SystemTime;
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(peer.link_state_machine.get_auth_expires(), None);
+
+                let now = SystemTime::now();
+                let expires = now + Duration::from_secs(3600);
+                peer.link_state_machine
+                    .set_auth_expires(now, expires, Duration::from_secs(300));
+                assert_eq!(peer.link_state_machine.get_auth_expires(), Some(expires));
+            })
+            .await
+    }
+
+    /// The renewal identity (original issuer + challenge-derived nonce)
+    /// round-trips through the LinkStateWrapper setter/getter.
+    #[tokio::test]
+    async fn test_link_data_renewal_identity_round_trip() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert!(peer.link_state_machine.get_renewal_identity().is_none());
+
+                let challenge = [3u8; 48];
+                peer.link_state_machine
+                    .set_renewal_identity(super::RenewalIdentity {
+                        idp: test_idp(),
+                        nonce: auth::oidc_nonce_for_challenge(&challenge),
+                    });
+                let stored = peer
+                    .link_state_machine
+                    .get_renewal_identity()
+                    .expect("identity must be stored");
+                assert_eq!(stored.idp.issuer, "https://idp.test");
+                assert_eq!(stored.nonce, auth::oidc_nonce_for_challenge(&challenge));
+            })
+            .await
     }
 
     /// With `auto_connect = false` (zipline#28), a dropped AdapterToNode
