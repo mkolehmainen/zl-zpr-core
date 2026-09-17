@@ -577,6 +577,24 @@ impl LinkStateWrapper {
         self.locked_data.lock().unwrap().renewal_identity.clone()
     }
 
+    /// Test-only: whether the one-shot "renewal due, no agent" warning fired.
+    #[cfg(test)]
+    pub fn test_renewal_no_agent_warned(&self) -> bool {
+        self.locked_data.lock().unwrap().renewal_no_agent_warned
+    }
+
+    /// Test-only: whether a renewal attempt is currently in flight.
+    #[cfg(test)]
+    pub fn test_renewal_in_flight(&self) -> bool {
+        self.locked_data.lock().unwrap().renewal_in_flight
+    }
+
+    /// Test-only: clear the recorded auth failure.
+    #[cfg(test)]
+    pub fn test_clear_last_auth_failure(&self) {
+        self.locked_data.lock().unwrap().last_auth_failure = None;
+    }
+
     /// Test-only: whether an AuthAgent handle is registered on this link.
     #[cfg(test)]
     pub fn test_has_auth_agent(&self) -> bool {
@@ -2370,8 +2388,170 @@ impl LinkStateWrapper {
 
         // delay before kicking off next echo request
         self.set_timeout(asm, &mut locked_fsm, config::DEFAULT_KEEP_ALIVE_PERIOD);
+        drop(locked_fsm);
+
+        // Piggyback the auth-renewal check on the keep-alive heartbeat
+        // (zipline#45): every successful echo response on an Active link is
+        // a renewal tick.
+        self.maybe_renew_auth(asm);
 
         Ok(())
+    }
+
+    /// One auth-renewal tick (zipline#45). No-op until the precomputed
+    /// renewal deadline passes; then, per tick:
+    /// - no AuthAgent registered (or no OIDC renewal identity): warn ONCE
+    ///   per authentication window and record [AuthFailureReason::NoAgent];
+    ///   no repeat warnings, no attempts.
+    /// - agent registered: at most one in-flight attempt at a time — a
+    ///   non-interactive getOidcCredential (never opens a browser) bound to
+    ///   the ORIGINAL issuer and challenge-derived nonce the actor
+    ///   authenticated with, then `vsconn.reauthorize`. Success refreshes
+    ///   `auth_expires` (restarting the window); any failure warns, records
+    ///   the reason, and clears the in-flight flag so the next due tick
+    ///   retries.
+    fn maybe_renew_auth(&self, asm: &Arc<Assembly>) {
+        let link_id = self.id;
+
+        // Snapshot under the data lock; bail on the cheap paths.
+        let identity = {
+            let mut data = self.locked_data.lock().unwrap();
+            let Some(deadline) = data.auth_renewal_deadline else {
+                return; // never authorized via the VS: nothing to renew
+            };
+            if SystemTime::now() < deadline || data.renewal_in_flight {
+                return;
+            }
+            if data.auth_agent.is_none() || data.renewal_identity.is_none() {
+                if !data.renewal_no_agent_warned {
+                    data.renewal_no_agent_warned = true;
+                    data.last_auth_failure = Some(AuthFailureReason::NoAgent);
+                    warn!(target: LINK_STATE,
+                        "{}: authentication expires soon but no AuthAgent is available to renew it;                          the actor must reconnect to re-authenticate",
+                        asm.formatted_link_id(link_id));
+                }
+                return;
+            }
+            data.renewal_in_flight = true;
+            data.renewal_identity.clone().unwrap()
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let request = OidcCredentialRequest {
+            idp: identity.idp.clone(),
+            nonce: identity.nonce.clone(),
+            interactive: false, // renewal must never open a browser
+            reply: reply_tx,
+        };
+
+        // Send to the agent bridge; a closed channel means the bridge task
+        // is gone (its admin connection died), so clear the stale slot (C2).
+        {
+            let mut data = self.locked_data.lock().unwrap();
+            let Some(agent) = data.auth_agent.clone() else {
+                data.renewal_in_flight = false;
+                return;
+            };
+            if agent.send(request).is_err() {
+                data.auth_agent = None;
+                data.renewal_in_flight = false;
+                data.last_auth_failure = Some(AuthFailureReason::AgentError(
+                    "AuthAgent bridge is gone".to_string(),
+                ));
+                warn!(target: LINK_STATE,
+                    "{}: AuthAgent bridge is gone; cleared the stale agent registration",
+                    asm.formatted_link_id(link_id));
+                return;
+            }
+        }
+
+        let task_asm = asm.clone();
+        let issuer = identity.idp.issuer.clone();
+        let nonce = identity.nonce;
+        tokio::task::spawn_local(async move {
+            let outcome = reply_rx.await;
+            let Some(peer) = task_asm.peer_table.get(link_id) else {
+                return; // link torn down while we waited
+            };
+            let lsm = &peer.link_state_machine;
+
+            let id_token = match outcome {
+                Ok(Ok(id_token)) => id_token,
+                Ok(Err(reason)) => {
+                    lsm.finish_renewal_failure(&task_asm, reason);
+                    return;
+                }
+                Err(_) => {
+                    lsm.finish_renewal_failure(
+                        &task_asm,
+                        AuthFailureReason::AgentError(
+                            "AuthAgent dropped the renewal request".to_string(),
+                        ),
+                    );
+                    return;
+                }
+            };
+
+            let Some(vsconn) = task_asm.vsconn.as_ref() else {
+                lsm.finish_renewal_failure(
+                    &task_asm,
+                    AuthFailureReason::AgentError(
+                        "no visa service connection for renewal".to_string(),
+                    ),
+                );
+                return;
+            };
+            let Some(actor_addr) = lsm.get_actor_addresses().first().cloned() else {
+                lsm.finish_renewal_failure(
+                    &task_asm,
+                    AuthFailureReason::AgentError("no actor address to renew".to_string()),
+                );
+                return;
+            };
+
+            use zpr::vsapi_types as vst;
+            let req = vst::ReauthRequest {
+                zpr_addr: std::net::IpAddr::from(actor_addr),
+                blobs: vec![vst::AuthBlob::Oidc(vst::OidcBlob {
+                    issuer,
+                    id_token,
+                    nonce,
+                })],
+            };
+            match vsconn.reauthorize(req).await {
+                Ok(conn) => {
+                    let expires = std::time::UNIX_EPOCH + Duration::from_secs(conn.auth_expires);
+                    info!(target: LINK_STATE,
+                        "{}: silently re-authenticated; new expiry {expires:?}",
+                        task_asm.formatted_link_id(link_id));
+                    // Restarts the renewal window and clears the
+                    // in-flight/warned bookkeeping.
+                    lsm.set_auth_expires(
+                        SystemTime::now(),
+                        expires,
+                        task_asm.config.get().auth_renewal_lead,
+                    );
+                }
+                Err(e) => {
+                    lsm.finish_renewal_failure(
+                        &task_asm,
+                        AuthFailureReason::VisaServiceRejected(e.to_string()),
+                    );
+                }
+            }
+        });
+    }
+
+    /// A renewal attempt ended in failure: warn, record the reason for
+    /// showLink, and clear the in-flight flag so the next due keep-alive
+    /// tick may retry (zipline#45).
+    fn finish_renewal_failure(&self, asm: &Arc<Assembly>, reason: AuthFailureReason) {
+        warn!(target: LINK_STATE,
+            "{}: silent re-authentication failed: {reason:?}",
+            asm.formatted_link_id(self.id));
+        let mut data = self.locked_data.lock().unwrap();
+        data.renewal_in_flight = false;
+        data.last_auth_failure = Some(reason);
     }
 
     /// Common code to enter the `Active` state and kick off our keepalive mechanism
@@ -2498,6 +2678,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use std::time::SystemTime;
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
     use zpr_utils::net_defs;
@@ -2640,6 +2821,185 @@ mod tests {
                     .expect("identity must be stored");
                 assert_eq!(stored.idp.issuer, "https://idp.test");
                 assert_eq!(stored.nonce, auth::oidc_nonce_for_challenge(&challenge));
+            })
+            .await
+    }
+
+    /// C4 (zipline#45): a due renewal tick with NO AuthAgent registered
+    /// warns exactly once per authentication window and records
+    /// [AuthFailureReason::NoAgent]; later due ticks are silent no-ops.
+    #[tokio::test]
+    async fn test_renewal_tick_without_agent_warns_once() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+
+                // Renewal overdue: the expiry is already in the past.
+                let past = SystemTime::now() - Duration::from_secs(10);
+                lsm.set_auth_expires(
+                    past - Duration::from_secs(600),
+                    past,
+                    Duration::from_secs(300),
+                );
+
+                lsm.maybe_renew_auth(&asm);
+                assert!(lsm.test_renewal_no_agent_warned());
+                assert!(matches!(
+                    lsm.get_last_auth_failure(),
+                    Some(AuthFailureReason::NoAgent)
+                ));
+
+                // Second due tick: no new failure is recorded (warned flag
+                // holds), and nothing is attempted.
+                lsm.test_clear_last_auth_failure();
+                lsm.maybe_renew_auth(&asm);
+                assert!(
+                    lsm.get_last_auth_failure().is_none(),
+                    "no-agent warning repeated on a later tick"
+                );
+                assert!(!lsm.test_renewal_in_flight());
+            })
+            .await
+    }
+
+    /// C4 (zipline#45): a renewal tick before the deadline attempts nothing,
+    /// even with an agent registered.
+    #[tokio::test]
+    async fn test_renewal_tick_before_deadline_is_noop() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+
+                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
+                lsm.set_auth_agent(agent_tx);
+                lsm.set_renewal_identity(super::RenewalIdentity {
+                    idp: test_idp(),
+                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
+                });
+                // Expires an hour out with a 300s lead: not due yet.
+                let now = SystemTime::now();
+                lsm.set_auth_expires(
+                    now,
+                    now + Duration::from_secs(3600),
+                    Duration::from_secs(300),
+                );
+
+                lsm.maybe_renew_auth(&asm);
+                assert!(!lsm.test_renewal_in_flight());
+                assert!(
+                    agent_rx.try_recv().is_err(),
+                    "agent was called before the renewal deadline"
+                );
+            })
+            .await
+    }
+
+    /// C4 (zipline#45): a due tick with a registered agent sends exactly ONE
+    /// non-interactive credential request bound to the ORIGINAL issuer and
+    /// the stored challenge-derived nonce; while that attempt is in flight,
+    /// further due ticks do not send another.
+    #[tokio::test]
+    async fn test_renewal_tick_sends_one_noninteractive_request() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+
+                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
+                lsm.set_auth_agent(agent_tx);
+                let challenge = [7u8; 48];
+                lsm.set_renewal_identity(super::RenewalIdentity {
+                    idp: test_idp(),
+                    nonce: auth::oidc_nonce_for_challenge(&challenge),
+                });
+                let past = SystemTime::now() - Duration::from_secs(1);
+                lsm.set_auth_expires(
+                    past - Duration::from_secs(600),
+                    past,
+                    Duration::from_secs(300),
+                );
+
+                lsm.maybe_renew_auth(&asm);
+                let req = agent_rx.try_recv().expect("agent must be called once");
+                assert!(
+                    !req.interactive,
+                    "renewal must never open a browser (interactive must be false)"
+                );
+                assert_eq!(req.idp.issuer, "https://idp.test");
+                assert_eq!(req.nonce, auth::oidc_nonce_for_challenge(&challenge));
+
+                // In flight: the next due tick must not send a second call.
+                lsm.maybe_renew_auth(&asm);
+                assert!(
+                    agent_rx.try_recv().is_err(),
+                    "second agent call while a renewal attempt is in flight"
+                );
+            })
+            .await
+    }
+
+    /// C4 (zipline#45): a failed attempt records the reason, clears the
+    /// in-flight flag, and the NEXT due tick retries (one attempt per tick).
+    #[tokio::test]
+    async fn test_renewal_failure_records_reason_and_next_tick_retries() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+
+                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
+                lsm.set_auth_agent(agent_tx);
+                lsm.set_renewal_identity(super::RenewalIdentity {
+                    idp: test_idp(),
+                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
+                });
+                let past = SystemTime::now() - Duration::from_secs(1);
+                lsm.set_auth_expires(
+                    past - Duration::from_secs(600),
+                    past,
+                    Duration::from_secs(300),
+                );
+
+                // Attempt 1: the agent answers with a failure.
+                lsm.maybe_renew_auth(&asm);
+                let req = agent_rx.try_recv().expect("agent must be called");
+                req.reply
+                    .send(Err(AuthFailureReason::IdpUnreachable(
+                        "refresh failed".to_string(),
+                    )))
+                    .unwrap();
+                // Let the completion task run.
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                    if !lsm.test_renewal_in_flight() {
+                        break;
+                    }
+                }
+                assert!(
+                    !lsm.test_renewal_in_flight(),
+                    "failure must clear in-flight"
+                );
+                assert!(matches!(
+                    lsm.get_last_auth_failure(),
+                    Some(AuthFailureReason::IdpUnreachable(_))
+                ));
+
+                // Attempt 2 on the next due tick.
+                lsm.maybe_renew_auth(&asm);
+                assert!(
+                    agent_rx.try_recv().is_ok(),
+                    "registered-but-failing agent must be retried once per due tick"
+                );
             })
             .await
     }
