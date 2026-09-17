@@ -562,6 +562,7 @@ impl LinkStateWrapper {
     }
 
     /// The actor's authentication expiry, if the VS has reported one.
+    #[cfg(test)]
     pub fn get_auth_expires(&self) -> Option<SystemTime> {
         self.locked_data.lock().unwrap().auth_expires
     }
@@ -573,6 +574,7 @@ impl LinkStateWrapper {
     }
 
     /// The stored renewal identity, if the actor authenticated via OIDC.
+    #[cfg(test)]
     pub fn get_renewal_identity(&self) -> Option<RenewalIdentity> {
         self.locked_data.lock().unwrap().renewal_identity.clone()
     }
@@ -2669,7 +2671,23 @@ impl Display for LinkData {
             "    Latency: Min {:?}, Max {:?}, Avg {average:?}\n",
             self.latency_data.get_min(),
             self.latency_data.get_max(),
-        )
+        )?;
+        // Surface the renewal picture in showLink (zipline#45).
+        if let Some(expires) = self.auth_expires {
+            match expires.duration_since(SystemTime::now()) {
+                Ok(remaining) => {
+                    write!(f, "  Auth expires: in {remaining:?}")?;
+                }
+                Err(_) => {
+                    write!(f, "  Auth expires: EXPIRED")?;
+                }
+            }
+            if self.renewal_in_flight {
+                write!(f, " (renewal in progress)")?;
+            }
+            write!(f, "\n")?;
+        }
+        Ok(())
     }
 }
 
