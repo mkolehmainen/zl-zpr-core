@@ -224,6 +224,18 @@ pub struct Config {
     /// section; defaults to [DEFAULT_AUTH_RENEWAL_LEAD]. The effective lead
     /// on a link is `min(this, remaining_lifetime / 2)`.
     pub auth_renewal_lead: std::time::Duration,
+
+    /// Security testing for A2A Pubkeys
+    #[cfg(feature = "enable-security-testing")]
+    pub security_testing_mangle_forwarded_pings: bool,
+
+    /// Security testing: force old-style unkeyed A2A MICVs.
+    #[cfg(feature = "enable-security-testing")]
+    pub security_testing_unkeyed_a2a_micv: bool,
+
+    /// Security testing: recompute the A2A MICV after mangling (vs. reuse it).
+    #[cfg(feature = "enable-security-testing")]
+    pub security_testing_recompute_micvs: bool,
 }
 
 impl Config {
@@ -680,6 +692,14 @@ impl Config {
             }
         };
 
+        #[cfg(feature = "enable-security-testing")]
+        {
+            self.security_testing_mangle_forwarded_pings =
+                common.security_testing_mangle_forwarded_pings;
+            self.security_testing_unkeyed_a2a_micv = common.security_testing_unkeyed_a2a_micv;
+            self.security_testing_recompute_micvs = common.security_testing_recompute_micvs;
+        }
+
         Ok(())
     }
 }
@@ -710,6 +730,12 @@ impl Default for Config {
             control_path_derived: true,
             capture_path_derived: true,
             auth_renewal_lead: DEFAULT_AUTH_RENEWAL_LEAD,
+            #[cfg(feature = "enable-security-testing")]
+            security_testing_mangle_forwarded_pings: false,
+            #[cfg(feature = "enable-security-testing")]
+            security_testing_unkeyed_a2a_micv: false,
+            #[cfg(feature = "enable-security-testing")]
+            security_testing_recompute_micvs: true,
         }
     }
 }
