@@ -684,6 +684,12 @@ impl LinkStateWrapper {
         self.locked_fsm.lock().unwrap().actor_addresses.push(addr);
     }
 
+    /// Test-only: dock an actor address on this link regardless of type.
+    #[cfg(test)]
+    pub fn test_add_actor_address(&self, addr: IpAddress) {
+        self.locked_fsm.lock().unwrap().actor_addresses.push(addr);
+    }
+
     /// Tell the VS that this actor has disconnected.
     /// Used in a NODE context only.
     fn deregister_actor_addresses(&self, asm: &Arc<Assembly>) -> tokio::task::JoinSet<()> {
