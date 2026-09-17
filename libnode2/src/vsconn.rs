@@ -21,8 +21,8 @@ use crate::error::VSApiError;
 use crate::logging::targets::VS_RPC;
 
 use zpr::vsapi_types::{
-    ConnectRequest, ConnectType, Connection, DisconnectNotice, Param, VSConnectRequest, Visa,
-    VisaDecision, VisaOp, VisaRequest, VisaResponse, pname,
+    ConnectRequest, ConnectType, Connection, DisconnectNotice, Param, ReauthRequest,
+    VSConnectRequest, Visa, VisaDecision, VisaOp, VisaRequest, VisaResponse, pname,
 };
 use zpr::write_to::WriteTo;
 
@@ -97,6 +97,11 @@ enum VS2Command {
     RegisterVss(SocketAddr, oneshot::Sender<VSRegisterVssResponse>),
 
     AuthorizeConnect(ConnectRequest, oneshot::Sender<VSAuthorizeConnectResponse>),
+
+    /// Re-prove an existing actor's authentication before `auth_expires`
+    /// (zipline#45). Mirrors [VS2Command::AuthorizeConnect]; the VS returns
+    /// an updated [Connection] with a new expiry.
+    Reauthorize(ReauthRequest, oneshot::Sender<VSAuthorizeConnectResponse>),
 
     NotifyDisconnect(
         DisconnectNotice,
@@ -565,6 +570,22 @@ impl VSConn {
                 Ok(())
             }
 
+            VS2Command::Reauthorize(req, resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: reauthorize");
+                let resp = if !cmd_state.is_connected() {
+                    Err(VSApiError::CommandFailed(
+                        "not connected to VS-API".to_string(),
+                    ))
+                } else {
+                    self.do_reauthorize(cmd_state.vs_handle.as_ref().unwrap(), req)
+                        .await
+                };
+                if let Err(e) = resp_tx.send(resp) {
+                    error!(target: VS_RPC, "failed to send reauthorize response: {:?}", e);
+                }
+                Ok(())
+            }
+
             VS2Command::NotifyDisconnect(req, resp_tx) => {
                 debug!(target: VS_RPC, "VSConn: notify_disconnect");
                 let resp = if !cmd_state.is_connected() {
@@ -820,6 +841,41 @@ impl VSConn {
         }
     }
 
+    /// Silent renewal counterpart of [Self::do_authorize_connect]
+    /// (zipline#45): submits fresh auth blobs for an actor that is already
+    /// docked at `req.zpr_addr`; the VS responds with an updated
+    /// [Connection] carrying the new `auth_expires`.
+    async fn do_reauthorize(
+        &self,
+        vs_h: &vsapi2::v_s_handle::Client,
+        req: ReauthRequest,
+    ) -> Result<Connection, VSApiError> {
+        let mut ra_request = vs_h.reauthorize_request();
+        let mut rr_bldr = ra_request.get().init_req();
+        req.write_to(&mut rr_bldr);
+
+        debug!(target: VS_RPC, "VS-API -> reauthorize");
+        let ra_response = rpc_with_timeout(
+            "reauthorize",
+            DEFAULT_RPC_TIMEOUT,
+            ra_request.send().promise,
+        )
+        .await?;
+        let conn_or_error = ra_response.get()?.get_resp()?;
+
+        match conn_or_error.which()? {
+            vsapi2::result::Which::Ok(conn) => {
+                let conn = conn?;
+                let connection = Connection::try_from(conn)?;
+                Ok(connection)
+            }
+            vsapi2::result::Which::Error(err_obj) => {
+                let err_obj = err_obj?;
+                Err(ApiResponseError::try_from(err_obj)?.into())
+            }
+        }
+    }
+
     async fn do_notify_disconnect(
         &self,
         vs_h: &vsapi2::v_s_handle::Client,
@@ -1021,6 +1077,15 @@ impl VSConnHandle {
         resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
     }
 
+    /// Re-prove an existing actor's authentication (zipline#45). Returns the
+    /// updated [Connection]; its `auth_expires` restarts the renewal clock.
+    pub async fn reauthorize(&self, req: ReauthRequest) -> Result<Connection, VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = VS2Command::Reauthorize(req, resp_tx);
+        self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+
     pub async fn notify_disconnect(&self, req: DisconnectNotice) -> Result<(), VSApiError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VS2Command::NotifyDisconnect(req, resp_tx);
@@ -1182,6 +1247,40 @@ mod tests {
                 connect_fn,
                 substrate_addr: "127.0.0.1:5000".parse().unwrap(),
             }
+        }
+    }
+
+    /// C3 (zipline#45): the zpr v0.27.0 `ReauthRequest` wrapper round-trips
+    /// through its capnp builder exactly as `do_reauthorize` writes it —
+    /// zprAddr and every auth blob survive write_to -> TryFrom intact.
+    #[test]
+    fn reauth_request_capnp_builder_round_trip() {
+        use zpr::vsapi_types::{AuthBlob, OidcBlob};
+
+        let req = ReauthRequest {
+            zpr_addr: "10.1.2.3".parse().unwrap(),
+            blobs: vec![AuthBlob::Oidc(OidcBlob {
+                issuer: "https://idp.test".to_string(),
+                id_token: "FAKE.JWT.TOKEN".to_string(),
+                nonce: "challenge-derived-nonce".to_string(),
+            })],
+        };
+
+        let mut message = capnp::message::Builder::new_default();
+        let mut bldr = message.init_root::<vsapi2::reauth_request::Builder>();
+        req.write_to(&mut bldr);
+
+        let reader = bldr.into_reader();
+        let decoded = ReauthRequest::try_from(reader).expect("round trip");
+        assert_eq!(decoded.zpr_addr, req.zpr_addr);
+        assert_eq!(decoded.blobs.len(), 1);
+        match &decoded.blobs[0] {
+            AuthBlob::Oidc(oidc) => {
+                assert_eq!(oidc.issuer, "https://idp.test");
+                assert_eq!(oidc.id_token, "FAKE.JWT.TOKEN");
+                assert_eq!(oidc.nonce, "challenge-derived-nonce");
+            }
+            other => panic!("expected OIDC blob, got {other:?}"),
         }
     }
 
