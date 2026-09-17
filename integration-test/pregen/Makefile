@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-file-interplay.bin2
+OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
@@ -39,6 +39,13 @@ v6-1node-3actor-ping.bin2: v6-1node-3actor-ping.zplc v4-1node-3actor-ping.zpl
 # warning — expected, do not add --Werror here.
 oidc-test.bin2: oidc-test.zpl oidc-test.zplc oidc-test-seed-jwks.json
 	$(ZPLC) -c oidc-test.zplc -k $(KEY) -f v2 -o $@ oidc-test.zpl
+
+# Silent-OIDC-renewal fixture (zipline#47). Deliberately reuses oidc-test.zpl
+# verbatim — the ZPL is identical and only the .zplc lifetime knobs differ —
+# the same trick v6-1node-2actor-ping.bin2 plays on v4-1node-2actor-ping.zpl
+# above. Same omitted-`service` warning as oidc-test; expected.
+oidc-renewal.bin2: oidc-renewal.zplc oidc-test.zpl oidc-test-seed-jwks.json
+	$(ZPLC) -c oidc-renewal.zplc -k $(KEY) -f v2 -o $@ oidc-test.zpl
 
 # oidc + file interplay fixture (zipline#27). Same fake-IdP pinning as
 # oidc-test, plus the happyfile file store from the trusted-service

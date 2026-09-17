@@ -149,9 +149,20 @@ pub enum Commands {
     Quit,
     /// Gets the address of an adapter's node
     Addr,
-    /// Connect (start) a link, performing interactive authentication when the
-    /// packet handler requests it
-    #[command(arg_required_else_help = true)]
+    /// Connect (start) a link, authenticate interactively if the packet
+    /// handler asks, then exit reporting the outcome.
+    ///
+    /// For scripts and CI: it blocks until the link is up or the attempt
+    /// fails and says which through its exit code (2 declined, 3 timeout,
+    /// 4 IdP unreachable, 5 visa service rejected the token, 6 policy
+    /// denied, 7 device blob rejected).
+    ///
+    /// It does NOT renew: the authentication agent it registers dies with
+    /// this process, so an OIDC actor connected this way is disconnected
+    /// once its authentication window closes. For an interactive session use
+    /// `auth-agent` instead — and do not run `connect` on a link that
+    /// already has one, because the registration overwrites it.
+    #[command(arg_required_else_help = true, verbatim_doc_comment)]
     Connect {
         #[arg(required = true)]
         /// Link id to connect
@@ -160,9 +171,18 @@ pub enum Commands {
         #[arg(long)]
         no_browser: bool,
     },
-    /// Register as the authentication agent for a link and run until
-    /// interrupted
-    #[command(arg_required_else_help = true)]
+    /// Start a link, serve its authentication requests, and stay resident to
+    /// renew them. This is how a human logs in.
+    ///
+    /// The browser opens once; after that this process renews the
+    /// authentication silently in the background for as long as it runs, up
+    /// to the policy's session ceiling. It does not report the link's
+    /// outcome — use `link show <id>`, which also reports the authentication
+    /// expiry — and it runs until interrupted (Ctrl-C).
+    ///
+    /// Under sudo, pass --no-browser and paste the printed URL into your own
+    /// browser: a root process cannot usefully open one.
+    #[command(arg_required_else_help = true, verbatim_doc_comment)]
     AuthAgent {
         #[arg(required = true)]
         /// Link id to serve as authentication agent for

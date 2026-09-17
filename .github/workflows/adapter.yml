@@ -234,6 +234,78 @@ jobs:
       run: |
         ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/one-node-oidc-test.sh
 
+  oidc-renewal-integration-test:
+    name: Run 1-Node OIDC Renewal Test
+    needs: [build-ph, build-ph-cli]
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v7
+    # Necessary to run before rust-cache
+    - run: rustup toolchain install stable --profile minimal
+    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      with:
+        workspaces: |
+          adapter/ph
+          adapter/cli
+          zpr-ext
+          cslab
+          cbpf-rs
+
+    # see <https://github.com/docker-library/golang/issues/452>
+    - name: Set workspace as safe
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+    - name: Setup Git credentials
+      timeout-minutes: 1
+      run: |
+        echo 'echo $ZPR_CICD_RO_TOKEN' > "$HOME/.git-askpass"
+        chmod +x "$HOME/.git-askpass"
+        echo "GIT_ASKPASS=$HOME/.git-askpass" >> "$GITHUB_ENV"
+        go env -w GOPRIVATE="github.com/org-zpr/*"
+
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: ph-*${{ matrix.os }}
+        merge-multiple: true
+
+    - name: Build
+      timeout-minutes: 10
+      env:
+        ZPR_CICD_RO_TOKEN: ${{ secrets.ZPR_CICD_RO_TOKEN }}
+      run: |
+        tar -xvf ph.tar
+        tar -xvf ph-cli.tar
+
+    - name: Download Asset
+      uses: robinraju/release-downloader@v1
+      with:
+        repository: 'mkolehmainen/zl-zpr-visaservice'
+        tag: ${{ env.VISA_SERVICE_RELEASE }}
+        fileName: 'release-linux-x86_64.tar.gz'
+        extract: true
+        out-file-path: 'integration-test'
+        token: ${{ secrets.ZPR_CICD_RO_TOKEN }}
+
+    - name: Set env
+      run: |
+        echo "DEBUG_TARGETS=all=DEBUG" >> $GITHUB_ENV
+
+    - name: Install valkey
+      timeout-minutes: 5
+      run: |
+        sudo apt-get update
+        sudo apt install -y valkey
+        sudo systemctl stop valkey-server
+        sudo systemctl disable valkey-server
+
+    - name: One Node OIDC Renewal Test
+      timeout-minutes: 25
+      run: |
+        ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/one-node-oidc-renewal-test.sh
+
   capture-integration-test:
     name: Run Capture Test
     needs: [build-ph, build-ph-cli]
