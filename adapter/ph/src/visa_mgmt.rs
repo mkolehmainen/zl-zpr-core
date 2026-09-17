@@ -198,6 +198,7 @@ fn build_connect_request_from_parts(
         });
     }
 
+    //stuff key into a vsapi_types::PublicKey so it can be sent in the connect request
     let a2a_dh_public_key = a2a_dh_public_key
         .map(|key| vsapi_types::PublicKey::new(key.as_bytes()))
         .unwrap_or_else(|| vsapi_types::PublicKey::new(&[]));
