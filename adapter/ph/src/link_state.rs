@@ -504,6 +504,23 @@ impl LinkStateWrapper {
         self.locked_data.lock().unwrap().auth_agent = Some(agent);
     }
 
+    /// Clear the AuthAgent slot, but only if it still holds `handle`'s
+    /// channel (zipline#45): the bridge for a dead capnp client must not
+    /// clobber a NEWER agent registered after it (e.g. the user re-ran
+    /// `ph-cli auth-agent`). Returns true if the slot was cleared.
+    pub fn clear_auth_agent_if(&self, handle: &AuthAgentHandle) -> bool {
+        let mut data = self.locked_data.lock().unwrap();
+        if data
+            .auth_agent
+            .as_ref()
+            .is_some_and(|current| current.same_channel(handle))
+        {
+            data.auth_agent = None;
+            return true;
+        }
+        false
+    }
+
     /// True if `attempt_clock` still identifies the FSM's current
     /// timeout/attempt. The logical clock advances on every state change
     /// (and every re-armed timeout), so a mismatch means the attempt that
@@ -2623,6 +2640,39 @@ mod tests {
                     .expect("identity must be stored");
                 assert_eq!(stored.idp.issuer, "https://idp.test");
                 assert_eq!(stored.nonce, auth::oidc_nonce_for_challenge(&challenge));
+            })
+            .await
+    }
+
+    /// C2 (zipline#45): clearing the AuthAgent slot is guarded — the handle
+    /// of a dead admin connection only clears the slot while it is still the
+    /// registered agent; a newer agent registered afterwards is left alone.
+    #[tokio::test]
+    async fn test_clear_auth_agent_if_only_clears_matching_handle() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+
+                let (agent1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+                let (agent2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+
+                // agent1 registers, then its admin connection dies: cleared.
+                peer.link_state_machine.set_auth_agent(agent1.clone());
+                assert!(peer.link_state_machine.test_has_auth_agent());
+                assert!(peer.link_state_machine.clear_auth_agent_if(&agent1));
+                assert!(!peer.link_state_machine.test_has_auth_agent());
+
+                // agent1 re-registers, then agent2 replaces it. agent1's
+                // stale cleanup must NOT clobber agent2.
+                peer.link_state_machine.set_auth_agent(agent1.clone());
+                peer.link_state_machine.set_auth_agent(agent2.clone());
+                assert!(!peer.link_state_machine.clear_auth_agent_if(&agent1));
+                assert!(
+                    peer.link_state_machine.test_has_auth_agent(),
+                    "stale bridge cleanup clobbered the newer agent"
+                );
             })
             .await
     }

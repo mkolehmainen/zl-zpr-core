@@ -19,6 +19,7 @@ use cbpf_rs;
 use cli::cmd_line_inter as svc;
 use core::future::Future;
 use hdrhistogram::Histogram;
+use std::cell::RefCell;
 use std::f64::consts::SQRT_2;
 use std::fmt::Write;
 use std::io::Error;
@@ -65,11 +66,31 @@ pub async fn launch_capnp(
             capnp::message::ReaderOptions::new(),
         );
 
-        let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl { asm: asm.clone() });
+        let agent_registrations = Rc::new(RefCell::new(Vec::new()));
+        let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
+            asm: asm.clone(),
+            agent_registrations: agent_registrations.clone(),
+        });
 
         let rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), Some(service.clone().client));
+        let cleanup_asm = asm.clone();
         tokio::task::spawn_local(async move {
             let err = rpc_system.await;
+            // This admin RPC connection is gone. Any AuthAgent registered
+            // over it is dead too: clear each link's agent slot (unless a
+            // newer agent has since replaced it) so renewal logic and
+            // showLink report the true state (zipline#45).
+            for (link_id, handle) in agent_registrations.borrow_mut().drain(..) {
+                if let Some(peer) = cleanup_asm.peer_table.get(link_id) {
+                    if peer.link_state_machine.clear_auth_agent_if(&handle) {
+                        debug!(
+                            target: RPC,
+                            "AuthAgent for {} unregistered (admin connection closed)",
+                            cleanup_asm.formatted_link_id(link_id)
+                        );
+                    }
+                }
+            }
             err
         });
     }
@@ -84,6 +105,13 @@ pub async fn launch(asm: Arc<Assembly>, listener: UnixListener) {
 
 struct AdminServiceImpl {
     asm: Arc<Assembly>,
+    /// AuthAgent registrations made over THIS admin RPC connection
+    /// (link id + the bridge handle installed on it). When the connection
+    /// drops — `ph-cli connect` / `auth-agent` exited — the corresponding
+    /// links' `auth_agent` slots are cleared so `auth_agent.is_some()`
+    /// reflects reality again (zipline#45). Guarded clearing: a NEWER agent
+    /// registered over another connection is left in place.
+    agent_registrations: Rc<RefCell<Vec<(u32, AuthAgentHandle)>>>,
 }
 
 impl svc::Server for AdminServiceImpl {
@@ -383,8 +411,14 @@ impl svc::Server for AdminServiceImpl {
         if params.get()?.has_auth_agent() {
             let agent_client = params.get()?.get_auth_agent()?;
             if let Some(peer) = self.asm.peer_table.get(id) {
-                peer.link_state_machine
-                    .set_auth_agent(spawn_auth_agent_bridge(agent_client));
+                let handle = spawn_auth_agent_bridge(agent_client);
+                // Remember the registration so the connection-close cleanup
+                // in launch_capnp can clear the slot when this admin RPC
+                // connection (the agent's process) goes away (zipline#45).
+                self.agent_registrations
+                    .borrow_mut()
+                    .push((id, handle.clone()));
+                peer.link_state_machine.set_auth_agent(handle);
                 debug!(target: RPC, "AuthAgent registered for {}", self.asm.formatted_link_id(id));
             } else {
                 warn!(target: RPC, "startLink: no such link {id}, cannot register AuthAgent");
@@ -1487,8 +1521,10 @@ mod test {
                 }
 
                 // Call the admin service the way ph-cli connect does.
-                let service: svc::Client =
-                    capnp_rpc::new_client(AdminServiceImpl { asm: asm.clone() });
+                let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
+                    asm: asm.clone(),
+                    agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                });
                 let agent: cli::auth_agent::Client = capnp_rpc::new_client(FakeAuthAgent {
                     id_token: "FAKE.JWT.TOKEN".to_string(),
                     seen_nonce: Rc::new(RefCell::new(None)),
