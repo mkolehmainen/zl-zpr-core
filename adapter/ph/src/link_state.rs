@@ -229,6 +229,26 @@ pub fn renewal_deadline(
     auth_expires.checked_sub(lead).unwrap_or(auth_expires)
 }
 
+/// Floor for one silent-renewal attempt's wait on the AuthAgent: even with
+/// (nearly) no window left, give a healthy agent a moment to answer from its
+/// refresh-token cache instead of a zero-length wait.
+pub const RENEWAL_ATTEMPT_TIMEOUT_FLOOR: Duration = Duration::from_secs(5);
+
+/// How long ONE silent-renewal attempt may wait on the AuthAgent: half the
+/// time remaining before `auth_expires`, clamped between
+/// [RENEWAL_ATTEMPT_TIMEOUT_FLOOR] and the bridge's own per-call bound
+/// ([config::OIDC_USER_INTERACTION_TIMEOUT]). Bounding by the remaining
+/// window means a hung request cannot pin `renewal_in_flight` past the point
+/// where a retry could still succeed against the current authentication —
+/// half, so at least one full retry fits in the window left (PR #14 review).
+pub fn renewal_attempt_timeout(now: SystemTime, auth_expires: SystemTime) -> Duration {
+    let remaining = auth_expires.duration_since(now).unwrap_or(Duration::ZERO);
+    (remaining / 2).clamp(
+        RENEWAL_ATTEMPT_TIMEOUT_FLOOR,
+        config::OIDC_USER_INTERACTION_TIMEOUT,
+    )
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, strum::IntoStaticStr)]
 pub enum LinkEvent {
@@ -452,6 +472,11 @@ impl LinkStateMachine {
 
 pub struct LinkStateWrapper {
     pub id: LinkId, // set at constructor, never changes.
+    /// Process-unique instance id: distinguishes THIS link from a later link
+    /// that reuses the same slab `id` after teardown. Renewal completions
+    /// carry the uid they were spawned under and are discarded when the
+    /// looked-up peer's uid differs (PR #14 review).
+    uid: u64,
     link_type: LinkType,
     locked_fsm: Mutex<LinkStateMachine>,
     pub locked_data: Mutex<LinkData>,
@@ -462,6 +487,8 @@ pub struct LinkStateWrapper {
 
 impl LinkStateWrapper {
     pub fn new(new_id: LinkId, new_link_type: LinkType) -> Self {
+        // Monotonic instance counter; see the `uid` field.
+        static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut lsm = LinkStateMachine::new(new_id);
 
         if matches!(new_link_type, LinkType::Internal) {
@@ -472,6 +499,7 @@ impl LinkStateWrapper {
 
         Self {
             id: new_id,
+            uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             link_type: new_link_type,
             locked_fsm: Mutex::new(lsm),
             locked_data: Mutex::new(LinkData::new()),
@@ -2424,7 +2452,7 @@ impl LinkStateWrapper {
         let link_id = self.id;
 
         // Snapshot under the data lock; bail on the cheap paths.
-        let identity = {
+        let (identity, auth_expires) = {
             let mut data = self.locked_data.lock().unwrap();
             let Some(deadline) = data.auth_renewal_deadline else {
                 return; // never authorized via the VS: nothing to renew
@@ -2443,7 +2471,11 @@ impl LinkStateWrapper {
                 return;
             }
             data.renewal_in_flight = true;
-            data.renewal_identity.clone().unwrap()
+            (
+                data.renewal_identity.clone().unwrap(),
+                // A renewal deadline implies set_auth_expires ran: present.
+                data.auth_expires.unwrap(),
+            )
         };
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -2478,78 +2510,111 @@ impl LinkStateWrapper {
         let task_asm = asm.clone();
         let issuer = identity.idp.issuer.clone();
         let nonce = identity.nonce;
+        // Bind the completion to THIS link instance: after teardown the slab
+        // id can be reused by a new peer, and the stale task must not act on
+        // it (PR #14 review).
+        let link_uid = self.uid;
+        // Bound the wait by the remaining authentication window so a hung
+        // agent cannot pin renewal_in_flight past expiry (PR #14 review).
+        let attempt_timeout = renewal_attempt_timeout(SystemTime::now(), auth_expires);
         tokio::task::spawn_local(async move {
-            let outcome = reply_rx.await;
-            let Some(peer) = task_asm.peer_table.get(link_id) else {
-                return; // link torn down while we waited
-            };
-            let lsm = &peer.link_state_machine;
-
-            let id_token = match outcome {
-                Ok(Ok(id_token)) => id_token,
-                Ok(Err(reason)) => {
-                    lsm.finish_renewal_failure(&task_asm, reason);
-                    return;
-                }
-                Err(_) => {
-                    lsm.finish_renewal_failure(
-                        &task_asm,
-                        AuthFailureReason::AgentError(
-                            "AuthAgent dropped the renewal request".to_string(),
-                        ),
-                    );
-                    return;
-                }
-            };
-
-            let Some(vsconn) = task_asm.vsconn.as_ref() else {
-                lsm.finish_renewal_failure(
-                    &task_asm,
+            let outcome = match tokio::time::timeout(attempt_timeout, reply_rx).await {
+                Ok(outcome) => outcome.map_err(|_| {
                     AuthFailureReason::AgentError(
-                        "no visa service connection for renewal".to_string(),
-                    ),
-                );
-                return;
+                        "AuthAgent dropped the renewal request".to_string(),
+                    )
+                }),
+                // Dropping reply_rx tells the bridge (via reply.closed()) to
+                // cancel the abandoned RPC.
+                Err(_elapsed) => Err(AuthFailureReason::AgentError(format!(
+                    "renewal attempt timed out after {attempt_timeout:?}"
+                ))),
             };
-            let Some(actor_addr) = lsm.get_actor_addresses().first().cloned() else {
-                lsm.finish_renewal_failure(
-                    &task_asm,
-                    AuthFailureReason::AgentError("no actor address to renew".to_string()),
-                );
-                return;
-            };
-
-            use zpr::vsapi_types as vst;
-            let req = vst::ReauthRequest {
-                zpr_addr: std::net::IpAddr::from(actor_addr),
-                blobs: vec![vst::AuthBlob::Oidc(vst::OidcBlob {
-                    issuer,
-                    id_token,
-                    nonce,
-                })],
-            };
-            match vsconn.reauthorize(req).await {
-                Ok(conn) => {
-                    let expires = std::time::UNIX_EPOCH + Duration::from_secs(conn.auth_expires);
-                    info!(target: LINK_STATE,
-                        "{}: silently re-authenticated; new expiry {expires:?}",
-                        task_asm.formatted_link_id(link_id));
-                    // Restarts the renewal window and clears the
-                    // in-flight/warned bookkeeping.
-                    lsm.set_auth_expires(
-                        SystemTime::now(),
-                        expires,
-                        task_asm.config.get().auth_renewal_lead,
-                    );
-                }
-                Err(e) => {
-                    lsm.finish_renewal_failure(
-                        &task_asm,
-                        AuthFailureReason::VisaServiceRejected(e.to_string()),
-                    );
-                }
-            }
+            Self::handle_renewal_reply(&task_asm, link_id, link_uid, issuer, nonce, outcome).await;
         });
+    }
+
+    /// Completion of one silent-renewal attempt (zipline#45): submit the
+    /// obtained id token to the VS (or record the failure). `link_uid` is the
+    /// [LinkStateWrapper::uid] of the link instance the attempt was spawned
+    /// for; a reply whose looked-up peer carries a DIFFERENT uid belongs to a
+    /// closed link whose slab id was reused, and is discarded without
+    /// touching the new link's state (PR #14 review).
+    async fn handle_renewal_reply(
+        asm: &Arc<Assembly>,
+        link_id: LinkId,
+        link_uid: u64,
+        issuer: String,
+        nonce: String,
+        outcome: Result<Result<String, AuthFailureReason>, AuthFailureReason>,
+    ) {
+        let Some(peer) = asm.peer_table.get(link_id) else {
+            return; // link torn down while we waited
+        };
+        let lsm = &peer.link_state_machine;
+        if lsm.uid != link_uid {
+            // The slab id was reused by a NEW link while this request was
+            // pending: the reply belongs to the closed link's actor and
+            // must not touch the new link's state (PR #14 review).
+            debug!(target: LINK_STATE,
+                "{}: discarding renewal reply for a closed link instance (id reused)",
+                asm.formatted_link_id(link_id));
+            return;
+        }
+
+        let id_token = match outcome {
+            Ok(Ok(id_token)) => id_token,
+            Ok(Err(reason)) | Err(reason) => {
+                lsm.finish_renewal_failure(asm, reason);
+                return;
+            }
+        };
+
+        let Some(vsconn) = asm.vsconn.as_ref() else {
+            lsm.finish_renewal_failure(
+                asm,
+                AuthFailureReason::AgentError("no visa service connection for renewal".to_string()),
+            );
+            return;
+        };
+        let Some(actor_addr) = lsm.get_actor_addresses().first().cloned() else {
+            lsm.finish_renewal_failure(
+                asm,
+                AuthFailureReason::AgentError("no actor address to renew".to_string()),
+            );
+            return;
+        };
+
+        use zpr::vsapi_types as vst;
+        let req = vst::ReauthRequest {
+            zpr_addr: std::net::IpAddr::from(actor_addr),
+            blobs: vec![vst::AuthBlob::Oidc(vst::OidcBlob {
+                issuer,
+                id_token,
+                nonce,
+            })],
+        };
+        match vsconn.reauthorize(req).await {
+            Ok(conn) => {
+                let expires = std::time::UNIX_EPOCH + Duration::from_secs(conn.auth_expires);
+                info!(target: LINK_STATE,
+                    "{}: silently re-authenticated; new expiry {expires:?}",
+                    asm.formatted_link_id(link_id));
+                // Restarts the renewal window and clears the
+                // in-flight/warned bookkeeping.
+                lsm.set_auth_expires(
+                    SystemTime::now(),
+                    expires,
+                    asm.config.get().auth_renewal_lead,
+                );
+            }
+            Err(e) => {
+                lsm.finish_renewal_failure(
+                    asm,
+                    AuthFailureReason::VisaServiceRejected(e.to_string()),
+                );
+            }
+        }
     }
 
     /// A renewal attempt ended in failure: warn, record the reason for
@@ -2967,6 +3032,180 @@ mod tests {
                 assert!(
                     agent_rx.try_recv().is_err(),
                     "second agent call while a renewal attempt is in flight"
+                );
+            })
+            .await
+    }
+
+    /// PR #14 review: one silent-renewal attempt waits at most half the time
+    /// remaining before expiry — clamped between the 5 s floor and the 300 s
+    /// interaction timeout — so a hung attempt can always be retried while
+    /// the current authentication is still valid.
+    #[test]
+    fn test_renewal_attempt_timeout_bounded_by_remaining_window() {
+        let now = SystemTime::now();
+        // Plenty of window: capped at the bridge's own per-call bound.
+        assert_eq!(
+            super::renewal_attempt_timeout(now, now + Duration::from_secs(3600)),
+            config::OIDC_USER_INTERACTION_TIMEOUT,
+        );
+        // 600 s remaining (the default-lead case that motivated the review
+        // finding): half the window, leaving room for a retry before expiry.
+        assert_eq!(
+            super::renewal_attempt_timeout(now, now + Duration::from_secs(600)),
+            Duration::from_secs(300),
+        );
+        // 60 s remaining: 30 s, again half.
+        assert_eq!(
+            super::renewal_attempt_timeout(now, now + Duration::from_secs(60)),
+            Duration::from_secs(30),
+        );
+        // Nearly (or already) expired: the floor keeps a healthy agent
+        // answerable instead of a zero-length wait.
+        assert_eq!(
+            super::renewal_attempt_timeout(now, now + Duration::from_secs(4)),
+            super::RENEWAL_ATTEMPT_TIMEOUT_FLOOR,
+        );
+        assert_eq!(
+            super::renewal_attempt_timeout(now, now - Duration::from_secs(10)),
+            super::RENEWAL_ATTEMPT_TIMEOUT_FLOOR,
+        );
+    }
+
+    /// PR #14 review: an AuthAgent that never answers must not pin
+    /// `renewal_in_flight` past the authentication window. The attempt times
+    /// out (bounded by the remaining window), records a failure, and the next
+    /// due tick retries.
+    #[tokio::test(start_paused = true)]
+    async fn test_hung_renewal_attempt_times_out_and_next_tick_retries() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+
+                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
+                lsm.set_auth_agent(agent_tx);
+                lsm.set_renewal_identity(super::RenewalIdentity {
+                    idp: test_idp(),
+                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
+                });
+                // Renewal overdue with ~20 s of validity left: the attempt
+                // timeout must be ~10 s, far below the 300 s bridge bound.
+                let now = SystemTime::now();
+                lsm.set_auth_expires(
+                    now - Duration::from_secs(580),
+                    now + Duration::from_secs(20),
+                    Duration::from_secs(300),
+                );
+
+                lsm.maybe_renew_auth(&asm);
+                // The agent hangs: hold the request (and its reply sender)
+                // without ever answering.
+                let hung_req = agent_rx.try_recv().expect("agent must be called");
+                assert!(lsm.test_renewal_in_flight());
+
+                // Let the spawned completion task register its timeout timer
+                // before advancing the paused clock.
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                // Well past the bounded attempt timeout, but well short of
+                // the 300 s bridge bound the review flagged.
+                tokio::time::advance(Duration::from_secs(30)).await;
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
+                    if !lsm.test_renewal_in_flight() {
+                        break;
+                    }
+                }
+                assert!(
+                    !lsm.test_renewal_in_flight(),
+                    "hung attempt still in flight after the remaining-window timeout"
+                );
+                assert!(matches!(
+                    lsm.get_last_auth_failure(),
+                    Some(AuthFailureReason::AgentError(_))
+                ));
+
+                // The next due tick retries while auth is still valid.
+                lsm.maybe_renew_auth(&asm);
+                assert!(
+                    agent_rx.try_recv().is_ok(),
+                    "next due tick must retry after a timed-out attempt"
+                );
+                drop(hung_req);
+            })
+            .await
+    }
+
+    /// PR #14 review: a renewal task that outlives its link must not act on
+    /// a NEW link that reused the same slab id. The reply from the closed
+    /// link's AuthAgent request carries the old instance's uid; when the
+    /// current occupant of the id has a different uid, the outcome must be
+    /// discarded instead of pushing the old actor's renewal result onto the
+    /// new link's state. The uid mismatch is driven directly through
+    /// [LinkStateWrapper::handle_renewal_reply] (exactly the call the task
+    /// spawned by maybe_renew_auth makes): the RCU slab defers slot
+    /// reclamation, so a unit test cannot force a real id reuse without
+    /// draining the epoch machinery.
+    #[tokio::test]
+    async fn test_stale_renewal_reply_after_link_id_reuse_is_discarded() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let current_uid = asm.peer_table.get(link_id).unwrap().link_state_machine.uid;
+
+                // A stale task from the closed PREVIOUS occupant of this id
+                // delivers a successful renewal outcome for the old actor.
+                let stale_uid = current_uid.wrapping_add(1);
+                super::LinkStateWrapper::handle_renewal_reply(
+                    &asm,
+                    link_id,
+                    stale_uid,
+                    "https://idp.test".to_string(),
+                    auth::oidc_nonce_for_challenge(&[7u8; 48]),
+                    Ok(Ok("stale-id-token".to_string())),
+                )
+                .await;
+
+                {
+                    let new_peer = asm.peer_table.get(link_id).unwrap();
+                    let new_lsm = &new_peer.link_state_machine;
+                    assert!(
+                        new_lsm.get_last_auth_failure().is_none(),
+                        "stale renewal task from the closed link wrote a failure onto the new link"
+                    );
+                    assert!(
+                        !new_lsm.test_renewal_in_flight(),
+                        "stale renewal task perturbed the new link's in-flight flag"
+                    );
+                    assert_eq!(
+                        new_lsm.get_auth_expires(),
+                        None,
+                        "stale renewal task overwrote the new link's auth expiry"
+                    );
+                }
+
+                // Control: the SAME reply with the matching uid is acted on
+                // (the test assembly has no vsconn, so the Ok token ends in a
+                // recorded failure) — proving the uid guard, not something
+                // else, discarded the stale reply above.
+                super::LinkStateWrapper::handle_renewal_reply(
+                    &asm,
+                    link_id,
+                    current_uid,
+                    "https://idp.test".to_string(),
+                    auth::oidc_nonce_for_challenge(&[7u8; 48]),
+                    Ok(Ok("current-id-token".to_string())),
+                )
+                .await;
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert!(
+                    peer.link_state_machine.get_last_auth_failure().is_some(),
+                    "a reply with the matching uid must be processed"
                 );
             })
             .await
