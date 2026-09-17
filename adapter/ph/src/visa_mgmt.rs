@@ -34,9 +34,26 @@ pub async fn send_deferred_vs_connect(
         )));
     }
 
+    record_auth_expires(asm, link_id, conn.auth_expires);
+
     info!(target: VISA_MGMT, "{}: visa service adapter registered with the visa service as {}",
         asm.formatted_link_id(link_id), conn.zpr_addr);
     Ok(())
+}
+
+/// Store the authentication expiry the VS reported in a `Connection`
+/// response on the link, converting the wire's epoch seconds and computing
+/// the renewal deadline from the configured lead (zipline#45).
+fn record_auth_expires(asm: &Arc<Assembly>, link_id: LinkId, auth_expires_epoch_secs: u64) {
+    let Some(peer) = asm.peer_table.get(link_id) else {
+        return;
+    };
+    let expires = std::time::UNIX_EPOCH + std::time::Duration::from_secs(auth_expires_epoch_secs);
+    peer.link_state_machine.set_auth_expires(
+        std::time::SystemTime::now(),
+        expires,
+        asm.config.get().auth_renewal_lead,
+    );
 }
 
 pub fn authorize_connect(
@@ -64,6 +81,7 @@ pub fn authorize_connect(
                         return;
                     }
                     IpAddr::V6(_) => {
+                        record_auth_expires(&task_asm, link_id, cr.auth_expires);
                         let zpr_addr = IpAddress::new_from_std(&cr.zpr_addr);
                         let _ignore_error = task_asm.process_link_state_event(
                             link_id,

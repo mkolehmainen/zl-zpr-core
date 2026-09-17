@@ -98,6 +98,14 @@ const DEFAULT_WORKER_CONCURRENCY: usize = 1;
 pub const DEFAULT_KEEP_ALIVE_PERIOD: std::time::Duration = std::time::Duration::from_secs(3);
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Default authentication-renewal lead: how far ahead of `auth_expires` the
+/// node starts trying to renew an actor's authentication on the keep-alive
+/// tick (zipline#45). Configurable per node via `auth_renewal_lead_seconds`
+/// in the `[node]` config section; the effective lead is further clamped to
+/// half the granted authentication lifetime so short `expiration_seconds`
+/// values stay workable (see [crate::link_state::renewal_lead]).
+pub const DEFAULT_AUTH_RENEWAL_LEAD: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub const DEFAULT_LINK_RESTART_HOLDDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Maximum length of payload to include in a Bind Request.
@@ -209,6 +217,13 @@ pub struct Config {
 
     /// Same as `control_path_derived`, for `capture_path`.
     pub(crate) capture_path_derived: bool,
+
+    /// Node only — how far ahead of an actor's `auth_expires` the node
+    /// starts attempting silent authentication renewal (zipline#45).
+    /// Configured via `auth_renewal_lead_seconds` in the `[node]` config
+    /// section; defaults to [DEFAULT_AUTH_RENEWAL_LEAD]. The effective lead
+    /// on a link is `min(this, remaining_lifetime / 2)`.
+    pub auth_renewal_lead: std::time::Duration,
 
     /// Security testing for A2A Pubkeys
     #[cfg(feature = "enable-security-testing")]
@@ -580,6 +595,9 @@ impl Config {
             if let Some(advertised) = &config.advertised_substrate_addr {
                 self.advertised_substrate_addr = Some(resolve_advertised_addr(advertised)?);
             }
+            if let Some(lead_seconds) = config.auth_renewal_lead_seconds {
+                self.auth_renewal_lead = std::time::Duration::from_secs(lead_seconds);
+            }
         }
         Ok(())
     }
@@ -711,6 +729,7 @@ impl Default for Config {
             socket_owner: None,
             control_path_derived: true,
             capture_path_derived: true,
+            auth_renewal_lead: DEFAULT_AUTH_RENEWAL_LEAD,
             #[cfg(feature = "enable-security-testing")]
             security_testing_mangle_forwarded_pings: false,
             #[cfg(feature = "enable-security-testing")]
@@ -749,6 +768,10 @@ pub struct NodeConfigSection {
     /// The substrate address this node advertises to the visa service, as a
     /// literal `"IP:port"` string (IPv6 in square-bracket notation).
     pub advertised_substrate_addr: Option<String>,
+
+    /// How far ahead of an actor's authentication expiry the node starts
+    /// attempting silent renewal, in seconds (zipline#45). Default 300.
+    pub auth_renewal_lead_seconds: Option<u64>,
 }
 
 // Global section is shared by nodes and adapters.
@@ -881,7 +904,7 @@ pub fn get_noise_cn(certificate_file: &Path) -> Result<String, ArgsError> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_deserialize_adapter_config() {
@@ -979,6 +1002,42 @@ mod test {
         let mut config = Config::default();
         config.set_from_node(&file_config.node).unwrap();
         assert_eq!(config.advertised_substrate_addr, None);
+    }
+
+    /// `auth_renewal_lead_seconds` in the `[node]` section overrides the
+    /// renewal lead; absent, the 300s default stands (zipline#45).
+    #[test]
+    fn test_node_config_auth_renewal_lead_seconds() {
+        // Default: 300 s.
+        let config = Config::default();
+        assert_eq!(config.auth_renewal_lead, DEFAULT_AUTH_RENEWAL_LEAD);
+        assert_eq!(config.auth_renewal_lead, Duration::from_secs(300));
+
+        // Config file overrides.
+        let toml_str = r#"
+            [global]
+            self_addr = "10.0.0.1:5000"
+
+            [node]
+            auth_renewal_lead_seconds = 60
+            "#;
+        let file_config: NodeConfig = toml::from_str(toml_str).unwrap();
+        let mut config = Config::default();
+        config.set_from_node(&file_config.node).unwrap();
+        assert_eq!(config.auth_renewal_lead, Duration::from_secs(60));
+
+        // A [node] section without the key preserves the default.
+        let toml_str = r#"
+            [global]
+            self_addr = "10.0.0.1:5000"
+
+            [node]
+            advertised_substrate_addr = "203.0.113.7:6000"
+            "#;
+        let file_config: NodeConfig = toml::from_str(toml_str).unwrap();
+        let mut config = Config::default();
+        config.set_from_node(&file_config.node).unwrap();
+        assert_eq!(config.auth_renewal_lead, DEFAULT_AUTH_RENEWAL_LEAD);
     }
 
     #[test]
