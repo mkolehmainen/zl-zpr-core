@@ -198,9 +198,12 @@ pub struct RenewalIdentity {
     pub idp: auth::OidcIdpInfo,
     /// The challenge-derived OIDC nonce ([auth::oidc_nonce_for_challenge])
     /// bound into the original credential. Reused verbatim on the renewal
-    /// blob: a refresh-grant id_token carries the ORIGINAL nonce (OIDC Core
-    /// §12.2), and the VS ignores the nonce on the reauthorize path — but
-    /// there is no empty-string special case on the wire.
+    /// blob because the VS ignores the nonce on the reauthorize path and
+    /// there is no empty-string special case on the wire. It cannot be
+    /// checked against the renewed id_token in any case: OIDC Core §12.2
+    /// says a refresh-grant id_token SHOULD NOT carry a nonce claim, and
+    /// MUST match the original only if it does — absent or original, never
+    /// fresh.
     pub nonce: String,
 }
 

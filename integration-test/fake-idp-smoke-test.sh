@@ -14,7 +14,7 @@
 #   5. the offline_access / refresh-grant path (zipline#47): the code
 #      exchange hands back a refresh_token only when `offline_access` was
 #      requested, the refresh grant mints a fresh id_token with a strictly
-#      greater `iat`, an UNCHANGED `auth_time` and the ORIGINAL `nonce`, and
+#      greater `iat`, an UNCHANGED `auth_time` and NO `nonce` claim, and
 #      --revoke-refresh turns every later grant into `invalid_grant`,
 #   6. after --rotate, /jwks serves the second `kid` and newly minted tokens
 #      are signed with it.
@@ -216,8 +216,14 @@ test "$RC" = "400" || fail "/auth accepted a non-S256 code_challenge_method (HTT
 #
 # The properties the visa service's reauthorize path binds to, per
 # docs/plans/2026-09-16-silent-oidc-reauth.md decision 1: same sub, strictly
-# increasing iat, unchanged auth_time, and the original nonce (which is why
-# that path cannot check the nonce against a fresh challenge at all).
+# increasing iat, unchanged auth_time.
+#
+# The renewed token carries NO nonce claim. OIDC Core 12.2 says a refreshed
+# id_token SHOULD NOT have one, and MUST match the original only if it is
+# present -- absent or original, never fresh, which is why the reauth path
+# cannot check a nonce against a fresh challenge at all. Omitting is the
+# spec-preferred branch and what Google does, so it is what the harness
+# serves and what this asserts.
 #
 
 OFF_NONCE="offline-nonce-$$"
@@ -262,8 +268,8 @@ test "$(jq -r .auth_time <<< "$CLAIMS")" = "$AUTH_TIME1" \
   || fail "refresh grant moved auth_time (the session ceiling would never bind)"
 test "$IAT2" -gt "$IAT1" \
   || fail "refresh grant did not advance iat ($IAT1 -> $IAT2)"
-test "$(jq -r .nonce <<< "$CLAIMS")" = "$OFF_NONCE" \
-  || fail "refresh grant did not echo the ORIGINAL nonce (OIDC Core 12.2)"
+test "$(jq -r 'has("nonce")' <<< "$CLAIMS")" = "false" \
+  || fail "refresh grant carried a nonce claim (OIDC Core 12.2 says SHOULD NOT): $CLAIMS"
 test "$(jq -r .sub <<< "$CLAIMS")" = "smoke-user" || fail "refresh grant changed sub"
 
 # Two renewals inside one wall-clock second must still strictly advance iat:

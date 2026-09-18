@@ -45,13 +45,19 @@ serving process to the other key with no signal plumbing:
 Refresh grants (zipline#47): an authorization request whose `scope`
 carries `offline_access` gets a `refresh_token` back from the code
 exchange, and `grant_type=refresh_token` renews the `id_token`. The
-renewed token models the three properties ZPR's silent
+renewed token models the properties ZPR's silent
 re-authentication depends on (docs/plans/2026-09-16-silent-oidc-reauth.md):
 `auth_time` does NOT move (it is the human's login moment, and the visa
 service anchors its session ceiling on it), `iat` strictly advances (the
-visa service rejects a replay), and the `nonce` is the ORIGINAL
-authorization request's, per OIDC Core section 12.2 — which is exactly why
-the reauthorize path cannot check a nonce against a fresh challenge.
+visa service rejects a replay), and there is NO `nonce` claim. The last
+follows OIDC Core section 12.2, which says a refreshed id_token "SHOULD NOT
+have a nonce Claim, even when the ID Token issued at the time of the
+original authentication contained nonce; however, if it is present, its
+value MUST be the same as in the ID Token issued at the time of the original
+authentication" — absent or original, never fresh, which is exactly why the
+reauthorize path cannot check a nonce against a fresh challenge. Omitting it
+is both the spec-preferred branch and what Google does, so it is what the
+harness models; the visa service must accept either.
 Revocation works like key rotation, through a file in `--state-dir` that
 is re-read on every request, so one invocation reaches every serving
 instance:
@@ -149,11 +155,13 @@ class IdpState:
         # redirect_uri, PKCE challenge), remembered by /auth so /token can
         # reject an exchange that does not match them. Codes are single use.
         self.codes: dict[str, dict] = {}
-        # refresh token -> the session it renews: the `sub`'s original nonce
-        # and auth_time (neither moves across a renewal) plus the highest
-        # `iat` minted so far, so the next one can be forced strictly past it.
-        # In-process, like `codes`: a netns runs its own instance and an
-        # adapter renews against the one it logged in to.
+        # refresh token -> the session it renews: the original auth_time
+        # (which does not move across a renewal) plus the highest `iat`
+        # minted so far, so the next one can be forced strictly past it. The
+        # original nonce is deliberately NOT kept — a refreshed id_token
+        # omits the claim (OIDC Core 12.2's SHOULD NOT). In-process, like
+        # `codes`: a netns runs its own instance and an adapter renews
+        # against the one it logged in to.
         self.sessions: dict[str, dict] = {}
 
     def active_key(self) -> SigningKey:
@@ -162,9 +170,15 @@ class IdpState:
         index = read_active_index(self.state_dir)
         return self.keys[min(index, len(self.keys) - 1)]
 
-    def mint_id_token(self, nonce: str, auth_time: int, after_iat: int = 0) -> tuple[str, int]:
-        """Mint an RS256 id_token with the active key, echoing `nonce`, and
-        return it with the `iat` it carries.
+    def mint_id_token(
+        self, nonce: str | None, auth_time: int, after_iat: int = 0
+    ) -> tuple[str, int]:
+        """Mint an RS256 id_token with the active key and return it with the
+        `iat` it carries.
+
+        `nonce` is echoed when given and the claim is OMITTED when None. The
+        refresh path passes None: OIDC Core section 12.2 says a refreshed
+        id_token SHOULD NOT carry the claim, and Google does not.
 
         `auth_time` is passed in rather than taken from the clock because a
         refresh grant must re-present the ORIGINAL login moment: it did not
@@ -187,11 +201,12 @@ class IdpState:
             "email": self.email,
             "email_verified": True,
             "hd": self.hd,
-            "nonce": nonce,
             "iat": iat,
             "auth_time": auth_time,
             "exp": iat + 3600,
         }
+        if nonce is not None:
+            claims["nonce"] = nonce
         signing_input = (
             b64url(json.dumps(header).encode()) + "." + b64url(json.dumps(claims).encode())
         ).encode("ascii")
@@ -365,7 +380,6 @@ class IdpHandler(BaseHTTPRequestHandler):
         if granted["offline"]:
             refresh_token = secrets.token_urlsafe(32)
             idp.sessions[refresh_token] = {
-                "nonce": granted["nonce"],
                 "auth_time": auth_time,
                 "last_iat": iat,
             }
@@ -375,6 +389,12 @@ class IdpHandler(BaseHTTPRequestHandler):
     def _refresh_grant(self, idp: IdpState, form: dict) -> None:
         """`grant_type=refresh_token` (RFC 6749 section 6): renew the
         `id_token` from a stored session.
+
+        The renewed id_token carries NO `nonce` claim, per OIDC Core section
+        12.2's SHOULD NOT and matching Google. The visa service's reauth path
+        must accept that as readily as a present-and-original one, since it
+        performs no nonce check at all; a harness that always echoed the
+        claim would not exercise the branch production actually presents.
 
         The refresh token is deliberately NOT rotated. RFC 6749 section 6
         leaves rotation optional, and a stable token keeps the test's
@@ -393,7 +413,7 @@ class IdpHandler(BaseHTTPRequestHandler):
             return
         session = idp.sessions[token]
         id_token, iat = idp.mint_id_token(
-            session["nonce"],
+            None,
             auth_time=session["auth_time"],
             after_iat=session["last_iat"],
         )
