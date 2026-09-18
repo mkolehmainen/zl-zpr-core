@@ -3,6 +3,17 @@
 //! `build.rs` stamps `<workspace pkg-version> (<git describe>)` at build
 //! time; each binary crate passes [`BUILD_VERSION`] to clap's `version`.
 
+/// Build-identity string: `<pkg-version> (<git describe>)`, stamped by
+/// `build.rs` at build time (zipline#64). The suffix is
+/// `git describe --always --dirty --tags`, or the value of `ZPR_BUILD_ID`
+/// verbatim, or the literal `unknown` when neither is available.
+pub const BUILD_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("ZPR_BUILD_DESCRIBE"),
+    ")"
+);
+
 #[cfg(test)]
 mod tests {
     /// Runs inside the real git checkout, so it can only assert the normal
