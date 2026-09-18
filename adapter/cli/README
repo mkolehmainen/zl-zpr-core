@@ -1,3 +1,63 @@
+How does a human log in, and keep the session alive?
+
+Two commands start a link and supply an OIDC credential. Use `auth-agent`
+for an interactive session and `connect` for scripts.
+
+  Command                    Starts    Reports the    Stays resident
+                             the link  outcome
+  -------------------------  --------  -------------  --------------------
+  ph-cli auth-agent <id>     yes       no             yes - until
+                                                      interrupted
+  ph-cli connect <id>        yes       yes, with      no - returns as soon
+                                       exit codes     as the link is up
+
+*** Background renewal does not work yet (zipline#47). ***
+
+The intent is that a resident `auth-agent` renews your authentication
+silently, so you log in once per session ceiling instead of once per
+`expiration_seconds`. Everything on the ph-cli side of that is built and
+tested: the refresh token is held in this process's memory, and a
+non-interactive credential request is served from it with no browser. But
+the packet handler cannot yet reach the agent when a renewal comes due --
+the renewal deadline is tracked on the node's side of the link and the agent
+is registered on the adapter's, with no message between them -- so TODAY
+both commands behave the same way at the end of the window: the actor is
+disconnected and the human logs in again. Run `auth-agent` anyway; it is
+where renewal lands, and it costs nothing.
+
+So the interactive flow is TWO steps, not three:
+
+  1. ph (the adapter) running          - daemon, systemd
+  2. ph-cli auth-agent <id>            - starts the link, the browser opens
+                                         once, the process stays resident
+
+`ph-cli connect` is redundant there. It keeps its value for CI and scripts,
+where the blocking outcome report and the exit-code contract (2 declined,
+3 timeout, 4 IdP unreachable, 5 visa service rejected the token, 6 policy
+denied, 7 device blob rejected) are the point.
+
+While ph needs root for the tun interface and the control socket is not yet
+reachable unprivileged for every deployment (zipline#39), the documented
+form is:
+
+  sudo ph-cli auth-agent 2 --no-browser
+
+`--no-browser` is the norm under sudo, not a workaround: a root process
+cannot usefully open the user's browser, and `xdg-open` fails silently after
+a successful spawn, so the printed URL is pasted into the user's own browser
+instead. That browser then redirects to http://127.0.0.1:<port>/callback -
+a plain loopback connect into the ph-cli process - so the cross-user
+boundary does not matter. The paste is bounded by a 300 s login timeout.
+Once renewal works, the paste is needed once per session ceiling
+(`max_auth_age_seconds`) rather than once per `expiration_seconds`.
+
+Do NOT run `connect` after `auth-agent` on the same link. Both register as
+the link's authentication agent and the second registration OVERWRITES the
+first, so a `connect` run "just to check" replaces a live resident agent
+with one that is about to exit -- silently, with nothing logged. Use
+`ph-cli link show <id>` to check on a link instead; it reports the
+authentication expiry and the last authentication failure.
+
 Which socket does ph-cli talk to?
 
 ph-cli needs no sudo. By default it searches for the packet handler's

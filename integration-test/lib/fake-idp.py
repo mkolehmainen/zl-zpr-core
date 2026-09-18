@@ -20,7 +20,9 @@ browser:
                                           code_verifier matches the stored
                                           code_challenge, so a relying-party
                                           regression in any of those is
-                                          rejected here just as Google would
+                                          rejected here just as Google would.
+                                          Serves `grant_type=refresh_token`
+                                          too — see "Refresh grants" below
   GET  /jwks                              JWKS for the currently active key,
                                           with a kid
 
@@ -39,6 +41,22 @@ so a second invocation with `--rotate` (same --state-dir) switches the
 serving process to the other key with no signal plumbing:
 
     fake-idp.py --state-dir "$DIR" --rotate
+
+Refresh grants (zipline#47): an authorization request whose `scope`
+carries `offline_access` gets a `refresh_token` back from the code
+exchange, and `grant_type=refresh_token` renews the `id_token`. The
+renewed token models the three properties ZPR's silent
+re-authentication depends on (docs/plans/2026-09-16-silent-oidc-reauth.md):
+`auth_time` does NOT move (it is the human's login moment, and the visa
+service anchors its session ceiling on it), `iat` strictly advances (the
+visa service rejects a replay), and the `nonce` is the ORIGINAL
+authorization request's, per OIDC Core section 12.2 — which is exactly why
+the reauthorize path cannot check a nonce against a fresh challenge.
+Revocation works like key rotation, through a file in `--state-dir` that
+is re-read on every request, so one invocation reaches every serving
+instance:
+
+    fake-idp.py --state-dir "$DIR" --revoke-refresh
 
 `--print-jwks` prints the JWKS for both keys and exits — the pregen
 Makefile uses it to build the seed JWKS fixture from the same code that
@@ -131,6 +149,12 @@ class IdpState:
         # redirect_uri, PKCE challenge), remembered by /auth so /token can
         # reject an exchange that does not match them. Codes are single use.
         self.codes: dict[str, dict] = {}
+        # refresh token -> the session it renews: the `sub`'s original nonce
+        # and auth_time (neither moves across a renewal) plus the highest
+        # `iat` minted so far, so the next one can be forced strictly past it.
+        # In-process, like `codes`: a netns runs its own instance and an
+        # adapter renews against the one it logged in to.
+        self.sessions: dict[str, dict] = {}
 
     def active_key(self) -> SigningKey:
         """The currently active signing key, re-read from the rotation file
@@ -138,10 +162,23 @@ class IdpState:
         index = read_active_index(self.state_dir)
         return self.keys[min(index, len(self.keys) - 1)]
 
-    def mint_id_token(self, nonce: str) -> str:
-        """Mint an RS256 id_token with the active key, echoing `nonce`."""
+    def mint_id_token(self, nonce: str, auth_time: int, after_iat: int = 0) -> tuple[str, int]:
+        """Mint an RS256 id_token with the active key, echoing `nonce`, and
+        return it with the `iat` it carries.
+
+        `auth_time` is passed in rather than taken from the clock because a
+        refresh grant must re-present the ORIGINAL login moment: it did not
+        re-authenticate the human, and the visa service anchors its session
+        ceiling on that claim not moving.
+
+        `after_iat` forces `iat` strictly past a previous token's. The visa
+        service rejects a reauthorization whose `iat` did not advance, and
+        `iat` has one-second granularity, so two renewals inside one
+        wall-clock second would otherwise mint the identical value and the
+        second would look like a replay.
+        """
         key = self.active_key()
-        now = int(time.time())
+        iat = max(int(time.time()), after_iat + 1)
         header = {"alg": "RS256", "typ": "JWT", "kid": key.kid}
         claims = {
             "iss": self.issuer,
@@ -151,18 +188,19 @@ class IdpState:
             "email_verified": True,
             "hd": self.hd,
             "nonce": nonce,
-            "iat": now,
-            "auth_time": now,
-            "exp": now + 3600,
+            "iat": iat,
+            "auth_time": auth_time,
+            "exp": iat + 3600,
         }
         signing_input = (
             b64url(json.dumps(header).encode()) + "." + b64url(json.dumps(claims).encode())
         ).encode("ascii")
         signature = key.sign_rs256(signing_input)
-        return signing_input.decode("ascii") + "." + b64url(signature)
+        return signing_input.decode("ascii") + "." + b64url(signature), iat
 
 
 ACTIVE_KEY_FILE = "active-key"
+REFRESH_REVOKED_FILE = "refresh-revoked"
 
 
 def read_active_index(state_dir: Path) -> int:
@@ -171,6 +209,21 @@ def read_active_index(state_dir: Path) -> int:
         return int((state_dir / ACTIVE_KEY_FILE).read_text().strip())
     except (FileNotFoundError, ValueError):
         return 0
+
+
+def refresh_revoked(state_dir: Path) -> bool:
+    """Whether refresh grants are currently revoked. Read on every request,
+    like the rotation file, so `--revoke-refresh` reaches serving instances
+    in other network namespaces without any signal plumbing."""
+    return (state_dir / REFRESH_REVOKED_FILE).exists()
+
+
+def revoke_refresh(state_dir: Path) -> None:
+    """Refuse every later refresh grant with `invalid_grant` (the
+    --revoke-refresh action) — what an IdP does once the user withdraws the
+    application's access."""
+    (state_dir / REFRESH_REVOKED_FILE).write_text("revoked\n")
+    print("refresh grants revoked")
 
 
 def rotate(state_dir: Path) -> None:
@@ -222,6 +275,12 @@ class IdpHandler(BaseHTTPRequestHandler):
             redirect_uri = query.get("redirect_uri", [None])[0]
             code_challenge = query.get("code_challenge", [None])[0]
             code_challenge_method = query.get("code_challenge_method", [None])[0]
+            # Offline access is a policy decision on the ZPR side
+            # (`allow_offline_access`), so the refresh token is vended only
+            # when the relying party actually asked for the scope. Google's
+            # `access_type=offline` is deliberately NOT honored as an
+            # alternative: the standard scope is what must work.
+            offline = "offline_access" in query.get("scope", [""])[0].split()
             if not state or not redirect_uri or not client_id:
                 self._json(400, {"error": "invalid_request"})
                 return
@@ -238,6 +297,7 @@ class IdpHandler(BaseHTTPRequestHandler):
                 "client_id": client_id,
                 "redirect_uri": redirect_uri,
                 "code_challenge": code_challenge,
+                "offline": offline,
             }
             sep = "&" if "?" in redirect_uri else "?"
             location = (
@@ -261,8 +321,12 @@ class IdpHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", "0"))
         form = urllib.parse.parse_qs(self.rfile.read(length).decode())
+        grant_type = form.get("grant_type", [None])[0]
+        if grant_type == "refresh_token":
+            self._refresh_grant(idp, form)
+            return
         code = form.get("code", [None])[0]
-        if form.get("grant_type", [None])[0] != "authorization_code" or code is None:
+        if grant_type != "authorization_code" or code is None:
             self._json(400, {"error": "invalid_request"})
             return
         # Codes are single use: pop, so a replay is rejected.
@@ -293,14 +357,48 @@ class IdpHandler(BaseHTTPRequestHandler):
             if b64url(digest) != granted["code_challenge"]:
                 self._json(400, {"error": "invalid_grant"})
                 return
-        self._json(
-            200,
-            {
-                "id_token": idp.mint_id_token(granted["nonce"]),
-                "token_type": "Bearer",
-                "expires_in": 3600,
-            },
+        # This is the interactive login, so `auth_time` is now; every later
+        # renewal of this session re-presents exactly this value.
+        auth_time = int(time.time())
+        id_token, iat = idp.mint_id_token(granted["nonce"], auth_time=auth_time)
+        payload = {"id_token": id_token, "token_type": "Bearer", "expires_in": 3600}
+        if granted["offline"]:
+            refresh_token = secrets.token_urlsafe(32)
+            idp.sessions[refresh_token] = {
+                "nonce": granted["nonce"],
+                "auth_time": auth_time,
+                "last_iat": iat,
+            }
+            payload["refresh_token"] = refresh_token
+        self._json(200, payload)
+
+    def _refresh_grant(self, idp: IdpState, form: dict) -> None:
+        """`grant_type=refresh_token` (RFC 6749 section 6): renew the
+        `id_token` from a stored session.
+
+        The refresh token is deliberately NOT rotated. RFC 6749 section 6
+        leaves rotation optional, and a stable token keeps the test's
+        revocation leg able to re-present the same value the relying party
+        is holding.
+        """
+        token = form.get("refresh_token", [None])[0]
+        if token is None or form.get("client_id", [None])[0] != idp.client_id:
+            self._json(400, {"error": "invalid_request"})
+            return
+        # A revoked grant and an unknown token are the same answer, which is
+        # also what makes ph-cli drop its stored token (RFC 6749 section 5.2
+        # `invalid_grant`).
+        if refresh_revoked(idp.state_dir) or token not in idp.sessions:
+            self._json(400, {"error": "invalid_grant"})
+            return
+        session = idp.sessions[token]
+        id_token, iat = idp.mint_id_token(
+            session["nonce"],
+            auth_time=session["auth_time"],
+            after_iat=session["last_iat"],
         )
+        session["last_iat"] = iat
+        self._json(200, {"id_token": id_token, "token_type": "Bearer", "expires_in": 3600})
 
 
 def main() -> int:
@@ -328,6 +426,11 @@ def main() -> int:
         help="toggle the active signing key of a server sharing --state-dir, then exit",
     )
     parser.add_argument(
+        "--revoke-refresh",
+        action="store_true",
+        help="refuse every later refresh grant of a server sharing --state-dir, then exit",
+    )
+    parser.add_argument(
         "--print-jwks",
         action="store_true",
         help="print the JWKS for all provided signing keys and exit (seed fixture)",
@@ -336,6 +439,10 @@ def main() -> int:
 
     if args.rotate:
         rotate(Path(args.state_dir))
+        return 0
+
+    if args.revoke_refresh:
+        revoke_refresh(Path(args.state_dir))
         return 0
 
     if not args.signing_key:

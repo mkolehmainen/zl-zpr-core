@@ -149,9 +149,20 @@ pub enum Commands {
     Quit,
     /// Gets the address of an adapter's node
     Addr,
-    /// Connect (start) a link, performing interactive authentication when the
-    /// packet handler requests it
-    #[command(arg_required_else_help = true)]
+    /// Connect (start) a link, authenticate interactively if the packet
+    /// handler asks, then exit reporting the outcome.
+    ///
+    /// For scripts and CI: it blocks until the link is up or the attempt
+    /// fails and says which through its exit code (2 declined, 3 timeout,
+    /// 4 IdP unreachable, 5 visa service rejected the token, 6 policy
+    /// denied, 7 device blob rejected).
+    ///
+    /// The authentication agent it registers dies with this process, so it
+    /// cannot serve a later credential request. For an interactive session
+    /// use `auth-agent`, which stays resident — and do not run `connect` on
+    /// a link that already has one, because the registration overwrites it
+    /// and replaces a live agent with one that is about to exit.
+    #[command(arg_required_else_help = true, verbatim_doc_comment)]
     Connect {
         #[arg(required = true)]
         /// Link id to connect
@@ -160,9 +171,24 @@ pub enum Commands {
         #[arg(long)]
         no_browser: bool,
     },
-    /// Register as the authentication agent for a link and run until
-    /// interrupted
-    #[command(arg_required_else_help = true)]
+    /// Start a link and stay resident serving its authentication requests.
+    /// This is how a human logs in.
+    ///
+    /// The browser opens once, and the process then runs until interrupted
+    /// (Ctrl-C). It does not report the link's outcome — use
+    /// `link show <id>`, which also reports the authentication expiry.
+    ///
+    /// NOTE: background renewal is NOT yet working (zipline#47). Everything
+    /// on this side is in place — the refresh token is held in memory and a
+    /// non-interactive credential request is served without a browser — but
+    /// the packet handler cannot yet reach this agent when the renewal is
+    /// due, so the session still ends when the authentication window closes
+    /// and you have to log in again. Keeping this process resident is what
+    /// will renew silently once that lands; it costs nothing meanwhile.
+    ///
+    /// Under sudo, pass --no-browser and paste the printed URL into your own
+    /// browser: a root process cannot usefully open one.
+    #[command(arg_required_else_help = true, verbatim_doc_comment)]
     AuthAgent {
         #[arg(required = true)]
         /// Link id to serve as authentication agent for

@@ -234,6 +234,92 @@ jobs:
       run: |
         ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/one-node-oidc-test.sh
 
+  # DISABLED until silent renewal is routable end to end (zipline#47).
+  #
+  # The job is wired and believed correct, but it cannot pass yet: `startLink`
+  # registers the AuthAgent on the adapter's `AdapterToNode` link, while
+  # `record_auth_expires`, `stash_renewal_identity` and `vsconn` all live on
+  # the node's `NodeToAdapter` link, and no code carries a credential request
+  # between them. The node therefore always takes `maybe_renew_auth`'s
+  # no-agent branch, so the script's leg 2 fails after RENEWAL_WAIT. Left
+  # armed, this would spend ~25 minutes per PR to produce a red check.
+  #
+  # To re-enable: delete this `if:` once the node-to-adapter credential
+  # request lands. Nothing else about the job needs to change. Until then the
+  # script is run by hand — see docs/BUILD.md, "Integration tests".
+  oidc-renewal-integration-test:
+    if: false
+    name: Run 1-Node OIDC Renewal Test
+    needs: [build-ph, build-ph-cli]
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v7
+    # Necessary to run before rust-cache
+    - run: rustup toolchain install stable --profile minimal
+    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      with:
+        workspaces: |
+          adapter/ph
+          adapter/cli
+          zpr-ext
+          cslab
+          cbpf-rs
+
+    # see <https://github.com/docker-library/golang/issues/452>
+    - name: Set workspace as safe
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+    - name: Setup Git credentials
+      timeout-minutes: 1
+      run: |
+        echo 'echo $ZPR_CICD_RO_TOKEN' > "$HOME/.git-askpass"
+        chmod +x "$HOME/.git-askpass"
+        echo "GIT_ASKPASS=$HOME/.git-askpass" >> "$GITHUB_ENV"
+        go env -w GOPRIVATE="github.com/org-zpr/*"
+
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: ph-*${{ matrix.os }}
+        merge-multiple: true
+
+    - name: Build
+      timeout-minutes: 10
+      env:
+        ZPR_CICD_RO_TOKEN: ${{ secrets.ZPR_CICD_RO_TOKEN }}
+      run: |
+        tar -xvf ph.tar
+        tar -xvf ph-cli.tar
+
+    - name: Download Asset
+      uses: robinraju/release-downloader@v1
+      with:
+        repository: 'mkolehmainen/zl-zpr-visaservice'
+        tag: ${{ env.VISA_SERVICE_RELEASE }}
+        fileName: 'release-linux-x86_64.tar.gz'
+        extract: true
+        out-file-path: 'integration-test'
+        token: ${{ secrets.ZPR_CICD_RO_TOKEN }}
+
+    - name: Set env
+      run: |
+        echo "DEBUG_TARGETS=all=DEBUG" >> $GITHUB_ENV
+
+    - name: Install valkey
+      timeout-minutes: 5
+      run: |
+        sudo apt-get update
+        sudo apt install -y valkey
+        sudo systemctl stop valkey-server
+        sudo systemctl disable valkey-server
+
+    - name: One Node OIDC Renewal Test
+      timeout-minutes: 25
+      run: |
+        ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/one-node-oidc-renewal-test.sh
+
   capture-integration-test:
     name: Run Capture Test
     needs: [build-ph, build-ph-cli]

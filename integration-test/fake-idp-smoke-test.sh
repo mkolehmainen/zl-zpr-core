@@ -11,7 +11,12 @@
 #   4. /token rejects a wrong client_id, a wrong redirect_uri, and a
 #      code_verifier that does not hash to the stored code_challenge
 #      (the code bindings a ph-cli regression would get wrong),
-#   5. after --rotate, /jwks serves the second `kid` and newly minted tokens
+#   5. the offline_access / refresh-grant path (zipline#47): the code
+#      exchange hands back a refresh_token only when `offline_access` was
+#      requested, the refresh grant mints a fresh id_token with a strictly
+#      greater `iat`, an UNCHANGED `auth_time` and the ORIGINAL `nonce`, and
+#      --revoke-refresh turns every later grant into `invalid_grant`,
+#   6. after --rotate, /jwks serves the second `kid` and newly minted tokens
 #      are signed with it.
 #
 # Needs no root and no network namespaces: everything binds 127.0.0.1.
@@ -155,6 +160,11 @@ test "$(jq -r .iss <<< "$CLAIMS")" = "$ISSUER" || fail "iss mismatch"
 test "$(jq -r .aud <<< "$CLAIMS")" = "zpr-test-client" || fail "aud mismatch"
 test "$(jq -r .hd <<< "$CLAIMS")" = "example.com" || fail "hd mismatch"
 
+# No `offline_access` in the request, so no refresh token in the response:
+# offline access is a policy decision (`allow_offline_access`), not a default.
+test "$(jq -r .refresh_token <<< "$TOKEN_RESP")" = "null" \
+  || fail "an exchange without offline_access returned a refresh_token"
+
 # A code is single use.
 SECOND=$("${CURL[@]}" --output /dev/null --write-out '%{http_code}' --data \
   "grant_type=authorization_code&code=$CODE&redirect_uri=$REDIRECT&client_id=zpr-test-client&code_verifier=$VERIFIER" \
@@ -202,7 +212,86 @@ RC=$("${CURL[@]}" --output /dev/null --write-out '%{http_code}' \
 test "$RC" = "400" || fail "/auth accepted a non-S256 code_challenge_method (HTTP $RC)"
 
 #
-# 5. --rotate: /jwks switches kid; new tokens are signed with the new key
+# 5. offline_access and the refresh grant (zipline#47)
+#
+# The properties the visa service's reauthorize path binds to, per
+# docs/plans/2026-09-16-silent-oidc-reauth.md decision 1: same sub, strictly
+# increasing iat, unchanged auth_time, and the original nonce (which is why
+# that path cannot check the nonce against a fresh challenge at all).
+#
+
+OFF_NONCE="offline-nonce-$$"
+
+# Authorization request carrying `offline_access`, as ph-cli sends when the
+# trusted service declares allow_offline_access.
+LOCATION=$("${CURL[@]}" --output /dev/null --write-out '%{redirect_url}' \
+  "$AUTH_EP?response_type=code&client_id=zpr-test-client&redirect_uri=$REDIRECT&scope=openid+offline_access&state=$STATE&nonce=$OFF_NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256&access_type=offline&prompt=consent")
+CODE=$(sed -n 's/.*[?&]code=\([^&]*\).*/\1/p' <<< "$LOCATION")
+test -n "$CODE" || fail "/auth issued no code for the offline_access request"
+
+TOKEN_RESP=$("${CURL[@]}" --data \
+  "grant_type=authorization_code&code=$CODE&redirect_uri=$REDIRECT&client_id=zpr-test-client&code_verifier=$VERIFIER" \
+  "$TOKEN_EP")
+REFRESH=$(jq -r .refresh_token <<< "$TOKEN_RESP")
+test -n "$REFRESH" -a "$REFRESH" != "null" \
+  || fail "offline_access exchange returned no refresh_token: $TOKEN_RESP"
+
+CLAIMS=$(b64d "$(cut -d. -f2 <<< "$(jq -r .id_token <<< "$TOKEN_RESP")")")
+IAT1=$(jq -r .iat <<< "$CLAIMS")
+AUTH_TIME1=$(jq -r .auth_time <<< "$CLAIMS")
+echo "offline login: iat=$IAT1 auth_time=$AUTH_TIME1"
+
+# POST a refresh grant, print the raw response. $1 = refresh token.
+refresh_grant() {
+  "${CURL[@]}" --data \
+    "grant_type=refresh_token&refresh_token=$1&client_id=zpr-test-client" \
+    "$TOKEN_EP"
+}
+
+# Let the wall clock move so this first renewal is the ordinary case; the
+# same-second case is covered immediately below.
+sleep 1
+REFRESH_RESP=$(refresh_grant "$REFRESH")
+ID_TOKEN=$(jq -r .id_token <<< "$REFRESH_RESP")
+test "$(awk -F. '{print NF}' <<< "$ID_TOKEN")" = 3 \
+  || fail "refresh grant returned no id_token: $REFRESH_RESP"
+CLAIMS=$(b64d "$(cut -d. -f2 <<< "$ID_TOKEN")")
+echo "renewed claims: $CLAIMS"
+IAT2=$(jq -r .iat <<< "$CLAIMS")
+test "$(jq -r .auth_time <<< "$CLAIMS")" = "$AUTH_TIME1" \
+  || fail "refresh grant moved auth_time (the session ceiling would never bind)"
+test "$IAT2" -gt "$IAT1" \
+  || fail "refresh grant did not advance iat ($IAT1 -> $IAT2)"
+test "$(jq -r .nonce <<< "$CLAIMS")" = "$OFF_NONCE" \
+  || fail "refresh grant did not echo the ORIGINAL nonce (OIDC Core 12.2)"
+test "$(jq -r .sub <<< "$CLAIMS")" = "smoke-user" || fail "refresh grant changed sub"
+
+# Two renewals inside one wall-clock second must still strictly advance iat:
+# the visa service rejects a reauthorization whose iat did not move, and a
+# 120s renewal cadence makes same-second renewals reachable in the e2e.
+REFRESH_RESP=$(refresh_grant "$REFRESH")
+CLAIMS=$(b64d "$(cut -d. -f2 <<< "$(jq -r .id_token <<< "$REFRESH_RESP")")")
+IAT3=$(jq -r .iat <<< "$CLAIMS")
+test "$IAT3" -gt "$IAT2" \
+  || fail "back-to-back refresh grants did not advance iat ($IAT2 -> $IAT3)"
+
+# An unknown refresh token is invalid_grant, not a 500 and not a token.
+RC=$(token_status "grant_type=refresh_token&refresh_token=not-a-real-token&client_id=zpr-test-client")
+test "$RC" = "400" || fail "unknown refresh token was not rejected (HTTP $RC)"
+
+# --revoke-refresh models the user withdrawing the app's access: every later
+# grant is invalid_grant, which is what makes ph-cli drop its stored token.
+python3 "$FAKE_IDP" --state-dir "$TMPDIR" --revoke-refresh
+REFRESH_RESP=$("${CURL[@]}" --write-out '\n%{http_code}' --data \
+  "grant_type=refresh_token&refresh_token=$REFRESH&client_id=zpr-test-client" \
+  "$TOKEN_EP")
+test "$(tail -n 1 <<< "$REFRESH_RESP")" = "400" \
+  || fail "refresh grant was accepted after --revoke-refresh"
+test "$(jq -r .error <<< "$(head -n 1 <<< "$REFRESH_RESP")")" = "invalid_grant" \
+  || fail "revoked refresh grant did not answer invalid_grant: $REFRESH_RESP"
+
+#
+# 6. --rotate: /jwks switches kid; new tokens are signed with the new key
 #
 python3 "$FAKE_IDP" --state-dir "$TMPDIR" --rotate
 
