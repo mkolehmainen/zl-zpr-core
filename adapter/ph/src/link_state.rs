@@ -2723,7 +2723,9 @@ impl LinkStateWrapper {
         let Some(key) = key else {
             self.finish_renewal_failure(
                 asm,
-                AuthFailureReason::AgentError("no auth key to mint a renewal challenge".to_string()),
+                AuthFailureReason::AgentError(
+                    "no auth key to mint a renewal challenge".to_string(),
+                ),
             );
             return;
         };
@@ -3625,9 +3627,9 @@ mod tests {
                         msg.contains("no visa service connection"),
                         "expected the reauthorize-step failure, got: {msg}"
                     ),
-                    other => panic!(
-                        "expected AgentError(no visa service connection), got {other:?}"
-                    ),
+                    other => {
+                        panic!("expected AgentError(no visa service connection), got {other:?}")
+                    }
                 }
                 assert_eq!(
                     lsm.get_state(),
@@ -3657,7 +3659,11 @@ mod tests {
                 });
                 let now = SystemTime::now();
                 let expires = now + Duration::from_secs(60);
-                lsm.set_auth_expires(now - Duration::from_secs(600), expires, Duration::from_secs(300));
+                lsm.set_auth_expires(
+                    now - Duration::from_secs(600),
+                    expires,
+                    Duration::from_secs(300),
+                );
 
                 lsm.maybe_renew_auth(&asm);
                 let _req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
@@ -3724,7 +3730,11 @@ mod tests {
                 });
                 let now = SystemTime::now();
                 let expires = now + Duration::from_secs(60);
-                lsm.set_auth_expires(now - Duration::from_secs(600), expires, Duration::from_secs(300));
+                lsm.set_auth_expires(
+                    now - Duration::from_secs(600),
+                    expires,
+                    Duration::from_secs(300),
+                );
 
                 lsm.maybe_renew_auth(&asm);
                 let _req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");

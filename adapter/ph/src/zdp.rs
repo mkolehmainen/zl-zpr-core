@@ -38,8 +38,8 @@ pub enum ZdpPacketType {
     AcquireZprAddress = 138, // TODO: add to RFC 6
     GrantZprAddress = 139,   // TODO: add to RFC 6
     RevokeZprAddress = 140,
-    InitAuthenticationRequest = 141, // TODO: add to RFC 6
-    RenewAuthenticationRequest = 142, // TODO: add to RFC 6 (zipline#66)
+    InitAuthenticationRequest = 141,   // TODO: add to RFC 6
+    RenewAuthenticationRequest = 142,  // TODO: add to RFC 6 (zipline#66)
     RenewAuthenticationResponse = 143, // TODO: add to RFC 6 (zipline#66)
 
     Canceled = 252, // TODO: add to RFC 17
