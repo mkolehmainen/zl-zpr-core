@@ -648,6 +648,12 @@ impl LinkStateWrapper {
         false
     }
 
+    /// Test-only: peek the stashed renewal challenge without consuming it.
+    #[cfg(test)]
+    pub fn test_renewal_challenge(&self) -> Option<[u8; 48]> {
+        self.locked_data.lock().unwrap().renewal_challenge
+    }
+
     /// Test-only: whether the one-shot "renewal due, no agent" warning fired.
     #[cfg(test)]
     pub fn test_renewal_no_agent_warned(&self) -> bool {
@@ -3553,6 +3559,74 @@ mod tests {
             .await
     }
 
+    /// Codex P1 (PR #17, thread 1): a second RenewAuthenticationRequest on
+    /// the same link supersedes the first — the node only retries after
+    /// abandoning its previous attempt, so the adapter must cancel the
+    /// superseded agent call (drop its reply channel, which the serial
+    /// bridge observes via `reply.closed()`) instead of leaving it to run
+    /// for up to OIDC_USER_INTERACTION_TIMEOUT while retries queue behind
+    /// it.
+    #[tokio::test]
+    async fn test_adapter_second_renew_request_cancels_superseded_agent_call() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress_rx) = assembly_with_observable_egress();
+                let link_id = add_adapter_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+                lsm.test_set_state(LinkState::Active);
+                lsm.test_set_oidc_idps(vec![test_idp()]);
+                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
+                lsm.set_auth_agent(agent_tx);
+                drop(peer);
+
+                // Attempt A: the agent receives the call and sits on it
+                // (a hung or slow AuthAgent).
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedRenewAuthRequest(test_challenge_payload()),
+                )
+                .unwrap();
+                let req_a = agent_rx.try_recv().expect("first agent call");
+                assert!(
+                    !req_a.reply.is_closed(),
+                    "attempt A's reply channel must be open while A is current"
+                );
+
+                // The node abandoned A (its attempt timeout fired) and
+                // retried: attempt B's request arrives on the same link.
+                let payload_b = auth::ZdpInitAuthenticationPayload {
+                    nonce: [8u8; 8],
+                    ctime: 434343u64.into(),
+                    hmac: [10u8; 32],
+                };
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedRenewAuthRequest(payload_b),
+                )
+                .unwrap();
+                let _req_b = agent_rx.try_recv().expect("second agent call");
+
+                // The superseded call must be cancelled: aborting the wait
+                // task drops its reply receiver, which tells the bridge to
+                // drop the in-flight RPC and service the next request.
+                let mut closed = false;
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
+                    if req_a.reply.is_closed() {
+                        closed = true;
+                        break;
+                    }
+                }
+                assert!(
+                    closed,
+                    "the superseded renewal call must be cancelled so the \
+                     serial bridge can service the retry"
+                );
+            })
+            .await
+    }
+
     /// R8 (zipline#66) step 4: a RenewAuthenticationResponse whose blob is
     /// bound to the node's outstanding challenge (HMAC-verified with this
     /// link's auth key) completes the renewal: the challenge is consumed and
@@ -3752,6 +3826,128 @@ mod tests {
                 );
                 assert_eq!(lsm.get_state(), LinkState::Active);
                 assert_eq!(lsm.get_auth_expires(), Some(expires));
+            })
+            .await
+    }
+
+    /// Codex P1 (PR #17, thread 2): attempt A times out, attempt B starts,
+    /// and A's DELAYED response then arrives. The stale response must not
+    /// consume (or fail against) B's challenge: B's attempt stays in
+    /// flight, and B's own valid response still completes the renewal.
+    /// Without correlation, A's response is recorded as B's failure and
+    /// B's valid response is discarded as unsolicited.
+    #[tokio::test]
+    async fn test_node_stale_renew_response_does_not_consume_new_attempts_challenge() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress_rx) = assembly_with_observable_egress();
+                let link_id = add_node_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+                lsm.test_set_state(LinkState::Active);
+                lsm.set_renewal_identity(super::RenewalIdentity {
+                    idp: test_idp(),
+                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
+                });
+                let now = SystemTime::now();
+                lsm.set_auth_expires(
+                    now - Duration::from_secs(600),
+                    now + Duration::from_secs(60),
+                    Duration::from_secs(300),
+                );
+
+                // Attempt A: request sent, challenge A stashed.
+                lsm.maybe_renew_auth(&asm);
+                let pkt_a = try_recv_egress(&mut egress_rx).expect("attempt A request");
+                let mut challenge_a = [0u8; 48];
+                challenge_a.copy_from_slice(&pkt_a.body()[12..60]);
+
+                // A's attempt timeout fires — exactly what the spawned
+                // timer does: fail the attempt and clear its challenge.
+                assert!(lsm.take_renewal_challenge_if(&challenge_a));
+                lsm.finish_renewal_failure(
+                    &asm,
+                    AuthFailureReason::AgentError(
+                        "renewal credential request timed out (test)".to_string(),
+                    ),
+                );
+
+                // Attempt B on the next due tick: fresh challenge stashed.
+                // (Its request packet may sit in the ZDP-R send window
+                // behind unacked attempt A — the transport is not under
+                // test — so read the challenge from the stash.)
+                lsm.maybe_renew_auth(&asm);
+                assert!(lsm.test_renewal_in_flight());
+                let challenge_b = lsm
+                    .test_renewal_challenge()
+                    .expect("attempt B must stash its challenge");
+                assert_ne!(challenge_a, challenge_b, "attempts must mint fresh challenges");
+
+                // A's DELAYED response arrives while B is in flight. Its
+                // blob is well-formed and HMAC-valid — just bound to A.
+                let blob_a =
+                    auth::encode_blobs(&[crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
+                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+                        issuer: "https://idp.test".to_string(),
+                        id_token: "stale-id-token".to_string(),
+                        challenge: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            challenge_a,
+                        ),
+                    })]);
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedRenewAuthResponse(Ok(blob_a)),
+                )
+                .unwrap();
+
+                // The stale response must be discarded: B stays in flight
+                // and its failure record is not overwritten with a
+                // misattributed challenge-mismatch failure.
+                assert!(
+                    lsm.test_renewal_in_flight(),
+                    "a stale response from a timed-out attempt must not fail \
+                     the newer attempt"
+                );
+
+                // B's own valid response still completes the renewal (the
+                // test assembly has no VS connection, so completion ends in
+                // exactly the reauthorize-step failure — reaching it proves
+                // B's challenge was still stashed and verified).
+                let blob_b =
+                    auth::encode_blobs(&[crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
+                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+                        issuer: "https://idp.test".to_string(),
+                        id_token: "renewed-id-token".to_string(),
+                        challenge: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            challenge_b,
+                        ),
+                    })]);
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedRenewAuthResponse(Ok(blob_b)),
+                )
+                .unwrap();
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
+                    if !lsm.test_renewal_in_flight() {
+                        break;
+                    }
+                }
+                assert!(
+                    !lsm.test_renewal_in_flight(),
+                    "B's valid response must complete the attempt"
+                );
+                match lsm.get_last_auth_failure() {
+                    Some(AuthFailureReason::AgentError(msg)) => assert!(
+                        msg.contains("no visa service connection"),
+                        "B's response must reach reauthorize, got: {msg}"
+                    ),
+                    other => {
+                        panic!("expected AgentError(no visa service connection), got {other:?}")
+                    }
+                }
             })
             .await
     }
