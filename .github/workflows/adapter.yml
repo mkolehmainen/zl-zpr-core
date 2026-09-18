@@ -234,21 +234,7 @@ jobs:
       run: |
         ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/one-node-oidc-test.sh
 
-  # DISABLED until silent renewal is routable end to end (zipline#47).
-  #
-  # The job is wired and believed correct, but it cannot pass yet: `startLink`
-  # registers the AuthAgent on the adapter's `AdapterToNode` link, while
-  # `record_auth_expires`, `stash_renewal_identity` and `vsconn` all live on
-  # the node's `NodeToAdapter` link, and no code carries a credential request
-  # between them. The node therefore always takes `maybe_renew_auth`'s
-  # no-agent branch, so the script's leg 2 fails after RENEWAL_WAIT. Left
-  # armed, this would spend ~25 minutes per PR to produce a red check.
-  #
-  # To re-enable: delete this `if:` once the node-to-adapter credential
-  # request lands. Nothing else about the job needs to change. Until then the
-  # script is run by hand — see docs/BUILD.md, "Integration tests".
   oidc-renewal-integration-test:
-    if: false
     name: Run 1-Node OIDC Renewal Test
     needs: [build-ph, build-ph-cli]
     strategy:

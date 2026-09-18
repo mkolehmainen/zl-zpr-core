@@ -174,6 +174,92 @@ pub async fn handle_init_authentication_request(
     Ok(())
 }
 
+/// Handle a Renew Authentication request (zipline#66; NOT YET IN RFC 6)
+///
+/// Node → adapter on an Active link: carries the fresh challenge the
+/// renewed credential must bind to. Raises
+/// [LinkEvent::ReceivedRenewAuthRequest].
+pub async fn handle_renew_authentication_request(
+    asm: &Arc<Assembly>,
+    mut pkt: Packet,
+) -> HandleMgmtResult {
+    let ingress_link_id = pkt.metadata().ingress_link_id;
+
+    let Ok(hdr) = zdp::ZdpRenewAuthenticationRequestHeader::read_from_buf(&mut pkt) else {
+        return Err(HandleMgmtError::BadStructure);
+    };
+    if usize::from(hdr.data_len.get()) < size_of::<auth::ZdpInitAuthenticationPayload>() {
+        warn!(target: ZDP, "Received Renew Authentication with unexpected payload size {}", hdr.data_len.get());
+        return Err(HandleMgmtError::BadStructure);
+    }
+    if pkt.remaining() < usize::from(hdr.data_len.get()) {
+        warn!(target: ZDP, "packet too short for renewal challenge payload");
+        return Err(HandleMgmtError::BadStructure);
+    }
+    let Ok(payload) = auth::ZdpInitAuthenticationPayload::read_from_buf(&mut pkt) else {
+        return Err(HandleMgmtError::BadStructure);
+    };
+
+    debug!(target: ZDP, "Received Renew Authentication request for {}", asm.formatted_link_id(ingress_link_id));
+
+    asm.process_link_state_event(
+        ingress_link_id,
+        LinkEvent::ReceivedRenewAuthRequest(payload),
+    )?;
+
+    Ok(())
+}
+
+/// Handle a Renew Authentication response (zipline#66; NOT YET IN RFC 6)
+///
+/// Adapter → node: the renewed auth blob on success, or the failure code,
+/// plus the echoed challenge of the request it answers.
+/// Raises [LinkEvent::ReceivedRenewAuthResponse].
+pub async fn handle_renew_authentication_response(
+    asm: &Arc<Assembly>,
+    mut pkt: Packet,
+) -> HandleMgmtResult {
+    let ingress_link_id = pkt.metadata().ingress_link_id;
+
+    let Ok(hdr) = zdp::ZdpRenewAuthenticationResponseHeader::read_from_buf(&mut pkt) else {
+        return Err(HandleMgmtError::BadStructure);
+    };
+    let challenge = hdr.challenge;
+
+    let result: Result<String, zdp::ResponseCode>;
+    if hdr.status_code == zdp::ResponseCode::Success {
+        let blen = hdr.blob_len.get() as usize;
+        if blen == 0 {
+            warn!(target: ZDP, "Received successful Renew Authentication response with no blob");
+            return Err(HandleMgmtError::BadStructure);
+        }
+        if pkt.remaining() < blen {
+            warn!(target: ZDP, "packet too short for renewal blob");
+            return Err(HandleMgmtError::BadStructure);
+        }
+        let blob_buffer = pkt.copy_to_bytes(blen);
+        match String::from_utf8(blob_buffer.into()) {
+            Ok(blob) => result = Ok(blob),
+            Err(_) => {
+                warn!(target: ZDP, "failed to parse renewal blob as utf8");
+                return Err(HandleMgmtError::BadStructure);
+            }
+        }
+    } else {
+        result = Err(hdr.status_code);
+    }
+
+    debug!(target: ZDP, "Received Renew Authentication response for {} (status {:?})",
+        asm.formatted_link_id(ingress_link_id), hdr.status_code);
+
+    asm.process_link_state_event(
+        ingress_link_id,
+        LinkEvent::ReceivedRenewAuthResponse(challenge, result),
+    )?;
+
+    Ok(())
+}
+
 /// handle a Terminate Link or Docking Session message (TODO: document in RFC 17)
 ///
 /// Sends [LinkEvent::ReceivedTerminateLink] into the link state machine.

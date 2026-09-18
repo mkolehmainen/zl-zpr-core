@@ -180,6 +180,14 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
                 handlers::handle_init_authentication_request(asm, pkt).await
             }
 
+            ZdpPacketType::RenewAuthenticationRequest => {
+                handlers::handle_renew_authentication_request(asm, pkt).await
+            }
+
+            ZdpPacketType::RenewAuthenticationResponse => {
+                handlers::handle_renew_authentication_response(asm, pkt).await
+            }
+
             ZdpPacketType::AcquireZprAddress => {
                 handlers::handle_acquire_zpr_address_request(asm, pkt).await
             }

@@ -152,6 +152,68 @@ pub fn send_init_authentication_request(
     )
 }
 
+/// Send a Renew Authentication request (zipline#66; NOT YET IN RFC 6)
+///
+/// Node → adapter on an Active link: the docked actor's authentication is
+/// nearing expiry, and this carries a fresh challenge (minted exactly as
+/// [send_init_authentication_request]'s) the renewed credential must bind to.
+pub fn send_renew_authentication_request(
+    asm: &Assembly,
+    link_id: LinkId,
+    payload: auth::ZdpInitAuthenticationPayload,
+) -> Sent<'_> {
+    debug!(target: ZDP, "{}: sending RenewAuthenticationRequest", asm.formatted_link_id(link_id));
+
+    let mut req = core::new_heap_packet();
+
+    let hdr = zdp::ZdpRenewAuthenticationRequestHeader {
+        data_len: (size_of::<auth::ZdpInitAuthenticationPayload>() as u16).into(),
+    };
+    hdr.write_to_buf(&mut req).unwrap();
+    payload.write_to_buf(&mut req).unwrap();
+
+    core::send_non_flow_mgmt(
+        asm,
+        link_id,
+        zdp::ZdpPacketType::RenewAuthenticationRequest,
+        req,
+    )
+}
+
+/// Send a Renew Authentication response (zipline#66; NOT YET IN RFC 6)
+///
+/// Adapter → node: on [zdp::ResponseCode::Success] `blob` carries the
+/// renewed auth blob (base64-encoded JSON, same encoding as the acquire
+/// request's); on any other code it is empty. `challenge` echoes the
+/// request's challenge bytes on every response so the node can correlate
+/// it with the attempt it answers (PR #17 review).
+pub fn send_renew_authentication_response<'a>(
+    asm: &'a Assembly,
+    link_id: LinkId,
+    status_code: zdp::ResponseCode,
+    challenge: &'_ [u8; 48],
+    blob: &'_ [u8],
+) -> Sent<'a> {
+    debug!(target: ZDP, "{}: sending RenewAuthenticationResponse, status: {status_code:?}", asm.formatted_link_id(link_id));
+
+    let mut rsp = core::new_heap_packet();
+
+    let hdr = zdp::ZdpRenewAuthenticationResponseHeader {
+        status_code,
+        blob_len: (blob.len() as u16).into(),
+        challenge: *challenge,
+    };
+    hdr.write_to_buf(&mut rsp).unwrap();
+    rsp.put_slice(blob);
+
+    core::send_non_flow_mgmt(
+        asm,
+        link_id,
+        zdp::ZdpPacketType::RenewAuthenticationResponse,
+        rsp,
+    )
+}
+
 /// Send an AcquireZPRAddressRequest (TODO: not yet in RFC 6)
 ///
 /// The `actor_addrs` is a list of addresses that this sender is
