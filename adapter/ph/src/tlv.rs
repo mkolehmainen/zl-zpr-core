@@ -480,6 +480,31 @@ mod tests {
         }
     }
 
+    /// zipline#64: `assembly::VERSION` is now the stamped build-identity
+    /// string, e.g. `0.7.0 (v0.6.0-12-gabc1234-dirty)` — longer than the
+    /// bare package version the mgmt version TLV used to carry. Prove the
+    /// exact value the hello response encodes round-trips unmodified.
+    #[test]
+    fn test_version_tlv_carries_stamped_build_version() {
+        let stamped = crate::assembly::VERSION;
+        assert!(
+            stamped.len() <= 255,
+            "stamped version must fit an un-truncated string TLV: {stamped}"
+        );
+
+        let mut buf = BytesMut::new();
+        TlvEncoding::new_version(stamped).put(&mut buf);
+
+        let mut buf_reader = buf.as_ref();
+        let result = parse_from_buf(&mut buf_reader).unwrap();
+        let values = result.get(&DataType::VERSION).unwrap();
+        assert_eq!(values.len(), 1);
+        match &values[0] {
+            TlvValue::Str(value) => assert_eq!(value, stamped),
+            _ => panic!("Expected Str value for VERSION"),
+        }
+    }
+
     #[test]
     fn test_put_and_parse_string_truncation() {
         let mut buf = BytesMut::new();

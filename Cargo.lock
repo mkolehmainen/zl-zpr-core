@@ -374,6 +374,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-info"
+version = "0.7.0"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2764,6 +2768,7 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
  "blake3",
+ "build-info",
  "bytes",
  "capnp",
  "capnp-futures",
@@ -2821,6 +2826,7 @@ version = "0.7.0"
 dependencies = [
  "admin-api",
  "base64 0.22.1",
+ "build-info",
  "capnp",
  "capnp-futures",
  "capnp-rpc",
