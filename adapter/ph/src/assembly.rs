@@ -39,7 +39,9 @@ pub enum PhMode {
     Adapter,
 }
 
-pub const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+/// The build-identity string reported by this assembly, e.g. on the
+/// mgmt-channel version TLV: `<pkg-version> (<git describe>)` (zipline#64).
+pub const VERSION: &'static str = build_info::BUILD_VERSION;
 
 /// Interface to full assembly of all stages.
 ///

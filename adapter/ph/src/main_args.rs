@@ -51,7 +51,7 @@ pub enum ArgsError {
 ///    sudo ./ph node -c node_config.toml
 ///
 #[derive(Debug, Parser)]
-#[command(version, verbatim_doc_comment)]
+#[command(version = build_info::BUILD_VERSION, verbatim_doc_comment)]
 pub struct Control {
     #[command(subcommand)]
     pub command: Command,

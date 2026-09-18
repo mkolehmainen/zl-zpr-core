@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use admin_api::{capture_socket_path, choose_socket_path, control_socket_path};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "This program controls the RPC calls to the ZPR Packet Handler\nRun without a command to enter CLI mode", long_about = None)]
+#[command(version = build_info::BUILD_VERSION, about = "This program controls the RPC calls to the ZPR Packet Handler\nRun without a command to enter CLI mode", long_about = None)]
 pub struct CmdlineArgs {
     #[command(subcommand)]
     pub command: Option<Commands>,
