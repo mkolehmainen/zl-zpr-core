@@ -39,6 +39,8 @@ pub enum ZdpPacketType {
     GrantZprAddress = 139,   // TODO: add to RFC 6
     RevokeZprAddress = 140,
     InitAuthenticationRequest = 141, // TODO: add to RFC 6
+    RenewAuthenticationRequest = 142, // TODO: add to RFC 6 (zipline#66)
+    RenewAuthenticationResponse = 143, // TODO: add to RFC 6 (zipline#66)
 
     Canceled = 252, // TODO: add to RFC 17
     Cancel = 253,   // TODO: add to RFC 17
@@ -161,6 +163,33 @@ pub struct ZdpInitAuthenticationRequestHeader {
     pub flags: u8,
     pub data_len: U16,
     // Followed by challenge payload, eg ZdpInitAuthenticationPayload in auth.rs.
+}
+
+/// Renew Authentication request (node → adapter; zipline#66, pending RFC 6).
+///
+/// Sent on an Active NodeToAdapter link when the docked actor's
+/// authentication nears expiry: carries a fresh challenge, minted exactly
+/// like the one in [ZdpInitAuthenticationRequestHeader]'s payload, that the
+/// renewed credential must be bound to.
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(packed)]
+pub struct ZdpRenewAuthenticationRequestHeader {
+    pub data_len: U16,
+    // Followed by the challenge payload (ZdpInitAuthenticationPayload in auth.rs).
+}
+
+/// Renew Authentication response (adapter → node; zipline#66, pending RFC 6).
+///
+/// On [ResponseCode::Success] carries the renewed auth blob — the same
+/// base64-encoded JSON encoding [ZdpAcquireZprAddressHeader]'s blob uses.
+/// [ResponseCode::AuthUnavailable] means no AuthAgent is registered (or it
+/// could not answer); the blob is then empty.
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(packed)]
+pub struct ZdpRenewAuthenticationResponseHeader {
+    pub status_code: ResponseCode,
+    pub blob_len: U16,
+    // Followed by the BLOB (blob_len bytes): base64 encoded json string.
 }
 
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
