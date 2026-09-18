@@ -184,11 +184,18 @@ pub struct ZdpRenewAuthenticationRequestHeader {
 /// base64-encoded JSON encoding [ZdpAcquireZprAddressHeader]'s blob uses.
 /// [ResponseCode::AuthUnavailable] means no AuthAgent is registered (or it
 /// could not answer); the blob is then empty.
+///
+/// `challenge` echoes the request's challenge bytes (nonce || ctime ||
+/// hmac) on EVERY response, success or failure, so the node can correlate
+/// a response with the attempt it answers before consuming any state: a
+/// delayed answer to an already-abandoned attempt must not be recorded
+/// against the current one (PR #17 review).
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(packed)]
 pub struct ZdpRenewAuthenticationResponseHeader {
     pub status_code: ResponseCode,
     pub blob_len: U16,
+    pub challenge: [u8; 48],
     // Followed by the BLOB (blob_len bytes): base64 encoded json string.
 }
 

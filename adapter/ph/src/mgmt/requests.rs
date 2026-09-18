@@ -184,11 +184,14 @@ pub fn send_renew_authentication_request(
 ///
 /// Adapter → node: on [zdp::ResponseCode::Success] `blob` carries the
 /// renewed auth blob (base64-encoded JSON, same encoding as the acquire
-/// request's); on any other code it is empty.
+/// request's); on any other code it is empty. `challenge` echoes the
+/// request's challenge bytes on every response so the node can correlate
+/// it with the attempt it answers (PR #17 review).
 pub fn send_renew_authentication_response<'a>(
     asm: &'a Assembly,
     link_id: LinkId,
     status_code: zdp::ResponseCode,
+    challenge: &'_ [u8; 48],
     blob: &'_ [u8],
 ) -> Sent<'a> {
     debug!(target: ZDP, "{}: sending RenewAuthenticationResponse, status: {status_code:?}", asm.formatted_link_id(link_id));
@@ -198,6 +201,7 @@ pub fn send_renew_authentication_response<'a>(
     let hdr = zdp::ZdpRenewAuthenticationResponseHeader {
         status_code,
         blob_len: (blob.len() as u16).into(),
+        challenge: *challenge,
     };
     hdr.write_to_buf(&mut rsp).unwrap();
     rsp.put_slice(blob);

@@ -212,7 +212,8 @@ pub async fn handle_renew_authentication_request(
 
 /// Handle a Renew Authentication response (zipline#66; NOT YET IN RFC 6)
 ///
-/// Adapter → node: the renewed auth blob on success, or the failure code.
+/// Adapter → node: the renewed auth blob on success, or the failure code,
+/// plus the echoed challenge of the request it answers.
 /// Raises [LinkEvent::ReceivedRenewAuthResponse].
 pub async fn handle_renew_authentication_response(
     asm: &Arc<Assembly>,
@@ -223,6 +224,7 @@ pub async fn handle_renew_authentication_response(
     let Ok(hdr) = zdp::ZdpRenewAuthenticationResponseHeader::read_from_buf(&mut pkt) else {
         return Err(HandleMgmtError::BadStructure);
     };
+    let challenge = hdr.challenge;
 
     let result: Result<String, zdp::ResponseCode>;
     if hdr.status_code == zdp::ResponseCode::Success {
@@ -252,7 +254,7 @@ pub async fn handle_renew_authentication_response(
 
     asm.process_link_state_event(
         ingress_link_id,
-        LinkEvent::ReceivedRenewAuthResponse(result),
+        LinkEvent::ReceivedRenewAuthResponse(challenge, result),
     )?;
 
     Ok(())

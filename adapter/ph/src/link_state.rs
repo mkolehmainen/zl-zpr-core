@@ -272,9 +272,11 @@ pub enum LinkEvent {
     /// Adapter side (zipline#66): the node asks for a renewed credential,
     /// carrying the fresh challenge it minted.
     ReceivedRenewAuthRequest(auth::ZdpInitAuthenticationPayload),
-    /// Node side (zipline#66): the adapter's answer — Ok(blob string) on
-    /// success, Err(the response's failure code) otherwise.
-    ReceivedRenewAuthResponse(Result<String, ResponseCode>),
+    /// Node side (zipline#66): the adapter's answer — the echoed challenge
+    /// of the request it answers (so it can be correlated with the attempt
+    /// that is actually outstanding, PR #17 review), plus Ok(blob string)
+    /// on success or Err(the response's failure code) otherwise.
+    ReceivedRenewAuthResponse([u8; 48], Result<String, ResponseCode>),
 
     ReceivedAcquireZprAddressRequest(Option<Vec<IpAddress>>, String), // (requested_addrs, auth_blob)
 
@@ -359,6 +361,14 @@ pub struct LinkData {
     /// blob must carry exactly these bytes; taken (cleared) on completion
     /// or attempt timeout.
     renewal_challenge: Option<[u8; 48]>,
+    /// Adapters only: the task awaiting the AuthAgent's answer to the
+    /// current renewal credential request (zipline#66). A new request
+    /// supersedes it: the node only retries after abandoning its previous
+    /// attempt, so the old task is aborted — dropping its reply receiver,
+    /// which the serial bridge observes (`reply.closed()`) and cancels the
+    /// in-flight RPC instead of letting retries queue behind it
+    /// (PR #17 review).
+    adapter_renewal_task: Option<tokio::task::AbortHandle>,
     /// Nodes only: the one-shot "renewal due but no AuthAgent registered"
     /// warning has fired for the current authentication window.
     renewal_no_agent_warned: bool,
@@ -379,6 +389,7 @@ impl LinkData {
             renewal_identity: None,
             renewal_in_flight: false,
             renewal_challenge: None,
+            adapter_renewal_task: None,
             renewal_no_agent_warned: false,
         }
     }
@@ -629,12 +640,6 @@ impl LinkStateWrapper {
         self.locked_data.lock().unwrap().renewal_challenge = Some(challenge);
     }
 
-    /// Take (and clear) the stashed renewal challenge, if any. The response
-    /// handler consumes it; a later response finds nothing and is ignored.
-    fn take_renewal_challenge(&self) -> Option<[u8; 48]> {
-        self.locked_data.lock().unwrap().renewal_challenge.take()
-    }
-
     /// Take the stashed renewal challenge only if it still equals
     /// `challenge`. Used by the attempt-timeout task so it cannot clobber a
     /// LATER attempt's challenge: true means this attempt was still the
@@ -822,8 +827,8 @@ impl LinkStateWrapper {
             LinkEvent::ReceivedRenewAuthRequest(challenge) => {
                 self.process_renew_auth_request(asm, challenge)
             }
-            LinkEvent::ReceivedRenewAuthResponse(result) => {
-                self.process_renew_auth_response(asm, result)
+            LinkEvent::ReceivedRenewAuthResponse(challenge, result) => {
+                self.process_renew_auth_response(asm, challenge, result)
             }
 
             LinkEvent::ReceivedGrantZprAddressRequest(result) => {
@@ -2799,6 +2804,28 @@ impl LinkStateWrapper {
             }
         }
 
+        // The raw 48-byte challenge: nonce || ctime || hmac. Assembled
+        // before any answer so every response — success or failure — can
+        // echo it for correlation on the node side (PR #17 review).
+        let mut challenge = [0u8; 48];
+        challenge[0..8].copy_from_slice(&challenge_payload.nonce);
+        challenge[8..16].copy_from_slice(&challenge_payload.ctime.to_bytes());
+        challenge[16..48].copy_from_slice(&challenge_payload.hmac);
+
+        // A new request supersedes any still-outstanding agent call: the
+        // node only retries after abandoning its previous attempt, so
+        // cancel the abandoned call instead of letting this retry queue
+        // behind it on the serial bridge for up to
+        // OIDC_USER_INTERACTION_TIMEOUT (PR #17 review). Aborting the wait
+        // task drops its reply receiver, which the bridge observes
+        // (`reply.closed()`) and drops the in-flight RPC.
+        if let Some(task) = self.locked_data.lock().unwrap().adapter_renewal_task.take() {
+            debug!(target: LINK_STATE,
+                "{}: a new renewal credential request supersedes the outstanding one; cancelling it",
+                asm.formatted_link_id(link_id));
+            task.abort();
+        }
+
         let (agent, idp) = {
             let data = self.locked_data.lock().unwrap();
             (
@@ -2814,17 +2841,12 @@ impl LinkStateWrapper {
                 asm,
                 link_id,
                 ResponseCode::AuthUnavailable,
+                &challenge,
                 &[],
             )
             .enqueue();
             return Ok(());
         };
-
-        // The raw 48-byte challenge: nonce || ctime || hmac.
-        let mut challenge = [0u8; 48];
-        challenge[0..8].copy_from_slice(&challenge_payload.nonce);
-        challenge[8..16].copy_from_slice(&challenge_payload.ctime.to_bytes());
-        challenge[16..48].copy_from_slice(&challenge_payload.hmac);
 
         let nonce = auth::oidc_nonce_for_challenge(&challenge);
         let issuer = idp.issuer.clone();
@@ -2847,6 +2869,7 @@ impl LinkStateWrapper {
                 asm,
                 link_id,
                 ResponseCode::AuthUnavailable,
+                &challenge,
                 &[],
             )
             .enqueue();
@@ -2855,7 +2878,7 @@ impl LinkStateWrapper {
 
         let task_asm = asm.clone();
         let link_uid = self.uid;
-        tokio::task::spawn_local(async move {
+        let task = tokio::task::spawn_local(async move {
             // The bridge bounds each call by OIDC_USER_INTERACTION_TIMEOUT
             // and answers or drops the reply either way, so awaiting the
             // reply is itself bounded.
@@ -2895,10 +2918,15 @@ impl LinkStateWrapper {
                 &task_asm,
                 link_id,
                 status,
+                &challenge,
                 blob.as_bytes(),
             )
             .enqueue();
         });
+        // Remember the wait task so the NEXT request can cancel it if the
+        // node abandons this attempt. Aborting an already-finished task is
+        // a no-op, so a stale handle here is harmless.
+        self.locked_data.lock().unwrap().adapter_renewal_task = Some(task.abort_handle());
 
         Ok(())
     }
@@ -2913,6 +2941,7 @@ impl LinkStateWrapper {
     fn process_renew_auth_response(
         &self,
         asm: &Arc<Assembly>,
+        echoed_challenge: [u8; 48],
         result: Result<String, ResponseCode>,
     ) -> Result<(), LinkStateError> {
         let link_id = self.id;
@@ -2929,15 +2958,21 @@ impl LinkStateWrapper {
             }
         }
 
-        // No stashed challenge means no request of ours is outstanding
-        // (completed, timed out, or never sent): a stale or unsolicited
-        // response, discarded without touching the renewal state.
-        let Some(challenge) = self.take_renewal_challenge() else {
+        // Correlate before consuming: the response echoes the challenge of
+        // the request it answers, and only a response to the CURRENT
+        // attempt may take the stash. A delayed answer to an abandoned
+        // attempt (it timed out; a newer attempt is in flight) must not
+        // consume the newer attempt's challenge and be recorded as its
+        // failure (PR #17 review). No match — stale or unsolicited — is
+        // discarded without touching the renewal state; if a newer attempt
+        // is outstanding, its own response or timeout settles it.
+        if !self.take_renewal_challenge_if(&echoed_challenge) {
             debug!(target: LINK_STATE,
-                "{}: discarding renewal response with no outstanding request",
+                "{}: discarding renewal response that answers no outstanding request",
                 asm.formatted_link_id(link_id));
             return Ok(());
-        };
+        }
+        let challenge = echoed_challenge;
 
         let blob_str = match result {
             Ok(blob_str) => blob_str,
@@ -3477,7 +3512,7 @@ mod tests {
                 let pkt = pkt.expect("a RenewAuthenticationResponse must be sent");
                 assert_eq!(pkt.metadata().egress_link_id, link_id);
                 // body: [0]=type, [1]=excess, [2..10]=seq, [10]=status,
-                // [11..13]=blob_len, [13..]=blob.
+                // [11..13]=blob_len, [13..61]=echoed challenge, [61..]=blob.
                 assert_eq!(pkt.body()[0], 143, "expected RenewAuthenticationResponse");
                 assert_eq!(
                     pkt.body()[10],
@@ -3486,8 +3521,13 @@ mod tests {
                 );
                 let blob_len = u16::from_be_bytes([pkt.body()[11], pkt.body()[12]]) as usize;
                 assert!(blob_len > 0, "success response must carry the blob");
+                assert_eq!(
+                    &pkt.body()[13..61],
+                    &challenge[..],
+                    "the response must echo the request's challenge"
+                );
                 let blob_str =
-                    std::str::from_utf8(&pkt.body()[13..13 + blob_len]).expect("utf8 blob");
+                    std::str::from_utf8(&pkt.body()[61..61 + blob_len]).expect("utf8 blob");
                 let blobs = auth::decode_blobs(blob_str).expect("valid blob encoding");
                 match &blobs[0] {
                     crate::auth::AuthBlob::Oidc(oidc) => {
@@ -3678,7 +3718,7 @@ mod tests {
                 })]);
                 asm.process_link_state_event(
                     link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(Ok(blob)),
+                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
                 )
                 .unwrap();
 
@@ -3740,7 +3780,11 @@ mod tests {
                 );
 
                 lsm.maybe_renew_auth(&asm);
-                let _req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
+                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
+                // The outstanding challenge, echoed by the (well-behaved)
+                // adapter on its response header.
+                let mut outstanding = [0u8; 48];
+                outstanding.copy_from_slice(&req_pkt.body()[12..60]);
 
                 // A blob correctly HMAC'd with this link's auth key ([42; 32]
                 // in the dummy peer) but bound to a DIFFERENT challenge.
@@ -3761,7 +3805,7 @@ mod tests {
                 })]);
                 asm.process_link_state_event(
                     link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(Ok(blob)),
+                    LinkEvent::ReceivedRenewAuthResponse(outstanding, Ok(blob)),
                 )
                 .unwrap();
 
@@ -3811,11 +3855,16 @@ mod tests {
                 );
 
                 lsm.maybe_renew_auth(&asm);
-                let _req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
+                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
+                let mut outstanding = [0u8; 48];
+                outstanding.copy_from_slice(&req_pkt.body()[12..60]);
 
                 asm.process_link_state_event(
                     link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(Err(ResponseCode::AuthUnavailable)),
+                    LinkEvent::ReceivedRenewAuthResponse(
+                        outstanding,
+                        Err(ResponseCode::AuthUnavailable),
+                    ),
                 )
                 .unwrap();
 
@@ -3881,7 +3930,10 @@ mod tests {
                 let challenge_b = lsm
                     .test_renewal_challenge()
                     .expect("attempt B must stash its challenge");
-                assert_ne!(challenge_a, challenge_b, "attempts must mint fresh challenges");
+                assert_ne!(
+                    challenge_a, challenge_b,
+                    "attempts must mint fresh challenges"
+                );
 
                 // A's DELAYED response arrives while B is in flight. Its
                 // blob is well-formed and HMAC-valid — just bound to A.
@@ -3897,7 +3949,7 @@ mod tests {
                     })]);
                 asm.process_link_state_event(
                     link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(Ok(blob_a)),
+                    LinkEvent::ReceivedRenewAuthResponse(challenge_a, Ok(blob_a)),
                 )
                 .unwrap();
 
@@ -3926,7 +3978,7 @@ mod tests {
                     })]);
                 asm.process_link_state_event(
                     link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(Ok(blob_b)),
+                    LinkEvent::ReceivedRenewAuthResponse(challenge_b, Ok(blob_b)),
                 )
                 .unwrap();
                 for _ in 0..50 {
@@ -3967,7 +4019,10 @@ mod tests {
 
                 asm.process_link_state_event(
                     link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(Ok("not-even-base64".to_string())),
+                    LinkEvent::ReceivedRenewAuthResponse(
+                        [3u8; 48],
+                        Ok("not-even-base64".to_string()),
+                    ),
                 )
                 .unwrap();
 
