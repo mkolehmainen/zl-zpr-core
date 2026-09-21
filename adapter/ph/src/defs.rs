@@ -85,10 +85,34 @@ impl From<zpr::vsapi_types::VsapiFiveTuple> for FiveTuple {
             src_address: other.source_addr.into(),
             dst_address: other.dest_addr.into(),
             l3_type: other.l3_type,
-            l4_protocol: net_defs::vsapi_ip_to_defs_ip(other.l4_protocol).unwrap(),
+            l4_protocol: vsapi_ip_to_defs_ip(other.l4_protocol).unwrap(),
             src_port: other.source_port,
             dst_port: other.dest_port,
         }
+    }
+}
+
+/// Translate a VSAPI IP protocol number into the local `net_defs::IpProtocol`
+/// representation. Relocated from `zpr-utils::net_defs` (zipline#69): this is
+/// its only caller, and keeping it here lets `zpr-utils` drop its dependency
+/// on the `zpr` crate. Returns `Err` for any protocol outside the mapped set.
+pub fn vsapi_ip_to_defs_ip(
+    vsapi_proto: zpr::vsapi_types::VsapiIpProtocol,
+) -> Result<net_defs::IpProtocol, &'static str> {
+    use net_defs::ip_number;
+    use zpr::vsapi_types::vsapi_ip_number;
+    match vsapi_proto {
+        vsapi_ip_number::HOPOPT => Ok(ip_number::HOPOPT),
+        vsapi_ip_number::ICMP => Ok(ip_number::ICMP),
+        vsapi_ip_number::IPINIP => Ok(ip_number::IPINIP),
+        vsapi_ip_number::TCP => Ok(ip_number::TCP),
+        vsapi_ip_number::UDP => Ok(ip_number::UDP),
+        vsapi_ip_number::IPV6_ROUTE => Ok(ip_number::IPV6_ROUTE),
+        vsapi_ip_number::IPV6_FRAG => Ok(ip_number::IPV6_FRAG),
+        vsapi_ip_number::AH => Ok(ip_number::AH),
+        vsapi_ip_number::IPV6_ICMP => Ok(ip_number::IPV6_ICMP),
+        vsapi_ip_number::IPV6_OPTS => Ok(ip_number::IPV6_OPTS),
+        _ => Err("Unknown protocol"),
     }
 }
 
@@ -117,5 +141,66 @@ impl std::fmt::Display for FiveTuple {
             self.src_port,
             self.dst_port
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use zpr::vsapi_types::vsapi_ip_number;
+
+    /// Pins the VSAPI-to-defs IP protocol mapping relocated from
+    /// zpr-utils::net_defs (zipline#69): every mapped row must translate to
+    /// the matching IANA protocol number, and an unmapped protocol must Err.
+    #[test]
+    fn vsapi_ip_to_defs_ip_maps_known_protocols() {
+        assert_eq!(
+            vsapi_ip_to_defs_ip(vsapi_ip_number::HOPOPT),
+            Ok(net_defs::ip_number::HOPOPT)
+        );
+        assert_eq!(
+            vsapi_ip_to_defs_ip(vsapi_ip_number::ICMP),
+            Ok(net_defs::ip_number::ICMP)
+        );
+        assert_eq!(
+            vsapi_ip_to_defs_ip(vsapi_ip_number::IPINIP),
+            Ok(net_defs::ip_number::IPINIP)
+        );
+        assert_eq!(
+            vsapi_ip_to_defs_ip(vsapi_ip_number::TCP),
+            Ok(net_defs::ip_number::TCP)
+        );
+        assert_eq!(
+            vsapi_ip_to_defs_ip(vsapi_ip_number::UDP),
+            Ok(net_defs::ip_number::UDP)
+        );
+        assert_eq!(
+            vsapi_ip_to_defs_ip(vsapi_ip_number::IPV6_ROUTE),
+            Ok(net_defs::ip_number::IPV6_ROUTE)
+        );
+        assert_eq!(
+            vsapi_ip_to_defs_ip(vsapi_ip_number::IPV6_FRAG),
+            Ok(net_defs::ip_number::IPV6_FRAG)
+        );
+        assert_eq!(
+            vsapi_ip_to_defs_ip(vsapi_ip_number::AH),
+            Ok(net_defs::ip_number::AH)
+        );
+        assert_eq!(
+            vsapi_ip_to_defs_ip(vsapi_ip_number::IPV6_ICMP),
+            Ok(net_defs::ip_number::IPV6_ICMP)
+        );
+        assert_eq!(
+            vsapi_ip_to_defs_ip(vsapi_ip_number::IPV6_OPTS),
+            Ok(net_defs::ip_number::IPV6_OPTS)
+        );
+    }
+
+    /// A VSAPI protocol number outside the mapped set must be rejected, not
+    /// silently passed through.
+    #[test]
+    fn vsapi_ip_to_defs_ip_rejects_unknown_protocol() {
+        // 253 is RFC 3692 "use for experimentation", not in the mapping.
+        assert!(vsapi_ip_to_defs_ip(253).is_err());
     }
 }
