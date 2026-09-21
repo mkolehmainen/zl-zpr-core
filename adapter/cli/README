@@ -11,19 +11,12 @@ for an interactive session and `connect` for scripts.
   ph-cli connect <id>        yes       yes, with      no - returns as soon
                                        exit codes     as the link is up
 
-*** Background renewal does not work yet (zipline#47). ***
-
-The intent is that a resident `auth-agent` renews your authentication
-silently, so you log in once per session ceiling instead of once per
-`expiration_seconds`. Everything on the ph-cli side of that is built and
-tested: the refresh token is held in this process's memory, and a
-non-interactive credential request is served from it with no browser. But
-the packet handler cannot yet reach the agent when a renewal comes due --
-the renewal deadline is tracked on the node's side of the link and the agent
-is registered on the adapter's, with no message between them -- so TODAY
-both commands behave the same way at the end of the window: the actor is
-disconnected and the human logs in again. Run `auth-agent` anyway; it is
-where renewal lands, and it costs nothing.
+A resident `auth-agent` renews your authentication silently (zipline#66),
+so you log in once per session ceiling (`max_auth_age_seconds`) instead of
+once per `expiration_seconds`. The refresh token is held in this process's
+memory; when a renewal comes due, the packet handler asks the agent for a
+fresh credential and it is served non-interactively, with no browser. Run
+`auth-agent` and leave it resident.
 
 So the interactive flow is TWO steps, not three:
 
@@ -48,7 +41,7 @@ a successful spawn, so the printed URL is pasted into the user's own browser
 instead. That browser then redirects to http://127.0.0.1:<port>/callback -
 a plain loopback connect into the ph-cli process - so the cross-user
 boundary does not matter. The paste is bounded by a 300 s login timeout.
-Once renewal works, the paste is needed once per session ceiling
+The paste is needed once per session ceiling
 (`max_auth_age_seconds`) rather than once per `expiration_seconds`.
 
 Do NOT run `connect` after `auth-agent` on the same link. Both register as

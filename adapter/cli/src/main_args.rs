@@ -178,13 +178,12 @@ pub enum Commands {
     /// (Ctrl-C). It does not report the link's outcome — use
     /// `link show <id>`, which also reports the authentication expiry.
     ///
-    /// NOTE: background renewal is NOT yet working (zipline#47). Everything
-    /// on this side is in place — the refresh token is held in memory and a
-    /// non-interactive credential request is served without a browser — but
-    /// the packet handler cannot yet reach this agent when the renewal is
-    /// due, so the session still ends when the authentication window closes
-    /// and you have to log in again. Keeping this process resident is what
-    /// will renew silently once that lands; it costs nothing meanwhile.
+    /// Keeping this process resident is what makes silent renewal happen:
+    /// when a renewal comes due, the packet handler asks this agent for a
+    /// fresh credential (zipline#66) and it is served from the refresh
+    /// token held in memory, with no browser. The browser paste is
+    /// therefore needed once per session ceiling (max_auth_age_seconds),
+    /// not once per expiration_seconds.
     ///
     /// Under sudo, pass --no-browser and paste the printed URL into your own
     /// browser: a root process cannot usefully open one.
