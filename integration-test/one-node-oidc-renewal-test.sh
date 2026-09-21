@@ -40,22 +40,19 @@
 # The run takes several minutes: the renewal cadence is a real wall clock and
 # cannot be fast-forwarded from outside the processes.
 #
-# *** THIS TEST DOES NOT PASS YET, AND THAT IS THE POINT (zipline#47). ***
+# *** THIS TEST HAS NOT YET BEEN OBSERVED PASSING (zipline#67). ***
 #
-# Leg 2 fails after RENEWAL_WAIT against the code as it stands. The renewal
-# tick, the tracked `auth_expires`, the stashed renewal identity and the
-# visa-service connection all live on the NODE's `NodeToAdapter` link, while
-# the AuthAgent `ph-cli` registers lives on the ADAPTER's `AdapterToNode`
-# link, and no code carries a credential request between them — so the node
-# reaches its renewal deadline with no agent to ask and logs "authentication
-# expires soon but no AuthAgent is available to renew it". Closing that needs
-# a node-to-adapter credential request, for which no ZDP message exists.
-#
-# The test is written to be the acceptance criterion for that work: when it
-# goes green, silent renewal works. It is deliberately NOT armed in CI (see
-# the `if: false` on `oidc-renewal-integration-test` in
-# .github/workflows/adapter.yml) so it cannot spend ~25 minutes per PR
-# producing a red check in the meantime.
+# The loop it exercises is implemented and unit-tested: R8 (zipline#66)
+# added the node-to-adapter credential request (ZDP
+# RenewAuthenticationRequest = 142 / RenewAuthenticationResponse = 143), so
+# the renewal tick on the NODE's `NodeToAdapter` link — where `auth_expires`,
+# the stashed renewal identity and the visa-service connection live — asks
+# the ADAPTER for a renewed credential, and the adapter serves it from the
+# AuthAgent `ph-cli` registers on its `AdapterToNode` side. This script is
+# that work's end-to-end proof, but zipline#66 records it was not run in the
+# environment that implemented R8 (no passwordless sudo there), so a green
+# run has not yet been recorded. Do not read a failure here as expected;
+# investigate it.
 set -euo pipefail
 
 export RUST_BACKTRACE=1
