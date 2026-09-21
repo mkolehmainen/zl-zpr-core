@@ -29,20 +29,34 @@ where the blocking outcome report and the exit-code contract (2 declined,
 3 timeout, 4 IdP unreachable, 5 visa service rejected the token, 6 policy
 denied, 7 device blob rejected) are the point.
 
-While ph needs root for the tun interface and the control socket is not yet
-reachable unprivileged for every deployment (zipline#39), the documented
-form is:
+Does step 2 need sudo? ph needs root for the tun interface, but since
+zipline#39 the control socket is handed off after bind
+(`adapter/ph/src/socket_access.rs`, `adapter/admin-api/src/socket_owner.rs`),
+so whether ph-cli needs privilege depends only on how ph was started:
 
-  sudo ph-cli auth-agent 2 --no-browser
+* ph started via sudo or pkexec: the socket is chowned to the invoking
+  user at /var/run/zpr/<uid>/control.sock, mode 0600. Run
+  `ph-cli auth-agent <id>` as yourself - no sudo, and the browser opens
+  normally.
+* ph started by systemd (or a direct root login) on a host that has a
+  "zpr" group: the shared socket is group zpr, mode 0660. Members of that
+  group run `ph-cli auth-agent <id>` unprivileged, browser as normal.
+* Residual case - no recorded owner AND no "zpr" group: the socket stays
+  root-only, and the documented form is
 
-`--no-browser` is the norm under sudo, not a workaround: a root process
-cannot usefully open the user's browser, and `xdg-open` fails silently after
-a successful spawn, so the printed URL is pasted into the user's own browser
-instead. That browser then redirects to http://127.0.0.1:<port>/callback -
-a plain loopback connect into the ph-cli process - so the cross-user
-boundary does not matter. The paste is bounded by a 300 s login timeout.
-The paste is needed once per session ceiling
-(`max_auth_age_seconds`) rather than once per `expiration_seconds`.
+    sudo ph-cli auth-agent <id> --no-browser
+
+  In this case only, `--no-browser` is the norm, not a workaround: a root
+  process cannot usefully open the user's browser, and `xdg-open` fails
+  silently after a successful spawn, so the printed URL is pasted into the
+  user's own browser instead. That browser then redirects to
+  http://127.0.0.1:<port>/callback - a plain loopback connect into the
+  ph-cli process - so the cross-user boundary does not matter. The paste is
+  bounded by a 300 s login timeout, and is needed once per session ceiling
+  (`max_auth_age_seconds`) rather than once per `expiration_seconds`.
+
+How ph-cli finds the right socket for each of these deployments is the
+"Which socket does ph-cli talk to?" section below.
 
 Do NOT run `connect` after `auth-agent` on the same link. Both register as
 the link's authentication agent and the second registration OVERWRITES the
@@ -53,8 +67,9 @@ authentication expiry and the last authentication failure.
 
 Which socket does ph-cli talk to?
 
-ph-cli needs no sudo. By default it searches for the packet handler's
-control socket in this order (zipline#39):
+ph-cli needs no sudo except in the residual case above (no recorded owner
+and no "zpr" group - see the login flow section). By default it searches
+for the packet handler's control socket in this order (zipline#39):
 
 1. The per-user socket for your uid: /var/run/zpr/<uid>/control.sock.
    This is where a sudo- or pkexec-started ph puts it, owned by the user
