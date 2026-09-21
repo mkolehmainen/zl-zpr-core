@@ -19,7 +19,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "admin-api"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "capnp",
  "capnpc",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "build-info"
-version = "0.7.0"
+version = "0.7.1"
 
 [[package]]
 name = "bumpalo"
@@ -892,14 +892,6 @@ dependencies = [
 name = "cslab"
 version = "0.1.2"
 source = "git+https://github.com/mkolehmainen/zl-zpr-utils.git?tag=cslab-v0.1.2#17e29a1686ac91e5fb0bd1eecc0a680f53ea1a97"
-dependencies = [
- "loom",
-]
-
-[[package]]
-name = "cslab"
-version = "0.1.2"
-source = "git+https://github.com/mkolehmainen/zl-zpr-utils.git?tag=zpr-utils-v0.1.0#17e29a1686ac91e5fb0bd1eecc0a680f53ea1a97"
 dependencies = [
  "loom",
 ]
@@ -2227,7 +2219,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libnode2"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aws-lc-rs",
  "capnp",
@@ -2245,7 +2237,7 @@ dependencies = [
  "tracing-subscriber",
  "tui-input",
  "x25519-dalek",
- "zpr 0.27.0",
+ "zpr 0.28.0",
  "zpr-utils",
 ]
 
@@ -2761,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "ph"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "admin-api",
  "arrayref",
@@ -2777,7 +2769,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
- "cslab 0.1.2 (git+https://github.com/mkolehmainen/zl-zpr-utils.git?tag=cslab-v0.1.2)",
+ "cslab",
  "curve25519-dalek 4.1.3",
  "dashmap",
  "ed25519-dalek",
@@ -2794,7 +2786,7 @@ dependencies = [
  "nix 0.29.0",
  "open-enum",
  "pkcs8",
- "rcu 0.1.2",
+ "rcu",
  "replace_with",
  "reqwest",
  "serde",
@@ -2815,14 +2807,14 @@ dependencies = [
  "x25519-dalek",
  "x509-cert",
  "zerocopy",
- "zpr 0.27.0",
+ "zpr 0.28.0",
  "zpr-ext",
  "zpr-utils",
 ]
 
 [[package]]
 name = "ph-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "admin-api",
  "base64 0.22.1",
@@ -3318,24 +3310,13 @@ dependencies = [
 
 [[package]]
 name = "rcu"
-version = "0.1.0"
-source = "git+https://github.com/mkolehmainen/zl-zpr-utils.git?tag=zpr-utils-v0.1.0#17e29a1686ac91e5fb0bd1eecc0a680f53ea1a97"
-dependencies = [
- "aarc",
- "arc-swap",
- "crossbeam-epoch",
- "cslab 0.1.2 (git+https://github.com/mkolehmainen/zl-zpr-utils.git?tag=zpr-utils-v0.1.0)",
-]
-
-[[package]]
-name = "rcu"
 version = "0.1.2"
 source = "git+https://github.com/mkolehmainen/zl-zpr-utils.git?tag=rcu-v0.1.2#29dc27e5aee90c07e9509a244e998179eed877c1"
 dependencies = [
  "aarc",
  "arc-swap",
  "crossbeam-epoch",
- "cslab 0.1.2 (git+https://github.com/mkolehmainen/zl-zpr-utils.git?tag=cslab-v0.1.2)",
+ "cslab",
 ]
 
 [[package]]
@@ -5475,8 +5456,8 @@ dependencies = [
 
 [[package]]
 name = "zpr"
-version = "0.27.0"
-source = "git+https://github.com/mkolehmainen/zl-zpr-common.git?tag=v0.27.0#5fbbff8580344fa1919926f385a8a1b6a02b4f8a"
+version = "0.28.0"
+source = "git+https://github.com/mkolehmainen/zl-zpr-common.git?tag=v0.28.0#3abdacfe817c6de4dc0b315616c73d4a813e379b"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5489,7 +5470,7 @@ dependencies = [
  "open-enum",
  "rand 0.10.1",
  "range-set-blaze",
- "rcu 0.1.0",
+ "rcu",
  "serde",
  "thiserror 1.0.69",
  "url",
