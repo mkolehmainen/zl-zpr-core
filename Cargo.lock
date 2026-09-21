@@ -2237,7 +2237,7 @@ dependencies = [
  "tracing-subscriber",
  "tui-input",
  "x25519-dalek",
- "zpr 0.28.0",
+ "zpr",
  "zpr-utils",
 ]
 
@@ -2807,7 +2807,7 @@ dependencies = [
  "x25519-dalek",
  "x509-cert",
  "zerocopy",
- "zpr 0.28.0",
+ "zpr",
  "zpr-ext",
  "zpr-utils",
 ]
@@ -5443,19 +5443,6 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zpr"
-version = "0.8.1"
-source = "git+https://github.com/mkolehmainen/zl-zpr-common.git?tag=v0.8.1#71ead993c6d21bdcd2f482513b53ebffec5f91fb"
-dependencies = [
- "capnp",
- "capnpc",
- "open-enum",
- "thiserror 1.0.69",
- "url",
- "zerocopy",
-]
-
-[[package]]
-name = "zpr"
 version = "0.28.0"
 source = "git+https://github.com/mkolehmainen/zl-zpr-common.git?tag=v0.28.0#3abdacfe817c6de4dc0b315616c73d4a813e379b"
 dependencies = [
@@ -5493,12 +5480,11 @@ dependencies = [
 
 [[package]]
 name = "zpr-utils"
-version = "0.2.2"
-source = "git+https://github.com/mkolehmainen/zl-zpr-utils.git?tag=zpr-utils-v0.2.2#29dc27e5aee90c07e9509a244e998179eed877c1"
+version = "0.2.3"
+source = "git+https://github.com/mkolehmainen/zl-zpr-utils.git?tag=zpr-utils-v0.2.3#8be1f934e094596e0ab5b4920ff4f7257e609caf"
 dependencies = [
  "aws-lc-rs",
  "internet-checksum",
  "pem-rfc7468",
  "zerocopy",
- "zpr 0.8.1",
 ]
