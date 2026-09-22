@@ -74,6 +74,11 @@ icmp_codes = [ 128, 129 ]
 [services.Web]
 protocol = "ping"
 
+# Provided by the user-a identity; exists only to mint a join policy for
+# adapter1 (see oidc-file-interplay.zpl, zipline#83).
+[services.UserASvc]
+protocol = "ping"
+
 [services.PingableVs]
 protocol = "ping"
 
