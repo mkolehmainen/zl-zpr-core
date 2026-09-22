@@ -87,9 +87,15 @@ ZPR_USER=$USER
 NODE_SUBSTRATE_ADDR_VS=10.0.0.1
 NODE_SUBSTRATE_ADDR_A=10.0.1.1
 NODE_SUBSTRATE_ADDR_B=10.0.2.1
+# The C namespace addresses: this test has no third actor (NUM_ACTORS=2, no
+# adapter3), but common_funcs.sh:create_network provisions the fixed zpr-c
+# namespace unconditionally and expands these under this script's `set -u` —
+# same values as the other two-actor tests (oidc-file-interplay-test.sh).
+NODE_SUBSTRATE_ADDR_C=10.0.3.1
 VS_SUBSTRATE_ADDR=10.0.0.2
 A_SUBSTRATE_ADDR=10.0.1.2
 B_SUBSTRATE_ADDR=10.0.2.2
+C_SUBSTRATE_ADDR=10.0.3.2
 
 # Fixed shape: the fixture declares exactly this topology.
 NUM_ACTORS=2
@@ -97,6 +103,7 @@ NODE_ZPR_ADDR=fd5a:5052::2
 VS_ZPR_ADDR=fd5a:5052::1
 A_ZPR_ADDR=fd00:1:1::1
 B_ZPR_ADDR=fd00:1:2::1
+C_ZPR_ADDR=fd00:1:3::1
 ZPR_SUBNET=fd00:1::0/32
 POLICY_BIN=attr-query.bin2
 
