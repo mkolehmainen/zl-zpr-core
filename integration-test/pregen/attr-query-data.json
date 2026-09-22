@@ -1,0 +1,8 @@
+{
+  "user.sub": {
+    "user-a": {
+      "dept": ["engineering"],
+      "contractor": []
+    }
+  }
+}
