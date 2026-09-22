@@ -432,11 +432,13 @@ chmod 600 attr-server.token zipline.token
 
 # The attribute server's TLS cert: 127.0.0.1 with an IP SAN, signed by the
 # PREGEN CA — the CA the fixture's ca_cert_path embedded into the policy,
-# so the vs's pinned client accepts it.
+# so the vs's pinned client accepts it. -CAserial keeps openssl's serial
+# bookkeeping in $TMPDIR instead of littering pregen/.
 openssl req -new -newkey rsa:2048 -nodes -keyout attr-server.key \
   -subj "/CN=127.0.0.1" -out attr-server.csr 2> /dev/null
 openssl x509 -req -in attr-server.csr -CA "$PREGEN/ca-cert.pem" \
-  -CAkey "$PREGEN/ca-key.pem" -CAcreateserial -days 1 -out attr-server.crt \
+  -CAkey "$PREGEN/ca-key.pem" -CAserial pregen-ca.srl -CAcreateserial \
+  -days 1 -out attr-server.crt \
   -extfile <(printf "subjectAltName=IP:127.0.0.1") 2> /dev/null
 
 # The vs admin TLS cert: the VS ZPR address as an IP SAN, signed by the
@@ -446,7 +448,8 @@ openssl x509 -req -in attr-server.csr -CA "$PREGEN/ca-cert.pem" \
 openssl req -new -newkey rsa:2048 -nodes -keyout vs-admin-tls.key \
   -subj "/CN=vs-admin" -out vs-admin-tls.csr 2> /dev/null
 openssl x509 -req -in vs-admin-tls.csr -CA "$PREGEN/ca-cert.pem" \
-  -CAkey "$PREGEN/ca-key.pem" -CAcreateserial -days 1 -out vs-admin-tls.crt \
+  -CAkey "$PREGEN/ca-key.pem" -CAserial pregen-ca.srl -CAcreateserial \
+  -days 1 -out vs-admin-tls.crt \
   -extfile <(printf "subjectAltName=IP:%s" "$VS_ZPR_ADDR") 2> /dev/null
 
 # The vs config. Not emit_vs_config: admin_cert is the runtime-minted
