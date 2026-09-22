@@ -84,6 +84,9 @@ source "$(dirname "$0")/lib/common_funcs.sh"
 
 ZPR_USER=$USER
 
+# The C actor is unused here (the fixture has two actors), but the shared
+# create_network() in lib/common_funcs.sh always sets up the zpr-c namespace
+# and requires its addresses.
 NODE_SUBSTRATE_ADDR_VS=10.0.0.1
 NODE_SUBSTRATE_ADDR_A=10.0.1.1
 NODE_SUBSTRATE_ADDR_B=10.0.2.1
@@ -246,9 +249,19 @@ function check_attr_server() {
 }
 
 # Stop the serve-mode server (notify-mode invocations exit on their own).
+#
+# SIGTERM, not SIGINT: a job launched with `&` from a non-interactive shell
+# inherits SIGINT *ignored*, and unlike ph/vs the reference server installs no
+# handler to override that, so a SIGINT is silently dropped, the old server
+# keeps the port, and the data-v2 relaunch fails with "Address already in use".
+# Then wait for the listener to be gone rather than racing the relaunch.
 function stop_attr_server() {
-  sudo pkill -SIGINT -f "zpr-attr-server --listen" || true
-  sleep 1
+  sudo pkill -SIGTERM -f "zpr-attr-server --listen" || true
+  wait_for 10 attr_server_down
+}
+
+function attr_server_down() {
+  ! check_attr_server
 }
 
 # Post a change notification from inside the zpr-vs netns with the
@@ -780,8 +793,10 @@ fi
 # Cleanup
 #
 
-sudo pkill -SIGINT -f "fake-idp.py --port" || true
-sudo pkill -SIGINT -f "zpr-attr-server --listen" || true
+# SIGTERM for the same reason as stop_attr_server (fake-idp is Python, which
+# also leaves an inherited SIGINT-ignore in place).
+sudo pkill -SIGTERM -f "fake-idp.py --port" || true
+sudo pkill -SIGTERM -f "zpr-attr-server --listen" || true
 
 for pid in $(get_descendants)
 do
