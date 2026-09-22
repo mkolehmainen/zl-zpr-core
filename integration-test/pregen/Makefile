@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2
+OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
@@ -57,6 +57,14 @@ oidc-renewal.bin2: oidc-renewal.zplc oidc-test.zpl oidc-test-seed-jwks.json
 # check catches the difference.
 oidc-file-interplay.bin2: oidc-file-interplay.zpl oidc-file-interplay.zplc oidc-test-seed-jwks.json
 	$(ZPLC) -c oidc-file-interplay.zplc -k $(KEY) -f v2 -o $@ oidc-file-interplay.zpl
+
+# oidc + zpr-attr/1 interplay fixture (zipline#81): oidc-file-interplay with
+# the file decorator replaced by the networked attribute service. Needs
+# zplc >= 0.19.0 (zipline#76: api = "zpr-attr/1" parsing) — an older zplc
+# fails with "trusted_service zipline missing provider". Same omitted-
+# `service` warning as oidc-test; expected.
+attr-query.bin2: attr-query.zpl attr-query.zplc oidc-test-seed-jwks.json
+	$(ZPLC) -c attr-query.zplc -k $(KEY) -f v2 -o $@ attr-query.zpl
 
 # Fake-IdP signing keys (checked in; test-only, no secrecy requirement) and
 # the seed JWKS derived from key 1 only via --print-jwks, which reuses the
