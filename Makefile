@@ -10,6 +10,7 @@ info:
 	@echo "  make test      - run all unit tests!"
 	@echo "  make clean     - clean everything!"
 	@echo "  make diagrams  - build PlantUML diagrams"
+	@echo "  make integration-test-docker - run integration-test/ in Docker (no host sudo needed)"
 	@echo 
 	@echo The resulting binaries are found in \`./target/debug\`.
 	@echo
@@ -38,6 +39,12 @@ zpr-crate-related:
 	$(MAKE) -C adapter/ph
 
 
-.PHONY: info help all test clean diagrams zpr-crate-related
+# The integration tests need root for network namespaces; this runs them as
+# root inside a Docker container instead.  See integration-test/Makefile.
+integration-test-docker:
+	$(MAKE) -C integration-test docker-test
+
+
+.PHONY: info help all test clean diagrams zpr-crate-related integration-test-docker
 
 .DEFAULT_GOAL := all
