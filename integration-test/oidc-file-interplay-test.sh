@@ -587,7 +587,7 @@ fi
 # Cleanup
 #
 
-sudo pkill -SIGINT -f "fake-idp.py --port" || true
+sudo pkill -SIGTERM -f "fake-idp.py --port" || true
 
 for pid in $(get_descendants)
 do

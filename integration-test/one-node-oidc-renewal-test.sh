@@ -714,7 +714,7 @@ do
   kill -SIGINT "$AGENT_PID" 2> /dev/null || true
 done
 
-sudo pkill -SIGINT -f "fake-idp.py --port" || true
+sudo pkill -SIGTERM -f "fake-idp.py --port" || true
 
 for pid in $(get_descendants)
 do
