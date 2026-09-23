@@ -425,6 +425,16 @@ destroy_network
 
 create_network
 
+# zipline#88 (the zipline#83 Step-4 configuration, now the test's normal
+# shape): adapter1 is user-only and runs on the dynamic fd5a:5052:adda:1::/64
+# address the fabric assigns, so its tun0 must NOT carry the pre-provisioned
+# static fd00:1:1::1 — the adapter itself adds the granted address (and the
+# fd5a:5052::/32 internal-net return route) on activation. Keep a bare
+# fd00:1::/32 route so adapter1's outbound traffic to the static actors still
+# enters the TUN (deleting the address removes its peer route too).
+sudo ip -n zpr-a addr del "$A_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
+sudo ip -n zpr-a -6 route add "$ZPR_SUBNET" dev tun0
+
 if [ -n "$NETEM_PARAMS" ]
 then configure_netem $NETEM_PARAMS  # split on whitespace
 fi
@@ -627,7 +637,11 @@ wait_for 30 check_node_has_auth_services || {
   exit 1
 }
 
-# adapter1: user-only (no bootstrap key) — the interplay's subject.
+# adapter1: user-only (no bootstrap key) — the interplay's subject. No
+# --zpr-addr: it accepts the dynamic fd5a:5052:adda:1::/64 address the
+# fabric assigns (zipline#88); a static demand would be scrubbed by the
+# visa service (no join policy) and the adapter would exit on the
+# mismatch (zipline#83).
 sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
@@ -639,8 +653,7 @@ sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" env SSL_CERT_FILE="$PWD/ca.cr
   --km-impl "$KM_IMPL" \
   --tun-if tun0 \
   --io-engine io_uring \
-  --node-addr "$NODE_SUBSTRATE_ADDR_A" \
-  --zpr-addr "$A_ZPR_ADDR" 2>&1 | tee adapter1.log | prefix_log zpr-a &
+  --node-addr "$NODE_SUBSTRATE_ADDR_A" 2>&1 | tee adapter1.log | prefix_log zpr-a &
 
 # adapter2: device-only (bootstrap key, no login) — it provides Web.
 sudo -E ip netns exec zpr-b sudo -E -u "$ZPR_USER" "$PH_BIN" \

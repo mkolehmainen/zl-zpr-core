@@ -79,11 +79,6 @@ icmp_codes = [ 128, 129 ]
 [services.Web]
 protocol = "ping"
 
-# Provided by the user-a identity; exists only to mint a join policy for
-# adapter1 (see attr-query.zpl).
-[services.UserASvc]
-protocol = "ping"
-
 [services.PingableVs]
 protocol = "ping"
 
