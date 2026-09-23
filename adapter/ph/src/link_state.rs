@@ -1542,6 +1542,34 @@ impl LinkStateWrapper {
                             return self.initiate_close(asm, TerminateReason::Other);
                         }
 
+                        // zipline#88: replies to a peer on a fabric-assigned
+                        // (dynamic-pool) address are dropped unless every
+                        // adapter's TUN routes the whole ZPR internal network
+                        // — add_address above only yields an on-link route
+                        // for OUR prefix. Install fd5a:5052::/32 on-link.
+                        //
+                        // Failure handling differs by path (operator ruling,
+                        // zipline#88): on a dynamic grant (nothing was
+                        // configured) fabric-installed state is all the
+                        // adapter has, so a failed install means the link
+                        // cannot function — fail the activation ASAP, like a
+                        // failed add_address. On the static path the
+                        // deployment provisioned addressing and routes out of
+                        // band and may well already carry them, so warn and
+                        // continue.
+                        if let Err(e) = asm
+                            .tun_ctl
+                            .add_route(IpAddr::V6(ZPR_INTERNAL_NETWORK), ZPRNET_PREFIX_LEN)
+                        {
+                            if configured.is_empty() {
+                                warn!(target: LINK_STATE, "{} failed to install ZPR internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}; a dynamically addressed adapter cannot function without it", asm.formatted_link_id(link_id));
+                                locked_fsm.set_state(LinkState::Error);
+                                drop(locked_fsm);
+                                return self.initiate_close(asm, TerminateReason::Other);
+                            }
+                            warn!(target: LINK_STATE, "{} failed to install ZPR internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}; continuing — statically provisioned deployments may already carry it", asm.formatted_link_id(link_id));
+                        }
+
                         // Update the global view of our ZPR addresses.
                         asm.set_local_zpr_addrs(addrs);
 
