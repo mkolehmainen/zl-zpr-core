@@ -6,6 +6,7 @@
 #   make docker-test                      # every *-test.sh (see TESTS), PASS/FAIL summary
 #   make docker-test TEST=one-node-test.sh
 #   make docker-test TEST="one-node-test.sh --actor_protocol ipv4"
+#   make docker-test TEST=one-node-test.sh DEBUG_TARGETS="all=INFO zdp=DEBUG"
 #   make docker-shell                     # root shell in this directory
 #
 # Host prerequisites: Docker running and the caller in the `docker` group.
@@ -25,13 +26,23 @@ WORKSPACE  := $(abspath $(CURDIR)/../..)
 # and io_uring (blocked by Docker's default seccomp profile) in one flag.  Narrow it
 # to --cap-add/--device/--security-opt only if this ever has to run untrusted code.
 DOCKER_TTY :=
-DOCKER_RUN  = docker run --rm --privileged $(DOCKER_TTY) \
+DOCKER_RUN  = docker run --rm --privileged $(DOCKER_TTY) $(DOCKER_ENV) \
                 -v $(WORKSPACE):$(WORKSPACE) -w $(CURDIR) $(IMAGE)
 
 # a2a-pubkey-test.sh needs a ph built with --features enable-security-testing
 # and bails out otherwise, so it is not in the default set; run it explicitly
 # with TEST=a2a-pubkey-test.sh against such a build.
 TESTS := $(filter-out a2a-pubkey-test.sh,$(sort $(wildcard *-test.sh)))
+
+# The scripts' own overrides (DEBUG_TARGETS, NETEM_PARAMS, PH_BIN, ...) are
+# read from the environment, which `docker run` does not inherit.  Forward each
+# one that is actually set -- in the environment or on the make command line --
+# with a bare `-e NAME`, which copies the caller's value in.  Unset ones are not
+# mentioned at all, so the image's own ENV (USER, VALKEY_SERVER_BIN, ...) stands.
+FORWARD_ENV := DEBUG_TARGETS KM_IMPL NETEM_PARAMS NODE_AUTH_PRIVATE_KEY FAKE_IDP_PORT \
+               SKIP_NOTIFY ZPR_TEST_VERBOSE \
+               PH_BIN PH_DEBUG_BIN VS_BIN VS_ADMIN_BIN ZPR_ATTR_SERVER_BIN ZPDUMP_BIN VALKEY_SERVER_BIN
+DOCKER_ENV := $(foreach v,$(FORWARD_ENV),$(if $(filter undefined,$(origin $(v))),,-e $(v)))
 
 .PHONY: docker-image docker-test docker-shell
 
