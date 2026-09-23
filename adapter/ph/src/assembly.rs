@@ -347,24 +347,44 @@ impl Assembly {
             // Withdraw each revoked stream from the *surviving* peers so
             // they drop their egress bindings and re-request visas instead
             // of blackholing traffic on dead streams (zipline#21). The
-            // message is StreamIdWithdrawal — "the stream id YOU send with
-            // has been withdrawn" — because entry.1 is the tether id the
-            // surviving adapter holds in its *outbound* ELT, not an id in
-            // its inbound DLT (which is what UnbindEgressStreamIndication's
-            // handler removes from). The dying link's own entries are
-            // skipped — that peer is gone.
-            // Note the expiry path (`VisaTable::handle_expirations`)
-            // deliberately does not notify: both ends share the visa expiry
-            // and eject on their own clocks, and a peer that sends early
-            // gets UnknownStreamId and re-requests.
-            for entry in withdrawn {
-                if entry.0 != link_id {
-                    mgmt::requests::send_stream_id_withdrawal(self, entry.0, entry.1).enqueue();
-                }
-            }
+            // dying link's own entries are skipped — that peer is gone.
+            self.withdraw_streams(withdrawn, Some(link_id));
         }
         self.peer_table.remove(link_id);
         info!(target: PEER_MGMT, "Removed peer {}", self.formatted_link_id(link_id));
+    }
+
+    /// Withdraw the given forwarding entries from the peers still bound to
+    /// them by sending each one a `StreamIdWithdrawal` — "the stream id YOU
+    /// send with has been withdrawn" — because `entry.1` is the tether id
+    /// the receiving adapter holds in its *outbound* ELT, not an id in its
+    /// inbound DLT (which is what UnbindEgressStreamIndication's handler
+    /// removes from). Shared by `drop_peer` (zipline#21) and
+    /// `visa_mgmt::handle_revocation` (zipline#85).
+    ///
+    /// `excluded_link` names a dying link whose own entries must be skipped
+    /// (that peer is gone) — `drop_peer` passes it. Entries whose link has
+    /// already left the peer table are skipped as well.
+    ///
+    /// Lock ordering (zipline#9): call this only AFTER releasing the
+    /// visa-table write lock — the send path takes the peer's `zdpr_send`
+    /// mutex, which must never nest under it.
+    ///
+    /// Note the expiry path (`VisaTable::handle_expirations`) deliberately
+    /// does not notify: both ends share the visa expiry and eject on their
+    /// own clocks, and a peer that sends early gets UnknownStreamId and
+    /// re-requests.
+    pub(crate) fn withdraw_streams(
+        &self,
+        withdrawn: Vec<ForwardingEntry>,
+        excluded_link: Option<LinkId>,
+    ) {
+        for entry in withdrawn {
+            if Some(entry.0) == excluded_link || self.peer_table.get(entry.0).is_none() {
+                continue;
+            }
+            mgmt::requests::send_stream_id_withdrawal(self, entry.0, entry.1).enqueue();
+        }
     }
 
     /// Part of graceful shutdown (or administrative link shutdown).
