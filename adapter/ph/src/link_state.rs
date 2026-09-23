@@ -1472,8 +1472,7 @@ impl LinkStateWrapper {
                         // record the mismatch, tear the link down, and exit
                         // the process non-zero with the remedy.
                         let configured = asm.get_local_zpr_addrs_std();
-                        let granted_std: Vec<IpAddr> =
-                            addrs.iter().map(IpAddr::from).collect();
+                        let granted_std: Vec<IpAddr> = addrs.iter().map(IpAddr::from).collect();
                         if !configured.is_empty() && {
                             let mut c = configured.clone();
                             let mut g = granted_std.clone();
@@ -1489,12 +1488,10 @@ impl LinkStateWrapper {
                                  to accept a fabric-assigned address."
                             );
                             error!(target: LINK_STATE, "{} {msg}", asm.formatted_link_id(link_id));
-                            self.record_auth_failure(
-                                AuthFailureReason::GrantedAddressMismatch {
-                                    requested: configured,
-                                    granted: granted_std,
-                                },
-                            );
+                            self.record_auth_failure(AuthFailureReason::GrantedAddressMismatch {
+                                requested: configured,
+                                granted: granted_std,
+                            });
                             locked_fsm.set_state(LinkState::Error);
                             drop(locked_fsm);
                             asm.signal_fatal_error(msg);
