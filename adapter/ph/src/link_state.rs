@@ -1461,7 +1461,46 @@ impl LinkStateWrapper {
             (LinkType::AdapterToNode, LinkState::RegisterAA) => {
                 match result {
                     Ok(addrs) => {
-                        // TODO: In future we will take addresses from here and configure TUN.
+                        // zipline#83: a configured `--zpr-addr` / `zpr_addr`
+                        // is a demand (see the doc comment above). A grant
+                        // differing from a non-empty configured set means the
+                        // fabric refused it (e.g. the visa service scrubbed
+                        // the unauthenticated claim: no matching join
+                        // policy). Running on the granted address would leave
+                        // the TUN/routes sourcing from the configured one and
+                        // the node denying every bind — so refuse to run:
+                        // record the mismatch, tear the link down, and exit
+                        // the process non-zero with the remedy.
+                        let configured = asm.get_local_zpr_addrs_std();
+                        let granted_std: Vec<IpAddr> =
+                            addrs.iter().map(IpAddr::from).collect();
+                        if !configured.is_empty() && {
+                            let mut c = configured.clone();
+                            let mut g = granted_std.clone();
+                            c.sort();
+                            g.sort();
+                            c != g
+                        } {
+                            let msg = format!(
+                                "fabric granted ZPR address(es) {granted_std:?} but this adapter \
+                                 is configured to demand {configured:?}; it cannot originate \
+                                 traffic from an address it was not granted. Remove the \
+                                 --zpr-addr argument / zpr_addr config line and try again \
+                                 to accept a fabric-assigned address."
+                            );
+                            error!(target: LINK_STATE, "{} {msg}", asm.formatted_link_id(link_id));
+                            self.record_auth_failure(
+                                AuthFailureReason::GrantedAddressMismatch {
+                                    requested: configured,
+                                    granted: granted_std,
+                                },
+                            );
+                            locked_fsm.set_state(LinkState::Error);
+                            drop(locked_fsm);
+                            asm.signal_fatal_error(msg);
+                            return self.initiate_close(asm, TerminateReason::Other);
+                        }
+
                         info!(target: LINK_STATE, "{} granted ZPR addresses {:?}, becoming ACTIVE", asm.formatted_link_id(link_id), addrs);
 
                         let data = self.locked_data.lock().unwrap();
