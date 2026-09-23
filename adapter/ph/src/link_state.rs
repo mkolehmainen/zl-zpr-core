@@ -1471,7 +1471,17 @@ impl LinkStateWrapper {
                         // the node denying every bind — so refuse to run:
                         // record the mismatch, tear the link down, and exit
                         // the process non-zero with the remedy.
-                        let configured = asm.get_local_zpr_addrs_std();
+                        //
+                        // The demand compared against is the STARTUP
+                        // configuration, frozen in
+                        // `Assembly::configured_zpr_addr_demand` — not the
+                        // current `config.zpr_addr`, which
+                        // `set_local_zpr_addrs` overwrites with each dynamic
+                        // grant. An adapter started without `--zpr-addr`
+                        // must keep accepting fabric-assigned addresses on
+                        // every reconnect, even when they differ from the
+                        // previous grant.
+                        let configured = asm.configured_zpr_addr_demand.clone();
                         let granted_std: Vec<IpAddr> = addrs.iter().map(IpAddr::from).collect();
                         if !configured.is_empty() && {
                             let mut c = configured.clone();

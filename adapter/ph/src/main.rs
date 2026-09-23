@@ -632,6 +632,7 @@ fn main() -> ExitCode {
         certx: Some(certx),
         system_start_time,
         address_pool: std::sync::Mutex::new(None),
+        configured_zpr_addr_demand: config.zpr_addr.clone(),
         config: rcu::RcuBox::new(config),
         fatal_error: Mutex::new(None),
         fatal_notify: tokio::sync::Notify::new(),
