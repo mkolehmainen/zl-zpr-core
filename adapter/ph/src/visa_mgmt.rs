@@ -1,6 +1,7 @@
 use crate::auth::AuthBlob;
 use crate::counters::ManagementCounterType;
 use crate::link_state::{LinkEvent, LinkStateError};
+use crate::mgmt;
 use crate::prelude::*;
 use crate::visa_table;
 
@@ -288,14 +289,24 @@ pub fn handle_revocation(
     asm: &Assembly,
     visa_id: VisaId,
 ) -> Result<(), visa_table::VisaTableError> {
-    // NOTE: the withdrawn forwarding entries are dropped here — VS-initiated
-    // revocation does not (yet) notify bound peers. Link-removal revocation
-    // does; see `Assembly::drop_peer` (zipline#21).
-    asm.visa_table
+    // Revoke under the write lock, but hold the withdrawn forwarding
+    // entries until the lock is released, then withdraw each stream from
+    // the peers still bound to it — same rule as `Assembly::drop_peer`
+    // (zipline#21, zipline#85): the send path must never nest under the
+    // visa-table lock.
+    let withdrawn = asm
+        .visa_table
         .write()
         .unwrap()
-        .revoke(&asm.peer_table, visa_id)
-        .map(|_| ())
+        .revoke(&asm.peer_table, visa_id)?;
+
+    for entry in withdrawn {
+        // Skip entries whose link is already gone.
+        if asm.peer_table.get(entry.0).is_some() {
+            mgmt::requests::send_stream_id_withdrawal(asm, entry.0, entry.1).enqueue();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
