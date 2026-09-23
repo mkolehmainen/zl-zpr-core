@@ -6,6 +6,7 @@ use tracing::*;
 
 use crate::logging::targets::NET_OS;
 use crate::sys::macos::tun;
+use crate::sys::macos_route::{self, ExistingRouteAction};
 use crate::zprtun::ZprTunError;
 use std::process::Command;
 
@@ -104,9 +105,13 @@ impl ZprTun {
 
     /// Ensure `dest/prefix_len` is routed on-link via this TUN device.
     ///
-    /// Idempotent: macOS `route add` has no `replace` mode, so a route that
-    /// is already in the table comes back as an error naming "File exists"
-    /// — that outcome is tolerated, everything else is reported.
+    /// Idempotent, with verification: macOS `route add` has no `replace`
+    /// mode, and a prefix already in the table comes back as "File exists"
+    /// whether the existing route targets this TUN or somewhere else. On
+    /// that error the existing route is inspected with `route -n get`; if it
+    /// already runs via this interface the call succeeds, otherwise the
+    /// stale route is deleted and ours installed — mirroring the Linux
+    /// side's `ip -6 route replace` semantics.
     pub fn add_route(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
         if dest.is_ipv4() {
             return Err(std::io::Error::new(
@@ -118,18 +123,9 @@ impl ZprTun {
             .mtx
             .lock()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Mutex lock failed"))?;
-        let mut c = Command::new(COMMAND_ROUTE);
-        c.arg("-n")
-            .arg("add")
-            .arg("-inet6")
-            .arg(format!("{}/{}", dest, prefix_len))
-            .arg("-interface")
-            .arg(self.inner.get_name());
-        debug!(target: NET_OS, "{:?}", c);
-        let output = c.output()?;
+        let output = self.route_add(dest, prefix_len)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // The route already being present is the idempotent success case.
             if !stderr.contains("File exists") && !stderr.contains("already in table") {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -142,8 +138,99 @@ impl ZprTun {
                     ),
                 ));
             }
+            // The prefix is already routed — but "File exists" does not say
+            // via what. Verify before treating this as idempotent success.
+            match self.existing_route_target(dest, prefix_len)? {
+                ExistingRouteAction::AlreadyOurs => {}
+                ExistingRouteAction::Replace => {
+                    debug!(
+                        target: NET_OS,
+                        "route {}/{} exists but not via {}; replacing",
+                        dest,
+                        prefix_len,
+                        self.inner.get_name()
+                    );
+                    self.route_delete(dest, prefix_len)?;
+                    let output = self.route_add(dest, prefix_len)?;
+                    if !output.status.success() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "{COMMAND_ROUTE} failed to reinstall route {}/{} on {} after \
+                                 deleting the stale route: {}",
+                                dest,
+                                prefix_len,
+                                self.inner.get_name(),
+                                String::from_utf8_lossy(&output.stderr)
+                            ),
+                        ));
+                    }
+                }
+            }
         }
         drop(mtx);
+        Ok(())
+    }
+
+    /// Run `route -n add` for `dest/prefix_len` via this TUN, returning the
+    /// raw output for the caller to interpret.
+    fn route_add(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<std::process::Output> {
+        let mut c = Command::new(COMMAND_ROUTE);
+        c.arg("-n")
+            .arg("add")
+            .arg("-inet6")
+            .arg(format!("{}/{}", dest, prefix_len))
+            .arg("-interface")
+            .arg(self.inner.get_name());
+        debug!(target: NET_OS, "{:?}", c);
+        c.output()
+    }
+
+    /// Inspect the route currently installed for `dest/prefix_len` and
+    /// decide whether it already targets this TUN. A `route -n get` that
+    /// fails or names another interface demands a replace — an
+    /// uninspectable route is never assumed to be ours.
+    fn existing_route_target(
+        &self,
+        dest: IpAddr,
+        prefix_len: u8,
+    ) -> std::io::Result<ExistingRouteAction> {
+        let mut c = Command::new(COMMAND_ROUTE);
+        c.arg("-n")
+            .arg("get")
+            .arg("-inet6")
+            .arg(format!("{}/{}", dest, prefix_len));
+        debug!(target: NET_OS, "{:?}", c);
+        let output = c.output()?;
+        if !output.status.success() {
+            return Ok(ExistingRouteAction::Replace);
+        }
+        Ok(macos_route::existing_route_action(
+            &String::from_utf8_lossy(&output.stdout),
+            self.inner.get_name(),
+        ))
+    }
+
+    /// Delete whatever route is installed for `dest/prefix_len`.
+    fn route_delete(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+        let mut c = Command::new(COMMAND_ROUTE);
+        c.arg("-n")
+            .arg("delete")
+            .arg("-inet6")
+            .arg(format!("{}/{}", dest, prefix_len));
+        debug!(target: NET_OS, "{:?}", c);
+        let output = c.output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "{COMMAND_ROUTE} failed to delete stale route {}/{}: {}",
+                    dest,
+                    prefix_len,
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ));
+        }
         Ok(())
     }
 

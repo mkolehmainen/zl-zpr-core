@@ -28,10 +28,16 @@ pub enum ExistingRouteAction {
 /// parseable `interface:` line — demands a replace: guessing "ours" is how
 /// a stale route silently swallows every reply.
 pub fn existing_route_action(route_get_stdout: &str, our_ifname: &str) -> ExistingRouteAction {
-    // Current behavior under test: "File exists" is unconditionally treated
-    // as idempotent success, i.e. the existing route is assumed to be ours.
-    let _ = (route_get_stdout, our_ifname);
-    ExistingRouteAction::AlreadyOurs
+    for line in route_get_stdout.lines() {
+        if let Some(value) = line.trim_start().strip_prefix("interface:") {
+            let ifname = value.trim();
+            if !ifname.is_empty() && ifname == our_ifname {
+                return ExistingRouteAction::AlreadyOurs;
+            }
+            return ExistingRouteAction::Replace;
+        }
+    }
+    ExistingRouteAction::Replace
 }
 
 #[cfg(test)]
