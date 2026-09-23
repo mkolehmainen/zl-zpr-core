@@ -166,6 +166,16 @@ pub enum AuthFailureReason {
     /// terminal outcome instead of polling it as Pending forever. Carries
     /// the TerminateReason's Debug spelling.
     LinkFailed(String),
+    /// The fabric granted a ZPR address set differing from the configured
+    /// `--zpr-addr` / `zpr_addr` (zipline#83): the configured address is a
+    /// demand, not a request, so the adapter refuses to run on the granted
+    /// one — it logs both addresses with the remedy (remove the configured
+    /// address and retry), tears the link down, and exits non-zero. Carries
+    /// both address sets so `ph-cli link show` names them.
+    GrantedAddressMismatch {
+        requested: Vec<IpAddr>,
+        granted: Vec<IpAddr>,
+    },
 }
 
 /// A single credential request forwarded to the out-of-band AuthAgent
@@ -1419,8 +1429,23 @@ impl LinkStateWrapper {
     /// If this inidicates success it will include the ZPR addresses we are
     /// supposed to use.  If this indicates failure we should tear down the link.
     ///
-    /// Currently we tell the node what address we want so these should be no
-    /// suprise and are actually already set.
+    /// **The address model (zipline#83):** a configured `--zpr-addr` /
+    /// `zpr_addr` is a *demand*, not a request. We forward it to the fabric in
+    /// the acquire request, and the fabric normally grants it back — but when
+    /// the visa service scrubs the request (e.g. a user-only actor matching no
+    /// join policy) it assigns a dynamic address instead. An adapter with a
+    /// configured address cannot honor such a grant: its TUN device and routes
+    /// were provisioned for the configured address, so it would keep sourcing
+    /// traffic from an address it no longer owns and the node would deny every
+    /// bind — silently, from the user's point of view. So a granted set that
+    /// differs from the non-empty configured set is a fatal error: log both
+    /// addresses with the remedy (remove the `--zpr-addr` argument / `zpr_addr`
+    /// config line and try again), record
+    /// [AuthFailureReason::GrantedAddressMismatch] for `ph-cli link show`,
+    /// tear the link down, and exit the process non-zero — even if other links
+    /// exist. An adapter with *no* configured address accepts whatever the
+    /// fabric grants: the granted address is added to the TUN and becomes the
+    /// local ZPR address set.
     ///
     /// `result` is Ok(granted addresses) on success; Err(code) carries the
     /// node's failure code, which we map to an [AuthFailureReason] so ph-cli
@@ -1436,7 +1461,53 @@ impl LinkStateWrapper {
             (LinkType::AdapterToNode, LinkState::RegisterAA) => {
                 match result {
                     Ok(addrs) => {
-                        // TODO: In future we will take addresses from here and configure TUN.
+                        // zipline#83: a configured `--zpr-addr` / `zpr_addr`
+                        // is a demand (see the doc comment above). A grant
+                        // differing from a non-empty configured set means the
+                        // fabric refused it (e.g. the visa service scrubbed
+                        // the unauthenticated claim: no matching join
+                        // policy). Running on the granted address would leave
+                        // the TUN/routes sourcing from the configured one and
+                        // the node denying every bind — so refuse to run:
+                        // record the mismatch, tear the link down, and exit
+                        // the process non-zero with the remedy.
+                        //
+                        // The demand compared against is the STARTUP
+                        // configuration, frozen in
+                        // `Assembly::configured_zpr_addr_demand` — not the
+                        // current `config.zpr_addr`, which
+                        // `set_local_zpr_addrs` overwrites with each dynamic
+                        // grant. An adapter started without `--zpr-addr`
+                        // must keep accepting fabric-assigned addresses on
+                        // every reconnect, even when they differ from the
+                        // previous grant.
+                        let configured = asm.configured_zpr_addr_demand.clone();
+                        let granted_std: Vec<IpAddr> = addrs.iter().map(IpAddr::from).collect();
+                        if !configured.is_empty() && {
+                            let mut c = configured.clone();
+                            let mut g = granted_std.clone();
+                            c.sort();
+                            g.sort();
+                            c != g
+                        } {
+                            let msg = format!(
+                                "fabric granted ZPR address(es) {granted_std:?} but this adapter \
+                                 is configured to demand {configured:?}; it cannot originate \
+                                 traffic from an address it was not granted. Remove the \
+                                 --zpr-addr argument / zpr_addr config line and try again \
+                                 to accept a fabric-assigned address."
+                            );
+                            error!(target: LINK_STATE, "{} {msg}", asm.formatted_link_id(link_id));
+                            self.record_auth_failure(AuthFailureReason::GrantedAddressMismatch {
+                                requested: configured,
+                                granted: granted_std,
+                            });
+                            locked_fsm.set_state(LinkState::Error);
+                            drop(locked_fsm);
+                            asm.signal_fatal_error(msg);
+                            return self.initiate_close(asm, TerminateReason::Other);
+                        }
+
                         info!(target: LINK_STATE, "{} granted ZPR addresses {:?}, becoming ACTIVE", asm.formatted_link_id(link_id), addrs);
 
                         let data = self.locked_data.lock().unwrap();
@@ -3214,7 +3285,7 @@ mod tests {
     use crate::peer_table;
     use crate::prelude::*;
     use crate::zdp::ResponseCode;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use std::time::SystemTime;
@@ -4774,6 +4845,261 @@ mod tests {
                     generation_before,
                     "the new session must be distinguishable from the old one"
                 );
+            })
+            .await
+    }
+
+    /// zipline#83 RED: a grant that differs from the non-empty configured
+    /// `--zpr-addr` must be refused — the FSM parks in Error (or the close it
+    /// initiates) instead of ACTIVE, the recorded failure is
+    /// `GrantedAddressMismatch` carrying both address sets, its rendered text
+    /// names the remedy (remove the `--zpr-addr` argument / `zpr_addr` config
+    /// line), and main's fatal-error watcher is signalled so the process
+    /// exits non-zero.
+    #[tokio::test(start_paused = true)]
+    async fn test_grant_address_mismatch_refuses_to_run() {
+        LocalSet::new()
+            .run_until(async {
+                let configured: IpAddr = "fd00:1:1::1".parse().unwrap();
+                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+
+                let mut builder = TestAssemblyBuilder::new();
+                let mut cfg = <crate::config::Config as std::default::Default>::default();
+                cfg.zpr_addr = vec![configured];
+                builder.config = Some(rcu::RcuBox::new(cfg));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let state = peer.link_state_machine.get_state();
+                assert!(
+                    matches!(state, LinkState::Error | LinkState::Closing),
+                    "a mismatched grant must not become ACTIVE; \
+                     expected Error (or the close it initiates), got {state:?}"
+                );
+
+                let reason = peer.link_state_machine.get_last_auth_failure();
+                match &reason {
+                    Some(AuthFailureReason::GrantedAddressMismatch {
+                        requested,
+                        granted: g,
+                    }) => {
+                        assert_eq!(requested, &vec![configured]);
+                        assert_eq!(g, &vec![granted]);
+                    }
+                    other => panic!("expected GrantedAddressMismatch, got {other:?}"),
+                }
+
+                // The local ZPR address set must NOT have been replaced by
+                // the refused grant.
+                assert_eq!(
+                    asm.get_local_zpr_addrs_std(),
+                    vec![configured],
+                    "a refused grant must not overwrite the configured address"
+                );
+
+                // The fatal signal main exits on, with the remedy in the text.
+                let fatal = asm
+                    .get_fatal_error()
+                    .expect("a mismatched grant must signal a fatal error so main exits non-zero");
+                assert!(
+                    fatal.contains("--zpr-addr") && fatal.contains("zpr_addr"),
+                    "the fatal error must carry the remedy (remove the \
+                     --zpr-addr argument / zpr_addr config line); got: {fatal}"
+                );
+                assert!(
+                    fatal.contains("fd00:1:1::1") && fatal.contains("fd5a:5052:adda:1::42"),
+                    "the fatal error must name both addresses; got: {fatal}"
+                );
+            })
+            .await
+    }
+
+    /// zipline#83 companion (GREEN lock-in): an adapter with NO configured
+    /// address accepts the dynamic grant — the TUN gets the granted address,
+    /// the local ZPR address set becomes the granted set, the link goes
+    /// ACTIVE, and no fatal error is signalled.
+    #[tokio::test(start_paused = true)]
+    async fn test_grant_with_no_configured_address_is_accepted() {
+        LocalSet::new()
+            .run_until(async {
+                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+
+                // Default config: zpr_addr is empty (no --zpr-addr).
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                assert!(
+                    asm.get_local_zpr_addrs_std().is_empty(),
+                    "test precondition: no configured ZPR address"
+                );
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_state(),
+                    LinkState::Active,
+                    "a dynamic grant with no configured address must go ACTIVE"
+                );
+                assert_eq!(
+                    asm.get_local_zpr_addrs_std(),
+                    vec![granted],
+                    "the granted address must become the local ZPR address set"
+                );
+                assert_eq!(peer.link_state_machine.get_last_auth_failure(), None);
+                assert_eq!(asm.get_fatal_error(), None);
+            })
+            .await
+    }
+
+    /// zipline#83 review fix (PR #27) RED: an adapter started with NO
+    /// `--zpr-addr` accepts its first dynamic grant — and on a later
+    /// reconnect must accept a DIFFERENT dynamic grant too. The demand the
+    /// mismatch check enforces is the *startup* configuration (empty here),
+    /// not whatever the fabric happened to grant last time:
+    /// `set_local_zpr_addrs` writes each grant into `config.zpr_addr` and
+    /// teardown never restores the original empty value, so before the fix
+    /// this reconnect mistook the previous dynamic address for an
+    /// operator-configured demand and exited on a mismatch it was
+    /// explicitly configured to accept.
+    #[tokio::test(start_paused = true)]
+    async fn test_reconnect_after_dynamic_grant_accepts_different_dynamic_address() {
+        LocalSet::new()
+            .run_until(async {
+                let first: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+                let second: IpAddr = "fd5a:5052:adda:1::43".parse().unwrap();
+
+                // Default config: zpr_addr is empty (no --zpr-addr).
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                assert!(
+                    asm.get_local_zpr_addrs_std().is_empty(),
+                    "test precondition: no configured ZPR address"
+                );
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                // First connection: dynamic grant accepted.
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&first),
+                    ])),
+                )
+                .unwrap();
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    assert_eq!(
+                        peer.link_state_machine.get_state(),
+                        LinkState::Active,
+                        "the first dynamic grant must go ACTIVE"
+                    );
+                }
+                assert_eq!(asm.get_local_zpr_addrs_std(), vec![first]);
+
+                // Reconnect: back through address registration. The fabric
+                // assigns a different dynamic address this time.
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&second),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_state(),
+                    LinkState::Active,
+                    "an adapter with no configured --zpr-addr must accept a \
+                     different dynamic grant on reconnect"
+                );
+                assert_eq!(
+                    asm.get_local_zpr_addrs_std(),
+                    vec![second],
+                    "the new grant must become the local ZPR address set"
+                );
+                assert_eq!(
+                    peer.link_state_machine.get_last_auth_failure(),
+                    None,
+                    "a fabric-assigned address is not a mismatch when nothing \
+                     was demanded"
+                );
+                assert_eq!(
+                    asm.get_fatal_error(),
+                    None,
+                    "no fatal exit: the adapter was configured to accept \
+                     fabric-assigned addresses"
+                );
+            })
+            .await
+    }
+
+    /// zipline#83 companion: a grant matching the configured address is the
+    /// normal path and must stay unchanged — ACTIVE, no failure, no fatal.
+    #[tokio::test(start_paused = true)]
+    async fn test_grant_matching_configured_address_stays_active() {
+        LocalSet::new()
+            .run_until(async {
+                let configured: IpAddr = "fd00:1:1::1".parse().unwrap();
+
+                let mut builder = TestAssemblyBuilder::new();
+                let mut cfg = <crate::config::Config as std::default::Default>::default();
+                cfg.zpr_addr = vec![configured];
+                builder.config = Some(rcu::RcuBox::new(cfg));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&configured),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(peer.link_state_machine.get_state(), LinkState::Active);
+                assert_eq!(peer.link_state_machine.get_last_auth_failure(), None);
+                assert_eq!(asm.get_fatal_error(), None);
+                assert_eq!(asm.get_local_zpr_addrs_std(), vec![configured]);
             })
             .await
     }

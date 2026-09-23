@@ -102,6 +102,22 @@ pub struct Assembly {
     /// If there is a static ZPR address present in the configuration it is set here in main.
     /// Various get_ and set_ functions are defined for this below.
     pub config: rcu::RcuBox<config::Config>,
+    /// The operator-configured ZPR address demand as it stood at startup
+    /// (`--zpr-addr` / `zpr_addr`), frozen at construction (zipline#83).
+    /// Empty means "accept whatever the fabric assigns". This is what the
+    /// granted-address mismatch check compares against — `config.zpr_addr`
+    /// cannot be, because [`Self::set_local_zpr_addrs`] overwrites it with
+    /// each dynamic grant and teardown never restores the startup value, so
+    /// after a reconnect it would mistake the previous dynamic address for
+    /// a configured demand.
+    pub configured_zpr_addr_demand: Vec<IpAddr>,
+    /// A fatal, unrecoverable error signalled from a worker (zipline#83:
+    /// the granted-ZPR-address mismatch). Set via
+    /// [`Self::signal_fatal_error`]; main watches [`Self::fatal_notify`] and
+    /// exits non-zero with this message on stderr.
+    pub fatal_error: Mutex<Option<String>>,
+    /// Wakes main's fatal-error watcher (see [`Self::signal_fatal_error`]).
+    pub fatal_notify: tokio::sync::Notify,
     pub logging: Mutex<HashMap<String, String>>,
     pub reload_handle:
         reload::Handle<filter::Filtered<fmt::Layer<Registry>, Targets, Registry>, Registry>,
@@ -232,6 +248,26 @@ impl Assembly {
     /// have been granted a ZPR address.
     pub fn get_local_zpr_addrs_std(&self) -> Vec<IpAddr> {
         self.config.get().zpr_addr.clone()
+    }
+
+    /// Record `msg` as a fatal, unrecoverable error and wake main's watcher
+    /// (see main.rs): the process exits non-zero with the message on stderr
+    /// (zipline#83). The first message wins — a later signal keeps the
+    /// original text but still notifies, so main wakes regardless of
+    /// ordering.
+    pub fn signal_fatal_error(&self, msg: String) {
+        {
+            let mut fatal = self.fatal_error.lock().unwrap();
+            if fatal.is_none() {
+                *fatal = Some(msg);
+            }
+        }
+        self.fatal_notify.notify_one();
+    }
+
+    /// The recorded fatal error, if any (see [`Self::signal_fatal_error`]).
+    pub fn get_fatal_error(&self) -> Option<String> {
+        self.fatal_error.lock().unwrap().clone()
     }
 
     /// Node only: the "dock address" is the first local ZPR address.
@@ -787,6 +823,7 @@ pub mod test {
             let config = <config::Config as std::default::Default>::default();
             rcu::RcuBox::new(config)
         });
+        let configured_zpr_addr_demand = config.get().zpr_addr.clone();
         let logging = builder
             .logging
             .unwrap_or_else(|| Mutex::new(HashMap::default()));
@@ -822,7 +859,10 @@ pub mod test {
             certx: builder.certx,
             system_start_time: std::time::Instant::now(),
             address_pool: std::sync::Mutex::new(None),
+            configured_zpr_addr_demand,
             config,
+            fatal_error: Mutex::new(None),
+            fatal_notify: tokio::sync::Notify::new(),
             logging,
             reload_handle,
         }
