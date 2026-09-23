@@ -24,6 +24,15 @@ pub trait TunCtl: Sync {
     /// inspect (currently IPv4 on both Linux and macOS), which callers must
     /// distinguish from a definite "not present".
     fn has_address(&self, addr: IpAddr) -> Result<bool>;
+
+    /// Ensure `dest/prefix_len` is routed on-link via the TUN device.
+    ///
+    /// Idempotent: installing a route that is already present is not an
+    /// error. Used on link activation to give every adapter a return route
+    /// covering the whole ZPR internal network, so replies to peers on
+    /// fabric-assigned (dynamic-pool) addresses have somewhere to go
+    /// (zipline#88).
+    fn add_route(&self, dest: IpAddr, prefix_len: u8) -> Result<()>;
 }
 
 /// Canonical implementation of the `TunCtl` interface, just a thin wrapper
@@ -50,5 +59,8 @@ impl TunCtl for TunCtlImpl {
     }
     fn has_address(&self, addr: IpAddr) -> Result<bool> {
         self.tun.has_address(addr)
+    }
+    fn add_route(&self, dest: IpAddr, prefix_len: u8) -> Result<()> {
+        self.tun.add_route(dest, prefix_len)
     }
 }

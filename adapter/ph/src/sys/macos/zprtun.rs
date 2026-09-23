@@ -10,6 +10,7 @@ use crate::zprtun::ZprTunError;
 use std::process::Command;
 
 const COMMAND_IFCONFIG: &str = "/sbin/ifconfig";
+const COMMAND_ROUTE: &str = "/sbin/route";
 
 pub struct ZprTun {
     inner: tun::Tun,
@@ -96,6 +97,51 @@ impl ZprTun {
                     String::from_utf8_lossy(&output.stderr)
                 ),
             ));
+        }
+        drop(mtx);
+        Ok(())
+    }
+
+    /// Ensure `dest/prefix_len` is routed on-link via this TUN device.
+    ///
+    /// Idempotent: macOS `route add` has no `replace` mode, so a route that
+    /// is already in the table comes back as an error naming "File exists"
+    /// — that outcome is tolerated, everything else is reported.
+    pub fn add_route(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+        if dest.is_ipv4() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "add_route with IPv4 is not supported on macOS",
+            ));
+        }
+        let mtx = self
+            .mtx
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Mutex lock failed"))?;
+        let mut c = Command::new(COMMAND_ROUTE);
+        c.arg("-n")
+            .arg("add")
+            .arg("-inet6")
+            .arg(format!("{}/{}", dest, prefix_len))
+            .arg("-interface")
+            .arg(self.inner.get_name());
+        debug!(target: NET_OS, "{:?}", c);
+        let output = c.output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // The route already being present is the idempotent success case.
+            if !stderr.contains("File exists") && !stderr.contains("already in table") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "{COMMAND_ROUTE} failed to install route {}/{} on {}: {}",
+                        dest,
+                        prefix_len,
+                        self.inner.get_name(),
+                        stderr
+                    ),
+                ));
+            }
         }
         drop(mtx);
         Ok(())
