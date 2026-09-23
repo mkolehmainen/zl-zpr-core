@@ -948,6 +948,43 @@ pub mod test {
             );
         }
 
+        /// VS-pushed revocation (`visa_mgmt::handle_revocation`) must send
+        /// `StreamIdWithdrawal` to every peer holding a forwarding entry for
+        /// the revoked visa — one per live-link entry, each naming that
+        /// link's tether id — so bound peers drop their egress bindings and
+        /// re-request visas instead of blackholing traffic (zipline#85).
+        #[tokio::test]
+        async fn test_handle_revocation_sends_stream_id_withdrawal_to_bound_peers() {
+            let (asm, mut egress_rx, link_a, link_b, tether_a, tether_b) = setup_two_link_visa();
+
+            // setup_two_link_visa inserts the visa with id 3000.
+            crate::visa_mgmt::handle_revocation(&asm, 3000).unwrap();
+
+            let mut got = Vec::new();
+            while let Some(pkt) = try_recv_packet(&mut egress_rx) {
+                let egress_link = pkt.metadata().egress_link_id;
+                let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+                assert_eq!(
+                    base_hdr.packet_type,
+                    zdp::ZdpPacketType::StreamIdWithdrawal,
+                    "only StreamIdWithdrawal may be enqueued by handle_revocation"
+                );
+                let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
+                let (per_flow_hdr, _rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();
+                let stream_id: u32 = per_flow_hdr.stream_id.into();
+                got.push((egress_link, stream_id));
+            }
+            got.sort_unstable();
+
+            let mut expected = vec![(link_a, tether_a), (link_b, tether_b)];
+            expected.sort_unstable();
+            assert_eq!(
+                got, expected,
+                "exactly one StreamIdWithdrawal per live-link forwarding entry, \
+                 each naming that link's tether id"
+            );
+        }
+
         /// Visa expiry must NOT notify peers: both ends hold the same expiry
         /// and eject on their own clocks; an early-sending peer gets
         /// UnknownStreamId and re-requests, unlike the revocation case.
