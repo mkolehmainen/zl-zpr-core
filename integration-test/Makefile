@@ -7,6 +7,7 @@
 #   make docker-test TEST=one-node-test.sh
 #   make docker-test TEST="one-node-test.sh --actor_protocol ipv4"
 #   make docker-test TEST=one-node-test.sh DEBUG_TARGETS="all=INFO zdp=DEBUG"
+#   make docker-test TEST=one-node-test.sh WORKSPACE=/path/containing/src/and/dist
 #   make docker-shell                     # root shell in this directory
 #
 # Host prerequisites: Docker running and the caller in the `docker` group.
@@ -19,8 +20,11 @@ BASE_IMAGE ?= ubuntu:26.04
 
 # The vs, vs-admin, zpdump, ... symlinks point into sibling repositories two
 # levels up, so mount the whole workspace at the same absolute path and they
-# resolve unchanged inside the container.
-WORKSPACE  := $(abspath $(CURDIR)/../..)
+# resolve unchanged inside the container.  Overridable because a zpr-dev build
+# keeps its staged dist/ *beside* src/ rather than inside it, outside the
+# computed mount -- such callers pass WORKSPACE=<build dir containing src/ and
+# dist/> so the staged binaries resolve inside the container too.
+WORKSPACE  ?= $(abspath $(CURDIR)/../..)
 
 # ponytail: --privileged covers CAP_SYS_ADMIN/CAP_NET_ADMIN for netns, /dev/net/tun,
 # and io_uring (blocked by Docker's default seccomp profile) in one flag.  Narrow it
