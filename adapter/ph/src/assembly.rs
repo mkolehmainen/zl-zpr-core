@@ -347,24 +347,44 @@ impl Assembly {
             // Withdraw each revoked stream from the *surviving* peers so
             // they drop their egress bindings and re-request visas instead
             // of blackholing traffic on dead streams (zipline#21). The
-            // message is StreamIdWithdrawal — "the stream id YOU send with
-            // has been withdrawn" — because entry.1 is the tether id the
-            // surviving adapter holds in its *outbound* ELT, not an id in
-            // its inbound DLT (which is what UnbindEgressStreamIndication's
-            // handler removes from). The dying link's own entries are
-            // skipped — that peer is gone.
-            // Note the expiry path (`VisaTable::handle_expirations`)
-            // deliberately does not notify: both ends share the visa expiry
-            // and eject on their own clocks, and a peer that sends early
-            // gets UnknownStreamId and re-requests.
-            for entry in withdrawn {
-                if entry.0 != link_id {
-                    mgmt::requests::send_stream_id_withdrawal(self, entry.0, entry.1).enqueue();
-                }
-            }
+            // dying link's own entries are skipped — that peer is gone.
+            self.withdraw_streams(withdrawn, Some(link_id));
         }
         self.peer_table.remove(link_id);
         info!(target: PEER_MGMT, "Removed peer {}", self.formatted_link_id(link_id));
+    }
+
+    /// Withdraw the given forwarding entries from the peers still bound to
+    /// them by sending each one a `StreamIdWithdrawal` — "the stream id YOU
+    /// send with has been withdrawn" — because `entry.1` is the tether id
+    /// the receiving adapter holds in its *outbound* ELT, not an id in its
+    /// inbound DLT (which is what UnbindEgressStreamIndication's handler
+    /// removes from). Shared by `drop_peer` (zipline#21) and
+    /// `visa_mgmt::handle_revocation` (zipline#85).
+    ///
+    /// `excluded_link` names a dying link whose own entries must be skipped
+    /// (that peer is gone) — `drop_peer` passes it. Entries whose link has
+    /// already left the peer table are skipped as well.
+    ///
+    /// Lock ordering (zipline#9): call this only AFTER releasing the
+    /// visa-table write lock — the send path takes the peer's `zdpr_send`
+    /// mutex, which must never nest under it.
+    ///
+    /// Note the expiry path (`VisaTable::handle_expirations`) deliberately
+    /// does not notify: both ends share the visa expiry and eject on their
+    /// own clocks, and a peer that sends early gets UnknownStreamId and
+    /// re-requests.
+    pub(crate) fn withdraw_streams(
+        &self,
+        withdrawn: Vec<ForwardingEntry>,
+        excluded_link: Option<LinkId>,
+    ) {
+        for entry in withdrawn {
+            if Some(entry.0) == excluded_link || self.peer_table.get(entry.0).is_none() {
+                continue;
+            }
+            mgmt::requests::send_stream_id_withdrawal(self, entry.0, entry.1).enqueue();
+        }
     }
 
     /// Part of graceful shutdown (or administrative link shutdown).
@@ -945,6 +965,43 @@ pub mod test {
             assert!(
                 try_recv_packet(&mut egress_rx).is_none(),
                 "no indication may be sent for the dying link's own entry"
+            );
+        }
+
+        /// VS-pushed revocation (`visa_mgmt::handle_revocation`) must send
+        /// `StreamIdWithdrawal` to every peer holding a forwarding entry for
+        /// the revoked visa — one per live-link entry, each naming that
+        /// link's tether id — so bound peers drop their egress bindings and
+        /// re-request visas instead of blackholing traffic (zipline#85).
+        #[tokio::test]
+        async fn test_handle_revocation_sends_stream_id_withdrawal_to_bound_peers() {
+            let (asm, mut egress_rx, link_a, link_b, tether_a, tether_b) = setup_two_link_visa();
+
+            // setup_two_link_visa inserts the visa with id 3000.
+            crate::visa_mgmt::handle_revocation(&asm, 3000).unwrap();
+
+            let mut got = Vec::new();
+            while let Some(pkt) = try_recv_packet(&mut egress_rx) {
+                let egress_link = pkt.metadata().egress_link_id;
+                let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+                assert_eq!(
+                    base_hdr.packet_type,
+                    zdp::ZdpPacketType::StreamIdWithdrawal,
+                    "only StreamIdWithdrawal may be enqueued by handle_revocation"
+                );
+                let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
+                let (per_flow_hdr, _rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();
+                let stream_id: u32 = per_flow_hdr.stream_id.into();
+                got.push((egress_link, stream_id));
+            }
+            got.sort_unstable();
+
+            let mut expected = vec![(link_a, tether_a), (link_b, tether_b)];
+            expected.sort_unstable();
+            assert_eq!(
+                got, expected,
+                "exactly one StreamIdWithdrawal per live-link forwarding entry, \
+                 each naming that link's tether id"
             );
         }
 

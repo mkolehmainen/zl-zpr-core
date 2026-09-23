@@ -288,14 +288,19 @@ pub fn handle_revocation(
     asm: &Assembly,
     visa_id: VisaId,
 ) -> Result<(), visa_table::VisaTableError> {
-    // NOTE: the withdrawn forwarding entries are dropped here — VS-initiated
-    // revocation does not (yet) notify bound peers. Link-removal revocation
-    // does; see `Assembly::drop_peer` (zipline#21).
-    asm.visa_table
+    // Revoke under the write lock, but hold the withdrawn forwarding
+    // entries until the lock is released, then withdraw each stream from
+    // the peers still bound to it — same rule and same helper as
+    // `Assembly::drop_peer` (zipline#21, zipline#85): the send path must
+    // never nest under the visa-table lock.
+    let withdrawn = asm
+        .visa_table
         .write()
         .unwrap()
-        .revoke(&asm.peer_table, visa_id)
-        .map(|_| ())
+        .revoke(&asm.peer_table, visa_id)?;
+
+    asm.withdraw_streams(withdrawn, None);
+    Ok(())
 }
 
 #[cfg(test)]
