@@ -19,7 +19,7 @@ use std::num::NonZero;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
-use zpr::addrs::ZPRNET_PREFIX_LEN;
+use zpr::addrs::{ZPR_INTERNAL_NETWORK, ZPRNET_PREFIX_LEN};
 use zpr_utils::net_defs::IpAddress;
 
 /// State machine for links and docking sessions
@@ -1540,6 +1540,34 @@ impl LinkStateWrapper {
                             locked_fsm.set_state(LinkState::Error);
                             drop(locked_fsm);
                             return self.initiate_close(asm, TerminateReason::Other);
+                        }
+
+                        // zipline#88: replies to a peer on a fabric-assigned
+                        // (dynamic-pool) address are dropped unless every
+                        // adapter's TUN routes the whole ZPR internal network
+                        // — add_address above only yields an on-link route
+                        // for OUR prefix. Install fd5a:5052::/32 on-link.
+                        //
+                        // Failure handling differs by path (operator ruling,
+                        // zipline#88): on a dynamic grant (nothing was
+                        // configured) fabric-installed state is all the
+                        // adapter has, so a failed install means the link
+                        // cannot function — fail the activation ASAP, like a
+                        // failed add_address. On the static path the
+                        // deployment provisioned addressing and routes out of
+                        // band and may well already carry them, so warn and
+                        // continue.
+                        if let Err(e) = asm
+                            .tun_ctl
+                            .add_route(IpAddr::V6(ZPR_INTERNAL_NETWORK), ZPRNET_PREFIX_LEN)
+                        {
+                            if configured.is_empty() {
+                                warn!(target: LINK_STATE, "{} failed to install ZPR internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}; a dynamically addressed adapter cannot function without it", asm.formatted_link_id(link_id));
+                                locked_fsm.set_state(LinkState::Error);
+                                drop(locked_fsm);
+                                return self.initiate_close(asm, TerminateReason::Other);
+                            }
+                            warn!(target: LINK_STATE, "{} failed to install ZPR internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}; continuing — statically provisioned deployments may already carry it", asm.formatted_link_id(link_id));
                         }
 
                         // Update the global view of our ZPR addresses.
@@ -3291,6 +3319,7 @@ mod tests {
     use std::time::SystemTime;
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
+    use zpr::addrs::{ZPR_INTERNAL_NETWORK, ZPRNET_PREFIX_LEN};
     use zpr_utils::net_defs;
 
     /// Insert an adapter-side (AdapterToNode) peer into the table and return
@@ -5143,6 +5172,187 @@ mod tests {
                         );
                     }
                 }
+            })
+            .await
+    }
+
+    /// zipline#88 RED: an adapter accepting a *dynamic* grant (no configured
+    /// address) must install an on-link route for the whole ZPR internal
+    /// network (`fd5a:5052::/32`) on its TUN at activation, so traffic to
+    /// and from fabric-assigned (dynamic-pool) addresses has a route.
+    #[tokio::test(start_paused = true)]
+    async fn test_dynamic_grant_installs_internal_net_route() {
+        LocalSet::new()
+            .run_until(async {
+                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+
+                let (tun_ctl, routes) = crate::assembly::test::RecordingTunCtl::new(false);
+                let mut builder = TestAssemblyBuilder::new();
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(peer.link_state_machine.get_state(), LinkState::Active);
+                assert!(
+                    routes
+                        .lock()
+                        .unwrap()
+                        .contains(&(IpAddr::V6(ZPR_INTERNAL_NETWORK), ZPRNET_PREFIX_LEN)),
+                    "activation on a dynamic grant must install the ZPR \
+                     internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} \
+                     on the TUN; recorded routes: {:?}",
+                    routes.lock().unwrap()
+                );
+            })
+            .await
+    }
+
+    /// zipline#88 RED: the statically-addressed activation path (grant
+    /// matching the configured demand) must install the same internal-network
+    /// route — this is the peer side of the return path: a static adapter
+    /// with only its own deployment-provisioned routes has no route back to
+    /// a dynamically-addressed peer, so its replies are dropped.
+    #[tokio::test(start_paused = true)]
+    async fn test_static_grant_installs_internal_net_route() {
+        LocalSet::new()
+            .run_until(async {
+                let configured: IpAddr = "fd00:1:2::1".parse().unwrap();
+
+                let (tun_ctl, routes) = crate::assembly::test::RecordingTunCtl::new(false);
+                let mut builder = TestAssemblyBuilder::new();
+                let mut cfg = <crate::config::Config as std::default::Default>::default();
+                cfg.zpr_addr = vec![configured];
+                builder.config = Some(rcu::RcuBox::new(cfg));
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&configured),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(peer.link_state_machine.get_state(), LinkState::Active);
+                assert!(
+                    routes
+                        .lock()
+                        .unwrap()
+                        .contains(&(IpAddr::V6(ZPR_INTERNAL_NETWORK), ZPRNET_PREFIX_LEN)),
+                    "activation on the static-address path must install the ZPR \
+                     internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} \
+                     on the TUN; recorded routes: {:?}",
+                    routes.lock().unwrap()
+                );
+            })
+            .await
+    }
+
+    /// zipline#88 (Q2, fail-fast leg): on a *dynamic* grant the adapter's
+    /// reachability rides entirely on fabric-installed state — nothing was
+    /// provisioned out of band — so a failed route install means the link
+    /// cannot do its job and must fail activation ASAP, exactly like a
+    /// failed `add_address`.
+    #[tokio::test(start_paused = true)]
+    async fn test_dynamic_grant_route_install_failure_is_fatal() {
+        LocalSet::new()
+            .run_until(async {
+                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+
+                let (tun_ctl, _routes) = crate::assembly::test::RecordingTunCtl::new(true);
+                let mut builder = TestAssemblyBuilder::new();
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let state = peer.link_state_machine.get_state();
+                assert!(
+                    matches!(state, LinkState::Error | LinkState::Closing),
+                    "a failed internal-net route install on a dynamic grant \
+                     must fail the activation (like a failed add_address); \
+                     expected Error (or the close it initiates), got {state:?}"
+                );
+            })
+            .await
+    }
+
+    /// zipline#88 (Q2, warn-and-continue leg): on the static-address path
+    /// the deployment provisioned the TUN's addressing and routes out of
+    /// band (and functioned that way before this route existed), so a failed
+    /// route install is a warning, not a reason to refuse a link that may
+    /// work.
+    #[tokio::test(start_paused = true)]
+    async fn test_static_grant_route_install_failure_warns_and_continues() {
+        LocalSet::new()
+            .run_until(async {
+                let configured: IpAddr = "fd00:1:2::1".parse().unwrap();
+
+                let (tun_ctl, _routes) = crate::assembly::test::RecordingTunCtl::new(true);
+                let mut builder = TestAssemblyBuilder::new();
+                let mut cfg = <crate::config::Config as std::default::Default>::default();
+                cfg.zpr_addr = vec![configured];
+                builder.config = Some(rcu::RcuBox::new(cfg));
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&configured),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_state(),
+                    LinkState::Active,
+                    "a statically-provisioned adapter must activate even when \
+                     the internal-net route install fails (warn and continue)"
+                );
+                assert_eq!(asm.get_fatal_error(), None);
             })
             .await
     }

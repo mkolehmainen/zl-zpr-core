@@ -120,6 +120,47 @@ impl ZprTun {
         Ok(())
     }
 
+    /// Ensure `dest/prefix_len` is routed on-link via this TUN device.
+    ///
+    /// `ip -6 route replace` succeeds whether or not the route is already
+    /// present, so the call is idempotent — the same reason `add_address`
+    /// checks first, achieved here by the kernel's own replace semantics.
+    pub fn add_route(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+        if dest.is_ipv4() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "add_route with IPv4 is not supported on linux",
+            ));
+        }
+        let mtx = self
+            .mtx
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Mutex lock failed"))?;
+        let mut c = Command::new(COMMAND_IP);
+        c.arg("-6")
+            .arg("route")
+            .arg("replace")
+            .arg(format!("{}/{}", dest, prefix_len))
+            .arg("dev")
+            .arg(&self.ifname);
+        debug!(target: NET_OS, "{:?}", c);
+        let output = c.output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "{COMMAND_IP} failed to install route {}/{} on {}: {}",
+                    dest,
+                    prefix_len,
+                    self.ifname,
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ));
+        }
+        drop(mtx);
+        Ok(())
+    }
+
     pub fn clear_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()> {
         let mtx = self
             .mtx

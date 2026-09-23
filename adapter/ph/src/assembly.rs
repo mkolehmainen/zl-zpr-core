@@ -593,6 +593,9 @@ pub mod test {
         fn has_address(&self, _addr: IpAddr) -> std::io::Result<bool> {
             Ok(true)
         }
+        fn add_route(&self, _dest: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// A `TunCtl` which reports exactly the addresses it was constructed with,
@@ -613,6 +616,57 @@ pub mod test {
         }
         fn has_address(&self, addr: IpAddr) -> std::io::Result<bool> {
             Ok(self.addresses.contains(&addr))
+        }
+        fn add_route(&self, _dest: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A `TunCtl` recording every `add_route` call, so tests can assert the
+    /// link-activation route install (zipline#88). With `fail_routes` set,
+    /// `add_route` fails instead, modelling a TUN whose routing table cannot
+    /// be updated — the fail-fast/warn-and-continue split's test double.
+    pub struct RecordingTunCtl {
+        pub routes: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
+        pub fail_routes: bool,
+    }
+
+    impl RecordingTunCtl {
+        /// A recording instance plus the shared log the test asserts on.
+        pub fn new(fail_routes: bool) -> (Self, Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) {
+            let routes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    routes: routes.clone(),
+                    fail_routes,
+                },
+                routes,
+            )
+        }
+    }
+
+    impl TunCtl for RecordingTunCtl {
+        fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn add_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn has_address(&self, _addr: IpAddr) -> std::io::Result<bool> {
+            Ok(true)
+        }
+        fn add_route(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+            if self.fail_routes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "RecordingTunCtl: add_route deliberately failing",
+                ));
+            }
+            self.routes.lock().unwrap().push((dest, prefix_len));
+            Ok(())
         }
     }
 

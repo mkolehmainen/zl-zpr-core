@@ -12,6 +12,11 @@ pub use self::macos::TunPiImpl;
 #[cfg(target_os = "macos")]
 pub use self::macos::ZprTun;
 
+// Pure decision logic for the macOS route path. Compiled on every OS so it
+// stays unit-testable from Linux builds; only macOS code calls it at runtime.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod macos_route;
+
 pub(crate) mod posix;
 pub use self::posix::notify;
 
