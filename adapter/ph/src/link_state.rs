@@ -166,6 +166,16 @@ pub enum AuthFailureReason {
     /// terminal outcome instead of polling it as Pending forever. Carries
     /// the TerminateReason's Debug spelling.
     LinkFailed(String),
+    /// The fabric granted a ZPR address set differing from the configured
+    /// `--zpr-addr` / `zpr_addr` (zipline#83): the configured address is a
+    /// demand, not a request, so the adapter refuses to run on the granted
+    /// one — it logs both addresses with the remedy (remove the configured
+    /// address and retry), tears the link down, and exits non-zero. Carries
+    /// both address sets so `ph-cli link show` names them.
+    GrantedAddressMismatch {
+        requested: Vec<IpAddr>,
+        granted: Vec<IpAddr>,
+    },
 }
 
 /// A single credential request forwarded to the out-of-band AuthAgent
@@ -1419,8 +1429,23 @@ impl LinkStateWrapper {
     /// If this inidicates success it will include the ZPR addresses we are
     /// supposed to use.  If this indicates failure we should tear down the link.
     ///
-    /// Currently we tell the node what address we want so these should be no
-    /// suprise and are actually already set.
+    /// **The address model (zipline#83):** a configured `--zpr-addr` /
+    /// `zpr_addr` is a *demand*, not a request. We forward it to the fabric in
+    /// the acquire request, and the fabric normally grants it back — but when
+    /// the visa service scrubs the request (e.g. a user-only actor matching no
+    /// join policy) it assigns a dynamic address instead. An adapter with a
+    /// configured address cannot honor such a grant: its TUN device and routes
+    /// were provisioned for the configured address, so it would keep sourcing
+    /// traffic from an address it no longer owns and the node would deny every
+    /// bind — silently, from the user's point of view. So a granted set that
+    /// differs from the non-empty configured set is a fatal error: log both
+    /// addresses with the remedy (remove the `--zpr-addr` argument / `zpr_addr`
+    /// config line and try again), record
+    /// [AuthFailureReason::GrantedAddressMismatch] for `ph-cli link show`,
+    /// tear the link down, and exit the process non-zero — even if other links
+    /// exist. An adapter with *no* configured address accepts whatever the
+    /// fabric grants: the granted address is added to the TUN and becomes the
+    /// local ZPR address set.
     ///
     /// `result` is Ok(granted addresses) on success; Err(code) carries the
     /// node's failure code, which we map to an [AuthFailureReason] so ph-cli

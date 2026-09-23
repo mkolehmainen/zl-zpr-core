@@ -633,6 +633,8 @@ fn main() -> ExitCode {
         system_start_time,
         address_pool: std::sync::Mutex::new(None),
         config: rcu::RcuBox::new(config),
+        fatal_error: Mutex::new(None),
+        fatal_notify: tokio::sync::Notify::new(),
         logging: Mutex::new(logging_map),
         reload_handle,
     });
