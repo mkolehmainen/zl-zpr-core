@@ -46,8 +46,31 @@ pub enum Platform {
 /// carrier. Lines without a parseable `dev <ifname>` pair are skipped —
 /// this parser reports owners, and a route it cannot attribute to an
 /// interface has no owner to report.
-pub fn parse_route_show(_stdout: &str) -> Vec<RouteOwner> {
-    todo!("zipline#101")
+pub fn parse_route_show(stdout: &str) -> Vec<RouteOwner> {
+    let mut owners = Vec::new();
+    for line in stdout.lines() {
+        let mut tokens = line.split_whitespace();
+        let mut ifname: Option<&str> = None;
+        let mut linkdown = false;
+        while let Some(token) = tokens.next() {
+            match token {
+                "dev" => {
+                    if let Some(name) = tokens.next() {
+                        ifname = Some(name);
+                    }
+                }
+                "linkdown" => linkdown = true,
+                _ => {}
+            }
+        }
+        if let Some(ifname) = ifname {
+            owners.push(RouteOwner {
+                ifname: ifname.to_string(),
+                linkdown,
+            });
+        }
+    }
+    owners
 }
 
 /// Decide whether any of `owners` conflicts with our TUN `our_ifname`.
@@ -61,11 +84,24 @@ pub fn parse_route_show(_stdout: &str) -> Vec<RouteOwner> {
 ///   block startup.
 /// - No route at all: no conflict.
 pub fn route_owner_conflict(
-    _owners: &[RouteOwner],
-    _our_ifname: &str,
-    _platform: Platform,
+    owners: &[RouteOwner],
+    our_ifname: &str,
+    platform: Platform,
 ) -> Option<ConflictingIf> {
-    todo!("zipline#101")
+    owners
+        .iter()
+        .filter(|owner| owner.ifname != our_ifname)
+        .find(|owner| match platform {
+            // A utun exists only while its process holds it: existence is
+            // liveness.
+            Platform::MacOs => true,
+            // A linkdown interface (persistent TUN, nobody attached) holds
+            // only a stale route; it cannot be receiving ZPR traffic.
+            Platform::Linux => !owner.linkdown,
+        })
+        .map(|owner| ConflictingIf {
+            ifname: owner.ifname.clone(),
+        })
 }
 
 #[cfg(test)]

@@ -48,8 +48,16 @@ pub fn existing_route_action(route_get_stdout: &str, our_ifname: &str) -> Existi
 /// [`existing_route_action`], no parseable `interface:` line means "no
 /// owner found" (`None`) rather than a demand to replace: the caller is
 /// asking who owns the route, not whether an install may be skipped.
-pub fn route_get_owner(_route_get_stdout: &str) -> Option<String> {
-    todo!("zipline#101")
+pub fn route_get_owner(route_get_stdout: &str) -> Option<String> {
+    for line in route_get_stdout.lines() {
+        if let Some(value) = line.trim_start().strip_prefix("interface:") {
+            let ifname = value.trim();
+            if !ifname.is_empty() {
+                return Some(ifname.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Outcome of a `route add` / `route delete` invocation.
