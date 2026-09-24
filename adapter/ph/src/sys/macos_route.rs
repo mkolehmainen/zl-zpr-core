@@ -77,10 +77,16 @@ pub fn classify_route_cmd(exit_success: bool, stderr: &str) -> RouteCmdResult {
 /// Classify `route -n get` output when probing whether a route is still
 /// installed: `true` means the route is gone from the table.
 ///
-/// A non-zero exit (macOS `route get` on an absent route) or a
-/// `not in table` marker means gone; a resolved route — exit 0 with no
-/// such marker — means present. Ambiguous output defaults to "present" so
-/// an idempotent delete fails loudly rather than guessing.
+/// Gone is decided by recognized absence markers in the output — macOS
+/// `route get` prints `route has not been found` (with a non-zero exit) or
+/// `not in table` (observed at exit 0 on a real Mac, zipline#100) — and by
+/// nothing else. A probe that fails for an operational reason (killed by a
+/// signal, cannot open the routing socket) exits non-zero *without* an
+/// absence marker, and that means "unknown", not "gone": the caller must
+/// propagate the original delete failure rather than declare success while
+/// a stale route may remain (PR #34 review). Ambiguous output likewise
+/// defaults to "present" so an idempotent delete fails loudly rather than
+/// guessing.
 pub fn route_gone(get_exit_success: bool, get_output: &str) -> bool {
     if !get_exit_success {
         // macOS `route -n get` on an absent route exits non-zero
@@ -277,6 +283,25 @@ add net fd5a:5052::/32: gateway utun5: File exists
     fn get_nonzero_exit_means_gone() {
         // macOS `route -n get` on an absent route exits non-zero.
         assert!(route_gone(false, "route: route has not been found\n"));
+    }
+
+    #[test]
+    fn get_nonzero_exit_without_absence_marker_means_present() {
+        // An operational probe failure — the probe could not query the
+        // table, it did not find the route absent. Declaring "gone" here
+        // would make route_delete swallow the original delete error and
+        // return success while a stale route may remain (PR #34 review).
+        assert!(!route_gone(
+            false,
+            "route: writing to routing socket: Operation not permitted\n"
+        ));
+    }
+
+    #[test]
+    fn get_nonzero_exit_empty_output_means_present() {
+        // E.g. the probe was killed by a signal: no output, nonzero exit.
+        // Nothing said "absent", so never guess gone.
+        assert!(!route_gone(false, ""));
     }
 
     #[test]
