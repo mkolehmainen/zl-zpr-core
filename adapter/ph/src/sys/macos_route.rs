@@ -88,14 +88,11 @@ pub fn classify_route_cmd(exit_success: bool, stderr: &str) -> RouteCmdResult {
 /// defaults to "present" so an idempotent delete fails loudly rather than
 /// guessing.
 pub fn route_gone(get_exit_success: bool, get_output: &str) -> bool {
-    if !get_exit_success {
-        // macOS `route -n get` on an absent route exits non-zero
-        // ("route has not been found").
-        return true;
-    }
-    // Exit 0: gone only if the output says so explicitly — the "not in
-    // table" marker (observed at exit 0 on a real Mac, zipline#100).
-    get_output.contains("not in table")
+    // Exit status is deliberately ignored: /sbin/route pairs both markers
+    // with inconsistent exits, and a non-zero exit alone can also mean the
+    // probe itself failed. Only the text is trusted.
+    let _ = get_exit_success;
+    get_output.contains("route has not been found") || get_output.contains("not in table")
 }
 
 #[cfg(test)]
