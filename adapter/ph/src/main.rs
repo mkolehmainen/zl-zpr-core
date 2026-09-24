@@ -90,8 +90,8 @@ use zpr_ext::socket2::SockAddrExt;
 use zpr_utils::net_defs::SocketAddrExt;
 
 use zpr::addrs::{
-    DEFAULT_TETHER_PORT, VISA_SERVICE_ADDR, VISA_SERVICE_PORT, ZPR_TEMP_LOCAL_ADDRESS,
-    ZPRNET_PREFIX_LEN,
+    DEFAULT_TETHER_PORT, VISA_SERVICE_ADDR, VISA_SERVICE_PORT, ZPR_INTERNAL_NETWORK,
+    ZPR_TEMP_LOCAL_ADDRESS, ZPRNET_PREFIX_LEN,
 };
 use zpr::packet_info::{DOCK_LINK_ID, LOCAL_ACTOR_LINK_ID};
 use zpr::vsapi_types::AuthServicesList;
@@ -360,6 +360,38 @@ fn main() -> ExitCode {
         }
     };
     let tun_ctl = Box::new(tun_ctl::TunCtlImpl::new(tun_devs[0].clone()));
+
+    // zipline#101: only one adapter per host can own fd5a:5052::/32. A
+    // second adapter would dock, activate, and then silently receive no
+    // traffic — its route loses to the first adapter's. Refuse to start
+    // when the internal-network route already resolves to another live
+    // interface (a route on our own TUN — the pre-provisioned tun_if case —
+    // or on a linkdown persistent TUN passes). Read-only route query, so
+    // unprivileged instances can still run it.
+    if ph_mode == PhMode::Adapter {
+        match tun_ctl.route_owner_conflict(IpAddr::V6(ZPR_INTERNAL_NETWORK), ZPRNET_PREFIX_LEN) {
+            Ok(None) => {}
+            Ok(Some(owner_if)) => {
+                error!(
+                    target: STARTUP,
+                    "refusing to start: {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} already \
+                     routes to interface {owner_if} — another ZPR adapter or tool already \
+                     owns ZPR traffic on this host. Stop it (or remove its route) and try \
+                     again; running two adapters on one host is not supported."
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                // Could not read the routing table at all: unknown, not a
+                // conflict. Do not block startup on a failed probe.
+                warn!(
+                    target: STARTUP,
+                    "could not check whether {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} is \
+                     already routed to another interface: {e}; continuing"
+                );
+            }
+        }
+    }
 
     // Node must be set ON (adapter will be turned on as part of finishing hello)
     // TODO: There is more subtlety here, see issue ( https://github.com/org-zpr/zpr-core/issues/937 )

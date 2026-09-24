@@ -596,6 +596,13 @@ pub mod test {
         fn add_route(&self, _dest: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
         }
+        fn route_owner_conflict(
+            &self,
+            _dest: IpAddr,
+            _prefix_len: u8,
+        ) -> std::io::Result<Option<String>> {
+            Ok(None)
+        }
     }
 
     /// A `TunCtl` which reports exactly the addresses it was constructed with,
@@ -620,15 +627,25 @@ pub mod test {
         fn add_route(&self, _dest: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
         }
+        fn route_owner_conflict(
+            &self,
+            _dest: IpAddr,
+            _prefix_len: u8,
+        ) -> std::io::Result<Option<String>> {
+            Ok(None)
+        }
     }
 
     /// A `TunCtl` recording every `add_route` call, so tests can assert the
     /// link-activation route install (zipline#88). With `fail_routes` set,
     /// `add_route` fails instead, modelling a TUN whose routing table cannot
     /// be updated — the fail-fast/warn-and-continue split's test double.
+    /// With `conflict` set, `route_owner_conflict` reports that interface
+    /// as the live owner of the queried route (zipline#101).
     pub struct RecordingTunCtl {
         pub routes: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
         pub fail_routes: bool,
+        pub conflict: Option<String>,
     }
 
     impl RecordingTunCtl {
@@ -639,9 +656,18 @@ pub mod test {
                 Self {
                     routes: routes.clone(),
                     fail_routes,
+                    conflict: None,
                 },
                 routes,
             )
+        }
+
+        /// A recording instance whose `route_owner_conflict` names
+        /// `owner_if` as the conflicting live owner (zipline#101).
+        pub fn with_conflict(owner_if: &str) -> (Self, Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) {
+            let (mut tun_ctl, routes) = Self::new(false);
+            tun_ctl.conflict = Some(owner_if.to_string());
+            (tun_ctl, routes)
         }
     }
 
@@ -667,6 +693,13 @@ pub mod test {
             }
             self.routes.lock().unwrap().push((dest, prefix_len));
             Ok(())
+        }
+        fn route_owner_conflict(
+            &self,
+            _dest: IpAddr,
+            _prefix_len: u8,
+        ) -> std::io::Result<Option<String>> {
+            Ok(self.conflict.clone())
         }
     }
 

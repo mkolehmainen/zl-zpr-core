@@ -9,6 +9,7 @@ use tokio_tun::{Tun, TunBuilder};
 use tracing::*;
 
 use crate::logging::targets::NET_OS;
+use crate::sys::linux_route;
 use crate::zprtun::ZprTunError;
 
 const COMMAND_IP: &str = "/usr/sbin/ip";
@@ -159,6 +160,50 @@ impl ZprTun {
         }
         drop(mtx);
         Ok(())
+    }
+
+    /// Report another live interface already carrying the route for
+    /// `dest/prefix_len`, if any (zipline#101).
+    ///
+    /// Reads `ip -6 route show <prefix>` — an unprivileged, read-only
+    /// query, so pre-provisioned `tun_if` instances running without
+    /// privileges can still perform the check. A route on this TUN or on a
+    /// `linkdown` interface (a persistent TUN with nobody attached, whose
+    /// stale route must not block startup) is not a conflict.
+    pub fn route_owner_conflict(
+        &self,
+        dest: IpAddr,
+        prefix_len: u8,
+    ) -> std::io::Result<Option<String>> {
+        if dest.is_ipv4() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "route_owner_conflict with IPv4 is not supported on linux",
+            ));
+        }
+        let mut c = Command::new(COMMAND_IP);
+        c.arg("-6")
+            .arg("route")
+            .arg("show")
+            .arg(format!("{}/{}", dest, prefix_len));
+        debug!(target: NET_OS, "{:?}", c);
+        let output = c.output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "{COMMAND_IP} failed to show routes for {}/{}: {}",
+                    dest,
+                    prefix_len,
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ));
+        }
+        let owners = linux_route::parse_route_show(&String::from_utf8_lossy(&output.stdout));
+        Ok(
+            linux_route::route_owner_conflict(&owners, &self.ifname, linux_route::Platform::Linux)
+                .map(|conflict| conflict.ifname),
+        )
     }
 
     pub fn clear_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()> {

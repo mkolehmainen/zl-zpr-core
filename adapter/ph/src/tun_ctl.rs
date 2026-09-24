@@ -33,6 +33,18 @@ pub trait TunCtl: Sync {
     /// fabric-assigned (dynamic-pool) addresses have somewhere to go
     /// (zipline#88).
     fn add_route(&self, dest: IpAddr, prefix_len: u8) -> Result<()>;
+
+    /// Report the name of another **live** interface that already carries
+    /// the route for `dest/prefix_len`, if any (zipline#101).
+    ///
+    /// Only one adapter per host can own the ZPR internal network: a
+    /// second adapter whose route loses to another interface docks,
+    /// activates, and then silently receives no traffic. `Ok(None)` means
+    /// the route is absent, on our own TUN, or (Linux) only on a
+    /// `linkdown` interface; `Ok(Some(ifname))` names the conflicting
+    /// owner. `Err` means the routing table could not be queried at all —
+    /// callers must treat that as "unknown", not as a conflict.
+    fn route_owner_conflict(&self, dest: IpAddr, prefix_len: u8) -> Result<Option<String>>;
 }
 
 /// Canonical implementation of the `TunCtl` interface, just a thin wrapper
@@ -62,5 +74,8 @@ impl TunCtl for TunCtlImpl {
     }
     fn add_route(&self, dest: IpAddr, prefix_len: u8) -> Result<()> {
         self.tun.add_route(dest, prefix_len)
+    }
+    fn route_owner_conflict(&self, dest: IpAddr, prefix_len: u8) -> Result<Option<String>> {
+        self.tun.route_owner_conflict(dest, prefix_len)
     }
 }

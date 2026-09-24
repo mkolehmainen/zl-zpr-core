@@ -1542,11 +1542,44 @@ impl LinkStateWrapper {
                             return self.initiate_close(asm, TerminateReason::Other);
                         }
 
+                        // zipline#101: before installing our own internal-
+                        // network route, check whether another live interface
+                        // already owns fd5a:5052::/32 — a second adapter that
+                        // activates anyway gets no traffic and nothing says
+                        // why. Failure handling follows the zipline#88 ruling
+                        // (same split as the add_route failure below): on a
+                        // dynamic grant fail the activation; on the static
+                        // path warn and continue. A query error means
+                        // "unknown", not "conflict" — never fail on a probe
+                        // that could not run.
+                        match asm.tun_ctl.route_owner_conflict(
+                            IpAddr::V6(ZPR_INTERNAL_NETWORK),
+                            ZPRNET_PREFIX_LEN,
+                        ) {
+                            Ok(None) => {}
+                            Ok(Some(owner_if)) => {
+                                if configured.is_empty() {
+                                    warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} already routes to interface {owner_if} — another ZPR adapter or tool already owns ZPR traffic on this host; failing activation", asm.formatted_link_id(link_id));
+                                    locked_fsm.set_state(LinkState::Error);
+                                    drop(locked_fsm);
+                                    return self.initiate_close(asm, TerminateReason::Other);
+                                }
+                                warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} already routes to interface {owner_if}; continuing — statically provisioned deployments may carry their own routes", asm.formatted_link_id(link_id));
+                            }
+                            Err(e) => {
+                                warn!(target: LINK_STATE, "{} could not check the owner of {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}; continuing", asm.formatted_link_id(link_id));
+                            }
+                        }
+
                         // zipline#88: replies to a peer on a fabric-assigned
                         // (dynamic-pool) address are dropped unless every
-                        // adapter's TUN routes the whole ZPR internal network
-                        // — add_address above only yields an on-link route
-                        // for OUR prefix. Install fd5a:5052::/32 on-link.
+                        // adapter's TUN routes the whole ZPR internal network.
+                        // With a /32 address, add_address above already yields
+                        // that route — both kernels install fd5a:5052::/32
+                        // themselves (zipline#101). The explicit install
+                        // matters when an address was pre-provisioned with a
+                        // longer prefix (e.g. /128): add_address skips, no
+                        // /32 route appears, so install it here.
                         //
                         // Failure handling differs by path (operator ruling,
                         // zipline#88): on a dynamic grant (nothing was
@@ -5351,6 +5384,98 @@ mod tests {
                     LinkState::Active,
                     "a statically-provisioned adapter must activate even when \
                      the internal-net route install fails (warn and continue)"
+                );
+                assert_eq!(asm.get_fatal_error(), None);
+            })
+            .await
+    }
+
+    /// zipline#101 (fail-fast leg): on a *dynamic* grant, another live
+    /// interface already owning fd5a:5052::/32 means this adapter's route
+    /// would lose and it would activate into silence — fail the activation,
+    /// same handling as a failed add_address.
+    #[tokio::test(start_paused = true)]
+    async fn test_dynamic_grant_route_owner_conflict_is_fatal() {
+        LocalSet::new()
+            .run_until(async {
+                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+
+                let (tun_ctl, routes) =
+                    crate::assembly::test::RecordingTunCtl::with_conflict("tunA");
+                let mut builder = TestAssemblyBuilder::new();
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let state = peer.link_state_machine.get_state();
+                assert!(
+                    matches!(state, LinkState::Error | LinkState::Closing),
+                    "a route-owner conflict on a dynamic grant must fail the \
+                     activation; expected Error (or the close it initiates), \
+                     got {state:?}"
+                );
+                assert!(
+                    routes.lock().unwrap().is_empty(),
+                    "no route must be installed over a conflicting owner's; \
+                     recorded routes: {:?}",
+                    routes.lock().unwrap()
+                );
+            })
+            .await
+    }
+
+    /// zipline#101 (warn-and-continue leg): on the static-address path a
+    /// route owned elsewhere is a warning, consistent with the zipline#88
+    /// ruling for a failed route install on that path.
+    #[tokio::test(start_paused = true)]
+    async fn test_static_grant_route_owner_conflict_warns_and_continues() {
+        LocalSet::new()
+            .run_until(async {
+                let configured: IpAddr = "fd00:1:2::1".parse().unwrap();
+
+                let (tun_ctl, _routes) =
+                    crate::assembly::test::RecordingTunCtl::with_conflict("tunA");
+                let mut builder = TestAssemblyBuilder::new();
+                let mut cfg = <crate::config::Config as std::default::Default>::default();
+                cfg.zpr_addr = vec![configured];
+                builder.config = Some(rcu::RcuBox::new(cfg));
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&configured),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_state(),
+                    LinkState::Active,
+                    "a statically-provisioned adapter must activate despite a \
+                     route-owner conflict (warn and continue)"
                 );
                 assert_eq!(asm.get_fatal_error(), None);
             })
