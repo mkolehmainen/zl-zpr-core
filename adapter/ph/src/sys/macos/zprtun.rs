@@ -6,7 +6,7 @@ use tracing::*;
 
 use crate::logging::targets::NET_OS;
 use crate::sys::macos::tun;
-use crate::sys::macos_route::{self, ExistingRouteAction};
+use crate::sys::macos_route::{self, ExistingRouteAction, RouteCmdResult};
 use crate::zprtun::ZprTunError;
 use std::process::Command;
 
@@ -124,9 +124,15 @@ impl ZprTun {
             .lock()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Mutex lock failed"))?;
         let output = self.route_add(dest, prefix_len)?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("File exists") && !stderr.contains("already in table") {
+        // /sbin/route exits 0 even when the add failed with "File exists"
+        // (observed on a real Mac, zipline#100), so classification reads
+        // stderr regardless of the exit status.
+        match macos_route::classify_route_cmd(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stderr),
+        ) {
+            RouteCmdResult::Ok => {}
+            RouteCmdResult::Failed(stderr) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!(
@@ -140,7 +146,7 @@ impl ZprTun {
             }
             // The prefix is already routed — but "File exists" does not say
             // via what. Verify before treating this as idempotent success.
-            match self.existing_route_target(dest, prefix_len)? {
+            RouteCmdResult::Exists => match self.existing_route_target(dest, prefix_len)? {
                 ExistingRouteAction::AlreadyOurs => {}
                 ExistingRouteAction::Replace => {
                     debug!(
@@ -152,21 +158,30 @@ impl ZprTun {
                     );
                     self.route_delete(dest, prefix_len)?;
                     let output = self.route_add(dest, prefix_len)?;
-                    if !output.status.success() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!(
-                                "{COMMAND_ROUTE} failed to reinstall route {}/{} on {} after \
-                                 deleting the stale route: {}",
-                                dest,
-                                prefix_len,
-                                self.inner.get_name(),
-                                String::from_utf8_lossy(&output.stderr)
-                            ),
-                        ));
+                    // An `Exists` here, right after deleting the stale
+                    // route, is unexpected: treat anything non-clean as a
+                    // failure.
+                    match macos_route::classify_route_cmd(
+                        output.status.success(),
+                        &String::from_utf8_lossy(&output.stderr),
+                    ) {
+                        RouteCmdResult::Ok => {}
+                        RouteCmdResult::Exists | RouteCmdResult::Failed(_) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!(
+                                    "{COMMAND_ROUTE} failed to reinstall route {}/{} on {} after \
+                                     deleting the stale route: {}",
+                                    dest,
+                                    prefix_len,
+                                    self.inner.get_name(),
+                                    String::from_utf8_lossy(&output.stderr)
+                                ),
+                            ));
+                        }
                     }
                 }
-            }
+            },
         }
         drop(mtx);
         Ok(())
@@ -212,6 +227,12 @@ impl ZprTun {
     }
 
     /// Delete whatever route is installed for `dest/prefix_len`.
+    ///
+    /// Idempotent: the contract is "the route is gone afterwards". On any
+    /// non-clean `route delete` result — including exit 0 with error text,
+    /// which macOS produces for "not in table" (zipline#100) — the routing
+    /// table is probed with `route -n get`; if the route is gone the delete
+    /// succeeded for our purposes (logged at warn), otherwise it failed.
     fn route_delete(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
         let mut c = Command::new(COMMAND_ROUTE);
         c.arg("-n")
@@ -220,18 +241,52 @@ impl ZprTun {
             .arg(format!("{}/{}", dest, prefix_len));
         debug!(target: NET_OS, "{:?}", c);
         let output = c.output()?;
-        if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "{COMMAND_ROUTE} failed to delete stale route {}/{}: {}",
-                    dest,
-                    prefix_len,
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
+        match macos_route::classify_route_cmd(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stderr),
+        ) {
+            RouteCmdResult::Ok => Ok(()),
+            RouteCmdResult::Exists | RouteCmdResult::Failed(_) => {
+                let delete_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                // Probe whether the route is still in the table: an absent
+                // route means the contract is met whatever the delete said.
+                let mut c = Command::new(COMMAND_ROUTE);
+                c.arg("-n")
+                    .arg("get")
+                    .arg("-inet6")
+                    .arg(format!("{}/{}", dest, prefix_len));
+                debug!(target: NET_OS, "{:?}", c);
+                let get = c.output()?;
+                let get_output = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&get.stdout),
+                    String::from_utf8_lossy(&get.stderr)
+                );
+                if macos_route::route_gone(get.status.success(), &get_output) {
+                    warn!(
+                        target: NET_OS,
+                        "route delete {}/{} reported an error but the route is gone; \
+                         treating as success (stderr: {})",
+                        dest,
+                        prefix_len,
+                        delete_stderr.trim()
+                    );
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "{COMMAND_ROUTE} failed to delete route {}/{} and it is still \
+                             in the table: delete stderr: {}; route get output: {}",
+                            dest,
+                            prefix_len,
+                            delete_stderr.trim(),
+                            get_output.trim()
+                        ),
+                    ))
+                }
+            }
         }
-        Ok(())
     }
 
     pub fn clear_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {

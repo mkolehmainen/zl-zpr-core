@@ -63,13 +63,13 @@ pub enum RouteCmdResult {
 /// Classify the result of a `route add` / `route delete` command from its
 /// exit status and stderr.
 pub fn classify_route_cmd(exit_success: bool, stderr: &str) -> RouteCmdResult {
-    // RED stub: mirrors the pre-fix call sites, which trust the exit status
-    // and read stderr only after a non-zero exit.
-    if exit_success {
-        return RouteCmdResult::Ok;
-    }
+    // stderr is read before the exit status: /sbin/route exits 0 on
+    // failures it reports only as text (see the enum docs).
     if stderr.contains("File exists") || stderr.contains("already in table") {
         return RouteCmdResult::Exists;
+    }
+    if exit_success && stderr.trim().is_empty() {
+        return RouteCmdResult::Ok;
     }
     RouteCmdResult::Failed(stderr.to_string())
 }
@@ -82,9 +82,14 @@ pub fn classify_route_cmd(exit_success: bool, stderr: &str) -> RouteCmdResult {
 /// such marker — means present. Ambiguous output defaults to "present" so
 /// an idempotent delete fails loudly rather than guessing.
 pub fn route_gone(get_exit_success: bool, get_output: &str) -> bool {
-    // RED stub: pre-fix semantics — only a non-zero exit means gone.
-    let _ = get_output;
-    !get_exit_success
+    if !get_exit_success {
+        // macOS `route -n get` on an absent route exits non-zero
+        // ("route has not been found").
+        return true;
+    }
+    // Exit 0: gone only if the output says so explicitly — the "not in
+    // table" marker (observed at exit 0 on a real Mac, zipline#100).
+    get_output.contains("not in table")
 }
 
 #[cfg(test)]
