@@ -78,6 +78,10 @@ icmp_codes = [ 128, 129 ]
 
 [services.Web]
 protocol = "ping"
+# zipline#96: pin adapter2's static ZPR address in policy (source 1 of the
+# static-address-grants rule). adapter1 stays dynamic — it is the one
+# dynamic-path test and has no join policy to pin.
+provider = [["zpr.addr", "fd5a:5052:8888::2:1"]]
 
 [services.PingableVs]
 protocol = "ping"
