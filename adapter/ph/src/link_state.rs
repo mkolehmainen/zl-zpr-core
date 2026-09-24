@@ -5482,6 +5482,118 @@ mod tests {
             .await
     }
 
+    /// zipline#101 (concurrent-activation race, Codex P1 on PR #35): two
+    /// adapters activating at once each pass the pre-install probe — the
+    /// other's route is still `linkdown` (carrier down) and filtered — and
+    /// then both raise carrier, leaving both active and traffic silently
+    /// split. The claim (route + carrier) must be re-verified after it is
+    /// made visible: whichever adapter re-probes last sees the other's
+    /// carrier already up, so both cannot stay active. On a dynamic grant
+    /// a post-carrier conflict must retract the claim (carrier back down)
+    /// and fail the activation.
+    #[tokio::test(start_paused = true)]
+    async fn test_dynamic_grant_late_route_owner_conflict_backs_off() {
+        LocalSet::new()
+            .run_until(async {
+                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+
+                let (tun_ctl, _routes) =
+                    crate::assembly::test::RecordingTunCtl::with_late_conflict("tunA");
+                let probes = tun_ctl.probes.clone();
+                let carriers = tun_ctl.carriers.clone();
+                let mut builder = TestAssemblyBuilder::new();
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
+                    ])),
+                )
+                .unwrap();
+
+                assert!(
+                    probes.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+                    "the ownership claim must be re-verified after carrier-up \
+                     (got {} probe(s)); a single pre-install probe is the \
+                     TOCTOU window two concurrent adapters both slip through",
+                    probes.load(std::sync::atomic::Ordering::SeqCst)
+                );
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let state = peer.link_state_machine.get_state();
+                assert!(
+                    matches!(state, LinkState::Error | LinkState::Closing),
+                    "a conflict surfacing after carrier-up on a dynamic grant \
+                     must fail the activation; got {state:?}"
+                );
+                assert_eq!(
+                    carriers.lock().unwrap().last(),
+                    Some(&false),
+                    "the losing adapter must retract its carrier claim, not \
+                     leave the TUN up; carrier calls: {:?}",
+                    carriers.lock().unwrap()
+                );
+            })
+            .await
+    }
+
+    /// zipline#101: on the static-address path a conflict surfacing after
+    /// carrier-up is a warning, consistent with the zipline#88 ruling for
+    /// the pre-install probe and the route install on that path.
+    #[tokio::test(start_paused = true)]
+    async fn test_static_grant_late_route_owner_conflict_warns_and_continues() {
+        LocalSet::new()
+            .run_until(async {
+                let configured: IpAddr = "fd00:1:2::1".parse().unwrap();
+
+                let (tun_ctl, _routes) =
+                    crate::assembly::test::RecordingTunCtl::with_late_conflict("tunA");
+                let carriers = tun_ctl.carriers.clone();
+                let mut builder = TestAssemblyBuilder::new();
+                let mut cfg = <crate::config::Config as std::default::Default>::default();
+                cfg.zpr_addr = vec![configured];
+                builder.config = Some(rcu::RcuBox::new(cfg));
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&configured),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_state(),
+                    LinkState::Active,
+                    "a statically-provisioned adapter must activate despite a \
+                     late route-owner conflict (warn and continue)"
+                );
+                assert_eq!(
+                    carriers.lock().unwrap().last(),
+                    Some(&true),
+                    "the static path must leave the carrier up"
+                );
+                assert_eq!(asm.get_fatal_error(), None);
+            })
+            .await
+    }
+
     #[tokio::test(start_paused = true)]
     async fn timeout_test() {
         LocalSet::new()
