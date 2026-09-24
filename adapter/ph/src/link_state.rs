@@ -1607,6 +1607,45 @@ impl LinkStateWrapper {
                         asm.set_local_zpr_addrs(addrs);
 
                         asm.tun_ctl.set_carrier(true).unwrap();
+
+                        // zipline#101 (Codex P1 on PR #35): the pre-install
+                        // probe above cannot see a concurrent adapter whose
+                        // carrier is still down — its route reads `linkdown`
+                        // and is filtered as an unattended persistent TUN —
+                        // so two adapters activating at once both pass it and
+                        // both raise carrier. Re-verify the claim now that
+                        // ours is fully visible (route installed, carrier
+                        // up). The ordering makes the race safe without a
+                        // cross-process lock: each adapter re-probes only
+                        // AFTER its own carrier-up, so two overlapping
+                        // activations cannot both observe a clear table —
+                        // whichever re-probes later sees the other live, and
+                        // at least one backs off (possibly both; failing
+                        // loudly beats both staying active in silence). On a
+                        // dynamic grant a conflict retracts the carrier
+                        // claim and fails the activation; the static path
+                        // warns and continues, same ruling as above. A probe
+                        // error is "unknown", never a conflict.
+                        match asm.tun_ctl.route_owner_conflict(
+                            IpAddr::V6(ZPR_INTERNAL_NETWORK),
+                            ZPRNET_PREFIX_LEN,
+                        ) {
+                            Ok(None) => {}
+                            Ok(Some(owner_if)) => {
+                                if configured.is_empty() {
+                                    warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} routes to interface {owner_if} after carrier-up — a concurrently starting ZPR adapter owns ZPR traffic on this host; backing off and failing activation", asm.formatted_link_id(link_id));
+                                    asm.tun_ctl.set_carrier(false).unwrap();
+                                    locked_fsm.set_state(LinkState::Error);
+                                    drop(locked_fsm);
+                                    return self.initiate_close(asm, TerminateReason::Other);
+                                }
+                                warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} routes to interface {owner_if} after carrier-up; continuing — statically provisioned deployments may carry their own routes", asm.formatted_link_id(link_id));
+                            }
+                            Err(e) => {
+                                warn!(target: LINK_STATE, "{} could not re-check the owner of {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} after carrier-up: {e}; continuing", asm.formatted_link_id(link_id));
+                            }
+                        }
+
                         debug!(
                             target: LINK_STATE,
                             "{} finished registering actor address: becoming active", asm.formatted_link_id(link_id)
