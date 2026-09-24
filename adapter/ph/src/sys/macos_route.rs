@@ -40,6 +40,18 @@ pub fn existing_route_action(route_get_stdout: &str, our_ifname: &str) -> Existi
     ExistingRouteAction::Replace
 }
 
+/// Interface named by `route -n get` output, if any: the owner of the
+/// looked-up route.
+///
+/// The zipline#101 route-owner check feeds this to
+/// [`super::linux_route::route_owner_conflict`]. Unlike
+/// [`existing_route_action`], no parseable `interface:` line means "no
+/// owner found" (`None`) rather than a demand to replace: the caller is
+/// asking who owns the route, not whether an install may be skipped.
+pub fn route_get_owner(_route_get_stdout: &str) -> Option<String> {
+    todo!("zipline#101")
+}
+
 /// Outcome of a `route add` / `route delete` invocation.
 ///
 /// macOS `/sbin/route` exits **0** even when the operation failed — observed
@@ -162,6 +174,45 @@ destination: fd5a:5052::
             existing_route_action("  interface: \n", "utun4"),
             ExistingRouteAction::Replace
         );
+    }
+
+    // ---- route_get_owner (zipline#101) ----
+    //
+    // The two-adapter Mac case from the issue (observed 2026-09-24):
+    // adapter A holds the unscoped route (`fd5a:5052::/32 Uc utun4`),
+    // adapter B only an interface-scoped one (`UcI utun5`). `route -n get`
+    // resolves via the unscoped route, so from B's seat the lookup names
+    // utun4 — someone else owns ZPR traffic on this host, even though B has
+    // a route of its own on utun5.
+
+    /// What B sees: `route -n get fd5a:5052::/32` resolving to A's utun.
+    const GET_SHADOWED_BY_OTHER_UTUN: &str = "\
+   route to: fd5a:5052::
+destination: fd5a:5052::
+       mask: ffff:ffff::
+  interface: utun4
+      flags: <UP,DONE,CLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      2000         0
+";
+
+    #[test]
+    fn get_owner_names_the_resolving_interface() {
+        assert_eq!(route_get_owner(GET_ON_OUR_TUN), Some("utun4".to_string()));
+        assert_eq!(
+            route_get_owner(GET_SHADOWED_BY_OTHER_UTUN),
+            Some("utun4".to_string())
+        );
+        assert_eq!(route_get_owner(GET_VIA_OTHER_IF), Some("en0".to_string()));
+    }
+
+    #[test]
+    fn get_owner_without_interface_line_is_none() {
+        // "no owner found", not "replace": route_get_owner answers who owns
+        // the route, and absence of an answer must not fabricate one.
+        assert_eq!(route_get_owner("not route output\n"), None);
+        assert_eq!(route_get_owner(""), None);
+        assert_eq!(route_get_owner("  interface: \n"), None);
     }
 
     // ---- classify_route_cmd ----
