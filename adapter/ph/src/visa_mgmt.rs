@@ -1,5 +1,4 @@
 use crate::auth::AuthBlob;
-use crate::counters::ManagementCounterType;
 use crate::link_state::{LinkEvent, LinkStateError};
 use crate::prelude::*;
 use crate::visa_table;
@@ -246,6 +245,12 @@ pub async fn actor_disconnect(asm: Arc<Assembly>, addr: IpAddress) {
 }
 
 /// Insert visa into table.
+///
+/// A visa whose next hop has no egress link yet is still stored, with a
+/// warning. The VS legitimately sends such visas -- e.g. a bootstrap visa for
+/// a policy-declared peer node that has not linked up yet -- and the egress
+/// link is resolved again at forwarding time (see [get_egress_link_for_visa]),
+/// so the visa becomes usable once the link comes up.
 pub fn insert_visa(
     asm: &Assembly,
     visa: vsapi_types::Visa,
@@ -260,8 +265,8 @@ pub fn insert_visa(
         .map(|p| p.next_hop)
         .unwrap_or(dest_addr);
     if asm.find_egress_link(next_hop.into()).is_none() {
-        asm.counters.management[ManagementCounterType::VisaRequestError].increment();
-        return Err(visa_table::VisaTableError::DestNotFound(next_hop.into()));
+        warn!(target: VISA_MGMT,
+            "visa {}: no egress link to next hop {next_hop} yet; storing it anyway", visa.issuer_id);
     }
     let visa_id = asm.visa_table.write().unwrap().insert_visa(visa)?;
     Ok(visa_id)
@@ -309,6 +314,47 @@ mod tests {
     use crate::auth::{self, BLOB_TYPE_OIDC, BLOB_TYPE_SS, ZdpOidcBlob, ZdpSelfSignedBlob};
     use crate::zdp::ResponseCode;
     use zpr::vsapi_types::{ApiResponseError, ErrorCode};
+
+    /// A pushed visa whose next hop has no egress link yet (e.g. a bootstrap
+    /// visa for a policy-declared peer node that has not linked up) must
+    /// still be stored. Rejecting it makes the VS retry the push forever and
+    /// blocks every visa queued behind it; the egress link is looked up again
+    /// at forwarding time by `get_egress_link_for_visa`.
+    #[test]
+    fn test_insert_visa_without_egress_link_is_stored() {
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        use crate::visa_table::VisaTable;
+        use crate::visa_table::tests::new_vsapi_visa_tcp_default;
+
+        let mut builder = TestAssemblyBuilder::new();
+        builder.visa_table = Some(VisaTable::new());
+        let asm = create_assembly(builder);
+
+        let visa_id = 4242;
+        // No peers exist, so the visa's destination has no egress link.
+        let visa =
+            new_vsapi_visa_tcp_default(visa_id, chrono::DateTime::<chrono::Utc>::MAX_UTC.into());
+        assert!(
+            asm.find_egress_link(visa.dock_pep.as_ref().unwrap().dest_addr.into())
+                .is_none()
+        );
+
+        let inserted = insert_visa(&asm, visa).expect("visa without egress link must be accepted");
+        assert_eq!(inserted, visa_id as VisaId);
+        assert!(
+            asm.visa_table
+                .read()
+                .unwrap()
+                .get_visa_next_hop_addr(inserted)
+                .is_ok(),
+            "visa must be stored in the visa table"
+        );
+        // Forwarding still refuses it until a link to the next hop exists.
+        assert!(matches!(
+            get_egress_link_for_visa(&asm, inserted),
+            Err(visa_table::VisaTableError::DestNotFound(_))
+        ));
+    }
 
     #[test]
     fn test_response_code_for_vs_error_mapping_table() {
