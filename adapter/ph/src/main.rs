@@ -4,7 +4,6 @@ use itertools::izip;
 use km_cert_exchange::KmCertExchange;
 use std::default::Default;
 use std::fs;
-use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::process;
 use std::process::ExitCode;
@@ -268,17 +267,15 @@ fn main() -> ExitCode {
     // create control socket
     //
 
-    fs::remove_file(&config.control_path)
-        .or_else(|e| {
-            if e.kind() == ErrorKind::NotFound {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        })
-        .unwrap();
-    let control_socket =
-        UnixListener::bind(&config.control_path).expect("failed to bind to control socket");
+    let control_socket = match socket_access::bind_socket("control", &config.control_path)
+        .and_then(UnixListener::from_std)
+    {
+        Ok(socket) => socket,
+        Err(e) => {
+            error!(target: STARTUP, "{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     info!(target: STARTUP, "control socket bound to {:?}", config.control_path);
 
     // zipline#39: hand the socket to whoever should drive ph-cli. Owner known
@@ -307,18 +304,15 @@ fn main() -> ExitCode {
 
     #[cfg(not(feature = "capnp-ancillary"))]
     let capture_socket = {
-        fs::remove_file(&config.capture_path)
-            .or_else(|e| {
-                if e.kind() == ErrorKind::NotFound {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })
-            .unwrap();
-        let capture_socket = Arc::new(
-            UnixListener::bind(&config.capture_path).expect("failed to bind to capture socket"),
-        );
+        let capture_socket = match socket_access::bind_socket("capture", &config.capture_path)
+            .and_then(UnixListener::from_std)
+        {
+            Ok(socket) => Arc::new(socket),
+            Err(e) => {
+                error!(target: STARTUP, "{e}");
+                return ExitCode::FAILURE;
+            }
+        };
         info!(target: STARTUP, "capture socket bound to {:?}", config.capture_path);
         // zipline#39: same ownership/mode treatment as the control socket.
         if let Err(e) = socket_access::apply_socket_access(&config.capture_path, &socket_plan) {

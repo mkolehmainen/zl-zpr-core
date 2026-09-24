@@ -16,6 +16,8 @@
 //! [plan_socket_access] is the pure, unit-tested decision; [apply_socket_access]
 //! is the thin syscall wrapper around it.
 
+use std::io;
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 use admin_api::SocketOwner;
@@ -69,6 +71,34 @@ where
     }
 }
 
+/// Bind a listening unix socket at `path`, first removing any stale socket
+/// file a previous run left behind. The listener is returned nonblocking so
+/// the caller can hand it to tokio with `UnixListener::from_std`.
+///
+/// Every error names the socket and its path and says what to do about it:
+/// the usual cause is running `ph` unprivileged while the socket directory
+/// (`/var/run/zpr` by default) is root-owned, which used to surface as a bare
+/// `PermissionDenied` panic with no path.
+pub fn bind_socket(desc: &str, path: &Path) -> io::Result<UnixListener> {
+    let explain = |what: &str, e: io::Error| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "{what} {desc} socket {path:?}: {e} \
+                 (run ph as root, or set `{desc}_path` to a socket in a writable directory)"
+            ),
+        )
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(explain("failed to remove stale", e)),
+    }
+    let listener = UnixListener::bind(path).map_err(|e| explain("failed to bind", e))?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
 /// Apply the plan to a bound socket path. Thin syscall wrapper; the decision
 /// logic lives in [plan_socket_access].
 pub fn apply_socket_access(path: &Path, plan: &SocketAccess) -> std::io::Result<()> {
@@ -106,6 +136,51 @@ pub fn system_group_gid(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A fresh directory under the system temp dir, unique per test.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ph-sock-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    /// Binding twice at the same path works: the second bind removes the
+    /// stale socket file the first one left behind.
+    #[test]
+    fn bind_socket_replaces_stale_socket_file() {
+        let dir = scratch_dir("stale");
+        let path = dir.join("control.sock");
+        drop(bind_socket("control", &path).unwrap());
+        assert!(path.exists(), "socket file should be left behind on drop");
+        bind_socket("control", &path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stale socket the process cannot remove yields a PermissionDenied
+    /// error that names the socket, the path and the fix, not a bare EACCES.
+    #[test]
+    fn bind_socket_names_path_when_stale_socket_is_unremovable() {
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipped: root can remove anything");
+            return;
+        }
+        let dir = scratch_dir("denied");
+        let path = dir.join("control.sock");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let err = bind_socket("control", &path).unwrap_err();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let msg = err.to_string();
+        assert!(msg.contains("control socket"), "{msg}");
+        assert!(msg.contains(path.to_str().unwrap()), "{msg}");
+        assert!(msg.contains("control_path"), "{msg}");
+    }
 
     // Lookups that must not be consulted for a given case.
     fn no_user_lookup(_uid: u32) -> Option<u32> {
