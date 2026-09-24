@@ -40,6 +40,53 @@ pub fn existing_route_action(route_get_stdout: &str, our_ifname: &str) -> Existi
     ExistingRouteAction::Replace
 }
 
+/// Outcome of a `route add` / `route delete` invocation.
+///
+/// macOS `/sbin/route` exits **0** even when the operation failed — observed
+/// on a real Mac (zipline#100): a duplicate `add` prints
+/// `route: writing to routing socket: File exists` and exits 0, and a
+/// `delete` of an absent route prints `... not in table` and exits 0.
+/// Classification therefore reads stderr first and trusts the exit status
+/// only when stderr is clean.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RouteCmdResult {
+    /// Clean success: exit 0 and nothing on stderr.
+    Ok,
+    /// The destination prefix is already in the table (`File exists` /
+    /// `already in table` on stderr), **whatever the exit status**.
+    Exists,
+    /// Anything else non-clean — including exit 0 with unexpected stderr
+    /// text. Carries the stderr for the caller's error message.
+    Failed(String),
+}
+
+/// Classify the result of a `route add` / `route delete` command from its
+/// exit status and stderr.
+pub fn classify_route_cmd(exit_success: bool, stderr: &str) -> RouteCmdResult {
+    // RED stub: mirrors the pre-fix call sites, which trust the exit status
+    // and read stderr only after a non-zero exit.
+    if exit_success {
+        return RouteCmdResult::Ok;
+    }
+    if stderr.contains("File exists") || stderr.contains("already in table") {
+        return RouteCmdResult::Exists;
+    }
+    RouteCmdResult::Failed(stderr.to_string())
+}
+
+/// Classify `route -n get` output when probing whether a route is still
+/// installed: `true` means the route is gone from the table.
+///
+/// A non-zero exit (macOS `route get` on an absent route) or a
+/// `not in table` marker means gone; a resolved route — exit 0 with no
+/// such marker — means present. Ambiguous output defaults to "present" so
+/// an idempotent delete fails loudly rather than guessing.
+pub fn route_gone(get_exit_success: bool, get_output: &str) -> bool {
+    // RED stub: pre-fix semantics — only a non-zero exit means gone.
+    let _ = get_output;
+    !get_exit_success
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -107,5 +154,146 @@ destination: fd5a:5052::
             existing_route_action("  interface: \n", "utun4"),
             ExistingRouteAction::Replace
         );
+    }
+
+    // ---- classify_route_cmd ----
+    //
+    // The stderr fixtures below quote a real Mac verbatim (zipline#100,
+    // operator run of 2026-09-24):
+    //
+    //   $ sudo route -n add -inet6 $P ::1;    echo "add#2 (exists) exit=$?"
+    //   route: writing to routing socket: File exists
+    //   add net fd00:6666:7777::/64: gateway ::1: File exists
+    //   add#2 (exists) exit=0
+    //
+    //   $ sudo route -n delete -inet6 $P;     echo "del#2 (absent) exit=$?"
+    //   route: writing to routing socket: not in table
+    //   delete net fd00:6666:7777::/64: not in table
+    //   del#2 (absent) exit=0
+    //
+    // Both failures exit 0 — that exit-0-on-failure is the whole bug.
+
+    /// Mac add#2 output: duplicate add, exit 0.
+    const ADD_EXISTS_STDERR: &str = "\
+route: writing to routing socket: File exists
+add net fd00:6666:7777::/64: gateway ::1: File exists
+";
+
+    /// Mac del#2 output: delete of an absent route, exit 0.
+    const DEL_NOT_IN_TABLE_STDERR: &str = "\
+route: writing to routing socket: not in table
+delete net fd00:6666:7777::/64: not in table
+";
+
+    /// The field observation from the issue body (2026-09-24, exit 0).
+    const FIELD_ADD_EXISTS_STDERR: &str = "\
+route: writing to routing socket: File exists
+add net fd5a:5052::/32: gateway utun5: File exists
+";
+
+    #[test]
+    fn clean_exit_zero_is_ok() {
+        // Mac add#1 / del#1: summary line goes to stdout, stderr is empty.
+        assert_eq!(classify_route_cmd(true, ""), RouteCmdResult::Ok);
+    }
+
+    #[test]
+    fn exit_zero_file_exists_is_exists() {
+        // The bug: /sbin/route exits 0 on "File exists".
+        assert_eq!(
+            classify_route_cmd(true, ADD_EXISTS_STDERR),
+            RouteCmdResult::Exists
+        );
+        assert_eq!(
+            classify_route_cmd(true, FIELD_ADD_EXISTS_STDERR),
+            RouteCmdResult::Exists
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_file_exists_is_exists() {
+        assert_eq!(
+            classify_route_cmd(false, ADD_EXISTS_STDERR),
+            RouteCmdResult::Exists
+        );
+    }
+
+    #[test]
+    fn already_in_table_is_exists_whatever_the_exit() {
+        assert_eq!(
+            classify_route_cmd(true, "add net fd5a:5052::/32: already in table\n"),
+            RouteCmdResult::Exists
+        );
+        assert_eq!(
+            classify_route_cmd(false, "add net fd5a:5052::/32: already in table\n"),
+            RouteCmdResult::Exists
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_other_stderr_is_failed_with_stderr() {
+        let stderr = "route: bad address: nonsense\n";
+        assert_eq!(
+            classify_route_cmd(false, stderr),
+            RouteCmdResult::Failed(stderr.to_string())
+        );
+    }
+
+    #[test]
+    fn exit_zero_unexpected_stderr_is_failed() {
+        // Exit 0 with error text is never success: the classifier reports
+        // "not in table" as non-clean; route_delete's route-gone probe is
+        // what turns it into idempotent success.
+        assert_eq!(
+            classify_route_cmd(true, DEL_NOT_IN_TABLE_STDERR),
+            RouteCmdResult::Failed(DEL_NOT_IN_TABLE_STDERR.to_string())
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_not_in_table_is_failed() {
+        assert_eq!(
+            classify_route_cmd(false, DEL_NOT_IN_TABLE_STDERR),
+            RouteCmdResult::Failed(DEL_NOT_IN_TABLE_STDERR.to_string())
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_empty_stderr_is_failed() {
+        assert_eq!(
+            classify_route_cmd(false, ""),
+            RouteCmdResult::Failed(String::new())
+        );
+    }
+
+    // ---- route_gone ----
+
+    #[test]
+    fn get_nonzero_exit_means_gone() {
+        // macOS `route -n get` on an absent route exits non-zero.
+        assert!(route_gone(false, "route: route has not been found\n"));
+    }
+
+    #[test]
+    fn not_in_table_at_exit_zero_means_gone() {
+        // Mac del#2 verbatim: the marker arrives at exit 0.
+        assert!(route_gone(true, DEL_NOT_IN_TABLE_STDERR));
+    }
+
+    #[test]
+    fn not_in_table_at_nonzero_exit_means_gone() {
+        assert!(route_gone(false, DEL_NOT_IN_TABLE_STDERR));
+    }
+
+    #[test]
+    fn resolved_route_means_present() {
+        assert!(!route_gone(true, GET_ON_OUR_TUN));
+    }
+
+    #[test]
+    fn ambiguous_exit_zero_output_means_present() {
+        // No gone-marker and exit 0: never guess "gone" — the idempotent
+        // delete must fail loudly instead.
+        assert!(!route_gone(true, ""));
     }
 }
