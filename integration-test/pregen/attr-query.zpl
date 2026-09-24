@@ -34,7 +34,7 @@ allow contractor users to access Web.
 # adapters now install a return route covering the whole ZPR internal net on
 # activation, so a dynamically-addressed actor is reachable). The former
 # UserASvc join-policy workaround (a service minted only so the visa service
-# would honor adapter1's static fd00:1:1::1 claim) is gone with it.
+# would honor adapter1's static fd5a:5052:8888::1:1 claim) is gone with it.
 
 # Fabric plumbing, unchanged from oidc-test.zpl.
 allow Node to access PingableVs.

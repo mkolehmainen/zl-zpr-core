@@ -104,10 +104,10 @@ C_SUBSTRATE_ADDR=10.0.3.2
 NUM_ACTORS=2
 NODE_ZPR_ADDR=fd5a:5052::2
 VS_ZPR_ADDR=fd5a:5052::1
-A_ZPR_ADDR=fd00:1:1::1
-B_ZPR_ADDR=fd00:1:2::1
-C_ZPR_ADDR=fd00:1:3::1
-ZPR_SUBNET=fd00:1::0/32
+A_ZPR_ADDR=fd5a:5052:8888::1:1
+B_ZPR_ADDR=fd5a:5052:8888::2:1
+C_ZPR_ADDR=fd5a:5052:8888::3:1
+ZPR_SUBNET=fd5a:5052::/32
 POLICY_BIN=attr-query.bin2
 
 DOCK_LINK=2
@@ -428,10 +428,10 @@ create_network
 # zipline#88 (the zipline#83 Step-4 configuration, now the test's normal
 # shape): adapter1 is user-only and runs on the dynamic fd5a:5052:adda:1::/64
 # address the fabric assigns, so its tun0 must NOT carry the pre-provisioned
-# static fd00:1:1::1 — the adapter itself adds the granted address (and the
-# fd5a:5052::/32 internal-net return route) on activation. Keep a bare
-# fd00:1::/32 route so adapter1's outbound traffic to the static actors still
-# enters the TUN (deleting the address removes its peer route too).
+# static fd5a:5052:8888::1:1 — the adapter itself adds the granted address (and
+# the fd5a:5052::/32 internal-net return route) on activation. Keep a bare
+# fd5a:5052::/32 route so adapter1's outbound traffic to the static actors
+# still enters the TUN (deleting the address removes its peer route too).
 sudo ip -n zpr-a addr del "$A_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
 sudo ip -n zpr-a -6 route add "$ZPR_SUBNET" dev tun0
 

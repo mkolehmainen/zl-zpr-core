@@ -68,10 +68,10 @@ case "$ACTOR_PROTOCOL" in
 		NODE_ZPR_ADDR=fd5a:5052::2
 		VS_ZPR_ADDR=fd5a:5052::1
 
-		A_ZPR_ADDR=fd00:1:1::1
-		B_ZPR_ADDR=fd00:1:2::1
-		C_ZPR_ADDR=fd00:1:3::1
-		ZPR_SUBNET=fd00:1::0/32
+		A_ZPR_ADDR=fd5a:5052:8888::1:1
+		B_ZPR_ADDR=fd5a:5052:8888::2:1
+		C_ZPR_ADDR=fd5a:5052:8888::3:1
+		ZPR_SUBNET=fd5a:5052::/32
 
 		POLICY_BIN="v6-1node-${NUM_ACTORS}actor-ping.bin2"
         ;;

@@ -30,9 +30,9 @@ define PingableNode as a service with device.zpr.adapter.cn:node.
 allow lazy users to access Web.
 
 # adapter1 must match a JOIN policy, or the visa service scrubs its requested
-# ZPR address (fd00:1:1::1, an unauthenticated claim) and assigns a dynamic
-# fd5a:5052:adda:1::/64 one instead. The test's static tun0 setup keeps
-# sourcing from fd00:1:1::1, so the node would then deny every bind with
+# ZPR address (fd5a:5052:8888::1:1, an unauthenticated claim) and assigns a
+# dynamic fd5a:5052:adda:1::/64 one instead. The test's static tun0 setup keeps
+# sourcing from fd5a:5052:8888::1:1, so the node would then deny every bind with
 # "source address ... does not match actor address" (zipline#83). Join
 # policies are minted per service provider, so give the user-a identity a
 # service to provide (same trick as oidc-test.zpl's A1Svc). Vs is the client

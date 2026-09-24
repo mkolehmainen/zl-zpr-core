@@ -33,9 +33,14 @@ icmp_codes = [ 128, 129 ]
 
 [services.A1Svc]
 protocol = "ping"
+# zipline#96: pin the adapter's static ZPR address in policy (source 1 of the
+# static-address-grants rule) so the visa service confirms it via the join
+# policy rather than committing an unauthenticated claim.
+provider = [["zpr.addr", "fd5a:5052:8888::1:1"]]
 
 [services.A2Svc]
 protocol = "ping"
+provider = [["zpr.addr", "fd5a:5052:8888::2:1"]]
 
 [services.PingableVs]
 protocol = "ping"
