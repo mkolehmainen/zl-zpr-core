@@ -17,6 +17,14 @@ pub use self::macos::ZprTun;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod macos_route;
 
+// Pure parsing/decision logic for the ZPR internal-network route-owner
+// check (zipline#101): the Linux `ip -6 route show` parser and the
+// platform-neutral conflict decision. Compiled on every OS, same pattern
+// and reason as `macos_route` above; the Linux parser half is dead code on
+// macOS.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) mod linux_route;
+
 pub(crate) mod posix;
 pub use self::posix::notify;
 

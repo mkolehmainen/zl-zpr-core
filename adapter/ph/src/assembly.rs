@@ -596,6 +596,13 @@ pub mod test {
         fn add_route(&self, _dest: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
         }
+        fn route_owner_conflict(
+            &self,
+            _dest: IpAddr,
+            _prefix_len: u8,
+        ) -> std::io::Result<Option<String>> {
+            Ok(None)
+        }
     }
 
     /// A `TunCtl` which reports exactly the addresses it was constructed with,
@@ -620,15 +627,33 @@ pub mod test {
         fn add_route(&self, _dest: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
         }
+        fn route_owner_conflict(
+            &self,
+            _dest: IpAddr,
+            _prefix_len: u8,
+        ) -> std::io::Result<Option<String>> {
+            Ok(None)
+        }
     }
 
     /// A `TunCtl` recording every `add_route` call, so tests can assert the
     /// link-activation route install (zipline#88). With `fail_routes` set,
     /// `add_route` fails instead, modelling a TUN whose routing table cannot
     /// be updated — the fail-fast/warn-and-continue split's test double.
+    /// With `conflict` set, `route_owner_conflict` reports that interface
+    /// as the live owner of the queried route (zipline#101). With
+    /// `late_conflict` set, only probes after the first report it — the
+    /// concurrent-activation race, where the other adapter's carrier-up
+    /// lands between our pre-install probe and the post-carrier re-check.
+    /// `carriers` logs every `set_carrier` call so tests can assert an
+    /// adapter that backed off did not leave its carrier up.
     pub struct RecordingTunCtl {
         pub routes: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
         pub fail_routes: bool,
+        pub conflict: Option<String>,
+        pub late_conflict: Option<String>,
+        pub probes: Arc<std::sync::atomic::AtomicUsize>,
+        pub carriers: Arc<std::sync::Mutex<Vec<bool>>>,
     }
 
     impl RecordingTunCtl {
@@ -639,14 +664,40 @@ pub mod test {
                 Self {
                     routes: routes.clone(),
                     fail_routes,
+                    conflict: None,
+                    late_conflict: None,
+                    probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    carriers: Arc::new(std::sync::Mutex::new(Vec::new())),
                 },
                 routes,
             )
         }
+
+        /// A recording instance whose `route_owner_conflict` names
+        /// `owner_if` as the conflicting live owner (zipline#101).
+        pub fn with_conflict(owner_if: &str) -> (Self, Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) {
+            let (mut tun_ctl, routes) = Self::new(false);
+            tun_ctl.conflict = Some(owner_if.to_string());
+            (tun_ctl, routes)
+        }
+
+        /// A recording instance whose `route_owner_conflict` reports no
+        /// conflict on the first probe and names `owner_if` on every later
+        /// one — the zipline#101 concurrent-activation race: the other
+        /// adapter's route was `linkdown` (filtered) at the pre-install
+        /// probe and its carrier came up before ours did.
+        pub fn with_late_conflict(
+            owner_if: &str,
+        ) -> (Self, Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) {
+            let (mut tun_ctl, routes) = Self::new(false);
+            tun_ctl.late_conflict = Some(owner_if.to_string());
+            (tun_ctl, routes)
+        }
     }
 
     impl TunCtl for RecordingTunCtl {
-        fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
+        fn set_carrier(&self, carrier: bool) -> std::io::Result<()> {
+            self.carriers.lock().unwrap().push(carrier);
             Ok(())
         }
         fn add_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
@@ -667,6 +718,24 @@ pub mod test {
             }
             self.routes.lock().unwrap().push((dest, prefix_len));
             Ok(())
+        }
+        fn route_owner_conflict(
+            &self,
+            _dest: IpAddr,
+            _prefix_len: u8,
+        ) -> std::io::Result<Option<String>> {
+            let probe = self
+                .probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(conflict) = &self.conflict {
+                return Ok(Some(conflict.clone()));
+            }
+            if probe > 0 {
+                if let Some(late) = &self.late_conflict {
+                    return Ok(Some(late.clone()));
+                }
+            }
+            Ok(None)
         }
     }
 

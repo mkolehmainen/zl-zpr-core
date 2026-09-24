@@ -5,6 +5,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use tracing::*;
 
 use crate::logging::targets::NET_OS;
+use crate::sys::linux_route;
 use crate::sys::macos::tun;
 use crate::sys::macos_route::{self, ExistingRouteAction, RouteCmdResult};
 use crate::zprtun::ZprTunError;
@@ -287,6 +288,73 @@ impl ZprTun {
                 }
             }
         }
+    }
+
+    /// Report another live interface already carrying the route for
+    /// `dest/prefix_len`, if any (zipline#101).
+    ///
+    /// Reads `route -n get -inet6 <prefix>` — unprivileged and read-only.
+    /// `route get` resolves through the route the kernel would actually
+    /// use, so a second adapter whose interface-scoped route is shadowed by
+    /// another utun's unscoped route sees that other utun here (Q2, the
+    /// two-adapter Mac case). Any resolved interface other than this TUN is
+    /// a conflict: a utun exists only while its process holds it, so its
+    /// route owner is live by existence. An unresolvable route ("not in
+    /// table" / "route has not been found") means no owner — no conflict.
+    pub fn route_owner_conflict(
+        &self,
+        dest: IpAddr,
+        prefix_len: u8,
+    ) -> std::io::Result<Option<String>> {
+        if dest.is_ipv4() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "route_owner_conflict with IPv4 is not supported on macOS",
+            ));
+        }
+        let mut c = Command::new(COMMAND_ROUTE);
+        c.arg("-n")
+            .arg("get")
+            .arg("-inet6")
+            .arg(format!("{}/{}", dest, prefix_len));
+        debug!(target: NET_OS, "{:?}", c);
+        let output = c.output()?;
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // No route in the table means no owner and no conflict. route_gone
+        // recognizes the absence markers whatever the exit status
+        // (zipline#100: /sbin/route pairs them with inconsistent exits).
+        if macos_route::route_gone(output.status.success(), &combined) {
+            return Ok(None);
+        }
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "{COMMAND_ROUTE} failed to look up route {}/{}: {}",
+                    dest,
+                    prefix_len,
+                    combined.trim()
+                ),
+            ));
+        }
+        let owners: Vec<linux_route::RouteOwner> =
+            macos_route::route_get_owner(&String::from_utf8_lossy(&output.stdout))
+                .map(|ifname| linux_route::RouteOwner {
+                    ifname,
+                    linkdown: false,
+                })
+                .into_iter()
+                .collect();
+        Ok(linux_route::route_owner_conflict(
+            &owners,
+            self.inner.get_name(),
+            linux_route::Platform::MacOs,
+        )
+        .map(|conflict| conflict.ifname))
     }
 
     pub fn clear_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
