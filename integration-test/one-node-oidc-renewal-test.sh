@@ -666,6 +666,46 @@ fi
 fi
 
 if [[ "$PASS" == 0 ]] then
+# The revocation must be exercised END TO END, not merely produce *a*
+# failure (zipline#104): in the 2026-09-25 run both post-revocation
+# renewals failed on TRANSPORT (IdpUnreachable: the per-netns fake IdP had
+# stopped accepting connections), the refresh grant was never presented,
+# and leg 3 still passed. Two assertions close that hole:
+#
+# (a) The IdP actually rejected a refresh grant: its log carries a
+#     `POST /token ... 400` (the login and the leg-2 renewal are 200s, so
+#     any 400 here is the revoked grant). adapter1 is user-only, so its
+#     IdP instance (zpr-a) must have seen it.
+if grep -qE '"POST /token[^"]*" 400' idp-zpr-a.log; then
+  echo "zpr-a's IdP rejected the revoked refresh grant:"
+  grep -E '"POST /token[^"]*" 400' idp-zpr-a.log | head -n 2
+else
+  echo "ERROR: zpr-a's IdP never answered a token-endpoint request with 400"
+  echo "       (the revoked grant was never presented — an unreachable IdP"
+  echo "       also fails renewal, but exercises nothing)"
+  grep -E '"POST /token' idp-zpr-a.log | tail -n 5 || true
+  PASS=1
+fi
+
+# (b) The failure the agent classified is the revoked grant: the adapter's
+#     `AuthAgent could not renew the credential` line must carry the RFC
+#     6749 `invalid_grant` code in its detail. A transport failure ("HTTP
+#     error talking to the IdP: error sending request") means the IdP was
+#     down — the bug this assertion exists to catch. (The node's own
+#     `silent re-authentication failed` line only ever says AuthUnavailable:
+#     the reason does not cross the ZDP wire, so it cannot carry this.)
+FAILURE_LINE=$(grep -E "could not renew the credential" adapter1.log | head -n 1)
+if grep -qE "invalid_grant" <<< "$FAILURE_LINE"; then
+  echo "the agent reported the revoked grant:"
+  echo "$FAILURE_LINE"
+else
+  echo "ERROR: adapter1's renewal failure does not carry invalid_grant:"
+  echo "$FAILURE_LINE"
+  PASS=1
+fi
+fi
+
+if [[ "$PASS" == 0 ]] then
 # The authentication-expiry sweep revokes on the docking node and drops the
 # actor, once the window the last good renewal bought finally closes.
 if wait_for_log "$REVOCATION_WAIT" vs.log "authentication expired for actor .*removing actor"; then
