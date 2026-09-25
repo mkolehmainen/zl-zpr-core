@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-node OIDC integration test (zipline#16, OIDC master plan D5).
+# One-node OIDC integration test (zipline#16).
 #
 # one-node-test.sh adapted to exercise user (OIDC) authentication through a
 # local fake IdP (lib/fake-idp.py) with no Google and no browser:

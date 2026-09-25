@@ -336,8 +336,8 @@ const CONNECT_DEADLINE: Duration = Duration::from_secs(330);
 const CONNECT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// `connect`: start a link, supplying this process as its AuthAgent
-/// (Contract 6), and hold the RPC connection open so the packet handler's
-/// `getOidcCredential` callback can reach us while the link authenticates.
+/// (`AuthAgent` in adapter/admin-api/cli.capnp), and hold the RPC
+/// connection open so the packet handler's `getOidcCredential` callback can reach us while the link authenticates.
 ///
 /// `startLink` returns as soon as the Start event is accepted, so the
 /// outcome is observed by polling `showLink` until the state is `Active`

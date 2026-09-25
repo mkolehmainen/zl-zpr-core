@@ -54,8 +54,8 @@ account's email address is made to look corporate.
 ## 3. `client_secret` — required for Google Desktop clients, or not?
 
 Google's native-app documentation marks `client_secret` *optional* and
-exempts only Android/iOS/Chrome clients, not Desktop (master plan, "What
-changed since the spec"). The implementation carries an **optional,
+exempts only Android/iOS/Chrome clients, not Desktop (zl-zpr-dev-context/docs/OIDC.md,
+"Design decisions"). The implementation carries an **optional,
 non-secret** `client_secret` end to end; this run settles whether Google's
 token endpoint actually demands it for a Desktop client.
 
@@ -70,7 +70,7 @@ token endpoint actually demands it for a Desktop client.
 ## 4. `offline_access` — not implemented (deferred, X3)
 
 `allow_offline_access` is plumbed end to end but the agent-side refresh
-token / keyring support is deferred (master plan X3): non-interactive
+token / keyring support is deferred (zipline#1, X3): non-interactive
 requests fail with `NonInteractiveUnsupported`, so every login is
 interactive.
 

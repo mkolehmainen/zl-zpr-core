@@ -139,7 +139,7 @@ pub enum LinkState {
 }
 
 /// Why an out-of-band authentication attempt failed, as reported to ph-cli.
-/// Mirrors the spec's error taxonomy (see zipline#13 / OIDC master plan D2).
+/// Mirrors the spec's error taxonomy (see zipline#13).
 #[allow(dead_code)] // some variants are constructed only by later deliverables
 #[derive(Clone, Debug, PartialEq, strum::IntoStaticStr)]
 pub enum AuthFailureReason {

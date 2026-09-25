@@ -25,7 +25,7 @@ interface CaptureFile {
 }
 
 # Provided by ph-cli (or another controller); called by ph when a credential
-# requiring a user session is needed (Contract 6 of the OIDC master plan).
+# requiring a user session is needed (zipline#13).
 # `interactive = false` means "satisfy from a stored refresh token or fail";
 # the agent must never open a browser on a non-interactive request.
 interface AuthAgent {

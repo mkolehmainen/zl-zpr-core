@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Silent-OIDC-renewal integration test (zipline#47, master plan R7).
+# Silent-OIDC-renewal integration test (zipline#47).
 #
 # one-node-oidc-test.sh proves an OIDC *login* works. This proves the whole
 # renewal loop that follows it, against the same fake IdP, with no Google and

@@ -2,8 +2,8 @@
 # oidc + file interplay integration-test fixture config (zipline#27).
 #
 # oidc-test.zplc's one-node topology and fake-IdP pinning, plus the two
-# trusted services from the master plan's Background
-# (zl-zpr-dev-context/docs/plans/2026-09-14-trusted-service-interplay.md):
+# trusted services of zipline#22 (rationale:
+# zl-zpr-dev-context/docs/VISA_SERVICE.md, "Design decisions"):
 #   - `google` (api = "oidc") is the compiler fixture
 #     test-oidc-file-interplay.zplc's service re-pinned to the fake IdP the
 #     test runs on each namespace's loopback (issuer, client_id, seed JWKS).
