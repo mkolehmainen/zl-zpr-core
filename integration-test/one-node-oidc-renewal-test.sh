@@ -668,8 +668,12 @@ if [[ "$PASS" == 0 ]] then
 # (a) The IdP actually rejected a refresh grant: its log carries a
 #     `POST /token ... 400` (the login and the leg-2 renewal are 200s, so
 #     any 400 here is the revoked grant). adapter1 is user-only, so its
-#     IdP instance (zpr-a) must have seen it.
-if grep -qE '"POST /token[^"]*" 400' idp-zpr-a.log; then
+#     IdP instance (zpr-a) must have seen it. The wait above accepts a
+#     failure from EITHER adapter, and the two renew independently —
+#     adapter2 can fail first while adapter1 is not yet due — so poll for
+#     zpr-a's 400 within the window rather than asserting on whatever
+#     happens to be in the log right now.
+if wait_for_log "$REVOCATION_WAIT" idp-zpr-a.log '"POST /token[^"]*" 400'; then
   echo "zpr-a's IdP rejected the revoked refresh grant:"
   grep -E '"POST /token[^"]*" 400' idp-zpr-a.log | head -n 2
 else
@@ -687,7 +691,13 @@ fi
 #     down — the bug this assertion exists to catch. (The node's own
 #     `silent re-authentication failed` line only ever says AuthUnavailable:
 #     the reason does not cross the ZDP wire, so it cannot carry this.)
-FAILURE_LINE=$(grep -E "could not renew the credential" adapter1.log | head -n 1)
+#     adapter1 logs its classification only after the IdP's response makes
+#     it back through the AuthAgent, so give that the same window; and the
+#     lookup must be non-fatal — under `set -euo pipefail` a bare
+#     `$(grep ...)` assignment with no match would kill the script right
+#     here, skipping the diagnostic branch below and all cleanup.
+wait_for_log "$REVOCATION_WAIT" adapter1.log "could not renew the credential" || true
+FAILURE_LINE=$(grep -E "could not renew the credential" adapter1.log | head -n 1 || true)
 if grep -qE "invalid_grant" <<< "$FAILURE_LINE"; then
   echo "the agent reported the revoked grant:"
   echo "$FAILURE_LINE"
