@@ -42,9 +42,10 @@
 #
 # Observed passing on 2026-09-25 at zl-zpr-core 824d7a5, twice: by the
 # operator on the host, and under Docker (make docker-test). Those runs
-# predate the strengthened leg-3 assertions added by zipline#104, which
+# predate the strengthened leg-3 assertions added by zipline#104 (which
 # require the revocation leg to prove the revoked grant was actually
-# presented and rejected (see LEG 3 below).
+# presented and rejected — see LEG 3 below); with those assertions and the
+# threaded fake IdP, observed passing under Docker on 2026-09-25.
 set -euo pipefail
 
 export RUST_BACKTRACE=1
