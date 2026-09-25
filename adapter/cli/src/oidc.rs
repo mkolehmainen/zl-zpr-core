@@ -893,6 +893,52 @@ pub fn start_link_error_is_fatal(msg: &str) -> bool {
     !msg.contains("UnexpectedTransition")
 }
 
+/// What a `startLink` error means to `connect`. ph only accepts Start from
+/// Inactive, and registers the agent before firing Start, so every
+/// `UnexpectedTransition` left our agent on the link.
+#[derive(Debug, PartialEq)]
+pub enum StartLinkError {
+    /// The link is tearing down (Closing, Resetting, Disconnecting, Error)
+    /// and will be Inactive shortly: retry Start.
+    TearingDown,
+    /// An attempt is already in flight. It reads the agent at InitAuth, so
+    /// it now authenticates with ours: judge its outcome rather than start
+    /// another attempt, which would prompt the user a second time.
+    InFlight,
+    /// The link is already up.
+    AlreadyActive,
+    /// No agent was registered (e.g. `NotFound`): give up.
+    Fatal,
+}
+
+/// Classify a `startLink` error text for `connect` (zipline#111) by the
+/// state ph reports in `UnexpectedTransition(<state>, "Start")`.
+pub fn classify_start_link_error(msg: &str) -> StartLinkError {
+    let Some((_, state)) = msg.split_once("UnexpectedTransition(") else {
+        return StartLinkError::Fatal;
+    };
+    const TEARDOWN_STATES: [&str; 4] = ["Closing", "Resetting", "Disconnecting", "Error"];
+    if state.starts_with("Active,") {
+        StartLinkError::AlreadyActive
+    } else if TEARDOWN_STATES.iter().any(|s| state.starts_with(s)) {
+        StartLinkError::TearingDown
+    } else {
+        StartLinkError::InFlight
+    }
+}
+
+/// Exit code when `connect` gives up on a `startLink` error instead of
+/// retrying (the deadline expired, or the error class is not retryable).
+pub fn exit_code_for_start_link_giveup(class: &StartLinkError) -> i32 {
+    match class {
+        // The link sat in a teardown state until the deadline expired — the
+        // wedged link CONNECT_DEADLINE exists to catch — so this is the
+        // documented timeout outcome, same as the polling loop's deadline.
+        StartLinkError::TearingDown => 3,
+        _ => 1,
+    }
+}
+
 /// Map an [`OidcCliError`] from the standalone `oidc-login` flow onto the
 /// same exit-code contract.
 pub fn exit_code_for_oidc_error(err: &OidcCliError) -> i32 {
@@ -1445,6 +1491,64 @@ mod tests {
             "Failed to start link 9: NotFound(9)\n"
         ));
         assert!(start_link_error_is_fatal("something unexpected"));
+    }
+
+    /// zipline#111: `connect` fired startLink while the agentless dock link
+    /// was tearing down after a NoAgent failure and exited 1 on the
+    /// UnexpectedTransition. A link tearing down must be retried; an attempt
+    /// already in flight picks up the just-registered agent, so it is judged
+    /// rather than restarted (restarting it would prompt for a second login);
+    /// an already-Active link and a missing link are neither.
+    #[test]
+    fn test_classify_start_link_error() {
+        let classify = |state: &str| {
+            classify_start_link_error(&format!(
+                "Failed to start link 2: UnexpectedTransition({state}, \"Start\")\n"
+            ))
+        };
+        for state in ["Closing", "Resetting", "Disconnecting(Reset)", "Error"] {
+            assert_eq!(classify(state), StartLinkError::TearingDown, "{state}");
+        }
+        for state in [
+            "Keying",
+            "Helloing",
+            "WaitForInitAuth",
+            "RegisterAA",
+            "WaitForAcquireZprAddress",
+            "WaitForUserAuth",
+        ] {
+            assert_eq!(classify(state), StartLinkError::InFlight, "{state}");
+        }
+        assert_eq!(classify("Active"), StartLinkError::AlreadyActive);
+        assert_eq!(
+            classify_start_link_error("Failed to start link 9: NotFound(9)\n"),
+            StartLinkError::Fatal
+        );
+        assert_eq!(
+            classify_start_link_error("something unexpected"),
+            StartLinkError::Fatal
+        );
+    }
+
+    /// PR #38 review (Codex P2): a link that stays in a teardown state until
+    /// `CONNECT_DEADLINE` expires is exactly the wedged-link condition the
+    /// deadline exists to catch, so giving up on `TearingDown` must exit with
+    /// the documented timeout code 3 — the same outcome as the polling loop's
+    /// deadline — not the generic failure code 1. Every other class that
+    /// reaches the give-up path (Fatal, first-call AlreadyActive) stays 1.
+    #[test]
+    fn test_exit_code_for_start_link_giveup() {
+        assert_eq!(
+            exit_code_for_start_link_giveup(&StartLinkError::TearingDown),
+            3
+        );
+        for class in [
+            StartLinkError::InFlight,
+            StartLinkError::AlreadyActive,
+            StartLinkError::Fatal,
+        ] {
+            assert_eq!(exit_code_for_start_link_giveup(&class), 1, "{class:?}");
+        }
     }
 
     /// Pure parser over the `showLink` result text, matching what ph's
