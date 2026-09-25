@@ -927,6 +927,18 @@ pub fn classify_start_link_error(msg: &str) -> StartLinkError {
     }
 }
 
+/// Exit code when `connect` gives up on a `startLink` error instead of
+/// retrying (the deadline expired, or the error class is not retryable).
+pub fn exit_code_for_start_link_giveup(class: &StartLinkError) -> i32 {
+    match class {
+        // The link sat in a teardown state until the deadline expired — the
+        // wedged link CONNECT_DEADLINE exists to catch — so this is the
+        // documented timeout outcome, same as the polling loop's deadline.
+        StartLinkError::TearingDown => 3,
+        _ => 1,
+    }
+}
+
 /// Map an [`OidcCliError`] from the standalone `oidc-login` flow onto the
 /// same exit-code contract.
 pub fn exit_code_for_oidc_error(err: &OidcCliError) -> i32 {
@@ -1516,6 +1528,27 @@ mod tests {
             classify_start_link_error("something unexpected"),
             StartLinkError::Fatal
         );
+    }
+
+    /// PR #38 review (Codex P2): a link that stays in a teardown state until
+    /// `CONNECT_DEADLINE` expires is exactly the wedged-link condition the
+    /// deadline exists to catch, so giving up on `TearingDown` must exit with
+    /// the documented timeout code 3 — the same outcome as the polling loop's
+    /// deadline — not the generic failure code 1. Every other class that
+    /// reaches the give-up path (Fatal, first-call AlreadyActive) stays 1.
+    #[test]
+    fn test_exit_code_for_start_link_giveup() {
+        assert_eq!(
+            exit_code_for_start_link_giveup(&StartLinkError::TearingDown),
+            3
+        );
+        for class in [
+            StartLinkError::InFlight,
+            StartLinkError::AlreadyActive,
+            StartLinkError::Fatal,
+        ] {
+            assert_eq!(exit_code_for_start_link_giveup(&class), 1, "{class:?}");
+        }
     }
 
     /// Pure parser over the `showLink` result text, matching what ph's

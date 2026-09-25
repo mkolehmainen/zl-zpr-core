@@ -392,9 +392,22 @@ async fn connect_task(service: svc::Client, id: u32, no_browser: bool) -> Result
                     msg.trim_end()
                 );
             }
-            _ => {
-                eprintln!("connect failed: {msg}");
-                std::process::exit(1);
+            class => {
+                // A TearingDown that reaches this arm means the deadline
+                // expired while the link stayed in teardown — the wedged
+                // link CONNECT_DEADLINE exists to catch — so it reports the
+                // documented timeout outcome (exit 3), matching the polling
+                // loop below. Everything else is a generic failure (exit 1).
+                let code = oidc::exit_code_for_start_link_giveup(&class);
+                if code == 3 {
+                    eprintln!(
+                        "connect failed: timed out waiting for link {id} to come up ({})",
+                        msg.trim_end()
+                    );
+                } else {
+                    eprintln!("connect failed: {msg}");
+                }
+                std::process::exit(code);
             }
         }
         first_attempt = false;
