@@ -141,6 +141,65 @@ emit_vs_config ca vs.zpr > vs-config.toml
 # directory, i.e. here). See lib/common_funcs.sh (zipline#107).
 copy_address_store
 
+# Admin API key for the grant assertion below: minted in the format vsapikey
+# uses (vs/src/apikey.rs: zpr_vsapi.<id_hex>.<b64url_secret>; vs_keys.toml
+# stores the sha256 of the secret). The vs reads vs_keys.toml from the config
+# directory; vs-admin reads the full key string from vs-admin.key. Same
+# pattern as oidc-file-interplay-test.sh.
+python3 - <<'PYEOF'
+import base64, hashlib, secrets
+
+key_id = secrets.token_bytes(4).hex()
+secret = secrets.token_bytes(32)
+b64 = base64.urlsafe_b64encode(secret).rstrip(b"=").decode()
+with open("vs_keys.toml", "w") as f:
+    f.write(f'[keys.{key_id}]\n')
+    f.write('owner = "integration-test"\n')
+    f.write('permission = "readwrite"\n')
+    f.write('status = "active"\n')
+    f.write('created = "2026-09-25"\n')
+    f.write(f'secret_hash = "{hashlib.sha256(secret).hexdigest()}"\n')
+    f.write('description = "one-node-test"\n')
+with open("vs-admin.key", "w") as f:
+    f.write(f"zpr_vsapi.{key_id}.{b64}\n")
+PYEOF
+chmod 600 vs-admin.key
+
+# The admin API listens on the VS ZPR address inside the zpr-vs netns.
+ADMIN_URL="https://[$VS_ZPR_ADDR]:8182"
+
+# Run vs-admin against the admin API from inside the zpr-vs netns.
+function vs_admin() {
+  sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" \
+    "$VS_ADMIN_BIN" --svc-url "$ADMIN_URL" --ca-cert ca.crt \
+    --api-key-file vs-admin.key --format compact "$@"
+}
+
+# zipline#107: assert the device.zpr_addr grant end to end (the first e2e
+# check of zipline#99): `vs-admin actors` must report the adapter joined at
+# exactly the address the `addresses` store grants it. The adapters demand
+# the same address via --zpr-addr, so a scrubbed demand or a pool assignment
+# cannot sneak past — the adapter would have exited on the mismatch
+# (zipline#83) — but this checks the visa service's own record of the
+# committed address and its source path.
+#
+# $1 = expected CN, $2 = expected granted ZPR address
+function assert_actor_granted_addr() {
+  local CN=$1 WANT=$2 ACTORS
+  ACTORS=$(vs_admin actors) || {
+    echo "GRANT ASSERTION FAILED: vs-admin actors call failed"
+    return 1
+  }
+  if ! jq -e --arg cn "$CN" --arg want "$WANT" \
+      '.[] | select(.cn==$cn) | select(.zpr_addr==$want)' \
+      >/dev/null <<<"$ACTORS"; then
+    echo "GRANT ASSERTION FAILED: expected actor cn=$CN at store-granted address $WANT; got:"
+    jq . <<<"$ACTORS" || echo "$ACTORS"
+    return 1
+  fi
+  echo "grant assertion OK: $CN joined at store-granted address $WANT"
+}
+
 #
 # Launch ValKey + Visa Service
 #
@@ -285,6 +344,17 @@ echo "TEST STARTING"
 PASS=0
 if ! ping_test
 then PASS=1
+fi
+
+# zipline#107: the store-grant assertion (see assert_actor_granted_addr
+# above). v6 only: the v4 fixtures are compile-only — their 10.253.x
+# addresses fail the static-range check and have no store entries.
+if [[ "$ACTOR_PROTOCOL" == "ipv6" ]]; then
+  assert_actor_granted_addr adapter1 "$A_ZPR_ADDR" || PASS=1
+  assert_actor_granted_addr adapter2 "$B_ZPR_ADDR" || PASS=1
+  if [[ "$NUM_ACTORS" -ge 3 ]]; then
+    assert_actor_granted_addr adapter3 "$C_ZPR_ADDR" || PASS=1
+  fi
 fi
 
 sleep 1
