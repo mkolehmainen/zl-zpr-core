@@ -70,8 +70,28 @@ pub enum OidcCliError {
     TokenExchange(String),
     #[error("failed to launch browser: {0}")]
     Browser(String),
+    /// The interactive login path's own failure: browser login cannot run
+    /// non-interactively. zipline#104 kept this variant when splitting the
+    /// no-refresh-token case out into [`OidcCliError::NoRefreshToken`], but
+    /// its last constructor (the plain `get_oidc_credential` wrapper) was
+    /// deleted in the same change (issue #104 Q2), so nothing builds it
+    /// today. It stays as the login path's designated error for a future
+    /// caller that must reject a non-interactive browser login.
+    #[allow(dead_code)]
     #[error("non-interactive OIDC login is not supported yet")]
     NonInteractiveUnsupported,
+    /// zipline#104: the refresh path's own failure, distinct from
+    /// [`OidcCliError::NonInteractiveUnsupported`] (the interactive login
+    /// path's "cannot do browser login without a browser"). Raised by
+    /// [`CliAuthAgent::refresh_credential`] when no refresh token is held
+    /// for the issuer — `allow_offline_access` was off, the IdP granted
+    /// none, or `invalid_grant` dropped it — so the operator reads what
+    /// actually happened instead of "not supported yet".
+    #[error(
+        "no refresh token held for {issuer}: silent renewal needs \
+         allow_offline_access and a login through this auth-agent"
+    )]
+    NoRefreshToken { issuer: String },
 }
 
 impl OidcCliError {
@@ -357,28 +377,6 @@ pub async fn login(
     .map(|tokens| tokens.id_token)
 }
 
-/// Wrapper matching the `getOidcCredential` contract semantics, stateless
-/// form: `interactive = false` cannot be satisfied without a stored refresh
-/// token, and this free function holds none, so it is rejected. The
-/// stateful path — refresh-token reuse across calls — lives on
-/// [`CliAuthAgent`], which serves ph over the RPC.
-// [CliAuthAgent] inlines the same logic to thread its progress sink and
-// token store; this stays as the plain-function form of the contract,
-// exercised by tests.
-#[allow(dead_code)]
-pub async fn get_oidc_credential(
-    idp: &OidcIdpInfo,
-    nonce: &str,
-    interactive: bool,
-    open_browser: bool,
-    timeout: Duration,
-) -> Result<String, OidcCliError> {
-    if !interactive {
-        return Err(OidcCliError::NonInteractiveUnsupported);
-    }
-    login(idp, nonce, open_browser, timeout).await
-}
-
 /// One `grant_type=refresh_token` POST to the token endpoint (RFC 6749
 /// section 6) and the resulting fresh [`TokenResponse`]. `client_secret` is
 /// sent only for a confidential client, mirroring [`exchange_code`] — as is
@@ -473,8 +471,8 @@ impl CliAuthAgent {
     }
 
     /// Satisfy a non-interactive request from the stored refresh token for
-    /// `idp.issuer`, or fail with [`OidcCliError::NonInteractiveUnsupported`]
-    /// when none is held. Neither the browser nor the authorization endpoint
+    /// `idp.issuer`, or fail with [`OidcCliError::NoRefreshToken`] when none
+    /// is held. Neither the browser nor the authorization endpoint
     /// nor the loopback listener is ever touched on this path. An
     /// `invalid_grant` answer drops the stored token — it is dead, and the
     /// next attempt should fail fast instead of replaying it — while every
@@ -483,7 +481,9 @@ impl CliAuthAgent {
         // Clone the token out rather than holding the RefCell borrow across
         // an await.
         let Some(refresh_token) = self.refresh_tokens.borrow().get(&idp.issuer).cloned() else {
-            return Err(OidcCliError::NonInteractiveUnsupported);
+            return Err(OidcCliError::NoRefreshToken {
+                issuer: idp.issuer.clone(),
+            });
         };
         let issuer = Url::parse(&idp.issuer)?;
         let http = reqwest::Client::new();
@@ -1333,24 +1333,6 @@ mod tests {
         }
     }
 
-    /// The non-interactive agent path is a follow-up issue and must be
-    /// rejected explicitly.
-    #[tokio::test]
-    async fn test_non_interactive_is_unsupported() {
-        let idp = OidcIdpInfo {
-            issuer: "http://127.0.0.1:1/".to_string(),
-            client_id: "c".to_string(),
-            client_secret: None,
-            scopes: vec![],
-            allow_offline_access: false,
-        };
-        let result = get_oidc_credential(&idp, "n", false, false, Duration::from_secs(1)).await;
-        assert!(matches!(
-            result,
-            Err(OidcCliError::NonInteractiveUnsupported)
-        ));
-    }
-
     /// The seven `connect` failure classes map onto exit codes 2-7 (and 1
     /// for anything unrecognized), keyed on the Debug spellings of ph's
     /// `AuthFailureReason` as printed by `showLink`'s "Last auth failure:"
@@ -1389,6 +1371,28 @@ mod tests {
             5
         );
         assert_eq!(exit_code_for_oidc_error(&OidcCliError::StateMismatch), 1);
+    }
+
+    /// zipline#104: when no refresh token is held for the issuer, the error
+    /// must say what actually happened and what silent renewal needs — the
+    /// old text ("non-interactive OIDC login is not supported yet") claimed
+    /// the feature did not exist, and that is what an operator read whenever
+    /// a renewal failed for want of a token.
+    #[test]
+    fn test_no_refresh_token_display() {
+        let err = OidcCliError::NoRefreshToken {
+            issuer: "https://127.0.0.1:9000".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "no refresh token held for https://127.0.0.1:9000: silent renewal \
+             needs allow_offline_access and a login through this auth-agent"
+        );
+        // Agent-side state, not an IdP failure: rpc_error_text sends it
+        // untagged, so ph classifies it as AgentError and `connect` maps it
+        // to exit 1 — deliberate, per the failure-class taxonomy.
+        assert_eq!(rpc_error_text(&err), err.to_string());
+        assert_eq!(exit_code_for_oidc_error(&err), 1);
     }
 
     /// The error text sent over the AuthAgent RPC must carry a stable class
@@ -1666,7 +1670,7 @@ mod tests {
                     cli::success_or_error::Which::Error(e) => {
                         let txt = e.unwrap().get_txt().unwrap().to_str().unwrap().to_string();
                         assert!(
-                            txt.contains("non-interactive"),
+                            txt.contains("no refresh token held for"),
                             "unexpected error text: {txt}"
                         );
                     }
@@ -2136,7 +2140,10 @@ mod tests {
                 match results.get_result().unwrap().which().unwrap() {
                     cli::success_or_error::Which::Error(e) => {
                         let txt = e.unwrap().get_txt().unwrap().to_str().unwrap().to_string();
-                        assert!(txt.contains("non-interactive"), "unexpected error: {txt}");
+                        assert!(
+                            txt.contains("no refresh token held for"),
+                            "unexpected error: {txt}"
+                        );
                     }
                     cli::success_or_error::Which::Success(_) => {
                         panic!("second attempt unexpectedly succeeded")
@@ -2242,7 +2249,10 @@ mod tests {
                 match results.get_result().unwrap().which().unwrap() {
                     cli::success_or_error::Which::Error(e) => {
                         let txt = e.unwrap().get_txt().unwrap().to_str().unwrap().to_string();
-                        assert!(txt.contains("non-interactive"), "unexpected error: {txt}");
+                        assert!(
+                            txt.contains("no refresh token held for"),
+                            "unexpected error: {txt}"
+                        );
                     }
                     cli::success_or_error::Which::Success(_) => {
                         panic!("stale refresh token was replayed after a tokenless login")
