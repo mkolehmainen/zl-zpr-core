@@ -1308,6 +1308,108 @@ mod tests {
         Box::new(|_addr| Box::pin(std::future::pending::<std::io::Result<tokio::net::TcpStream>>()))
     }
 
+    /// A minimal local TLS server: accepts one TCP connection, completes the
+    /// TLS handshake, then holds the stream open. Enough for `VSConn::run`
+    /// to get past TLS and emit `RunLoopStarts`; no Cap'n Proto traffic is
+    /// exchanged. Returns the bound address.
+    async fn spawn_tls_holding_server() -> SocketAddr {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let chain = vec![CertificateDer::from(cert.cert.der().clone())];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+        let cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::task::spawn_local(async move {
+                    if let Ok(_tls) = acceptor.accept(sock).await {
+                        // Hold the connection open; never speak.
+                        std::future::pending::<()>().await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// zipline#113 (recovery half): after a run-loop error — here the first
+    /// TCP connect being refused — `run_with_reconnect` must re-dial and,
+    /// once a dial succeeds, emit `RunLoopStarts` again so `vs_worker` can
+    /// re-gate and re-register with the visa service. Characterizes the
+    /// reconnect machinery the keep-alive fix now relies on: it only engages
+    /// because a timeout-driven VS link close no longer sends `Stop`.
+    #[tokio::test]
+    async fn run_loop_error_leads_to_redial_and_run_loop_starts() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let server_addr = spawn_tls_holding_server().await;
+
+                // First dial fails (a run-loop error); later dials reach the
+                // TLS server.
+                let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let attempts_in_fn = attempts.clone();
+                let connect_fn: ConnectFn = Box::new(move |_addr| {
+                    let n = attempts_in_fn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async move {
+                        if n == 0 {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                "first attempt refused (test stub)",
+                            ))
+                        } else {
+                            tokio::net::TcpStream::connect(server_addr).await
+                        }
+                    })
+                });
+
+                let mut vsconn = test_vsconn(connect_fn);
+                let mut lifecycle_rx = vsconn.subscribe_lifecycle_events();
+                let handle = vsconn.handle();
+
+                let task = tokio::task::spawn_local(async move {
+                    vsconn.run_with_reconnect(Duration::from_millis(50)).await
+                });
+
+                // The re-dial after the initial failure must reach
+                // RunLoopStarts.
+                let evt = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match lifecycle_rx.recv().await {
+                            Ok(VSConnLifecycleEvent::RunLoopStarts) => break,
+                            Ok(_) => continue,
+                            Err(e) => panic!("lifecycle channel died: {e:?}"),
+                        }
+                    }
+                })
+                .await;
+                assert!(
+                    evt.is_ok(),
+                    "run_with_reconnect never re-dialed to RunLoopStarts after the initial connect error"
+                );
+                assert!(
+                    attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+                    "RunLoopStarts must come from a re-dial, not the failed first attempt"
+                );
+
+                // Clean exit still works from the reconnected loop.
+                handle.stop(false).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .expect("run loop failed to stop")
+                    .expect("task panicked")
+                    .expect("run_with_reconnect returned an error");
+            })
+            .await;
+    }
+
     fn test_vsconn(connect_fn: ConnectFn) -> VSConn {
         VSConn::new_for_test(
             "127.0.0.1:1".parse().unwrap(),
