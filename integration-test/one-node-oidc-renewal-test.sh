@@ -351,6 +351,11 @@ cp "$PREGEN/actorvs-rsa.key" actorvs-rsa.key
 
 emit_vs_config ca vs.zpr > vs-config.toml
 
+# The policy's `addresses` trusted service reads its grant data from
+# file_ts_dir/addresses.json (file_ts_dir defaults to the vs config's
+# directory, i.e. here). See lib/common_funcs.sh (zipline#107).
+copy_address_store
+
 #
 # Fake IdP: TLS server cert for 127.0.0.1 signed by the test CA, shared
 # rotation/revocation state, one instance per netns that dials the issuer.

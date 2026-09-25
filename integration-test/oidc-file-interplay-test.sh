@@ -341,6 +341,13 @@ cp "$PREGEN/happyfile.json" happyfile.json
 
 emit_vs_config ca vs.zpr > vs-config.toml
 
+# The policy's `addresses` trusted service reads its grant data from
+# file_ts_dir/addresses.json (file_ts_dir defaults to the vs config's
+# directory, i.e. here). adapter1's own grant rides happyfile.json above;
+# addresses.json carries adapter2's CN grant. See lib/common_funcs.sh
+# (zipline#107).
+copy_address_store
+
 # Admin API key: mint one directly in the format vsapikey uses
 # (vs/src/apikey.rs: zpr_vsapi.<id_hex>.<b64url_secret>; vs_keys.toml
 # stores the sha256 of the secret). The vs reads vs_keys.toml from the

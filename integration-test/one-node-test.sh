@@ -136,6 +136,11 @@ cp "$PREGEN/actorvs-rsa.key" actorvs-rsa.key
 
 emit_vs_config ca vs.zpr > vs-config.toml
 
+# The policy's `addresses` trusted service reads its grant data from
+# file_ts_dir/addresses.json (file_ts_dir defaults to the vs config's
+# directory, i.e. here). See lib/common_funcs.sh (zipline#107).
+copy_address_store
+
 #
 # Launch ValKey + Visa Service
 #

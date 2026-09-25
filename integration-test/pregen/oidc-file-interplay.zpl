@@ -29,16 +29,13 @@ define PingableNode as a service with device.zpr.adapter.cn:node.
 # that `google` mints.
 allow lazy users to access Web.
 
-# adapter1 must match a JOIN policy, or the visa service scrubs its requested
-# ZPR address (fd5a:5052:8888::1:1, an unauthenticated claim) and assigns a
-# dynamic fd5a:5052:adda:1::/64 one instead. The test's static tun0 setup keeps
-# sourcing from fd5a:5052:8888::1:1, so the node would then deny every bind with
-# "source address ... does not match actor address" (zipline#83). Join
-# policies are minted per service provider, so give the user-a identity a
-# service to provide (same trick as oidc-test.zpl's A1Svc). Vs is the client
-# only so the service survives compilation; nothing in the test exercises it.
-define UserASvc as a service with user.sub:'user-a'.
-allow Vs to access UserASvc.
+# adapter1 must still be granted its static ZPR address: the test's static
+# tun0 setup sources from fd5a:5052:8888::1:1, so the visa service must
+# place it there. zipline#107: that grant is the happyfile trusted service
+# vending zpr_addr -> device.zpr_addr keyed on user.sub:'user-a'
+# (zipline#99), replacing the former UserASvc join-policy pin — a service
+# minted only so a matched join policy would carry the address
+# (zipline#83/#96). No workaround define is needed anymore.
 
 # Fabric plumbing, unchanged from oidc-test.zpl.
 allow Node to access PingableVs.

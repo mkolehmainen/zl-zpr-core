@@ -34,6 +34,20 @@ in1 = "n0.overlay:12345"
 [trusted_services.default]
 cert_path = "ca-cert.pem"
 
+# zipline#107: the `addresses` file store grants adapter2 its static ZPR
+# address by vending device.zpr_addr on its authenticated device CN
+# (zipline#99). Data: pregen/addresses.json, copied in by
+# lib/common_funcs.sh::copy_address_store. adapter1 deliberately gets NO
+# grant — it is the one dynamic-path test (zipline#88): user-only, no
+# --zpr-addr, and this policy maps `sub` to user.sub while the store's only
+# user-keyed section is user.oidc-subject, so nothing matches it. No ZPL
+# statement references the store; the compiler retains it because it vends a
+# VS-interpreted attribute (zipline#105).
+[trusted_services.addresses]
+api = "file"
+returns_attributes = ["zpr_addr -> device.zpr_addr"]
+expiration_seconds = 3600
+
 [trusted_services.zipline]
 api = "zpr-attr/1"
 url = "https://127.0.0.1:8443/"
@@ -78,10 +92,11 @@ icmp_codes = [ 128, 129 ]
 
 [services.Web]
 protocol = "ping"
-# zipline#96: pin adapter2's static ZPR address in policy (source 1 of the
-# static-address-grants rule). adapter1 stays dynamic — it is the one
-# dynamic-path test and has no join policy to pin.
-provider = [["zpr.addr", "fd5a:5052:8888::2:1"]]
+# zipline#107: adapter2's static ZPR address is granted by the `addresses`
+# trusted service on its device CN (device.zpr_addr, zipline#99), not pinned
+# in policy. The provider entry mirrors the .zpl define's device CN.
+# adapter1 stays dynamic — the one dynamic-path test (zipline#88).
+provider = [["device.zpr.adapter.cn", "adapter2"]]
 
 [services.PingableVs]
 protocol = "ping"
