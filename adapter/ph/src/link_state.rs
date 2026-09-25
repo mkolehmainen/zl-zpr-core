@@ -431,6 +431,11 @@ pub struct LinkStateMachine {
     /// Handle to an outstanding echo/keepalive task; used only during Active.
     /// Instant is time at which the echo was sent.
     echo_handle: Option<(Instant, tokio::task::AbortHandle)>,
+    /// Consecutive keep-alive misses on this Active session (zipline#113).
+    /// Incremented when an outstanding echo times out, reset by a keep-alive
+    /// response (and on entering Active); the link is only torn down when it
+    /// reaches [config::KEEP_ALIVE_MAX_MISSES].
+    keep_alive_misses: u32,
     shutting_down: bool, // only ever goes from False -> True once
 }
 
@@ -448,6 +453,7 @@ impl LinkStateMachine {
             timeout_count: 0,
             stowed_init_auth: None,
             echo_handle: None,
+            keep_alive_misses: 0,
             shutting_down: false,
         }
     }
@@ -2255,46 +2261,52 @@ impl LinkStateWrapper {
             }
 
             (_, LinkState::Active) => {
-                match locked_fsm.echo_handle.take() {
-                    Some((_start_time, echo_handle)) => {
-                        // there was an outstanding echo, and we've timed out
-                        echo_handle.abort();
-                        self.locked_data.lock().unwrap().echo_timeout += 1;
+                if let Some((_start_time, echo_handle)) = locked_fsm.echo_handle.take() {
+                    // There was an outstanding echo, and we've timed out: a
+                    // consecutive keep-alive miss (zipline#113). Only tear
+                    // the link down when the tolerance is exhausted; until
+                    // then, log the miss and immediately try another echo.
+                    echo_handle.abort();
+                    self.locked_data.lock().unwrap().echo_timeout += 1;
+                    locked_fsm.keep_alive_misses += 1;
+                    if locked_fsm.keep_alive_misses >= config::KEEP_ALIVE_MAX_MISSES {
                         error!(target: LINK_STATE, "{} failed to respond to keep-alive messages", asm.formatted_link_id(self.id));
                         locked_fsm.set_state(LinkState::Error);
                         drop(locked_fsm);
                         return self.initiate_close(asm, TerminateReason::RequestTimedOut);
                     }
-
-                    None => {
-                        // no outstanding echo, time for a new one!
-                        let link_id = self.id;
-                        let task_asm = asm.clone();
-                        let jh = tokio::task::spawn_local(async move {
-                            match mgmt::requests::send_echo_request(&task_asm, link_id)
-                                .acked()
-                                .await
-                            {
-                                Ok(()) => {
-                                    // success! poke the state machine
-                                    // ignore any errors, that just means we've left Active and are already shutting down the link
-                                    let _ = task_asm.process_link_state_event(
-                                        link_id,
-                                        LinkEvent::ReceivedKeepAliveResponse,
-                                    );
-                                }
-
-                                // ignore link closed, we are already shutting down
-                                Err(mgmt::core::MgmtSendError::LinkClosed) => (),
-                            }
-                        });
-
-                        // store new echo handle and kick off timeout
-                        locked_fsm.echo_handle = Some((Instant::now(), jh.abort_handle()));
-                        self.set_timeout(asm, &mut locked_fsm, config::DEFAULT_KEEP_ALIVE_TIMEOUT);
-                        Ok(())
-                    }
+                    warn!(target: LINK_STATE, "{} missed keep-alive {} of {}",
+                        asm.formatted_link_id(self.id),
+                        locked_fsm.keep_alive_misses,
+                        config::KEEP_ALIVE_MAX_MISSES);
                 }
+
+                // No outstanding echo (or a tolerated miss): send a new one.
+                let link_id = self.id;
+                let task_asm = asm.clone();
+                let jh = tokio::task::spawn_local(async move {
+                    match mgmt::requests::send_echo_request(&task_asm, link_id)
+                        .acked()
+                        .await
+                    {
+                        Ok(()) => {
+                            // success! poke the state machine
+                            // ignore any errors, that just means we've left Active and are already shutting down the link
+                            let _ = task_asm.process_link_state_event(
+                                link_id,
+                                LinkEvent::ReceivedKeepAliveResponse,
+                            );
+                        }
+
+                        // ignore link closed, we are already shutting down
+                        Err(mgmt::core::MgmtSendError::LinkClosed) => (),
+                    }
+                });
+
+                // store new echo handle and kick off timeout
+                locked_fsm.echo_handle = Some((Instant::now(), jh.abort_handle()));
+                self.set_timeout(asm, &mut locked_fsm, config::DEFAULT_KEEP_ALIVE_TIMEOUT);
+                Ok(())
             }
 
             (_, LinkState::Closing) => {
@@ -2647,6 +2659,7 @@ impl LinkStateWrapper {
         };
 
         // we got a successful echo response, track it
+        locked_fsm.keep_alive_misses = 0; // zipline#113: a response resets the miss tolerance
         let mut link_data = self.locked_data.lock().unwrap();
         link_data.echo_success += 1;
         link_data
@@ -3260,6 +3273,7 @@ impl LinkStateWrapper {
 
         // kick off our keepalive mechanism
         locked_fsm.echo_handle.take().inspect(|(_, h)| h.abort()); // should already be None (indicating no echo outstanding) but let's be sure
+        locked_fsm.keep_alive_misses = 0; // fresh Active session, fresh tolerance (zipline#113)
         self.set_timeout(asm, &mut locked_fsm, config::DEFAULT_KEEP_ALIVE_TIMEOUT);
 
         Ok(())
@@ -5729,5 +5743,94 @@ mod tests {
                 }
                 tx.send(()).unwrap();
             });
+    }
+
+    /// Deliver a Timeout event carrying the link's CURRENT logical clock,
+    /// as the real timeout task does (zipline#113 keep-alive tests).
+    fn fire_current_timeout(asm: &Arc<Assembly>, link_id: LinkId) {
+        let clock = asm
+            .peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .test_logical_clock();
+        asm.process_link_state_event(
+            link_id,
+            LinkEvent::Timeout {
+                logical_clock: clock,
+            },
+        )
+        .unwrap();
+    }
+
+    fn link_state_of(asm: &Arc<Assembly>, link_id: LinkId) -> LinkState {
+        asm.peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .get_state()
+    }
+
+    /// zipline#113: one missed keep-alive echo must NOT kill an Active link.
+    /// The link tolerates consecutive misses and only goes to `Error` (and
+    /// closes) on the KEEP_ALIVE_MAX_MISSES'th consecutive miss; a keep-alive
+    /// response in between resets the counter. Before the fix, the FIRST
+    /// timeout with an outstanding echo set `Error` and initiated the close.
+    #[tokio::test]
+    async fn test_keep_alive_tolerates_misses_and_resets_on_response() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_node_peer(&asm);
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .link_state_machine
+                    .test_set_state(LinkState::Active);
+
+                // First timeout: no echo outstanding -> sends a fresh echo.
+                fire_current_timeout(&asm, link_id);
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Active);
+
+                // Misses 1 and 2: echo outstanding, timeout fires. The link
+                // must stay Active (tolerated) and keep echoing.
+                for miss in 1..config::KEEP_ALIVE_MAX_MISSES {
+                    fire_current_timeout(&asm, link_id);
+                    assert_eq!(
+                        link_state_of(&asm, link_id),
+                        LinkState::Active,
+                        "link must survive consecutive keep-alive miss {miss}"
+                    );
+                }
+
+                // A keep-alive response arrives: counter resets.
+                asm.process_link_state_event(link_id, LinkEvent::ReceivedKeepAliveResponse)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Active);
+
+                // Fresh echo, then the full tolerated run of misses again —
+                // proving the reset (without it the counter would hit the
+                // limit early).
+                fire_current_timeout(&asm, link_id);
+                for miss in 1..config::KEEP_ALIVE_MAX_MISSES {
+                    fire_current_timeout(&asm, link_id);
+                    assert_eq!(
+                        link_state_of(&asm, link_id),
+                        LinkState::Active,
+                        "post-reset miss {miss} must still be tolerated"
+                    );
+                }
+
+                // The final consecutive miss is fatal: the link leaves Active
+                // and starts closing.
+                fire_current_timeout(&asm, link_id);
+                assert_ne!(
+                    link_state_of(&asm, link_id),
+                    LinkState::Active,
+                    "miss {} must close the link",
+                    config::KEEP_ALIVE_MAX_MISSES
+                );
+            })
+            .await
     }
 }
