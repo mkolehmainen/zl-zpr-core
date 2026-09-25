@@ -345,28 +345,64 @@ const CONNECT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// 3 timeout, 4 IdP unreachable, 5 VS rejected token, 6 policy denied,
 /// 7 device blob rejected, 1 anything else). On a device-only link the
 /// agent is supplied but never called and the link simply comes up.
+///
+/// ph only accepts Start from Inactive; any other state answers
+/// `UnexpectedTransition`, but the agent is registered by then (zipline#111).
+/// A link tearing down (e.g. before its holddown restart) is retried until
+/// Start is accepted. An attempt already in flight authenticates with our
+/// agent, so its outcome is polled like our own. An already-Active link is
+/// still an error on the first call, but a success on a retry: an attempt
+/// ran between two retries and came up with our agent.
 async fn connect_task(service: svc::Client, id: u32, no_browser: bool) -> Result<(), CliError> {
     println!("Connecting link {id}…");
-    let mut request = service.start_link_request();
-    request.get().set_id(id);
-    // The agent prints its own progress ("Authentication with <issuer>
-    // required…") when — and only when — ph calls back for a credential,
-    // since the issuer is not known until then.
-    request
-        .get()
-        .set_auth_agent(capnp_rpc::new_client(interactive_auth_agent(no_browser)));
+    let deadline = tokio::time::Instant::now() + CONNECT_DEADLINE;
+    let mut first_attempt = true;
+    loop {
+        let mut request = service.start_link_request();
+        request.get().set_id(id);
+        // Register the agent on the first call only. It stays on the link
+        // for the link's lifetime, so retries must not spawn another bridge.
+        // The agent prints its own progress ("Authentication with <issuer>
+        // required…") when — and only when — ph calls back for a credential,
+        // since the issuer is not known until then.
+        if first_attempt {
+            request
+                .get()
+                .set_auth_agent(capnp_rpc::new_client(interactive_auth_agent(no_browser)));
+        }
 
-    let response = request.send().promise.await?;
-    let results = response.get()?;
-    if let cli::success_or_error::Which::Error(e) = results.get_result()?.which()? {
+        let response = request.send().promise.await?;
+        let results = response.get()?;
+        let cli::success_or_error::Which::Error(e) = results.get_result()?.which()? else {
+            break; // Start accepted.
+        };
         let msg = e?.get_txt()?.to_string()?;
-        eprintln!("connect failed: {msg}");
-        std::process::exit(1);
+        match oidc::classify_start_link_error(&msg) {
+            oidc::StartLinkError::AlreadyActive if !first_attempt => {
+                println!("Link {id} up");
+                return Ok(());
+            }
+            oidc::StartLinkError::InFlight => {
+                println!("Link {id} already connecting; waiting for that attempt");
+                break;
+            }
+            oidc::StartLinkError::TearingDown if tokio::time::Instant::now() < deadline => {
+                println!(
+                    "Link {id} not startable yet ({}), retrying…",
+                    msg.trim_end()
+                );
+            }
+            _ => {
+                eprintln!("connect failed: {msg}");
+                std::process::exit(1);
+            }
+        }
+        first_attempt = false;
+        sleep(CONNECT_POLL_INTERVAL).await;
     }
 
     // Started. Poll showLink for the outcome; the RpcSystem stays alive on
     // this LocalSet the whole time, serving getOidcCredential callbacks.
-    let deadline = tokio::time::Instant::now() + CONNECT_DEADLINE;
     loop {
         if tokio::time::Instant::now() >= deadline {
             eprintln!("connect failed: timed out waiting for link {id} to come up");
