@@ -22,7 +22,7 @@
 #      visa works (adapter1 -> Web connectivity).
 #   2. The same assertions hold across attribute-refresh cycles in which
 #      the decorating store answers. This is the load-bearing part: the
-#      Finding 3 regression (a decorating store displacing the
+#      zipline#24 regression (a decorating store displacing the
 #      authenticator's user.zpr.authority) is invisible on the connect
 #      path alone — the authority is displaced once, and the attribute
 #      loss (google's vouched_here gate pruning user.sub, then happyfile's
@@ -549,7 +549,7 @@ fi
 fi
 
 #
-# Refresh legs — the part a Finding 3 regression needs (zipline#24).
+# Refresh legs — the part a user.zpr.authority-displacement regression needs (zipline#24).
 #
 
 if [[ "$PASS" == 0 ]] then

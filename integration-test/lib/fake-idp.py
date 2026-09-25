@@ -46,7 +46,8 @@ Refresh grants (zipline#47): an authorization request whose `scope`
 carries `offline_access` gets a `refresh_token` back from the code
 exchange, and `grant_type=refresh_token` renews the `id_token`. The
 renewed token models the properties ZPR's silent
-re-authentication depends on (docs/plans/2026-09-16-silent-oidc-reauth.md):
+re-authentication depends on (zl-zpr-dev-context/docs/OIDC.md,
+"Credential lifetimes and re-authentication"):
 `auth_time` does NOT move (it is the human's login moment, and the visa
 service anchors its session ceiling on it), `iat` strictly advances (the
 visa service rejects a replay), and there is NO `nonce` claim. The last

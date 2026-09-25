@@ -1,7 +1,7 @@
 # oidc + file trusted-service interplay fixture (zipline#27, epic #22 finale).
 #
-# The Background policy from
-# zl-zpr-dev-context/docs/plans/2026-09-14-trusted-service-interplay.md,
+# The zipline#22 policy (rationale: zl-zpr-dev-context/docs/VISA_SERVICE.md,
+# "Design decisions"),
 # adapted to the one-node OIDC topology (oidc-test.zpl):
 #   - adapter1 is USER-ONLY: no bootstrap key; it authenticates through the
 #     fake IdP (`google`, api = "oidc") as sub `user-a`.

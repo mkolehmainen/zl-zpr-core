@@ -215,7 +215,8 @@ test "$RC" = "400" || fail "/auth accepted a non-S256 code_challenge_method (HTT
 # 5. offline_access and the refresh grant (zipline#47)
 #
 # The properties the visa service's reauthorize path binds to, per
-# docs/plans/2026-09-16-silent-oidc-reauth.md decision 1: same sub, strictly
+# zl-zpr-dev-context/docs/OIDC.md ("Credential lifetimes and
+# re-authentication"): same sub, strictly
 # increasing iat, unchanged auth_time.
 #
 # The renewed token carries NO nonce claim. OIDC Core 12.2 says a refreshed

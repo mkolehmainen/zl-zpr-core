@@ -5,7 +5,7 @@
 //! listener as the redirect target. The entry point is [`login`], used
 //! standalone by the hidden `ph-cli oidc-login` debug subcommand and served
 //! to the packet handler behind the `AuthAgent` capability ([`CliAuthAgent`],
-//! Contract 6) by the `connect` and `auth-agent` commands.
+//! `AuthAgent` in adapter/admin-api/cli.capnp) by the `connect` and `auth-agent` commands.
 //!
 //! Security invariants:
 //! - The authorization `code`, the `id_token`, and the PKCE `verifier` are
@@ -88,8 +88,8 @@ impl OidcCliError {
 
 /// Description of an OIDC identity provider a link may authenticate against.
 ///
-/// Field set matches Contract "OidcIdpInfo" in the OIDC master plan
-/// (docs/plans/2026-09-02-oidc-implementation-plan.md) and the wire fields
+/// Field set matches the IdP advertisement ph relays from the node
+/// (zipline#12/#13) and the wire fields
 /// of `AuthAgent.getOidcCredential` (adapter/admin-api/cli.capnp).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OidcIdpInfo {
@@ -437,7 +437,7 @@ pub async fn refresh_grant(
 }
 
 /// The CLI-side implementation of the packet handler's `AuthAgent`
-/// capability (Contract 6): ph calls `getOidcCredential` back over the RPC
+/// capability (adapter/admin-api/cli.capnp): ph calls `getOidcCredential` back over the RPC
 /// connection `connect`/`auth-agent` keep open, and this server runs the
 /// interactive relying-party flow to satisfy it — or, for `interactive =
 /// false`, a silent refresh grant from the in-memory token store.
@@ -451,8 +451,9 @@ pub struct CliAuthAgent {
     /// Progress sink override for tests; `None` means stderr.
     pub progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Refresh tokens from interactive logins, keyed by issuer, held in
-    /// memory for the life of the agent process only (master plan Decision
-    /// 2): never logged, never written to disk, never set on RPC results.
+    /// memory for the life of the agent process only (zipline#46; the
+    /// rationale is in zl-zpr-dev-context/docs/OIDC.md): never logged, never
+    /// written to disk, never set on RPC results.
     /// `RefCell` suffices — the capnp server runs single-threaded on a
     /// LocalSet, same as the existing `Rc<Self>` receiver.
     pub refresh_tokens: RefCell<HashMap<String, String>>,
