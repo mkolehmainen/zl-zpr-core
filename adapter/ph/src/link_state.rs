@@ -2349,7 +2349,17 @@ impl LinkStateWrapper {
                 .peer_table
                 .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
             if vs_id.is_some() && vs_id.unwrap().get() == link_id {
-                if let Some(vsconn) = asm.vsconn.as_ref() {
+                // Only a genuine shutdown stops the VSConn run loop: `Stop`
+                // makes `run_with_reconnect` return permanently, after which
+                // every VS API call fails `ConnClosed` forever (zipline#113).
+                // A failure-driven close (keep-alive timeout, link error)
+                // falls through to the ordinary close below, leaving VSConn
+                // alive to reconnect and the VS link to be brought up again.
+                if !matches!(reason, TerminateReason::Shutdown) {
+                    info!(target: LINK_STATE,
+                        "{}: VS adapter link closing ({reason:?}); leaving VSConn running for reconnect",
+                        asm.formatted_link_id(link_id));
+                } else if let Some(vsconn) = asm.vsconn.as_ref() {
                     locked_fsm.set_state(LinkState::Disconnecting(reason));
 
                     let task_asm = asm.clone();
@@ -3398,7 +3408,9 @@ mod tests {
     use crate::auth;
     use crate::peer_table;
     use crate::prelude::*;
+    use crate::special_peers::SpecialPeerName;
     use crate::zdp::ResponseCode;
+    use crate::zdp::TerminateReason;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -5830,6 +5842,103 @@ mod tests {
                     "miss {} must close the link",
                     config::KEEP_ALIVE_MAX_MISSES
                 );
+            })
+            .await
+    }
+
+    /// Build a real [libnode::vsconn::VSConn] aimed at a refusing address,
+    /// plus a test assembly whose VS special peer is a NodeToAdapter link
+    /// (zipline#113 recovery tests). Returns the assembly, the VS link id,
+    /// and the VSConn instance (run it yourself so the test owns its task).
+    fn assembly_with_vs_peer() -> (Arc<Assembly>, LinkId, libnode::vsconn::VSConn) {
+        let key = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
+        let vsconn = libnode::vsconn::VSConn::new(
+            16,
+            "127.0.0.1:1".parse().unwrap(), // nothing listens on port 1: connect is refused fast
+            "test-node".to_string(),
+            key,
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        // Observable egress: the close path puts a Terminate on the mgmt
+        // substrate queue, which must have a live receiver.
+        let (egress_tx, _egress_rx) = crate::packet_queue::packet_queue(8);
+        let mut builder = TestAssemblyBuilder::new();
+        builder.mgmt_substrate_egress = Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
+        builder.vsconn = Some(Some(vsconn.handle()));
+        let asm = Arc::new(create_assembly(builder));
+        // Leak the receiver so the egress queue outlives the test body.
+        std::mem::forget(_egress_rx);
+        let link_id = add_node_peer(&asm);
+        asm.peer_table
+            .assign_special_name(SpecialPeerName::VisaServiceAdapter, link_id)
+            .unwrap();
+        asm.peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .test_set_state(LinkState::Active);
+        (asm, link_id, vsconn)
+    }
+
+    /// zipline#113: closing the VS adapter link because of a keep-alive
+    /// timeout must NOT send `VS2Command::Stop` — the VSConn run loop stays
+    /// alive so it can reconnect. Before the fix, ANY close of the VS
+    /// special-peer link stopped VSConn, and `run_with_reconnect` treated
+    /// that clean return as a permanent shutdown (`terminated: Ok(())`),
+    /// after which every VS API call failed `ConnClosed` forever.
+    #[tokio::test]
+    async fn test_vs_link_timeout_close_leaves_vsconn_running() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link_id, mut vsconn) = assembly_with_vs_peer();
+
+                let vsconn_task = tokio::task::spawn_local(async move {
+                    vsconn.run_with_reconnect(Duration::from_millis(200)).await
+                });
+                // Let the run loop start its first (refused) connect attempt.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // Keep-alive gave up on the link: close with RequestTimedOut.
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::Close(TerminateReason::RequestTimedOut),
+                )
+                .unwrap();
+
+                // Give a (wrongly sent) Stop ample time to be consumed by the
+                // reconnect loop: it polls the command channel while waiting.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(
+                    !vsconn_task.is_finished(),
+                    "a timeout-driven VS link close must leave the VSConn run \
+                     loop alive to reconnect; it received a Stop and exited"
+                );
+                vsconn_task.abort();
+            })
+            .await
+    }
+
+    /// Companion (zipline#113): a Shutdown-reason close of the VS adapter
+    /// link still stops VSConn — `Stop` stays reserved for process exit.
+    #[tokio::test]
+    async fn test_vs_link_shutdown_close_still_stops_vsconn() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link_id, mut vsconn) = assembly_with_vs_peer();
+
+                let vsconn_task = tokio::task::spawn_local(async move {
+                    vsconn.run_with_reconnect(Duration::from_millis(200)).await
+                });
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                asm.process_link_state_event(link_id, LinkEvent::Close(TerminateReason::Shutdown))
+                    .unwrap();
+
+                let res = tokio::time::timeout(Duration::from_secs(5), vsconn_task)
+                    .await
+                    .expect("Shutdown close must stop the VSConn run loop")
+                    .expect("VSConn task panicked");
+                assert!(res.is_ok(), "run_with_reconnect exits Ok on Stop: {res:?}");
             })
             .await
     }
