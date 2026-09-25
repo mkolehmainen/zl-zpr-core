@@ -40,19 +40,11 @@
 # The run takes several minutes: the renewal cadence is a real wall clock and
 # cannot be fast-forwarded from outside the processes.
 #
-# *** THIS TEST HAS NOT YET BEEN OBSERVED PASSING (zipline#67). ***
-#
-# The loop it exercises is implemented and unit-tested: R8 (zipline#66)
-# added the node-to-adapter credential request (ZDP
-# RenewAuthenticationRequest = 142 / RenewAuthenticationResponse = 143), so
-# the renewal tick on the NODE's `NodeToAdapter` link — where `auth_expires`,
-# the stashed renewal identity and the visa-service connection live — asks
-# the ADAPTER for a renewed credential, and the adapter serves it from the
-# AuthAgent `ph-cli` registers on its `AdapterToNode` side. This script is
-# that work's end-to-end proof, but zipline#66 records it was not run in the
-# environment that implemented R8 (no passwordless sudo there), so a green
-# run has not yet been recorded. Do not read a failure here as expected;
-# investigate it.
+# Observed passing on 2026-09-25 at zl-zpr-core 824d7a5, twice: by the
+# operator on the host, and under Docker (make docker-test). Those runs
+# predate the strengthened leg-3 assertions added by zipline#104, which
+# require the revocation leg to prove the revoked grant was actually
+# presented and rejected (see LEG 3 below).
 set -euo pipefail
 
 export RUST_BACKTRACE=1

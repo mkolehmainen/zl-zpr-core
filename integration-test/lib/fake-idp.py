@@ -81,7 +81,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -477,11 +477,41 @@ def main() -> int:
     if not args.tls_cert or not args.tls_key:
         parser.error("--tls-cert and --tls-key are required to serve (issuer is https-only)")
 
-    server = HTTPServer(("127.0.0.1", args.port), IdpHandler)
-    server.idp = idp
+    # Threaded, because a single-threaded HTTPServer serializes EVERYTHING
+    # through one loop: a client that stalls mid-TLS-handshake or holds a
+    # keep-alive connection open blocks accept() for every later client. In
+    # the 2026-09-25 renewal-test run (zipline#104) exactly that made the
+    # per-netns instance go deaf after leg 2 — both post-revocation renewals
+    # failed on transport ("error sending request") and the revoked grant was
+    # never presented.
+    #
+    # Threading alone is not enough: on a TLS-wrapped LISTENING socket the
+    # handshake runs inside accept() — still in the accept loop's thread —
+    # so a stalled handshake would wedge the server anyway. The listener
+    # therefore stays plaintext and each connection is wrapped in
+    # finish_request(), which ThreadingMixIn runs in the per-connection
+    # thread; a stuck client rots in its own thread while the accept loop
+    # keeps serving. A failed handshake raises there and is reported by
+    # handle_error() without killing the server. The shared IdpState is safe
+    # enough for a test harness: the mutations are single dict/property
+    # operations (atomic under the GIL), and rotation/revocation state is a
+    # file re-read per request.
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=args.tls_cert, keyfile=args.tls_key)
-    server.socket = context.wrap_socket(server.socket, server_side=True)
+
+    class TlsIdpServer(ThreadingHTTPServer):
+        # Do not block exit on a wedged connection thread.
+        daemon_threads = True
+
+        def finish_request(self, request, client_address):
+            tls_request = context.wrap_socket(request, server_side=True)
+            try:
+                super().finish_request(tls_request, client_address)
+            finally:
+                tls_request.close()
+
+    server = TlsIdpServer(("127.0.0.1", args.port), IdpHandler)
+    server.idp = idp
     sys.stderr.write(f"fake-idp: serving {idp.issuer} (kid {idp.active_key().kid})\n")
     try:
         server.serve_forever()
