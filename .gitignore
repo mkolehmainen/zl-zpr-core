@@ -6,3 +6,5 @@ integration-test/valkey-server
 target/
 completions/
 *.pcap
+__pycache__/
+*.pyc
