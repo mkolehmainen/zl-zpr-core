@@ -1,0 +1,10 @@
+{
+  "device.zpr.adapter.cn": {
+    "adapter1": { "zpr_addr": ["fd5a:5052:8888::1:1"] },
+    "adapter2": { "zpr_addr": ["fd5a:5052:8888::2:1"] },
+    "adapter3": { "zpr_addr": ["fd5a:5052:8888::3:1"] }
+  },
+  "user.oidc-subject": {
+    "user-a": { "zpr_addr": ["fd5a:5052:8888::1:1"] }
+  }
+}

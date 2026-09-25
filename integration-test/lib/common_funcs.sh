@@ -169,6 +169,20 @@ vk_uri = "redis://127.0.0.1:6379"
 EOF
 }
 
+# Install the shared static-address store for the `addresses` file trusted
+# service (zipline#107). Every fixture policy that declares
+# [trusted_services.addresses] gets its data from pregen/addresses.json: one
+# CN-keyed store granting adapter1/2/3 their static ZPR addresses via
+# device.zpr_addr (zipline#99), plus a user-keyed entry for the user-only
+# OIDC adapter1 (its CN is never authenticated, so the grant is keyed on the
+# user identity the policy maps `sub` to). The visa service reads
+# <file_ts_dir>/addresses.json, and file_ts_dir defaults to the directory of
+# the vs config file — call this from that directory (the test's $TMPDIR),
+# like the happyfile/attr-query copies.
+function copy_address_store() {
+  cp "$PREGEN/addresses.json" addresses.json
+}
+
 function check_vs_valkey_port() {
   sudo ip netns exec zpr-vs bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6379'
 }

@@ -494,6 +494,13 @@ vk_uri = "redis://127.0.0.1:6379"
 ts_secrets_dir = "."
 EOF
 
+# The policy's `addresses` trusted service reads its grant data from
+# file_ts_dir/addresses.json (file_ts_dir defaults to the vs config's
+# directory, i.e. here). Only adapter2's CN grant applies in this test:
+# adapter1 is the one dynamic-path actor (zipline#88) and matches no store
+# entry. See lib/common_funcs.sh (zipline#107).
+copy_address_store
+
 # Admin API keys: mint two directly in the format vsapikey uses
 # (vs/src/apikey.rs: zpr_vsapi.<id_hex>.<b64url_secret>; vs_keys.toml
 # stores the sha256 of the secret). vs-admin.key is the readwrite key the
