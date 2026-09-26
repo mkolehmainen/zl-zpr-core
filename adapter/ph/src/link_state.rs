@@ -2353,12 +2353,34 @@ impl LinkStateWrapper {
                 // makes `run_with_reconnect` return permanently, after which
                 // every VS API call fails `ConnClosed` forever (zipline#113).
                 // A failure-driven close (keep-alive timeout, link error)
-                // falls through to the ordinary close below, leaving VSConn
-                // alive to reconnect and the VS link to be brought up again.
+                // falls through to the ordinary close below — but VSConn's
+                // current run loop must be explicitly restarted: if the
+                // Cap'n Proto TCP connection survived the link flap (or the
+                // failure was ZDP-only), the loop would otherwise stay
+                // parked, never emit RunLoopExits/RunLoopStarts, and
+                // vs_worker — gated on RunLoopStarts before it re-runs
+                // register_vss — would leave the replacement link's
+                // deferred_vs_connect pending forever. `restart` recycles
+                // the loop (RunLoopExits, re-dial, fresh RunLoopStarts)
+                // without stopping the reconnect manager; if the loop is
+                // already mid-dial or in its reconnect delay, the command
+                // is discarded, which is fine — a restart is already in
+                // progress.
                 if !matches!(reason, TerminateReason::Shutdown) {
                     info!(target: LINK_STATE,
-                        "{}: VS adapter link closing ({reason:?}); leaving VSConn running for reconnect",
+                        "{}: VS adapter link closing ({reason:?}); restarting VSConn run loop for reconnect",
                         asm.formatted_link_id(link_id));
+                    if let Some(vsconn) = asm.vsconn.as_ref() {
+                        let restart_hndl = vsconn.clone();
+                        tokio::task::spawn_local(async move {
+                            if let Err(e) = restart_hndl.restart().await {
+                                // ConnClosed here means the run loop is
+                                // between dials — already restarting.
+                                debug!(target: LINK_STATE,
+                                    "VSConn restart command not delivered (already recycling): {e}");
+                            }
+                        });
+                    }
                 } else if let Some(vsconn) = asm.vsconn.as_ref() {
                     locked_fsm.set_state(LinkState::Disconnecting(reason));
 

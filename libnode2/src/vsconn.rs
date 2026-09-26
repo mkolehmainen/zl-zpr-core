@@ -85,6 +85,17 @@ enum VS2Command {
     /// Stop the local vs-api run loop, optionally de-register from the visa service first.
     Stop(bool),
 
+    /// Recycle the current run loop: exit it (emitting
+    /// [VSConnLifecycleEvent::RunLoopExits]) so [VSConn::run_with_reconnect]
+    /// re-dials and a fresh [VSConnLifecycleEvent::RunLoopStarts] follows.
+    /// Unlike [VS2Command::Stop] this never terminates the reconnect
+    /// manager. Used when the VS adapter *link* closes on a failure while
+    /// the underlying Cap'n Proto TCP connection may have survived: without
+    /// a restart, `vs_worker` stays parked waiting for a `RunLoopStarts`
+    /// that will never come and the replacement link's deferred
+    /// authorization is stuck pending (zipline#113).
+    Restart,
+
     /// Run through the "bootstrap" connect sequence. If connect succeeds the VSHandle is kept internally.
     Connect(NodeConnect, oneshot::Sender<VSConnectResponse>),
 
@@ -456,6 +467,18 @@ impl VSConn {
                     }
                 }
                 Ok(())
+            }
+
+            VS2Command::Restart => {
+                info!(
+                    target: VS_RPC,
+                    "VSConn: restart requested; recycling run loop for a fresh dial"
+                );
+                // Erroring out of handle_command makes the run loop emit
+                // RunLoopExits and return Err, which run_with_reconnect
+                // answers with a re-dial — and the re-dial's success emits
+                // the fresh RunLoopStarts that un-parks vs_worker.
+                Err(VSApiError::RunLoopRestart)
             }
 
             VS2Command::Connect(req, resp_tx) => {
@@ -1050,6 +1073,16 @@ impl VSConnHandle {
     pub async fn stop(&self, deregister: bool) -> Result<(), VSApiError> {
         let cmd = VS2Command::Stop(deregister);
         self.send_command(cmd).await
+    }
+
+    /// Recycle the current run loop without terminating the reconnect
+    /// manager: the loop exits (`RunLoopExits`), `run_with_reconnect`
+    /// re-dials, and a fresh `RunLoopStarts` follows (zipline#113). Like
+    /// every other command, this is discarded if it lands while the run
+    /// loop is mid-dial or waiting out a reconnect delay — in those windows
+    /// a restart is already in progress, so that is the desired outcome.
+    pub async fn restart(&self) -> Result<(), VSApiError> {
+        self.send_command(VS2Command::Restart).await
     }
 
     pub async fn visa_request(&self, req: VisaRequest) -> Result<VisaDecision, VSApiError> {
