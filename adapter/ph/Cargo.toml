@@ -63,7 +63,12 @@ tokio-tun = { version = "0.11.5" }
 
 [dev-dependencies]
 futures = "0.3.31"
+# TLS holding-server test helper (zipline#113): same versions libnode2 uses,
+# so no new crates enter the build graph.
+rcgen = "0.14.7"
+rustls = "0.23.36"
 serial_test = "4.0"
+tokio-rustls = "0.26.4"
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]

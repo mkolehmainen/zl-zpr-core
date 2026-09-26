@@ -5846,15 +5846,20 @@ mod tests {
             .await
     }
 
-    /// Build a real [libnode::vsconn::VSConn] aimed at a refusing address,
-    /// plus a test assembly whose VS special peer is a NodeToAdapter link
+    /// Build a real [libnode::vsconn::VSConn] aimed at `vs_addr`, plus a
+    /// test assembly whose VS special peer is a NodeToAdapter link
     /// (zipline#113 recovery tests). Returns the assembly, the VS link id,
     /// and the VSConn instance (run it yourself so the test owns its task).
-    fn assembly_with_vs_peer() -> (Arc<Assembly>, LinkId, libnode::vsconn::VSConn) {
+    /// Pass a refusing address (e.g. `127.0.0.1:1`) to keep the run loop in
+    /// its dial/retry phase, or a live TLS server's address to get it parked
+    /// in its command loop.
+    fn assembly_with_vs_peer(
+        vs_addr: std::net::SocketAddr,
+    ) -> (Arc<Assembly>, LinkId, libnode::vsconn::VSConn) {
         let key = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
         let vsconn = libnode::vsconn::VSConn::new(
             16,
-            "127.0.0.1:1".parse().unwrap(), // nothing listens on port 1: connect is refused fast
+            vs_addr,
             "test-node".to_string(),
             key,
             "127.0.0.1:5000".parse().unwrap(),
@@ -5890,7 +5895,10 @@ mod tests {
     async fn test_vs_link_timeout_close_leaves_vsconn_running() {
         LocalSet::new()
             .run_until(async {
-                let (asm, link_id, mut vsconn) = assembly_with_vs_peer();
+                // Nothing listens on port 1: connect is refused fast, so the
+                // run loop stays in its dial/retry phase.
+                let (asm, link_id, mut vsconn) =
+                    assembly_with_vs_peer("127.0.0.1:1".parse().unwrap());
 
                 let vsconn_task = tokio::task::spawn_local(async move {
                     vsconn.run_with_reconnect(Duration::from_millis(200)).await
@@ -5924,7 +5932,8 @@ mod tests {
     async fn test_vs_link_shutdown_close_still_stops_vsconn() {
         LocalSet::new()
             .run_until(async {
-                let (asm, link_id, mut vsconn) = assembly_with_vs_peer();
+                let (asm, link_id, mut vsconn) =
+                    assembly_with_vs_peer("127.0.0.1:1".parse().unwrap());
 
                 let vsconn_task = tokio::task::spawn_local(async move {
                     vsconn.run_with_reconnect(Duration::from_millis(200)).await
@@ -5939,6 +5948,117 @@ mod tests {
                     .expect("Shutdown close must stop the VSConn run loop")
                     .expect("VSConn task panicked");
                 assert!(res.is_ok(), "run_with_reconnect exits Ok on Stop: {res:?}");
+            })
+            .await
+    }
+
+    /// A minimal local TLS server: accepts connections, completes the TLS
+    /// handshake, then holds each stream open. Enough for `VSConn::run` to
+    /// get past TLS and emit `RunLoopStarts`; no Cap'n Proto traffic is
+    /// exchanged. Returns the bound address. Mirrors the libnode2 test
+    /// helper of the same name.
+    async fn spawn_tls_holding_server() -> std::net::SocketAddr {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let chain = vec![CertificateDer::from(cert.cert.der().clone())];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+        let cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::task::spawn_local(async move {
+                    if let Ok(_tls) = acceptor.accept(sock).await {
+                        // Hold the connection open; never speak.
+                        std::future::pending::<()>().await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// zipline#113, Codex P1 on PR #40: when the VS adapter link closes on a
+    /// failure (keep-alive timeout, ZDP-only failure) while the underlying
+    /// Cap'n Proto TCP connection SURVIVES, leaving VSConn untouched is not
+    /// enough — its run loop stays parked in its command loop, never emits
+    /// `RunLoopExits`/`RunLoopStarts`, so `vs_worker` (gated on
+    /// `RunLoopStarts`) never re-runs `register_vss` and the replacement VS
+    /// link's `deferred_vs_connect` stays pending forever. The close path
+    /// must explicitly restart the current run loop: this test demands a
+    /// fresh `RunLoopStarts` after the failure-close.
+    #[tokio::test]
+    async fn test_vs_link_timeout_close_restarts_vsconn_run_loop() {
+        use libnode::vsconn::VSConnLifecycleEvent;
+
+        LocalSet::new()
+            .run_until(async {
+                // A live TLS server, so VSConn::run reaches its command loop
+                // and the TCP connection survives the link flap.
+                let server_addr = spawn_tls_holding_server().await;
+                let (asm, link_id, mut vsconn) = assembly_with_vs_peer(server_addr);
+                let mut lifecycle_rx = vsconn.subscribe_lifecycle_events();
+
+                let vsconn_task = tokio::task::spawn_local(async move {
+                    vsconn.run_with_reconnect(Duration::from_millis(50)).await
+                });
+
+                // First RunLoopStarts: the run loop is up and parked.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match lifecycle_rx.recv().await {
+                            Ok(VSConnLifecycleEvent::RunLoopStarts) => break,
+                            Ok(_) => continue,
+                            Err(e) => panic!("lifecycle channel died: {e:?}"),
+                        }
+                    }
+                })
+                .await
+                .expect("VSConn never reached its first RunLoopStarts");
+
+                // Keep-alive gave up on the link: close with RequestTimedOut.
+                // The TCP connection to the (held-open) TLS server survives.
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::Close(TerminateReason::RequestTimedOut),
+                )
+                .unwrap();
+
+                // The close path must force the run loop to restart: a fresh
+                // RunLoopStarts (preceded by RunLoopExits) has to arrive, or
+                // vs_worker stays parked and the replacement VS link's
+                // deferred authorization is never sent.
+                let restarted = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match lifecycle_rx.recv().await {
+                            Ok(VSConnLifecycleEvent::RunLoopStarts) => break,
+                            Ok(_) => continue,
+                            Err(e) => panic!("lifecycle channel died: {e:?}"),
+                        }
+                    }
+                })
+                .await;
+                assert!(
+                    restarted.is_ok(),
+                    "a failure-close of the VS link with a surviving TCP \
+                     connection must restart the VSConn run loop (fresh \
+                     RunLoopStarts); otherwise vs_worker never re-registers \
+                     and deferred_vs_connect is stuck pending"
+                );
+
+                // And the reconnect manager itself must stay alive.
+                assert!(
+                    !vsconn_task.is_finished(),
+                    "restart must recycle the run loop, not stop run_with_reconnect"
+                );
+                vsconn_task.abort();
             })
             .await
     }
