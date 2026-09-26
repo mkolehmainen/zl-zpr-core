@@ -431,6 +431,11 @@ pub struct LinkStateMachine {
     /// Handle to an outstanding echo/keepalive task; used only during Active.
     /// Instant is time at which the echo was sent.
     echo_handle: Option<(Instant, tokio::task::AbortHandle)>,
+    /// Consecutive keep-alive misses on this Active session (zipline#113).
+    /// Incremented when an outstanding echo times out, reset by a keep-alive
+    /// response (and on entering Active); the link is only torn down when it
+    /// reaches [config::KEEP_ALIVE_MAX_MISSES].
+    keep_alive_misses: u32,
     shutting_down: bool, // only ever goes from False -> True once
 }
 
@@ -448,6 +453,7 @@ impl LinkStateMachine {
             timeout_count: 0,
             stowed_init_auth: None,
             echo_handle: None,
+            keep_alive_misses: 0,
             shutting_down: false,
         }
     }
@@ -2255,46 +2261,52 @@ impl LinkStateWrapper {
             }
 
             (_, LinkState::Active) => {
-                match locked_fsm.echo_handle.take() {
-                    Some((_start_time, echo_handle)) => {
-                        // there was an outstanding echo, and we've timed out
-                        echo_handle.abort();
-                        self.locked_data.lock().unwrap().echo_timeout += 1;
+                if let Some((_start_time, echo_handle)) = locked_fsm.echo_handle.take() {
+                    // There was an outstanding echo, and we've timed out: a
+                    // consecutive keep-alive miss (zipline#113). Only tear
+                    // the link down when the tolerance is exhausted; until
+                    // then, log the miss and immediately try another echo.
+                    echo_handle.abort();
+                    self.locked_data.lock().unwrap().echo_timeout += 1;
+                    locked_fsm.keep_alive_misses += 1;
+                    if locked_fsm.keep_alive_misses >= config::KEEP_ALIVE_MAX_MISSES {
                         error!(target: LINK_STATE, "{} failed to respond to keep-alive messages", asm.formatted_link_id(self.id));
                         locked_fsm.set_state(LinkState::Error);
                         drop(locked_fsm);
                         return self.initiate_close(asm, TerminateReason::RequestTimedOut);
                     }
-
-                    None => {
-                        // no outstanding echo, time for a new one!
-                        let link_id = self.id;
-                        let task_asm = asm.clone();
-                        let jh = tokio::task::spawn_local(async move {
-                            match mgmt::requests::send_echo_request(&task_asm, link_id)
-                                .acked()
-                                .await
-                            {
-                                Ok(()) => {
-                                    // success! poke the state machine
-                                    // ignore any errors, that just means we've left Active and are already shutting down the link
-                                    let _ = task_asm.process_link_state_event(
-                                        link_id,
-                                        LinkEvent::ReceivedKeepAliveResponse,
-                                    );
-                                }
-
-                                // ignore link closed, we are already shutting down
-                                Err(mgmt::core::MgmtSendError::LinkClosed) => (),
-                            }
-                        });
-
-                        // store new echo handle and kick off timeout
-                        locked_fsm.echo_handle = Some((Instant::now(), jh.abort_handle()));
-                        self.set_timeout(asm, &mut locked_fsm, config::DEFAULT_KEEP_ALIVE_TIMEOUT);
-                        Ok(())
-                    }
+                    warn!(target: LINK_STATE, "{} missed keep-alive {} of {}",
+                        asm.formatted_link_id(self.id),
+                        locked_fsm.keep_alive_misses,
+                        config::KEEP_ALIVE_MAX_MISSES);
                 }
+
+                // No outstanding echo (or a tolerated miss): send a new one.
+                let link_id = self.id;
+                let task_asm = asm.clone();
+                let jh = tokio::task::spawn_local(async move {
+                    match mgmt::requests::send_echo_request(&task_asm, link_id)
+                        .acked()
+                        .await
+                    {
+                        Ok(()) => {
+                            // success! poke the state machine
+                            // ignore any errors, that just means we've left Active and are already shutting down the link
+                            let _ = task_asm.process_link_state_event(
+                                link_id,
+                                LinkEvent::ReceivedKeepAliveResponse,
+                            );
+                        }
+
+                        // ignore link closed, we are already shutting down
+                        Err(mgmt::core::MgmtSendError::LinkClosed) => (),
+                    }
+                });
+
+                // store new echo handle and kick off timeout
+                locked_fsm.echo_handle = Some((Instant::now(), jh.abort_handle()));
+                self.set_timeout(asm, &mut locked_fsm, config::DEFAULT_KEEP_ALIVE_TIMEOUT);
+                Ok(())
             }
 
             (_, LinkState::Closing) => {
@@ -2337,7 +2349,39 @@ impl LinkStateWrapper {
                 .peer_table
                 .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
             if vs_id.is_some() && vs_id.unwrap().get() == link_id {
-                if let Some(vsconn) = asm.vsconn.as_ref() {
+                // Only a genuine shutdown stops the VSConn run loop: `Stop`
+                // makes `run_with_reconnect` return permanently, after which
+                // every VS API call fails `ConnClosed` forever (zipline#113).
+                // A failure-driven close (keep-alive timeout, link error)
+                // falls through to the ordinary close below — but VSConn's
+                // current run loop must be explicitly restarted: if the
+                // Cap'n Proto TCP connection survived the link flap (or the
+                // failure was ZDP-only), the loop would otherwise stay
+                // parked, never emit RunLoopExits/RunLoopStarts, and
+                // vs_worker — gated on RunLoopStarts before it re-runs
+                // register_vss — would leave the replacement link's
+                // deferred_vs_connect pending forever. `restart` recycles
+                // the loop (RunLoopExits, re-dial, fresh RunLoopStarts)
+                // without stopping the reconnect manager; if the loop is
+                // already mid-dial or in its reconnect delay, the command
+                // is discarded, which is fine — a restart is already in
+                // progress.
+                if !matches!(reason, TerminateReason::Shutdown) {
+                    info!(target: LINK_STATE,
+                        "{}: VS adapter link closing ({reason:?}); restarting VSConn run loop for reconnect",
+                        asm.formatted_link_id(link_id));
+                    if let Some(vsconn) = asm.vsconn.as_ref() {
+                        let restart_hndl = vsconn.clone();
+                        tokio::task::spawn_local(async move {
+                            if let Err(e) = restart_hndl.restart().await {
+                                // ConnClosed here means the run loop is
+                                // between dials — already restarting.
+                                debug!(target: LINK_STATE,
+                                    "VSConn restart command not delivered (already recycling): {e}");
+                            }
+                        });
+                    }
+                } else if let Some(vsconn) = asm.vsconn.as_ref() {
                     locked_fsm.set_state(LinkState::Disconnecting(reason));
 
                     let task_asm = asm.clone();
@@ -2647,6 +2691,7 @@ impl LinkStateWrapper {
         };
 
         // we got a successful echo response, track it
+        locked_fsm.keep_alive_misses = 0; // zipline#113: a response resets the miss tolerance
         let mut link_data = self.locked_data.lock().unwrap();
         link_data.echo_success += 1;
         link_data
@@ -3260,6 +3305,7 @@ impl LinkStateWrapper {
 
         // kick off our keepalive mechanism
         locked_fsm.echo_handle.take().inspect(|(_, h)| h.abort()); // should already be None (indicating no echo outstanding) but let's be sure
+        locked_fsm.keep_alive_misses = 0; // fresh Active session, fresh tolerance (zipline#113)
         self.set_timeout(asm, &mut locked_fsm, config::DEFAULT_KEEP_ALIVE_TIMEOUT);
 
         Ok(())
@@ -3384,7 +3430,9 @@ mod tests {
     use crate::auth;
     use crate::peer_table;
     use crate::prelude::*;
+    use crate::special_peers::SpecialPeerName;
     use crate::zdp::ResponseCode;
+    use crate::zdp::TerminateReason;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -5729,5 +5777,311 @@ mod tests {
                 }
                 tx.send(()).unwrap();
             });
+    }
+
+    /// Deliver a Timeout event carrying the link's CURRENT logical clock,
+    /// as the real timeout task does (zipline#113 keep-alive tests).
+    fn fire_current_timeout(asm: &Arc<Assembly>, link_id: LinkId) {
+        let clock = asm
+            .peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .test_logical_clock();
+        asm.process_link_state_event(
+            link_id,
+            LinkEvent::Timeout {
+                logical_clock: clock,
+            },
+        )
+        .unwrap();
+    }
+
+    fn link_state_of(asm: &Arc<Assembly>, link_id: LinkId) -> LinkState {
+        asm.peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .get_state()
+    }
+
+    /// zipline#113: one missed keep-alive echo must NOT kill an Active link.
+    /// The link tolerates consecutive misses and only goes to `Error` (and
+    /// closes) on the KEEP_ALIVE_MAX_MISSES'th consecutive miss; a keep-alive
+    /// response in between resets the counter. Before the fix, the FIRST
+    /// timeout with an outstanding echo set `Error` and initiated the close.
+    #[tokio::test]
+    async fn test_keep_alive_tolerates_misses_and_resets_on_response() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_node_peer(&asm);
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .link_state_machine
+                    .test_set_state(LinkState::Active);
+
+                // First timeout: no echo outstanding -> sends a fresh echo.
+                fire_current_timeout(&asm, link_id);
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Active);
+
+                // Misses 1 and 2: echo outstanding, timeout fires. The link
+                // must stay Active (tolerated) and keep echoing.
+                for miss in 1..config::KEEP_ALIVE_MAX_MISSES {
+                    fire_current_timeout(&asm, link_id);
+                    assert_eq!(
+                        link_state_of(&asm, link_id),
+                        LinkState::Active,
+                        "link must survive consecutive keep-alive miss {miss}"
+                    );
+                }
+
+                // A keep-alive response arrives: counter resets.
+                asm.process_link_state_event(link_id, LinkEvent::ReceivedKeepAliveResponse)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Active);
+
+                // Fresh echo, then the full tolerated run of misses again —
+                // proving the reset (without it the counter would hit the
+                // limit early).
+                fire_current_timeout(&asm, link_id);
+                for miss in 1..config::KEEP_ALIVE_MAX_MISSES {
+                    fire_current_timeout(&asm, link_id);
+                    assert_eq!(
+                        link_state_of(&asm, link_id),
+                        LinkState::Active,
+                        "post-reset miss {miss} must still be tolerated"
+                    );
+                }
+
+                // The final consecutive miss is fatal: the link leaves Active
+                // and starts closing.
+                fire_current_timeout(&asm, link_id);
+                assert_ne!(
+                    link_state_of(&asm, link_id),
+                    LinkState::Active,
+                    "miss {} must close the link",
+                    config::KEEP_ALIVE_MAX_MISSES
+                );
+            })
+            .await
+    }
+
+    /// Build a real [libnode::vsconn::VSConn] aimed at `vs_addr`, plus a
+    /// test assembly whose VS special peer is a NodeToAdapter link
+    /// (zipline#113 recovery tests). Returns the assembly, the VS link id,
+    /// and the VSConn instance (run it yourself so the test owns its task).
+    /// Pass a refusing address (e.g. `127.0.0.1:1`) to keep the run loop in
+    /// its dial/retry phase, or a live TLS server's address to get it parked
+    /// in its command loop.
+    fn assembly_with_vs_peer(
+        vs_addr: std::net::SocketAddr,
+    ) -> (Arc<Assembly>, LinkId, libnode::vsconn::VSConn) {
+        let key = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
+        let vsconn = libnode::vsconn::VSConn::new(
+            16,
+            vs_addr,
+            "test-node".to_string(),
+            key,
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        // Observable egress: the close path puts a Terminate on the mgmt
+        // substrate queue, which must have a live receiver.
+        let (egress_tx, _egress_rx) = crate::packet_queue::packet_queue(8);
+        let mut builder = TestAssemblyBuilder::new();
+        builder.mgmt_substrate_egress = Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
+        builder.vsconn = Some(Some(vsconn.handle()));
+        let asm = Arc::new(create_assembly(builder));
+        // Leak the receiver so the egress queue outlives the test body.
+        std::mem::forget(_egress_rx);
+        let link_id = add_node_peer(&asm);
+        asm.peer_table
+            .assign_special_name(SpecialPeerName::VisaServiceAdapter, link_id)
+            .unwrap();
+        asm.peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .test_set_state(LinkState::Active);
+        (asm, link_id, vsconn)
+    }
+
+    /// zipline#113: closing the VS adapter link because of a keep-alive
+    /// timeout must NOT send `VS2Command::Stop` — the VSConn run loop stays
+    /// alive so it can reconnect. Before the fix, ANY close of the VS
+    /// special-peer link stopped VSConn, and `run_with_reconnect` treated
+    /// that clean return as a permanent shutdown (`terminated: Ok(())`),
+    /// after which every VS API call failed `ConnClosed` forever.
+    #[tokio::test]
+    async fn test_vs_link_timeout_close_leaves_vsconn_running() {
+        LocalSet::new()
+            .run_until(async {
+                // Nothing listens on port 1: connect is refused fast, so the
+                // run loop stays in its dial/retry phase.
+                let (asm, link_id, mut vsconn) =
+                    assembly_with_vs_peer("127.0.0.1:1".parse().unwrap());
+
+                let vsconn_task = tokio::task::spawn_local(async move {
+                    vsconn.run_with_reconnect(Duration::from_millis(200)).await
+                });
+                // Let the run loop start its first (refused) connect attempt.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // Keep-alive gave up on the link: close with RequestTimedOut.
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::Close(TerminateReason::RequestTimedOut),
+                )
+                .unwrap();
+
+                // Give a (wrongly sent) Stop ample time to be consumed by the
+                // reconnect loop: it polls the command channel while waiting.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(
+                    !vsconn_task.is_finished(),
+                    "a timeout-driven VS link close must leave the VSConn run \
+                     loop alive to reconnect; it received a Stop and exited"
+                );
+                vsconn_task.abort();
+            })
+            .await
+    }
+
+    /// Companion (zipline#113): a Shutdown-reason close of the VS adapter
+    /// link still stops VSConn — `Stop` stays reserved for process exit.
+    #[tokio::test]
+    async fn test_vs_link_shutdown_close_still_stops_vsconn() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link_id, mut vsconn) =
+                    assembly_with_vs_peer("127.0.0.1:1".parse().unwrap());
+
+                let vsconn_task = tokio::task::spawn_local(async move {
+                    vsconn.run_with_reconnect(Duration::from_millis(200)).await
+                });
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                asm.process_link_state_event(link_id, LinkEvent::Close(TerminateReason::Shutdown))
+                    .unwrap();
+
+                let res = tokio::time::timeout(Duration::from_secs(5), vsconn_task)
+                    .await
+                    .expect("Shutdown close must stop the VSConn run loop")
+                    .expect("VSConn task panicked");
+                assert!(res.is_ok(), "run_with_reconnect exits Ok on Stop: {res:?}");
+            })
+            .await
+    }
+
+    /// A minimal local TLS server: accepts connections, completes the TLS
+    /// handshake, then holds each stream open. Enough for `VSConn::run` to
+    /// get past TLS and emit `RunLoopStarts`; no Cap'n Proto traffic is
+    /// exchanged. Returns the bound address. Mirrors the libnode2 test
+    /// helper of the same name.
+    async fn spawn_tls_holding_server() -> std::net::SocketAddr {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let chain = vec![CertificateDer::from(cert.cert.der().clone())];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+        let cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::task::spawn_local(async move {
+                    if let Ok(_tls) = acceptor.accept(sock).await {
+                        // Hold the connection open; never speak.
+                        std::future::pending::<()>().await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// zipline#113, Codex P1 on PR #40: when the VS adapter link closes on a
+    /// failure (keep-alive timeout, ZDP-only failure) while the underlying
+    /// Cap'n Proto TCP connection SURVIVES, leaving VSConn untouched is not
+    /// enough — its run loop stays parked in its command loop, never emits
+    /// `RunLoopExits`/`RunLoopStarts`, so `vs_worker` (gated on
+    /// `RunLoopStarts`) never re-runs `register_vss` and the replacement VS
+    /// link's `deferred_vs_connect` stays pending forever. The close path
+    /// must explicitly restart the current run loop: this test demands a
+    /// fresh `RunLoopStarts` after the failure-close.
+    #[tokio::test]
+    async fn test_vs_link_timeout_close_restarts_vsconn_run_loop() {
+        use libnode::vsconn::VSConnLifecycleEvent;
+
+        LocalSet::new()
+            .run_until(async {
+                // A live TLS server, so VSConn::run reaches its command loop
+                // and the TCP connection survives the link flap.
+                let server_addr = spawn_tls_holding_server().await;
+                let (asm, link_id, mut vsconn) = assembly_with_vs_peer(server_addr);
+                let mut lifecycle_rx = vsconn.subscribe_lifecycle_events();
+
+                let vsconn_task = tokio::task::spawn_local(async move {
+                    vsconn.run_with_reconnect(Duration::from_millis(50)).await
+                });
+
+                // First RunLoopStarts: the run loop is up and parked.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match lifecycle_rx.recv().await {
+                            Ok(VSConnLifecycleEvent::RunLoopStarts) => break,
+                            Ok(_) => continue,
+                            Err(e) => panic!("lifecycle channel died: {e:?}"),
+                        }
+                    }
+                })
+                .await
+                .expect("VSConn never reached its first RunLoopStarts");
+
+                // Keep-alive gave up on the link: close with RequestTimedOut.
+                // The TCP connection to the (held-open) TLS server survives.
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::Close(TerminateReason::RequestTimedOut),
+                )
+                .unwrap();
+
+                // The close path must force the run loop to restart: a fresh
+                // RunLoopStarts (preceded by RunLoopExits) has to arrive, or
+                // vs_worker stays parked and the replacement VS link's
+                // deferred authorization is never sent.
+                let restarted = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match lifecycle_rx.recv().await {
+                            Ok(VSConnLifecycleEvent::RunLoopStarts) => break,
+                            Ok(_) => continue,
+                            Err(e) => panic!("lifecycle channel died: {e:?}"),
+                        }
+                    }
+                })
+                .await;
+                assert!(
+                    restarted.is_ok(),
+                    "a failure-close of the VS link with a surviving TCP \
+                     connection must restart the VSConn run loop (fresh \
+                     RunLoopStarts); otherwise vs_worker never re-registers \
+                     and deferred_vs_connect is stuck pending"
+                );
+
+                // And the reconnect manager itself must stay alive.
+                assert!(
+                    !vsconn_task.is_finished(),
+                    "restart must recycle the run loop, not stop run_with_reconnect"
+                );
+                vsconn_task.abort();
+            })
+            .await
     }
 }

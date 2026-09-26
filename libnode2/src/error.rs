@@ -6,6 +6,11 @@ pub enum VSApiError {
     #[error("VS API connection is closed")]
     ConnClosed,
 
+    /// The run loop was asked to recycle itself (zipline#113): it exits with
+    /// this error so `run_with_reconnect` re-dials rather than terminating.
+    #[error("run loop restart requested")]
+    RunLoopRestart,
+
     #[error("command failed: {0}")]
     CommandFailed(String),
 
