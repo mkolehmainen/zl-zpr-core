@@ -481,13 +481,21 @@ echo "Rotating fake-IdP signing key"
 python3 "$FAKE_IDP" --state-dir idp-state --rotate
 
 echo "Restarting adapter1"
-ADAPTER1_PID=$(pgrep -f "control-path $ADAPTER1_SOCK" | head -n 1 || true)
+ADAPTER1_PID=$(ph_pid_for_socket "$ADAPTER1_SOCK")
 if [ -z "$ADAPTER1_PID" ]; then
   echo "ERROR: cannot find adapter1 to restart"
   PASS=1
 else
   sudo kill -SIGINT "$ADAPTER1_PID"
-  sleep 2
+  # The old adapter must be gone before the new one docks: while its link
+  # is up the visa service holds its granted address for a live actor and
+  # rejects the new login with "already held by a live actor".
+  if ! wait_for 10 process_exited "$ADAPTER1_PID"; then
+    echo "ERROR: adapter1 (PID $ADAPTER1_PID) did not exit after SIGINT"
+    PASS=1
+  fi
+fi
+if [[ "$PASS" == 0 ]] then
   launch_adapter1
   sleep 2
 

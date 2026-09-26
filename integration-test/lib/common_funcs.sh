@@ -38,6 +38,27 @@ function wait_for() {
   return "$RET"
 }
 
+# Print the PID of the ph process serving control socket $1, or nothing if
+# there is none. Expects PH_BIN to be the ph binary path.
+#
+# The tests launch ph through a chain of wrappers
+# (`sudo ... ip netns exec ... sudo ... env ... $PH_BIN ... --control-path S`),
+# and every wrapper's command line contains "--control-path S" too. A bare
+# match on the socket finds the outermost sudo first, and a signal sent to it
+# is not reliably passed on to ph (under sudo-rs it is not passed on at all),
+# so the pattern is anchored on $PH_BIN: env execs ph, so only ph's own
+# command line starts with it (zipline#116).
+function ph_pid_for_socket() {
+  pgrep -f "^$PH_BIN .*--control-path $1( |\$)" | head -n 1 || true
+}
+
+# Succeed once process $1 no longer exists. Uses ps rather than `kill -0`,
+# which fails with EPERM on a live process owned by another user (ph runs
+# as $ZPR_USER) and would read as "exited".
+function process_exited() {
+  ! ps -p "$1" > /dev/null
+}
+
 function create_network() {
   sudo ip netns add zpr-node
   sudo ip netns add zpr-vs
