@@ -48,8 +48,21 @@ function wait_for() {
 # is not reliably passed on to ph (under sudo-rs it is not passed on at all),
 # so the pattern is anchored on $PH_BIN: env execs ph, so only ph's own
 # command line starts with it (zipline#116).
+#
+# Both values are escaped, since pgrep reads the pattern as an extended
+# regex: otherwise a "+" in the binary path would stop it matching itself,
+# and "adapter1.sock" would also match some other process's "adapter1Xsock".
 function ph_pid_for_socket() {
-  pgrep -f "^$PH_BIN .*--control-path $1( |\$)" | head -n 1 || true
+  local bin sock
+  bin=$(ere_escape "$PH_BIN")
+  sock=$(ere_escape "$1")
+  pgrep -f "^$bin .*--control-path $sock( |\$)" | head -n 1 || true
+}
+
+# Print $1 with every extended-regex metacharacter backslash-escaped, so it
+# matches only itself when used in a pattern.
+function ere_escape() {
+  printf '%s' "$1" | sed 's/[][\\.^$*+?(){}|]/\\&/g'
 }
 
 # Succeed once process $1 no longer exists. Uses ps rather than `kill -0`,
