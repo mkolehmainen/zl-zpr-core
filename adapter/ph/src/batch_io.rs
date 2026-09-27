@@ -176,6 +176,64 @@ mod io_uring {
         }
     }
 
+    /// Rounds of re-cancel + bounded wait before declaring the kernel is
+    /// never going to complete a straggler.  Every operation we submit
+    /// either completes immediately (`MSG_DONTWAIT`) or is paired with a
+    /// cancel, so more than a handful of rounds already indicates something
+    /// is deeply wrong; ~5 s puts it beyond doubt.
+    const MAX_REAP_ROUNDS: u32 = 5000;
+
+    /// Round accounting for the straggler-reap loop (zipline#117 review).
+    ///
+    /// A "round" is one guard timeout's worth of waiting (`REAP_TIMEOUT`).
+    /// The loop may wake many times within a single round -- e.g. when a
+    /// re-cancel promptly completes with `-ENOENT` while its operation is
+    /// still pending -- and those wakeups must not count against
+    /// `MAX_REAP_ROUNDS`, or the documented ~5 s bound would burn out in
+    /// far less time and panic in the very cancel-miss condition this path
+    /// exists to tolerate.  A new round starts (re-cancels plus a fresh
+    /// guard timeout) only once the previous round's timeout CQE has been
+    /// reaped, so rounds advance at timeout cadence and at most one guard
+    /// timeout is ever outstanding.
+    struct ReapGuard {
+        rounds: u32,
+        timeout_outstanding: bool,
+    }
+
+    impl ReapGuard {
+        fn new() -> Self {
+            Self {
+                rounds: 0,
+                timeout_outstanding: false,
+            }
+        }
+
+        /// Completed (timeout-gated) rounds so far.
+        fn rounds(&self) -> u32 {
+            self.rounds
+        }
+
+        /// Record a reaped guard-timeout CQE, ending the current round.
+        fn timeout_reaped(&mut self) {
+            debug_assert!(self.timeout_outstanding);
+            self.timeout_outstanding = false;
+        }
+
+        /// Called when operations remain unaccounted for after draining the
+        /// completion queue.  Returns whether a new round should be
+        /// submitted (re-cancels plus a fresh guard timeout); `false` means
+        /// the current round's timeout is still pending and the caller
+        /// should only wait.
+        fn try_start_round(&mut self) -> bool {
+            if self.timeout_outstanding {
+                return false;
+            }
+            self.rounds += 1;
+            self.timeout_outstanding = true;
+            true
+        }
+    }
+
     trait BatchOp<Item, State, Res> {
         fn new() -> Self;
 
@@ -614,12 +672,6 @@ mod io_uring {
             const TIMEOUT_USER_DATA: u64 = u64::MAX;
             /// Bound of each straggler wait.
             const REAP_TIMEOUT: types::Timespec = types::Timespec::new().nsec(1_000_000);
-            /// Rounds of re-cancel + bounded wait before declaring the kernel
-            /// is never going to complete a straggler.  Every operation we
-            /// submit either completes immediately (`MSG_DONTWAIT`) or is
-            /// paired with a cancel, so more than a handful of rounds already
-            /// indicates something is deeply wrong; ~5 s puts it beyond doubt.
-            const MAX_REAP_ROUNDS: u32 = 5000;
 
             let fd = types::Fd(fd.as_raw_fd());
 
@@ -634,7 +686,17 @@ mod io_uring {
 
             let mut squeue = self.io_uring.submission();
 
-            let max_to_submit = (squeue.capacity() - squeue.len()) / entries_per_op;
+            // The SQ has room for `capacity / entries_per_op` operations, but
+            // every per-operation slab (`state_slab`, the socket ops'
+            // sockaddr/cmsg slabs, `op_seen`) holds only MAX_ENTRIES.  With
+            // needs_cancel the two limits coincide (capacity = 2 * entries,
+            // entries <= MAX_ENTRIES); without it (MSG_DONTWAIT socket ops,
+            // one SQE each) the ring alone would admit up to 2 * MAX_ENTRIES
+            // operations and the (MAX_ENTRIES + 1)-th `Slab::push` would
+            // panic.  Clamp to the slab capacity so an over-long backlog
+            // comes back as a partial batch instead (zipline#117 review).
+            let max_to_submit =
+                ((squeue.capacity() - squeue.len()) / entries_per_op).min(MAX_ENTRIES);
 
             let mut state_slab = Slab::new();
 
@@ -721,14 +783,22 @@ mod io_uring {
             let mut aux_expected = if needs_cancel { submitted } else { 0 };
             let mut aux_seen = 0usize;
 
-            let mut rounds = 0u32;
+            let mut reap_guard = ReapGuard::new();
 
             loop {
                 // Read results from the completion queue.
                 for entry in self.io_uring.completion() {
                     let user_data = entry.user_data();
 
-                    if user_data == CANCEL_USER_DATA || user_data == TIMEOUT_USER_DATA {
+                    if user_data == TIMEOUT_USER_DATA {
+                        // The current round's guard timeout has fired (or
+                        // was cancelled); only now may the next round start.
+                        reap_guard.timeout_reaped();
+                        aux_seen += 1;
+                        continue;
+                    }
+
+                    if user_data == CANCEL_USER_DATA {
                         aux_seen += 1;
                         continue;
                     }
@@ -789,37 +859,46 @@ mod io_uring {
                 // MSG_DONTWAIT.  Re-cancel every unaccounted-for operation
                 // and wait again, bounded by a timeout so this loop can never
                 // block waiting for traffic.
-                rounds += 1;
-                assert!(
-                    rounds <= MAX_REAP_ROUNDS,
-                    "io_uring batch operation never completed: \
-                     {} of {} operations (and {} of {} cancels/timeouts) reaped \
-                     after {} re-cancel rounds",
-                    ops_seen,
-                    submitted,
-                    aux_seen,
-                    aux_expected,
-                    rounds - 1,
-                );
+                //
+                // A round is gated on its guard timeout's CQE (see
+                // `ReapGuard`): a wakeup caused by anything else -- e.g. a
+                // re-cancel promptly completing with -ENOENT while its
+                // operation is still pending -- neither consumes a round nor
+                // submits more work, so MAX_REAP_ROUNDS really bounds the
+                // wait at ~MAX_REAP_ROUNDS * REAP_TIMEOUT and at most one
+                // guard timeout is outstanding at a time.
+                if reap_guard.try_start_round() {
+                    assert!(
+                        reap_guard.rounds() <= MAX_REAP_ROUNDS,
+                        "io_uring batch operation never completed: \
+                         {} of {} operations (and {} of {} cancels/timeouts) reaped \
+                         after {} re-cancel rounds",
+                        ops_seen,
+                        submitted,
+                        aux_seen,
+                        aux_expected,
+                        reap_guard.rounds() - 1,
+                    );
 
-                let mut squeue = self.io_uring.submission();
-                for (idx, seen) in op_seen.iter().enumerate().take(submitted) {
-                    if !seen {
-                        let cancel = opcode::AsyncCancel::new((idx as u64) + 1)
-                            .build()
-                            .user_data(CANCEL_USER_DATA);
-                        // SAFETY: cancel entries reference no caller memory.
-                        unsafe { squeue.push(&cancel) }.unwrap();
-                        aux_expected += 1;
+                    let mut squeue = self.io_uring.submission();
+                    for (idx, seen) in op_seen.iter().enumerate().take(submitted) {
+                        if !seen {
+                            let cancel = opcode::AsyncCancel::new((idx as u64) + 1)
+                                .build()
+                                .user_data(CANCEL_USER_DATA);
+                            // SAFETY: cancel entries reference no caller memory.
+                            unsafe { squeue.push(&cancel) }.unwrap();
+                            aux_expected += 1;
+                        }
                     }
+                    let timeout = opcode::Timeout::new(&REAP_TIMEOUT)
+                        .build()
+                        .user_data(TIMEOUT_USER_DATA);
+                    // SAFETY: REAP_TIMEOUT is 'static.
+                    unsafe { squeue.push(&timeout) }.unwrap();
+                    aux_expected += 1;
+                    drop(squeue);
                 }
-                let timeout = opcode::Timeout::new(&REAP_TIMEOUT)
-                    .build()
-                    .user_data(TIMEOUT_USER_DATA);
-                // SAFETY: REAP_TIMEOUT is 'static.
-                unsafe { squeue.push(&timeout) }.unwrap();
-                aux_expected += 1;
-                drop(squeue);
 
                 self.io_uring.submit_and_wait(1)?;
             }
@@ -894,6 +973,51 @@ mod io_uring {
         libc::iovec {
             iov_base: buf.as_ptr() as *mut u8 as *mut _,
             iov_len: buf.len(),
+        }
+    }
+
+    #[cfg(test)]
+    mod reap_guard_tests {
+        use super::*;
+
+        #[test]
+        fn test_prompt_cancel_completions_do_not_burn_reap_rounds() {
+            // zipline#117 review (PR #43): if a straggler operation stays
+            // pending while each re-cancel promptly completes with -ENOENT,
+            // submit_and_wait(1) is satisfied by the cancel CQE rather than
+            // the 1 ms guard timeout.  Such wakeups must not consume reap
+            // rounds (or MAX_REAP_ROUNDS burns out in far less than the
+            // documented ~5 s and the loop panics in the very cancel-miss
+            // condition it tolerates), and must not enqueue additional
+            // guard timeouts.  A round may only advance once the previous
+            // round's timeout CQE has been reaped.
+            let mut guard = ReapGuard::new();
+
+            assert!(guard.try_start_round(), "first round must start");
+            assert_eq!(guard.rounds(), 1);
+
+            // Many wakeups within the round (prompt -ENOENT cancel
+            // completions), no timeout CQE reaped: no new round, no new
+            // timeout submission.
+            for _ in 0..10 * MAX_REAP_ROUNDS {
+                assert!(
+                    !guard.try_start_round(),
+                    "a wakeup without a reaped guard-timeout CQE must not \
+                     start a new round (or submit another timeout)"
+                );
+            }
+            assert_eq!(
+                guard.rounds(),
+                1,
+                "wakeups without timeout CQEs must not consume reap rounds"
+            );
+
+            // Only a reaped guard-timeout CQE lets the next round start,
+            // so rounds advance at REAP_TIMEOUT cadence and MAX_REAP_ROUNDS
+            // really bounds the wait at ~MAX_REAP_ROUNDS * REAP_TIMEOUT.
+            guard.timeout_reaped();
+            assert!(guard.try_start_round());
+            assert_eq!(guard.rounds(), 2);
         }
     }
 
@@ -1707,6 +1831,53 @@ mod tests {
     }
 
     // NOTE: we don't have any way of really testing the "send_from" functionality as a unit test
+
+    #[test]
+    fn test_send_backlog_over_slab_capacity() {
+        // zipline#117 review (PR #43): with MSG_DONTWAIT socket operations
+        // (needs_cancel == false) each operation occupies a single SQE, so
+        // the submission limit derived from the ring capacity (2 * entries)
+        // can exceed MAX_ENTRIES -- but the state slab, the per-op sockaddr
+        // slabs and `op_seen` all hold only MAX_ENTRIES.  A backlog larger
+        // than MAX_ENTRIES must come back as a partial batch (like the old
+        // `/ 2` limit produced), not panic on the (MAX_ENTRIES + 1)-th push.
+        for engine in ENGINES {
+            let inq = udp_socket().unwrap();
+            let outq = udp_socket().unwrap();
+            inq.set_nonblocking(true).unwrap();
+            let dest = outq.local_addr().unwrap();
+
+            let max = engine.max_entries();
+            let nmsgs = max + max / 2;
+
+            // Instantiate at the engine's advertised maximum, the
+            // configuration under which the limit overshoots the slabs.
+            let mut bio = engine.instantiate(max).unwrap();
+
+            let msg = [42u8; 8];
+            let mut results = Vec::new();
+
+            let n = bio
+                .try_send_to_batch(&inq, (0..nmsgs).map(|_| (&msg[..], dest, 0)), &mut results)
+                .unwrap();
+
+            assert!(
+                n >= 1 && n <= nmsgs,
+                "[{}] expected a (possibly partial) batch, got {n} of {nmsgs}",
+                engine.engine_name()
+            );
+
+            if engine.engine_name() == "io_uring" {
+                // The io_uring engine must clamp the batch to its slab
+                // capacity and return the remainder to the caller.
+                assert_eq!(
+                    n, max,
+                    "[io_uring] a backlog over the slab capacity must return \
+                     a partial batch of exactly the slab capacity"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_recv_stress_no_stall() {
