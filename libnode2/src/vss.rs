@@ -43,6 +43,14 @@ pub enum VSSMessage {
     SetServices(Vec<ServiceDescriptor>, oneshot::Sender<SetServicesResponse>),
     Configure(Vec<Param>, oneshot::Sender<ConfigureResponse>),
     SetTopology(Vec<Link>, oneshot::Sender<SetTopologyResponse>),
+    /// The visa service asks the node to re-authenticate the listed actors
+    /// (zipline#121, contract K1): the node's own address means "re-prove
+    /// yourself to the VS over the existing session"; a docked adapter's
+    /// address means "send that adapter an on-demand renewal request". The
+    /// ack reports how many addresses the node *started* re-auth for, not
+    /// the outcome — outcomes arrive at the VS as `authenticate` /
+    /// `reauthorize` calls.
+    RequestAuthentication(Vec<IpAddr>, oneshot::Sender<ListProcessingResponse>),
 }
 
 /// Launch the VSS. Pings are responded to internally. Other VSS messages are sent
@@ -384,6 +392,79 @@ impl v1::v_s_s_handle::Server for VSSHandleImpl {
             // Probably our handler has gone away.
             // TODO: Shut down this VSS service connection. How?
             error!("failed to send RevokeAuth message to handler: {}", e);
+            let mut ack_builder = results.get().init_ack();
+            self.build_ack_zero_with_error(
+                &mut ack_builder,
+                &ApiResponseError::new_code_msg(ErrorCode::Internal, "message processing failed"),
+            );
+            return Ok(()); // Exit early with error
+        }
+
+        let mut ack_builder = results.get().init_ack();
+        self.handle_list_processing_result(resp_rx, &mut ack_builder)
+            .await;
+
+        Ok(())
+    }
+
+    /// VSS `requestAuthentication @6` (zipline#121, contract K1): the VS asks
+    /// the node to re-authenticate the listed actors. Modeled on
+    /// [Self::revoke_authentication]: parse the address list, forward it to
+    /// the handler as [VSSMessage::RequestAuthentication], and ack with the
+    /// count of addresses for which re-auth was *started* — the ack reports
+    /// the request, never the outcome.
+    async fn request_authentication(
+        self: Rc<Self>,
+        params: v1::v_s_s_handle::RequestAuthenticationParams,
+        mut results: v1::v_s_s_handle::RequestAuthenticationResults,
+    ) -> Result<(), capnp::Error> {
+        debug!(target: VSS_RPC, "request_authentication called by {}", self.remote);
+
+        let addrs_rdr = params.get()?.get_addrs()?;
+
+        let mut addrs = Vec::new();
+        for addr_rdr in addrs_rdr.iter() {
+            match IpAddr::try_from(addr_rdr) {
+                Ok(ip) => addrs.push(ip),
+                Err(e) => {
+                    warn!(target: VSS_RPC, "received invalid IpAddr from vs: {}", e);
+                    let mut ack_builder = results.get().init_ack();
+                    self.build_ack_zero_with_error(
+                        &mut ack_builder,
+                        &ApiResponseError::new_code_msg(
+                            ErrorCode::ParamError,
+                            "failed to parse an IpAddr",
+                        ),
+                    );
+                    return Ok(()); // Exit early with error
+                }
+            }
+        }
+
+        if addrs.is_empty() {
+            warn!(target: VSS_RPC, "request_authentication called with empty addr list from {}", self.remote);
+            let mut ack_builder = results.get().init_ack();
+            self.build_ack_zero_with_error(
+                &mut ack_builder,
+                &ApiResponseError::new_code_msg(
+                    ErrorCode::InvalidOperation,
+                    "empty IpAddr list provided",
+                ),
+            );
+            return Ok(()); // Exit early with error
+        }
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if let Err(e) = self
+            .send_message(VSSMessage::RequestAuthentication(addrs, resp_tx))
+            .await
+        {
+            // Probably our handler has gone away.
+            // TODO: Shut down this VSS service connection. How?
+            error!(
+                "failed to send RequestAuthentication message to handler: {}",
+                e
+            );
             let mut ack_builder = results.get().init_ack();
             self.build_ack_zero_with_error(
                 &mut ack_builder,

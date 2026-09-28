@@ -641,6 +641,7 @@ fn main() -> ExitCode {
         )),
         vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
         deferred_vs_connect: Mutex::new(None),
+        self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
         capture_queue: Capture::new(cap_inq),
         capture_worker: CaptureWorker::new(),
         flow_control: FlowControl::new(),

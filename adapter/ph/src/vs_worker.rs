@@ -22,7 +22,6 @@ pub async fn launch(
     //derive pubkey from a2a_dh_keypair
     let a2a_dh_pubkey = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
 
-    // TODO: The new visa service supports a "reconnect" signal. That is not yet exposed by libnode2
     loop {
         // This acts as a gate -- waiting for runloop to start.
         wait_for_runloop_start(&mut lifecycle_rx).await;

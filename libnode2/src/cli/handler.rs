@@ -216,6 +216,16 @@ pub async fn run_handler(
                             ));
                             let _ = resp_tx.send(ListProcessingResponse::Ack { processed: ip_addrs.len() as u32 });
                         }
+                        VSSMessage::RequestAuthentication(ip_addrs, resp_tx) => {
+                            // The CLI is a bare VS-API test client with no
+                            // actors and no self re-auth machinery, so it
+                            // only reports the request. Nothing is started,
+                            // so nothing is counted (contract K1).
+                            let _ = output_tx.send(format!(
+                                "[VSS incoming] RequestAuthentication for {} addresses (not supported by the CLI)", ip_addrs.len()
+                            ));
+                            let _ = resp_tx.send(ListProcessingResponse::Ack { processed: 0 });
+                        }
                         VSSMessage::SetServices(services, resp_tx) => {
                             let _ = output_tx.send(format!(
                                 "[VSS incoming] SetServices with {} services", services.len()
