@@ -2,6 +2,7 @@
 //!
 //! Useful to signal events to a thread which is using `poll(2)`.
 
+use crate::sys::wait::{WaitHandle, Waitable};
 use nix::{errno, fcntl, ioctl_read_bad, libc, poll, unistd};
 use std::io::Result;
 use std::mem::MaybeUninit;
@@ -135,6 +136,14 @@ impl Notify {
                 Err(err) => panic!("Unexpected error: {err}"),
             }
         }
+    }
+}
+
+/// A `Notify`'s readiness (a pending notification) can be awaited in a
+/// `WaitSet` alongside other waitables.
+impl Waitable for Notify {
+    fn handle(&self) -> WaitHandle<'_> {
+        self.poll_fd().into()
     }
 }
 

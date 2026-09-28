@@ -28,6 +28,10 @@ pub(crate) mod linux_route;
 pub(crate) mod posix;
 pub use self::posix::notify;
 
+// Readiness waiting over multiple OS objects (fds today, HANDLEs when the
+// Windows arm lands in zipline#130). See `docs/plans/2026-09-28-windows.md`.
+pub mod wait;
+
 use bytes::buf;
 
 /// per-packet packet info
