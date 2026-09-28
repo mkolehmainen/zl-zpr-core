@@ -44,6 +44,20 @@ pub async fn launch(asm: Arc<Assembly>, mut queue: mpsc::Receiver<VSSMessage>) {
                 let _ = resp_tx.send(ListProcessingResponse::Ack { processed });
             }
 
+            VSSMessage::RequestAuthentication(addrs, resp_tx) => {
+                // zipline#121 K1: classify each address and start re-auth
+                // where we can; the ack reports what was accepted, never the
+                // outcome — outcomes reach the VS as authenticate/reauthorize
+                // calls in their own time.
+                let outcome = process_request_authentication(&asm, &addrs);
+                if outcome.start_self_reauth {
+                    spawn_self_reauth(&asm);
+                }
+                let _ = resp_tx.send(ListProcessingResponse::Ack {
+                    processed: outcome.processed,
+                });
+            }
+
             VSSMessage::SetServices(services, resp_tx) => {
                 debug!(target: VSS_RPC, "received services update with {} entries", services.len());
                 let mut svcs = asm.vs_auth_services.write().unwrap();
@@ -124,6 +138,141 @@ pub fn process_revoke_auth(asm: &Arc<Assembly>, addrs: &[std::net::IpAddr]) -> u
         }
     }
     addrs.len() as u32
+}
+
+/// What [process_request_authentication] decided: how many addresses were
+/// accepted for the ack (K1), and whether the caller should start the node's
+/// in-place self re-auth. Splitting decision from action keeps the
+/// classification synchronously testable.
+pub struct RequestAuthOutcome {
+    pub processed: u32,
+    pub start_self_reauth: bool,
+}
+
+/// Classify each address of a VSS `requestAuthentication` (zipline#121, K1).
+///
+/// - The node's own address: start an in-place self re-auth against the VS —
+///   counted, and coalesced onto a running attempt if one is in flight
+///   ([Assembly::self_reauth_in_flight] stays set until that attempt
+///   resolves; a coalesced address is still counted, because re-auth for it
+///   *is* underway).
+/// - A docked adapter's address: N2's (zipline#122) on-demand renewal hook.
+///   Until N2 lands this is logged and skipped, NOT counted in `processed`.
+/// - An unknown address: skipped and not counted.
+///
+/// Sets [Assembly::self_reauth_in_flight] when it decides to start a self
+/// re-auth; the caller must then actually spawn it (see [spawn_self_reauth])
+/// and that task clears the flag when done.
+pub fn process_request_authentication(
+    asm: &Arc<Assembly>,
+    addrs: &[std::net::IpAddr],
+) -> RequestAuthOutcome {
+    // RED stub (zipline#121): not yet implemented — accepts nothing.
+    let _ = (asm, addrs);
+    RequestAuthOutcome {
+        processed: 0,
+        start_self_reauth: false,
+    }
+}
+
+#[allow(dead_code)]
+fn process_request_authentication_impl(
+    asm: &Arc<Assembly>,
+    addrs: &[std::net::IpAddr],
+) -> RequestAuthOutcome {
+    use std::sync::atomic::Ordering;
+
+    let local_addrs = asm.get_local_zpr_addrs_std();
+    let mut processed = 0u32;
+    let mut start_self_reauth = false;
+
+    for addr in addrs {
+        if local_addrs.contains(addr) {
+            // Our own address: re-authenticate ourselves to the VS (K2).
+            // swap(true) is the claim: false -> we start one; true -> one is
+            // already in flight and this request coalesces onto it.
+            if !start_self_reauth && !asm.self_reauth_in_flight.swap(true, Ordering::SeqCst) {
+                start_self_reauth = true;
+            } else {
+                debug!(target: VSS_RPC,
+                    "request_auth: self re-auth already in flight, coalescing request for {addr}");
+            }
+            processed += 1;
+            continue;
+        }
+
+        let addr_ip = zpr_utils::net_defs::IpAddress::new_from_std(addr);
+        let docked_link = asm.peer_table.find(|(_id, peer)| {
+            peer.link_state_machine
+                .get_actor_addresses()
+                .iter()
+                .any(|a| *a == addr_ip)
+        });
+        match docked_link {
+            Some((link_id, _peer)) => {
+                // A docked adapter: N2 (zipline#122) adds the on-demand ZDP
+                // 142 renewal hook. Until it lands, log and skip — NOT
+                // counted, so the VS knows re-auth was not started (K1).
+                let link_id = link_id.get();
+                warn!(target: VSS_RPC,
+                    "request_auth: adapter re-auth for {addr} on {} not yet supported (zipline#122); skipping",
+                    asm.formatted_link_id(link_id));
+            }
+            None => {
+                // Unknown address: skipped, not counted (K1).
+                debug!(target: VSS_RPC,
+                    "request_auth: {addr} is not this node and not docked here; skipping");
+            }
+        }
+    }
+
+    RequestAuthOutcome {
+        processed,
+        start_self_reauth,
+    }
+}
+
+/// Spawn the in-place self re-authentication decided by
+/// [process_request_authentication] (zipline#121, K2): re-run
+/// connect/challenge/authenticate on the existing VS session via
+/// [libnode::vsconn::VSConnHandle::reauthenticate]. Failure is logged and
+/// nothing else — the old handle stays in place and the VS deadline decides.
+/// Always clears [Assembly::self_reauth_in_flight] when the attempt
+/// resolves. Runs on the local set (the VSS worker runs there too).
+pub fn spawn_self_reauth(asm: &Arc<Assembly>) {
+    use libnode::vsconn::{NodeConnect, StateFlag};
+    use std::sync::atomic::Ordering;
+
+    let Some(vsconn) = asm.vsconn.as_ref().cloned() else {
+        error!(target: VSS_RPC, "request_auth: no VS connection on this assembly; cannot self re-auth");
+        asm.self_reauth_in_flight.store(false, Ordering::SeqCst);
+        return;
+    };
+
+    let zpr_addr = asm.get_local_dock_addr();
+    let a2a_dh_pubkey = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
+    let asm = asm.clone();
+
+    tokio::task::spawn_local(async move {
+        let req = NodeConnect {
+            zpr_addr,
+            // We hold session state with the VS; K2's Reconnect keeps docked
+            // adapters, visas and router links undisturbed.
+            state: StateFlag::HasState,
+            a2a_dh_pubkey,
+        };
+        match vsconn.reauthenticate(req).await {
+            Ok(()) => {
+                info!(target: VSS_RPC, "self re-authentication with the visa service succeeded");
+            }
+            Err(e) => {
+                // Keep the old handle (the run loop already did); the VS
+                // re-auth deadline decides whether we are revoked.
+                error!(target: VSS_RPC, "self re-authentication with the visa service failed: {e:?}");
+            }
+        }
+        asm.self_reauth_in_flight.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Visa service sends configuration info here. Currently includes:
@@ -275,6 +424,129 @@ mod tests {
                         .get_state(),
                     LinkState::Active,
                     "an unrelated link must not be disturbed"
+                );
+            })
+            .await
+    }
+
+    /// zipline#121 K1: the node's own address in a `requestAuthentication`
+    /// starts exactly one self re-auth and counts in the ack; an unknown
+    /// address is skipped and NOT counted.
+    #[tokio::test]
+    async fn test_request_auth_own_address_starts_self_reauth_unknown_not_counted() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let own: IpAddr = "10.1.1.1".parse().unwrap();
+                let unknown: IpAddr = "10.0.0.99".parse().unwrap();
+                asm.set_local_zpr_addrs([own]);
+
+                let outcome = process_request_authentication(&asm, &[own, unknown]);
+                assert_eq!(
+                    outcome.processed, 1,
+                    "own address counted, unknown skipped (K1)"
+                );
+                assert!(
+                    outcome.start_self_reauth,
+                    "own address must start a self re-auth"
+                );
+                assert!(
+                    asm.self_reauth_in_flight
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "the in-flight flag must be claimed for the started re-auth"
+                );
+            })
+            .await
+    }
+
+    /// zipline#121 K1/K2: a second `requestAuthentication` naming the node's
+    /// own address while a self re-auth is already in flight is coalesced —
+    /// still counted in the ack (re-auth for it IS underway) but no second
+    /// attempt is started. Once the attempt resolves (flag cleared), the
+    /// next request starts a fresh one.
+    #[tokio::test]
+    async fn test_request_auth_second_own_address_in_flight_is_coalesced() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let own: IpAddr = "10.1.1.1".parse().unwrap();
+                asm.set_local_zpr_addrs([own]);
+
+                let first = process_request_authentication(&asm, &[own]);
+                assert!(first.start_self_reauth, "first request starts the re-auth");
+                assert_eq!(first.processed, 1);
+
+                // The attempt is still in flight (flag set): coalesce.
+                let second = process_request_authentication(&asm, &[own]);
+                assert!(
+                    !second.start_self_reauth,
+                    "second request while in flight must be coalesced, not started"
+                );
+                assert_eq!(
+                    second.processed, 1,
+                    "a coalesced own-address is still counted: its re-auth is underway"
+                );
+
+                // The attempt resolves; the next request starts a new one.
+                asm.self_reauth_in_flight
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                let third = process_request_authentication(&asm, &[own]);
+                assert!(
+                    third.start_self_reauth,
+                    "after the attempt resolves a new request must start again"
+                );
+            })
+            .await
+    }
+
+    /// zipline#121: until N2 (zipline#122) lands its on-demand hook, a
+    /// docked adapter's address is logged and skipped — NOT counted in the
+    /// ack — and the adapter's link, its actor and the visa table are left
+    /// untouched.
+    #[tokio::test]
+    async fn test_request_auth_adapter_address_skipped_until_n2_and_untouched() {
+        use crate::visa_table::tests::new_vsapi_visa_tcp_default;
+        use std::time::{Duration, SystemTime};
+
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let own: IpAddr = "10.1.1.1".parse().unwrap();
+                let docked: IpAddr = "10.9.8.7".parse().unwrap();
+                asm.set_local_zpr_addrs([own]);
+                let link_id = add_active_peer_with_actor(&asm, docked);
+                asm.visa_table
+                    .write()
+                    .unwrap()
+                    .insert_visa(new_vsapi_visa_tcp_default(
+                        77,
+                        SystemTime::now() + Duration::from_secs(3600),
+                    ))
+                    .unwrap();
+
+                let outcome = process_request_authentication(&asm, &[docked]);
+                assert_eq!(
+                    outcome.processed, 0,
+                    "an adapter address is skipped and not counted until N2 (zipline#122)"
+                );
+                assert!(!outcome.start_self_reauth);
+                assert!(
+                    !asm.self_reauth_in_flight
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "an adapter address must not claim the self re-auth flag"
+                );
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Active,
+                    "the adapter's link must be untouched"
+                );
+                assert!(
+                    asm.visa_table.read().unwrap().table.contains_key(&77),
+                    "visas must be untouched"
                 );
             })
             .await

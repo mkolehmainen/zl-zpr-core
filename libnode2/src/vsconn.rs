@@ -114,6 +114,17 @@ enum VS2Command {
     /// an updated [Connection] with a new expiry.
     Reauthorize(ReauthRequest, oneshot::Sender<VSAuthorizeConnectResponse>),
 
+    /// In-place node self re-authentication (zipline#121, contract K2): runs
+    /// the connect → challenge → authenticate sequence again on the SAME
+    /// `vs_service` bootstrap capability, deliberately bypassing the
+    /// already-connected guard that [VS2Command::Connect] enforces. On
+    /// success the new handle replaces the old one; on failure the old
+    /// handle is kept — the visa service's re-auth deadline decides the
+    /// actor's fate, not the node. The run loop handles commands serially,
+    /// so at most one re-authentication is ever in flight here; the caller
+    /// additionally coalesces duplicate requests (see ph's `vss_worker`).
+    Reauthenticate(NodeConnect, oneshot::Sender<VSConnectResponse>),
+
     NotifyDisconnect(
         DisconnectNotice,
         oneshot::Sender<VSNotifyDisconnectResponse>,
@@ -605,6 +616,17 @@ impl VSConn {
                 };
                 if let Err(e) = resp_tx.send(resp) {
                     error!(target: VS_RPC, "failed to send reauthorize response: {:?}", e);
+                }
+                Ok(())
+            }
+
+            VS2Command::Reauthenticate(_req, resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: reauthenticate");
+                let retval = Err(VSApiError::CommandFailed(
+                    "reauthenticate not implemented".to_string(),
+                ));
+                if let Err(e) = resp_tx.send(retval) {
+                    error!(target: VS_RPC, "failed to send reauthenticate response: {:?}", e);
                 }
                 Ok(())
             }
@@ -1120,6 +1142,19 @@ impl VSConnHandle {
         resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
     }
 
+    /// In-place node self re-authentication (zipline#121, contract K2):
+    /// re-run connect → challenge → authenticate on the existing
+    /// `vs_service` session. On success the run loop swaps in the new
+    /// `vs_handle`; on failure it keeps the old one and the VS re-auth
+    /// deadline decides. `Ok(())` means the node re-proved itself, not that
+    /// the VS finished anything else.
+    pub async fn reauthenticate(&self, req: NodeConnect) -> Result<(), VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = VS2Command::Reauthenticate(req, resp_tx);
+        self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+
     pub async fn notify_disconnect(&self, req: DisconnectNotice) -> Result<(), VSApiError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VS2Command::NotifyDisconnect(req, resp_tx);
@@ -1450,6 +1485,283 @@ mod tests {
             test_key(),
             connect_fn,
         )
+    }
+
+    // ------------------------------------------------------------------
+    // zipline#121 (K2): in-place self re-authentication over the existing
+    // VS session. The fake visa service below implements just enough of
+    // the VS-API — connect → challenge → authenticate, plus per-handle
+    // ping — to observe which VSHandle serves calls after a re-auth.
+    // ------------------------------------------------------------------
+
+    /// Shared observable state of the fake visa service.
+    struct FakeVsState {
+        /// How many `authenticate` calls the gate has served.
+        auth_calls: u32,
+        /// When set, the next `authenticate` fails with AuthError (and the
+        /// flag clears, so a later attempt could succeed again).
+        fail_next_auth: bool,
+        /// The id of the [FakeVsHandle] that served the most recent ping.
+        /// Handle ids are 1-based in `authenticate` order, so after a
+        /// successful re-auth a ping must arrive on id 2.
+        last_ping_handle: Option<u32>,
+    }
+
+    struct FakeVs {
+        state: Rc<RefCell<FakeVsState>>,
+    }
+
+    struct FakeVsGate {
+        state: Rc<RefCell<FakeVsState>>,
+    }
+
+    struct FakeVsHandle {
+        id: u32,
+        state: Rc<RefCell<FakeVsState>>,
+    }
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    impl vsapi2::visa_service::Server for FakeVs {
+        async fn connect(
+            self: Rc<Self>,
+            _params: vsapi2::visa_service::ConnectParams,
+            mut results: vsapi2::visa_service::ConnectResults,
+        ) -> Result<(), capnp::Error> {
+            let gate: vsapi2::v_s_gate::Client = capnp_rpc::new_client(FakeVsGate {
+                state: self.state.clone(),
+            });
+            results.get().init_resp().set_ok(gate)?;
+            Ok(())
+        }
+    }
+
+    impl vsapi2::v_s_gate::Server for FakeVsGate {
+        async fn challenge(
+            self: Rc<Self>,
+            _params: vsapi2::v_s_gate::ChallengeParams,
+            mut results: vsapi2::v_s_gate::ChallengeResults,
+        ) -> Result<(), capnp::Error> {
+            let mut chal = results.get().init_challenge();
+            chal.set_alg(vsapi2::ChallengeAlg::RsaSha256Pkcs1v15);
+            chal.set_bytes(b"fake-challenge");
+            Ok(())
+        }
+
+        async fn authenticate(
+            self: Rc<Self>,
+            _params: vsapi2::v_s_gate::AuthenticateParams,
+            mut results: vsapi2::v_s_gate::AuthenticateResults,
+        ) -> Result<(), capnp::Error> {
+            let id = {
+                let mut st = self.state.borrow_mut();
+                st.auth_calls += 1;
+                if st.fail_next_auth {
+                    st.fail_next_auth = false;
+                    let mut err = results.get().init_res().init_error();
+                    ApiResponseError::new_code_msg(
+                        zpr::vsapi_types::ErrorCode::AuthError,
+                        "fake auth failure",
+                    )
+                    .write_to(&mut err);
+                    return Ok(());
+                }
+                st.auth_calls
+            };
+            let handle: vsapi2::v_s_handle::Client = capnp_rpc::new_client(FakeVsHandle {
+                id,
+                state: self.state.clone(),
+            });
+            results.get().init_res().set_ok(handle)?;
+            Ok(())
+        }
+    }
+
+    impl vsapi2::v_s_handle::Server for FakeVsHandle {
+        async fn ping(
+            self: Rc<Self>,
+            _params: vsapi2::v_s_handle::PingParams,
+            mut results: vsapi2::v_s_handle::PingResults,
+        ) -> Result<(), capnp::Error> {
+            self.state.borrow_mut().last_ping_handle = Some(self.id);
+            results.get().init_res().set_ok(());
+            Ok(())
+        }
+    }
+
+    /// Spawn the fake VS: TLS + capnp RPC, bootstrap capability is a
+    /// [FakeVs]. Returns the bound address and the shared state.
+    async fn spawn_fake_vs() -> (SocketAddr, Rc<RefCell<FakeVsState>>) {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let state = Rc::new(RefCell::new(FakeVsState {
+            auth_calls: 0,
+            fail_next_auth: false,
+            last_ping_handle: None,
+        }));
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let chain = vec![CertificateDer::from(cert.cert.der().clone())];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+        let cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        tokio::task::spawn_local(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let state = server_state.clone();
+                tokio::task::spawn_local(async move {
+                    let Ok(tls) = acceptor.accept(sock).await else {
+                        return;
+                    };
+                    let (reader, writer) = tokio::io::split(tls);
+                    let network = capnp_rpc::twoparty::VatNetwork::new(
+                        tokio::io::BufReader::new(reader).compat(),
+                        tokio::io::BufWriter::new(writer).compat_write(),
+                        capnp_rpc::rpc_twoparty_capnp::Side::Server,
+                        capnp::message::ReaderOptions::new(),
+                    );
+                    let vs: vsapi2::visa_service::Client = capnp_rpc::new_client(FakeVs { state });
+                    let rpc = capnp_rpc::RpcSystem::new(Box::new(network), Some(vs.client));
+                    let _ = rpc.await;
+                });
+            }
+        });
+        (addr, state)
+    }
+
+    /// Drive a real VSConn against the fake VS through the initial connect,
+    /// returning (handle, state, run-loop task). The caller re-auths.
+    async fn connected_vsconn_against_fake_vs() -> (
+        VSConnHandle,
+        Rc<RefCell<FakeVsState>>,
+        tokio::task::JoinHandle<Result<(), VSApiError>>,
+    ) {
+        let (vs_addr, state) = spawn_fake_vs().await;
+        let mut vsconn = VSConn::new(
+            16,
+            vs_addr,
+            "test-node".to_string(),
+            test_key(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let mut lifecycle_rx = vsconn.subscribe_lifecycle_events();
+        let handle = vsconn.handle();
+        let task = tokio::task::spawn_local(async move {
+            vsconn.run_with_reconnect(Duration::from_millis(100)).await
+        });
+
+        // Wait for the run loop, then bootstrap-connect.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match lifecycle_rx.recv().await {
+                    Ok(VSConnLifecycleEvent::RunLoopStarts) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("lifecycle channel died: {e:?}"),
+                }
+            }
+        })
+        .await
+        .expect("run loop never started against the fake VS");
+
+        handle
+            .connect(NodeConnect {
+                zpr_addr: "10.1.1.1".parse().unwrap(),
+                state: StateFlag::NoState,
+                a2a_dh_pubkey: x25519_dalek::PublicKey::from([7u8; 32]),
+            })
+            .await
+            .expect("initial connect against the fake VS failed");
+
+        (handle, state, task)
+    }
+
+    /// zipline#121 K2: a successful `Reauthenticate` re-runs the
+    /// connect/challenge/authenticate sequence on the existing session and
+    /// swaps in the new handle — a subsequent ping is served by the second
+    /// handle the fake VS minted.
+    #[tokio::test]
+    async fn reauthenticate_success_swaps_the_vs_handle() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+                assert_eq!(state.borrow().auth_calls, 1);
+
+                handle.ping().await.expect("ping on the original handle");
+                assert_eq!(state.borrow().last_ping_handle, Some(1));
+
+                handle
+                    .reauthenticate(NodeConnect {
+                        zpr_addr: "10.1.1.1".parse().unwrap(),
+                        state: StateFlag::HasState,
+                        a2a_dh_pubkey: x25519_dalek::PublicKey::from([7u8; 32]),
+                    })
+                    .await
+                    .expect("reauthenticate must succeed against the fake VS");
+                assert_eq!(
+                    state.borrow().auth_calls,
+                    2,
+                    "re-auth must run the authenticate sequence exactly once more"
+                );
+
+                handle.ping().await.expect("ping after re-auth");
+                assert_eq!(
+                    state.borrow().last_ping_handle,
+                    Some(2),
+                    "after a successful re-auth the NEW handle must serve calls"
+                );
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zipline#121 K2: a failed `Reauthenticate` keeps the old handle — the
+    /// VS deadline decides the actor's fate, the node does not tear anything
+    /// down. A subsequent ping is still served by the original handle.
+    #[tokio::test]
+    async fn reauthenticate_failure_keeps_the_old_vs_handle() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+
+                state.borrow_mut().fail_next_auth = true;
+                let res = handle
+                    .reauthenticate(NodeConnect {
+                        zpr_addr: "10.1.1.1".parse().unwrap(),
+                        state: StateFlag::HasState,
+                        a2a_dh_pubkey: x25519_dalek::PublicKey::from([7u8; 32]),
+                    })
+                    .await;
+                assert!(res.is_err(), "reauthenticate must report the VS rejection");
+                assert_eq!(
+                    state.borrow().auth_calls,
+                    2,
+                    "the failed re-auth still reached authenticate"
+                );
+
+                handle
+                    .ping()
+                    .await
+                    .expect("the session must survive a failed re-auth");
+                assert_eq!(
+                    state.borrow().last_ping_handle,
+                    Some(1),
+                    "after a failed re-auth the OLD handle must still serve calls"
+                );
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
     }
 
     /// Before fix: run_with_reconnect blocks in tokio::time::sleep(reconnect_after) even when a

@@ -69,6 +69,12 @@ pub struct Assembly {
     pub vsconn: Option<libnode::vsconn::VSConnHandle>, // present only on nodes
     pub vs_auth_services: std::sync::RwLock<AuthServicesList>, // present only on nodes, may be empty, managed by visa service
     pub deferred_vs_connect: Mutex<Option<(LinkId, IpAddress, ConnectRequest)>>, // present only on nodes, the VS adapter's connect request and self-granted address, held until the node has VSAPI access
+    /// Node only (zipline#121): true while an in-place self re-authentication
+    /// against the visa service is in flight. A VSS `requestAuthentication`
+    /// naming this node's own address while set is coalesced into the running
+    /// attempt instead of queueing a second one; the spawned re-auth task
+    /// clears it when the attempt resolves either way.
+    pub self_reauth_in_flight: std::sync::atomic::AtomicBool,
 
     pub visa_table: std::sync::RwLock<visa_table::VisaTable>, // Only for nodes
 
@@ -965,6 +971,7 @@ pub mod test {
             visa_table,
             vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
             deferred_vs_connect: Mutex::new(None),
+            self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
             capture_queue,
             capture_worker,
             flow_control,
