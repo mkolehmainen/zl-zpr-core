@@ -119,6 +119,32 @@ pub enum AuthBlob {
     Oidc(ZdpOidcBlob),
 }
 
+/// The authority namespace one authentication leg proves (zipline#122):
+/// an SS (bootstrap) blob proves the `device` namespace, an OIDC blob the
+/// `user` namespace. Mirrors the visa service's per-namespace authority
+/// model (K3/K4): on re-auth the actor must re-prove exactly the set of
+/// namespaces it originally authenticated with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuthNamespace {
+    Device,
+    User,
+}
+
+impl AuthBlob {
+    /// The namespace this blob proves.
+    pub fn namespace(&self) -> AuthNamespace {
+        match self {
+            AuthBlob::SelfSigned(_) => AuthNamespace::Device,
+            AuthBlob::Oidc(_) => AuthNamespace::User,
+        }
+    }
+}
+
+/// The namespace set a blob array proves: one entry per distinct namespace.
+pub fn blob_namespaces(blobs: &[AuthBlob]) -> std::collections::BTreeSet<AuthNamespace> {
+    blobs.iter().map(|b| b.namespace()).collect()
+}
+
 /// What a client adapter needs to talk to an off-net OIDC identity provider.
 /// Advertised by the node in HelloResponse via `OIDC_IDP` TLVs (JSON encoded);
 /// mirrors the visa service's `OidcClientConfig`. All public data.
@@ -180,11 +206,18 @@ impl ZdpSelfSignedBlob {
     ///     cert CN to bind to, so this check is skipped and the blob CN is
     ///     authenticated solely by the visa service's RSA signature check.
     ///   - The HMAC in the blob is valid for the provided `key`.
-    ///   - The blob is not older than `MAX_BLOB_AGE_SECONDS`.
+    ///   - The blob is not older than `max_age_seconds`. At connect this is
+    ///     [MAX_BLOB_AGE_SECONDS]; on the renewal path it is
+    ///     [MAX_OIDC_BLOB_AGE_SECONDS], because a combined Device+User
+    ///     renewal binds the SS leg to the same challenge the OIDC leg
+    ///     waits on (the noninteractive agent may take up to the permitted
+    ///     wait), and replay is separately prevented by exact byte-equality
+    ///     with the single outstanding stashed challenge.
     pub fn verify_blob_challenge(
         &self,
         peer_cert: Option<&X509Certificate>,
         key: &[u8; AUTH_KEY_SIZE_BYTES],
+        max_age_seconds: u64,
     ) -> Result<(), AuthError> {
         if let Some(peer_cert) = peer_cert {
             if let Some(link_cn) = pki::common_name(peer_cert) {
@@ -200,7 +233,7 @@ impl ZdpSelfSignedBlob {
         }
 
         let payload_bytes = BASE64_STANDARD.decode(self.challenge.clone())?;
-        verify_challenge_bytes(&payload_bytes, key, MAX_BLOB_AGE_SECONDS)?;
+        verify_challenge_bytes(&payload_bytes, key, max_age_seconds)?;
         Ok(())
     }
 }
