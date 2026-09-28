@@ -176,8 +176,74 @@ mod io_uring {
         }
     }
 
+    /// Rounds of re-cancel + bounded wait before declaring the kernel is
+    /// never going to complete a straggler.  Every operation we submit
+    /// either completes immediately (`MSG_DONTWAIT`) or is paired with a
+    /// cancel, so more than a handful of rounds already indicates something
+    /// is deeply wrong; ~5 s puts it beyond doubt.
+    const MAX_REAP_ROUNDS: u32 = 5000;
+
+    /// Round accounting for the straggler-reap loop (zipline#117 review).
+    ///
+    /// A "round" is one guard timeout's worth of waiting (`REAP_TIMEOUT`).
+    /// The loop may wake many times within a single round -- e.g. when a
+    /// re-cancel promptly completes with `-ENOENT` while its operation is
+    /// still pending -- and those wakeups must not count against
+    /// `MAX_REAP_ROUNDS`, or the documented ~5 s bound would burn out in
+    /// far less time and panic in the very cancel-miss condition this path
+    /// exists to tolerate.  A new round starts (re-cancels plus a fresh
+    /// guard timeout) only once the previous round's timeout CQE has been
+    /// reaped, so rounds advance at timeout cadence and at most one guard
+    /// timeout is ever outstanding.
+    struct ReapGuard {
+        rounds: u32,
+        timeout_outstanding: bool,
+    }
+
+    impl ReapGuard {
+        fn new() -> Self {
+            Self {
+                rounds: 0,
+                timeout_outstanding: false,
+            }
+        }
+
+        /// Completed (timeout-gated) rounds so far.
+        fn rounds(&self) -> u32 {
+            self.rounds
+        }
+
+        /// Record a reaped guard-timeout CQE, ending the current round.
+        fn timeout_reaped(&mut self) {
+            debug_assert!(self.timeout_outstanding);
+            self.timeout_outstanding = false;
+        }
+
+        /// Called when operations remain unaccounted for after draining the
+        /// completion queue.  Returns whether a new round should be
+        /// submitted (re-cancels plus a fresh guard timeout); `false` means
+        /// the current round's timeout is still pending and the caller
+        /// should only wait.
+        fn try_start_round(&mut self) -> bool {
+            if self.timeout_outstanding {
+                return false;
+            }
+            self.rounds += 1;
+            self.timeout_outstanding = true;
+            true
+        }
+    }
+
     trait BatchOp<Item, State, Res> {
         fn new() -> Self;
+
+        /// Whether operations built by `build_op` can remain pending in the
+        /// kernel when the fd is not ready, and so must each be paired with
+        /// a cancel request.  Operations which complete immediately no
+        /// matter what (e.g. socket operations carrying `MSG_DONTWAIT`)
+        /// return false.
+        fn needs_cancel(&self) -> bool;
+
         fn build_op(&mut self, fd: types::Fd, item: Item, idx: usize) -> (squeue::Entry, State);
         fn process_result(&self, idx: usize, state: State, amt: usize) -> Res;
     }
@@ -198,6 +264,13 @@ mod io_uring {
     impl BatchOp<&[u8], (), usize> for TryWriteBatchOp {
         fn new() -> Self {
             Self {}
+        }
+
+        fn needs_cancel(&self) -> bool {
+            // Writes (to the actor TUN) cannot be made unconditionally
+            // immediate: O_NONBLOCK is ignored by io_uring and RWF_NOWAIT is
+            // not supported by TUN devices.
+            true
         }
 
         fn build_op(&mut self, fd: types::Fd, buf: &[u8], _idx: usize) -> (squeue::Entry, ()) {
@@ -221,6 +294,13 @@ mod io_uring {
             Self {
                 phantom: std::marker::PhantomData,
             }
+        }
+
+        fn needs_cancel(&self) -> bool {
+            // Reads (from the actor TUN) cannot be made unconditionally
+            // immediate: O_NONBLOCK is ignored by io_uring and RWF_NOWAIT is
+            // not supported by TUN devices.
+            true
         }
 
         fn build_op(
@@ -258,6 +338,11 @@ mod io_uring {
             }
         }
 
+        fn needs_cancel(&self) -> bool {
+            // MSG_DONTWAIT makes the send complete immediately.
+            false
+        }
+
         fn build_op(
             &mut self,
             fd: types::Fd,
@@ -279,7 +364,11 @@ mod io_uring {
 
             (
                 opcode::SendMsg::new(fd, msghdr_ref as *const _)
-                    .flags(flags as u32)
+                    // MSG_DONTWAIT: complete immediately (with -EAGAIN if the
+                    // socket is not ready) instead of arming internal poll,
+                    // so no pending operation is left for a cancel to miss
+                    // (zipline#117).
+                    .flags(flags as u32 | libc::MSG_DONTWAIT as u32)
                     .build(),
                 (),
             )
@@ -307,6 +396,11 @@ mod io_uring {
                 cmsg_slab: Slab::new(),
                 msghdr_slab: Slab::new(),
             }
+        }
+
+        fn needs_cancel(&self) -> bool {
+            // MSG_DONTWAIT makes the send complete immediately.
+            false
         }
 
         fn build_op(
@@ -352,7 +446,8 @@ mod io_uring {
 
             (
                 opcode::SendMsg::new(fd, msghdr_ref as *const _)
-                    .flags(flags as u32)
+                    // MSG_DONTWAIT: see TrySendToBatchOp (zipline#117).
+                    .flags(flags as u32 | libc::MSG_DONTWAIT as u32)
                     .build(),
                 (),
             )
@@ -382,6 +477,11 @@ mod io_uring {
             }
         }
 
+        fn needs_cancel(&self) -> bool {
+            // MSG_DONTWAIT makes the receive complete immediately.
+            false
+        }
+
         fn build_op(
             &mut self,
             fd: types::Fd,
@@ -400,7 +500,16 @@ mod io_uring {
                 msg_flags: 0,
             });
 
-            (opcode::RecvMsg::new(fd, msghdr_ref as *mut _).build(), buf)
+            (
+                opcode::RecvMsg::new(fd, msghdr_ref as *mut _)
+                    // MSG_DONTWAIT: complete immediately (with -EAGAIN if the
+                    // socket is empty) instead of arming internal poll, so no
+                    // pending operation is left for a cancel to miss
+                    // (zipline#117).
+                    .flags(libc::MSG_DONTWAIT as u32)
+                    .build(),
+                buf,
+            )
         }
 
         fn process_result(
@@ -446,6 +555,11 @@ mod io_uring {
             }
         }
 
+        fn needs_cancel(&self) -> bool {
+            // MSG_DONTWAIT makes the receive complete immediately.
+            false
+        }
+
         fn build_op(
             &mut self,
             fd: types::Fd,
@@ -465,7 +579,13 @@ mod io_uring {
                 msg_flags: 0,
             });
 
-            (opcode::RecvMsg::new(fd, msghdr_ref as *mut _).build(), buf)
+            (
+                opcode::RecvMsg::new(fd, msghdr_ref as *mut _)
+                    // MSG_DONTWAIT: see TryRecvBufFromBatchOp (zipline#117).
+                    .flags(libc::MSG_DONTWAIT as u32)
+                    .build(),
+                buf,
+            )
         }
 
         fn process_result(
@@ -507,6 +627,7 @@ mod io_uring {
 
         const REQUIRED_OPCODES: &[u8] = &[
             opcode::AsyncCancel::CODE,
+            opcode::Timeout::CODE,
             opcode::Write::CODE,
             opcode::Read::CODE,
             opcode::SendMsg::CODE,
@@ -545,14 +666,37 @@ mod io_uring {
             items: &mut dyn Iterator<Item = Item>,
             results: &mut Vec<Result<Res>>,
         ) -> Result<usize> {
+            /// `user_data` of cancel requests, which carry no result.
+            const CANCEL_USER_DATA: u64 = 0;
+            /// `user_data` of reap-bounding timeouts, which carry no result.
+            const TIMEOUT_USER_DATA: u64 = u64::MAX;
+            /// Bound of each straggler wait.
+            const REAP_TIMEOUT: types::Timespec = types::Timespec::new().nsec(1_000_000);
+
             let fd = types::Fd(fd.as_raw_fd());
+
+            // Whether each operation must be paired with a cancel request
+            // (see `BatchOp::needs_cancel`).  Socket operations carry
+            // MSG_DONTWAIT and complete immediately instead, which sidesteps
+            // the cancel-miss stall (zipline#117) and halves their SQE usage.
+            let needs_cancel = batch_op.needs_cancel();
+            let entries_per_op = if needs_cancel { 2 } else { 1 };
 
             let mut submitted = 0;
 
             let mut squeue = self.io_uring.submission();
 
-            // Each operation consumes two entries (one for the operation, one for the cancel request).
-            let max_to_submit = (squeue.capacity() - squeue.len()) / 2;
+            // The SQ has room for `capacity / entries_per_op` operations, but
+            // every per-operation slab (`state_slab`, the socket ops'
+            // sockaddr/cmsg slabs, `op_seen`) holds only MAX_ENTRIES.  With
+            // needs_cancel the two limits coincide (capacity = 2 * entries,
+            // entries <= MAX_ENTRIES); without it (MSG_DONTWAIT socket ops,
+            // one SQE each) the ring alone would admit up to 2 * MAX_ENTRIES
+            // operations and the (MAX_ENTRIES + 1)-th `Slab::push` would
+            // panic.  Clamp to the slab capacity so an over-long backlog
+            // comes back as a partial batch instead (zipline#117 review).
+            let max_to_submit =
+                ((squeue.capacity() - squeue.len()) / entries_per_op).min(MAX_ENTRIES);
 
             let mut state_slab = Slab::new();
 
@@ -570,22 +714,18 @@ mod io_uring {
                 let (entry, state) = batch_op.build_op(fd, item, submitted);
                 state_slab.push(Some(state));
 
-                let entries = [
-                    entry.user_data(user_data),
-                    opcode::AsyncCancel::new(user_data).build(),
-                ];
-
                 // NOTE: ideally we'd use LINK and O_NONBLOCK, but:
                 // (a) since all reads from a TUN are "short", LINK treats them as failures,
                 // (b) O_NONBLOCK is ignored by io_uring, and
                 // (c) RWF_NOWAIT is not supported by TUN devices.
                 //
-                // So instead we must manually cancel all requests which
-                // weren't immediately fulfilled (since they otherwise will
-                // run asynchronously).  This means we must live with the
-                // (rare) possibility that reads after the first which would
-                // have blocked actually complete (since we are racing with
-                // the TUN device).
+                // So instead (for TUN operations -- socket operations use
+                // MSG_DONTWAIT and complete immediately) we must manually
+                // cancel all requests which weren't immediately fulfilled
+                // (since they otherwise will run asynchronously).  This means
+                // we must live with the (rare) possibility that reads after
+                // the first which would have blocked actually complete
+                // (since we are racing with the TUN device).
                 //
                 // (Note, even if (b) and (c) were solved, HARDLINK puts us in the same situation.)
                 //
@@ -593,76 +733,174 @@ mod io_uring {
                 // only on newer kernels anyway) only cancels the first item
                 // of a linked chain!)
 
-                // SAFETY: the buf ptrs are valid for our entire body, and we
-                // are waiting on completion before we exit.
-                unsafe { squeue.push_multiple(&entries) }.unwrap();
+                if needs_cancel {
+                    let entries = [
+                        entry.user_data(user_data),
+                        opcode::AsyncCancel::new(user_data)
+                            .build()
+                            .user_data(CANCEL_USER_DATA),
+                    ];
+
+                    // SAFETY: the buf ptrs are valid for our entire body, and we
+                    // are waiting on completion before we exit.
+                    unsafe { squeue.push_multiple(&entries) }.unwrap();
+                } else {
+                    // SAFETY: as above.
+                    unsafe { squeue.push(&entry.user_data(user_data)) }.unwrap();
+                }
                 submitted += 1;
             }
 
             drop(squeue);
 
-            // Submit the operations and "wait" for completion (which should not block,
-            // thanks to our cancels).
-            // TODO: do we actually need `_and_wait` here?
-            let completed = self.io_uring.submit_and_wait(2 * submitted)?;
-            assert_eq!(completed, 2 * submitted);
-
-            // Read results from the completion queue.
-            let mut cqueue = self.io_uring.completion();
-            let mut completions = [const { MaybeUninit::uninit() }; MAX_ENTRIES * 2];
-            let completions = cqueue.fill(&mut completions);
-            assert_eq!(completions.len(), 2 * submitted);
+            // Submit the operations.
+            //
+            // A cancel can return -ENOENT while its operation is still
+            // pending in the kernel (e.g. the operation was awoken by a
+            // datagram which a sibling operation then consumed, and re-armed
+            // its poll).  The old `submit_and_wait(2 * submitted)` here then
+            // blocked until unrelated traffic completed the operation --
+            // observed as ~600 ms fastpath stalls (zipline#117).
+            //
+            // So instead: submit without waiting, then reap completions,
+            // re-cancelling stragglers with a bounded wait per round until
+            // every operation is accounted for.  We must never return with
+            // operations in flight (their SQEs point into caller-owned
+            // buffers), and with the re-cancel loop the wait for that is
+            // bounded; if a straggler never completes we panic explicitly
+            // rather than hang.
+            self.io_uring.submit()?;
 
             let results_base = results.len();
             results.reserve(submitted);
 
-            // Process results, skipping over the results of our cancel operations.
-            for entry in completions {
-                if entry.user_data() == 0 {
-                    // a cancel request
-                    continue;
+            // Number of operation results reaped (identified by user_data 1..=submitted).
+            let mut ops_seen = 0usize;
+            let mut op_seen = [false; MAX_ENTRIES];
+            // Cancels and timeouts submitted vs. reaped: their completions
+            // must be drained too, or they would be misread as operation
+            // results of a later batch.
+            let mut aux_expected = if needs_cancel { submitted } else { 0 };
+            let mut aux_seen = 0usize;
+
+            let mut reap_guard = ReapGuard::new();
+
+            loop {
+                // Read results from the completion queue.
+                for entry in self.io_uring.completion() {
+                    let user_data = entry.user_data();
+
+                    if user_data == TIMEOUT_USER_DATA {
+                        // The current round's guard timeout has fired (or
+                        // was cancelled); only now may the next round start.
+                        reap_guard.timeout_reaped();
+                        aux_seen += 1;
+                        continue;
+                    }
+
+                    if user_data == CANCEL_USER_DATA {
+                        aux_seen += 1;
+                        continue;
+                    }
+
+                    // Grab the unique identifier of the operation.
+                    let idx = (user_data - 1) as usize;
+                    assert!(idx < submitted && !op_seen[idx]);
+                    op_seen[idx] = true;
+                    ops_seen += 1;
+
+                    let result = entry.result();
+
+                    if result == -libc::ECANCELED {
+                        // This operation was cancelled.  Don't append to `results`,
+                        // under the assumption that the remainder of operations were
+                        // cancelled as well.
+                        //
+                        // Note though that, because io_uring processing is racing
+                        // against the rest of the system, and we are unable to use
+                        // linking to stop processing at the first error for the reasons
+                        // above, we may see successful operations after cancelled ones.
+                        // So we must `continue` here, and not `break`.
+                        // Filling in the gaps in the `results` vector is handled below.
+
+                        continue;
+                    }
+
+                    if idx >= results.len() - results_base {
+                        // Note that results may come out of order (cancellation, and
+                        // completion itself, are asynchronous).  So, fill skipped-over
+                        // results with EWOULDBLOCK.
+
+                        results.resize_with(results_base + idx + 1, || {
+                            Err(std::io::Error::from_raw_os_error(libc::EWOULDBLOCK))
+                        });
+                    }
+
+                    // Translate the result.
+                    results[results_base + idx] = if result < 0 {
+                        Err(std::io::Error::from_raw_os_error(-result))
+                    } else {
+                        Ok(batch_op.process_result(
+                            idx,
+                            state_slab.get_mut(idx).take().unwrap(),
+                            result as usize,
+                        ))
+                    };
                 }
 
-                let result = entry.result();
-
-                if result == -libc::ECANCELED {
-                    // This operation was cancelled.  Don't append to `results`,
-                    // under the assumption that the remainder of operations were
-                    // cancelled as well.
-                    //
-                    // Note though that, because io_uring processing is racing
-                    // against the rest of the system, and we are unable to use
-                    // linking to stop processing at the first error for the reasons
-                    // above, we may see successful operations after cancelled ones.
-                    // So we must `continue` here, and not `break`.
-                    // Filling in the gaps in the `results` vector is handled below.
-
-                    continue;
+                if ops_seen == submitted && aux_seen == aux_expected {
+                    break;
                 }
 
-                // Grab the unique identifier of the operation.
-                let idx = (entry.user_data() - 1) as usize;
+                // Some operations (or cancels/timeouts) are still in flight:
+                // either a cancel missed (-ENOENT with the operation still
+                // pending), or -- for socket operations, as defense-in-depth
+                // -- an operation did not complete immediately despite
+                // MSG_DONTWAIT.  Re-cancel every unaccounted-for operation
+                // and wait again, bounded by a timeout so this loop can never
+                // block waiting for traffic.
+                //
+                // A round is gated on its guard timeout's CQE (see
+                // `ReapGuard`): a wakeup caused by anything else -- e.g. a
+                // re-cancel promptly completing with -ENOENT while its
+                // operation is still pending -- neither consumes a round nor
+                // submits more work, so MAX_REAP_ROUNDS really bounds the
+                // wait at ~MAX_REAP_ROUNDS * REAP_TIMEOUT and at most one
+                // guard timeout is outstanding at a time.
+                if reap_guard.try_start_round() {
+                    assert!(
+                        reap_guard.rounds() <= MAX_REAP_ROUNDS,
+                        "io_uring batch operation never completed: \
+                         {} of {} operations (and {} of {} cancels/timeouts) reaped \
+                         after {} re-cancel rounds",
+                        ops_seen,
+                        submitted,
+                        aux_seen,
+                        aux_expected,
+                        reap_guard.rounds() - 1,
+                    );
 
-                if idx >= results.len() - results_base {
-                    // Note that, for some reason, results may come out of order.
-                    // (It seems that cancel operations may be processed asynchronously.)
-                    // So, fill skipped-over results with EWOULDBLOCK.
-
-                    results.resize_with(results_base + idx + 1, || {
-                        Err(std::io::Error::from_raw_os_error(libc::EWOULDBLOCK))
-                    });
+                    let mut squeue = self.io_uring.submission();
+                    for (idx, seen) in op_seen.iter().enumerate().take(submitted) {
+                        if !seen {
+                            let cancel = opcode::AsyncCancel::new((idx as u64) + 1)
+                                .build()
+                                .user_data(CANCEL_USER_DATA);
+                            // SAFETY: cancel entries reference no caller memory.
+                            unsafe { squeue.push(&cancel) }.unwrap();
+                            aux_expected += 1;
+                        }
+                    }
+                    let timeout = opcode::Timeout::new(&REAP_TIMEOUT)
+                        .build()
+                        .user_data(TIMEOUT_USER_DATA);
+                    // SAFETY: REAP_TIMEOUT is 'static.
+                    unsafe { squeue.push(&timeout) }.unwrap();
+                    aux_expected += 1;
+                    drop(squeue);
                 }
 
-                // Translate the result.
-                results[results_base + idx] = if result < 0 {
-                    Err(std::io::Error::from_raw_os_error(-result))
-                } else {
-                    Ok(batch_op.process_result(
-                        idx,
-                        state_slab.get_mut(idx).take().unwrap(),
-                        result as usize,
-                    ))
-                };
+                self.io_uring.submit_and_wait(1)?;
             }
 
             Ok(results.len() - results_base)
@@ -735,6 +973,51 @@ mod io_uring {
         libc::iovec {
             iov_base: buf.as_ptr() as *mut u8 as *mut _,
             iov_len: buf.len(),
+        }
+    }
+
+    #[cfg(test)]
+    mod reap_guard_tests {
+        use super::*;
+
+        #[test]
+        fn test_prompt_cancel_completions_do_not_burn_reap_rounds() {
+            // zipline#117 review (PR #43): if a straggler operation stays
+            // pending while each re-cancel promptly completes with -ENOENT,
+            // submit_and_wait(1) is satisfied by the cancel CQE rather than
+            // the 1 ms guard timeout.  Such wakeups must not consume reap
+            // rounds (or MAX_REAP_ROUNDS burns out in far less than the
+            // documented ~5 s and the loop panics in the very cancel-miss
+            // condition it tolerates), and must not enqueue additional
+            // guard timeouts.  A round may only advance once the previous
+            // round's timeout CQE has been reaped.
+            let mut guard = ReapGuard::new();
+
+            assert!(guard.try_start_round(), "first round must start");
+            assert_eq!(guard.rounds(), 1);
+
+            // Many wakeups within the round (prompt -ENOENT cancel
+            // completions), no timeout CQE reaped: no new round, no new
+            // timeout submission.
+            for _ in 0..10 * MAX_REAP_ROUNDS {
+                assert!(
+                    !guard.try_start_round(),
+                    "a wakeup without a reaped guard-timeout CQE must not \
+                     start a new round (or submit another timeout)"
+                );
+            }
+            assert_eq!(
+                guard.rounds(),
+                1,
+                "wakeups without timeout CQEs must not consume reap rounds"
+            );
+
+            // Only a reaped guard-timeout CQE lets the next round start,
+            // so rounds advance at REAP_TIMEOUT cadence and MAX_REAP_ROUNDS
+            // really bounds the wait at ~MAX_REAP_ROUNDS * REAP_TIMEOUT.
+            guard.timeout_reaped();
+            assert!(guard.try_start_round());
+            assert_eq!(guard.rounds(), 2);
         }
     }
 
@@ -1548,6 +1831,196 @@ mod tests {
     }
 
     // NOTE: we don't have any way of really testing the "send_from" functionality as a unit test
+
+    #[test]
+    fn test_send_backlog_over_slab_capacity() {
+        // zipline#117 review (PR #43): with MSG_DONTWAIT socket operations
+        // (needs_cancel == false) each operation occupies a single SQE, so
+        // the submission limit derived from the ring capacity (2 * entries)
+        // can exceed MAX_ENTRIES -- but the state slab, the per-op sockaddr
+        // slabs and `op_seen` all hold only MAX_ENTRIES.  A backlog larger
+        // than MAX_ENTRIES must come back as a partial batch (like the old
+        // `/ 2` limit produced), not panic on the (MAX_ENTRIES + 1)-th push.
+        for engine in ENGINES {
+            let inq = udp_socket().unwrap();
+            let outq = udp_socket().unwrap();
+            inq.set_nonblocking(true).unwrap();
+            let dest = outq.local_addr().unwrap();
+
+            let max = engine.max_entries();
+            let nmsgs = max + max / 2;
+
+            // Instantiate at the engine's advertised maximum, the
+            // configuration under which the limit overshoots the slabs.
+            let mut bio = engine.instantiate(max).unwrap();
+
+            let msg = [42u8; 8];
+            let mut results = Vec::new();
+
+            let n = bio
+                .try_send_to_batch(&inq, (0..nmsgs).map(|_| (&msg[..], dest, 0)), &mut results)
+                .unwrap();
+
+            assert!(
+                n >= 1 && n <= nmsgs,
+                "[{}] expected a (possibly partial) batch, got {n} of {nmsgs}",
+                engine.engine_name()
+            );
+
+            if engine.engine_name() == "io_uring" {
+                // The io_uring engine must clamp the batch to its slab
+                // capacity and return the remainder to the caller.
+                assert_eq!(
+                    n, max,
+                    "[io_uring] a backlog over the slab capacity must return \
+                     a partial batch of exactly the slab capacity"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_recv_stress_no_stall() {
+        // zipline#117: a batch receive on an empty or partly-filled socket
+        // must never block the calling thread waiting for traffic that has
+        // not arrived.
+        //
+        // On the io_uring engine, each batch op was paired with an
+        // AsyncCancel and the engine waited for every completion, relying on
+        // each cancel finding its op.  A cancel can return -ENOENT while its
+        // op is still pending (e.g. the op was woken by a datagram that a
+        // sibling op then consumed, and re-armed its poll), leaving
+        // submit_and_wait() blocked until the next unrelated datagram
+        // completes the op -- observed as ~600 ms fastpath stalls in the
+        // netns integration tier.
+        //
+        // Reproduce: the sender sends sequenced datagrams one at a time at
+        // randomized sub-millisecond offsets while the receiver busy-loops
+        // 64-op batch receives on the otherwise empty socket, so datagrams
+        // keep arriving inside the submit/cancel window.  The receiver acks
+        // each newly-seen datagram; the sender sends the next only on an
+        // ack, or after GAP if the ack never comes (i.e. the receiver is
+        // blocked inside a batch call).  A stalled call is thus always
+        // unblocked by a later datagram, its duration is measured, and no
+        // datagram can paper over a preceding one's stall.  Any batch call
+        // taking STALL or longer fails the test, as does any datagram that
+        // is never returned.
+
+        const BATCH: usize = 64;
+        const NDATAGRAMS: u64 = 1000;
+        const STALL: Duration = Duration::from_millis(50);
+        const GAP: Duration = Duration::from_millis(100);
+        const HEARTBEAT: u64 = u64::MAX;
+
+        // Iterate posix_unbatched (the control engine) first, so an io_uring
+        // failure does not mask its result.
+        for engine in ENGINES.iter().rev() {
+            let engine_name = engine.engine_name();
+
+            let inq = udp_socket().unwrap();
+            let outq = udp_socket().unwrap();
+            inq.set_nonblocking(true).unwrap();
+            outq.set_nonblocking(true).unwrap();
+            inq.connect(outq.local_addr().unwrap()).unwrap();
+
+            let mut bio = engine.instantiate(BATCH).unwrap();
+
+            let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let sender_stop = stop.clone();
+            let sender = std::thread::spawn(move || {
+                let mut rng = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos() as u64
+                    | 1;
+
+                let mut seq = 0u64;
+                while seq < NDATAGRAMS {
+                    // One datagram at a randomized sub-millisecond offset, to
+                    // land it at an arbitrary point of the receiver's batch
+                    // calls; then wait for its ack before the next, so that a
+                    // stall shows up as a >= GAP batch call instead of being
+                    // cut short by the following datagram.
+                    std::thread::sleep(Duration::from_micros(xorshift(&mut rng) % 700));
+                    inq.send(&seq.to_le_bytes()).unwrap();
+                    seq += 1;
+                    let _ = ack_rx.recv_timeout(GAP);
+                }
+
+                // Keep the receiver unblockable while it drains the last
+                // bursts: a stalled batch call only returns when the next
+                // datagram arrives.
+                while !sender_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    inq.send(&HEARTBEAT.to_le_bytes()).unwrap();
+                    std::thread::sleep(GAP);
+                }
+            });
+
+            let mut seen = vec![false; NDATAGRAMS as usize];
+            let mut nseen = 0usize;
+            let mut max_elapsed = Duration::ZERO;
+            let mut bufs = vec![Vec::with_capacity(64); BATCH];
+            let mut results = Vec::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+
+            while nseen < NDATAGRAMS as usize {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "[{engine_name}] lost datagram(s): only {nseen} of {NDATAGRAMS} received"
+                );
+
+                bufs.iter_mut().for_each(|b| b.clear());
+                results.clear();
+
+                let start = std::time::Instant::now();
+                match bio.try_recv_buf_from_batch(&outq, bufs.iter_mut(), &mut results) {
+                    Ok(_) => (),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => (),
+                    Err(err) => panic!("[{engine_name}] batch receive failed: {err}"),
+                }
+                let elapsed = start.elapsed();
+                max_elapsed = max_elapsed.max(elapsed);
+
+                assert!(
+                    elapsed < STALL,
+                    "[{engine_name}] batch receive blocked for {elapsed:?} (>= {STALL:?}) \
+                     after {nseen} of {NDATAGRAMS} datagrams: an operation was left in \
+                     flight and the engine waited for traffic that had not arrived"
+                );
+
+                for (buf, result) in bufs.iter().zip(results.drain(..)) {
+                    let Ok(packet) = result else { continue };
+                    assert_eq!(packet.size, 8, "[{engine_name}] short datagram");
+                    let seq = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                    if seq == HEARTBEAT || seq as usize >= seen.len() {
+                        continue;
+                    }
+                    if !seen[seq as usize] {
+                        seen[seq as usize] = true;
+                        nseen += 1;
+                        let _ = ack_tx.send(());
+                    }
+                }
+            }
+
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            sender.join().unwrap();
+
+            println!(
+                "engine {engine_name}: received all {NDATAGRAMS} datagrams, \
+                 max batch call {max_elapsed:?}"
+            );
+        }
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
 
     fn udp_socket() -> Result<UdpSocket> {
         UdpSocket::bind(std::net::SocketAddrV6::new(
