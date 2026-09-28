@@ -461,7 +461,10 @@ impl v1::v_s_s_handle::Server for VSSHandleImpl {
         {
             // Probably our handler has gone away.
             // TODO: Shut down this VSS service connection. How?
-            error!("failed to send RequestAuthentication message to handler: {}", e);
+            error!(
+                "failed to send RequestAuthentication message to handler: {}",
+                e
+            );
             let mut ack_builder = results.get().init_ack();
             self.build_ack_zero_with_error(
                 &mut ack_builder,
