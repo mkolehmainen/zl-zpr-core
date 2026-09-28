@@ -363,6 +363,11 @@ pub struct LinkData {
     /// Nodes only: the issuer/nonce identity the actor originally
     /// authenticated with, for silent renewal. None on device-only links.
     renewal_identity: Option<RenewalIdentity>,
+    /// The authority namespace set this link's actor authenticated with
+    /// (zipline#122): recorded at auth time on both sides of the hop. The
+    /// node requires a renewal reply's set to EQUAL it; the adapter builds
+    /// its renewal blob array from it. None until authenticated.
+    authenticated_namespaces: Option<std::collections::BTreeSet<auth::AuthNamespace>>,
     /// Nodes only: a renewal attempt is underway; suppresses further
     /// attempts until it completes (one attempt per due tick at most).
     renewal_in_flight: bool,
@@ -397,6 +402,7 @@ impl LinkData {
             auth_expires: None,
             auth_renewal_deadline: None,
             renewal_identity: None,
+            authenticated_namespaces: None,
             renewal_in_flight: false,
             renewal_challenge: None,
             adapter_renewal_task: None,
@@ -642,6 +648,26 @@ impl LinkStateWrapper {
     /// with, so silent renewal can re-prove against the same issuer.
     pub fn set_renewal_identity(&self, identity: RenewalIdentity) {
         self.locked_data.lock().unwrap().renewal_identity = Some(identity);
+    }
+
+    /// Record the authority namespace set the actor authenticated with
+    /// (zipline#122); a renewal must re-prove exactly this set.
+    pub fn set_authenticated_namespaces(
+        &self,
+        namespaces: std::collections::BTreeSet<auth::AuthNamespace>,
+    ) {
+        self.locked_data.lock().unwrap().authenticated_namespaces = Some(namespaces);
+    }
+
+    /// The recorded authority namespace set, if the link has authenticated.
+    pub fn get_authenticated_namespaces(
+        &self,
+    ) -> Option<std::collections::BTreeSet<auth::AuthNamespace>> {
+        self.locked_data
+            .lock()
+            .unwrap()
+            .authenticated_namespaces
+            .clone()
     }
 
     /// The stored renewal identity, if the actor authenticated via OIDC.
@@ -1293,6 +1319,10 @@ impl LinkStateWrapper {
             self.stash_renewal_identity(asm, link_id, oidc_blob);
         }
 
+        // Record which authority namespaces this (verified) blob set proves
+        // (zipline#122): a renewal reply must re-prove exactly this set.
+        self.set_authenticated_namespaces(auth::blob_namespaces(&d_blobs));
+
         locked_fsm.set_state(LinkState::RegisterAA);
 
         let is_vs_link = asm
@@ -1879,6 +1909,12 @@ impl LinkStateWrapper {
                     if let Some(bs) = asm.config.get().bootstrap.as_ref() {
                         match bs.authenticate(&challenge) {
                             Ok(blobstr) => {
+                                // Device-only bootstrap authentication
+                                // (zipline#122): record the namespace set a
+                                // renewal must re-prove.
+                                self.set_authenticated_namespaces(
+                                    [auth::AuthNamespace::Device].into(),
+                                );
                                 // The send function below will invoke a state event callback.
                                 // We staty in RegisterAA state until we get a grant.
                                 let requested_addrs = asm.get_local_zpr_addrs_std();
@@ -2196,6 +2232,10 @@ impl LinkStateWrapper {
         }
 
         info!(target: LINK_STATE, "{}: authentication success ({} blob(s))", asm.formatted_link_id(link_id), blobs.len());
+        // Record which authority namespaces we authenticated with
+        // (zipline#122): a later renewal request is answered with exactly
+        // this set of legs.
+        self.set_authenticated_namespaces(auth::blob_namespaces(&blobs));
         let blobstr = auth::encode_blobs(&blobs);
         let requested_addrs = asm.get_local_zpr_addrs_std();
         self.send_acquire_zpr_address_request(asm, &requested_addrs, &blobstr);
@@ -3553,6 +3593,201 @@ mod tests {
                 peer.link_state_machine
                     .set_auth_expires(now, expires, Duration::from_secs(300));
                 assert_eq!(peer.link_state_machine.get_auth_expires(), Some(expires));
+            })
+            .await
+    }
+
+    /// N2 (zipline#122) step 1: the authenticated namespace set round-trips
+    /// through the LinkStateWrapper setter/getter — None until recorded.
+    #[tokio::test]
+    async fn test_link_data_authenticated_namespaces_round_trip() {
+        use crate::auth::AuthNamespace;
+        use std::collections::BTreeSet;
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_authenticated_namespaces(),
+                    None,
+                    "no namespace set before authentication"
+                );
+
+                let set: BTreeSet<AuthNamespace> =
+                    [AuthNamespace::Device, AuthNamespace::User].into();
+                peer.link_state_machine
+                    .set_authenticated_namespaces(set.clone());
+                assert_eq!(
+                    peer.link_state_machine.get_authenticated_namespaces(),
+                    Some(set)
+                );
+            })
+            .await
+    }
+
+    /// N2 (zipline#122) step 1, adapter side: AuthenticationSuccess with an
+    /// SS + OIDC blob array records {Device, User} as the namespace set the
+    /// link authenticated with.
+    #[tokio::test]
+    async fn test_adapter_auth_success_records_namespace_set() {
+        use crate::auth::AuthNamespace;
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress_rx) = assembly_with_observable_egress();
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForUserAuth);
+                }
+
+                let challenge = [5u8; 48];
+                let blobs = vec![
+                    crate::auth::AuthBlob::SelfSigned(auth::ZdpSelfSignedBlob {
+                        blob_type: auth::BLOB_TYPE_SS.to_string(),
+                        ts: 12345,
+                        cn: "test.cn.zpr".to_string(),
+                        challenge: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            challenge,
+                        ),
+                        sig: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            [2u8; 16],
+                        ),
+                    }),
+                    crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
+                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+                        issuer: "https://idp.test".to_string(),
+                        id_token: "tok".to_string(),
+                        challenge: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            challenge,
+                        ),
+                    }),
+                ];
+                asm.process_link_state_event(link_id, LinkEvent::AuthenticationSuccess(blobs))
+                    .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_authenticated_namespaces(),
+                    Some([AuthNamespace::Device, AuthNamespace::User].into()),
+                    "SS + OIDC authentication must record both namespaces"
+                );
+            })
+            .await
+    }
+
+    /// N2 (zipline#122) step 1, adapter side: the device-only bootstrap path
+    /// (no OIDC IdP advertised) records {Device}.
+    #[tokio::test]
+    async fn test_adapter_bootstrap_only_auth_records_device_namespace() {
+        use crate::auth::AuthNamespace;
+        LocalSet::new()
+            .run_until(async {
+                let mut config = <config::Config as std::default::Default>::default();
+                let mut keypath =
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                keypath.push("tests");
+                keypath.push("data");
+                keypath.push("rsa-key.pem");
+                config.bootstrap =
+                    Some(auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap());
+                let (egress_tx, _egress_rx) = crate::packet_queue::packet_queue(8);
+                let mut builder = TestAssemblyBuilder::new();
+                builder.mgmt_substrate_egress =
+                    Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
+                builder.config = Some(rcu::RcuBox::new(config));
+                let asm = Arc::new(create_assembly(builder));
+
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((true, Some(test_challenge_payload()))),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_authenticated_namespaces(),
+                    Some([AuthNamespace::Device].into()),
+                    "bootstrap-only authentication must record the device namespace"
+                );
+            })
+            .await
+    }
+
+    /// N2 (zipline#122) step 1, node side: a verified acquire request records
+    /// the namespace set of its blobs alongside the renewal identity.
+    #[tokio::test]
+    async fn test_node_acquire_records_namespace_set() {
+        use crate::auth::AuthNamespace;
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_node_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForAcquireZprAddress);
+                }
+                // The SS challenge check needs an established SA (peer_cert
+                // None skips the CN leg; HMAC and age still verify).
+                asm.peer_table
+                    .set_security_association(link_id, crate::km::KmTransportSA::default())
+                    .unwrap();
+
+                // Blobs bound to a challenge HMAC'd with the dummy peer's
+                // auth key ([42; 32]).
+                let key = [42u8; auth::AUTH_KEY_SIZE_BYTES];
+                let payload = auth::ZdpInitAuthenticationPayload::new(&key);
+                let mut challenge = [0u8; 48];
+                challenge[0..8].copy_from_slice(&payload.nonce);
+                challenge[8..16].copy_from_slice(&payload.ctime.to_bytes());
+                challenge[16..48].copy_from_slice(&payload.hmac);
+                let mut keypath =
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                keypath.push("tests");
+                keypath.push("data");
+                keypath.push("rsa-key.pem");
+                let bs = auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap();
+                let ss = bs.authenticate_blob(&payload).unwrap();
+                let oidc = auth::ZdpOidcBlob {
+                    blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+                    issuer: "https://idp.test".to_string(),
+                    id_token: "tok".to_string(),
+                    challenge: base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        challenge,
+                    ),
+                };
+                let blob_str = auth::encode_blobs(&[
+                    crate::auth::AuthBlob::SelfSigned(ss),
+                    crate::auth::AuthBlob::Oidc(oidc),
+                ]);
+
+                // NOTE: no yields after the event — the authorize task the
+                // acquire path spawns toward the (absent) VS must not run.
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedAcquireZprAddressRequest(None, blob_str),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_authenticated_namespaces(),
+                    Some([AuthNamespace::Device, AuthNamespace::User].into()),
+                    "the node must record the verified blob set's namespaces"
+                );
             })
             .await
     }

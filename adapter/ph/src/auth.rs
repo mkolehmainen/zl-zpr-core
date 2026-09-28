@@ -119,6 +119,32 @@ pub enum AuthBlob {
     Oidc(ZdpOidcBlob),
 }
 
+/// The authority namespace one authentication leg proves (zipline#122):
+/// an SS (bootstrap) blob proves the `device` namespace, an OIDC blob the
+/// `user` namespace. Mirrors the visa service's per-namespace authority
+/// model (K3/K4): on re-auth the actor must re-prove exactly the set of
+/// namespaces it originally authenticated with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuthNamespace {
+    Device,
+    User,
+}
+
+impl AuthBlob {
+    /// The namespace this blob proves.
+    pub fn namespace(&self) -> AuthNamespace {
+        match self {
+            AuthBlob::SelfSigned(_) => AuthNamespace::Device,
+            AuthBlob::Oidc(_) => AuthNamespace::User,
+        }
+    }
+}
+
+/// The namespace set a blob array proves: one entry per distinct namespace.
+pub fn blob_namespaces(blobs: &[AuthBlob]) -> std::collections::BTreeSet<AuthNamespace> {
+    blobs.iter().map(|b| b.namespace()).collect()
+}
+
 /// What a client adapter needs to talk to an off-net OIDC identity provider.
 /// Advertised by the node in HelloResponse via `OIDC_IDP` TLVs (JSON encoded);
 /// mirrors the visa service's `OidcClientConfig`. All public data.
