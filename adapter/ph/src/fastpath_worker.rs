@@ -2,19 +2,9 @@ use crate::fastpath::{FastpathWorker, FastpathWorkerConfig};
 use crate::fastpath_io::FastpathIo;
 use crate::packet_queue;
 use crate::prelude::*;
+use crate::sys::wait::{Interest, WaitSet, Waitable};
 use crate::sys::ZprTun;
-use enum_map::{Enum, enum_map};
-use nix::poll;
 use std::net::UdpSocket;
-
-#[derive(Debug, Enum)]
-enum PollSlot {
-    Substrate,
-    Tun,
-    Requeue,
-    MgmtSubstrate,
-    Returns,
-}
 
 pub fn launch(
     config: FastpathWorkerConfig,
@@ -48,40 +38,38 @@ fn fastpath_main(mut worker: FastpathWorker, mut io: FastpathIo) {
         // if we can't, drop it, unless it's on the substrate and marked PRIORITY
         io.process_out_queues(&mut worker);
 
-        let recv_poll_flags;
+        let recv_interest;
         if worker.buffers.is_empty() {
             // If we have no buffers, let's not get woken up to receive packets.
-            recv_poll_flags = poll::PollFlags::empty();
+            recv_interest = Interest::NONE;
         } else {
-            recv_poll_flags = poll::PollFlags::POLLIN;
+            recv_interest = Interest::READ;
         }
 
-        let send_poll_flags;
+        let send_interest;
         if worker.substrate_egress_packets_queued() {
-            send_poll_flags = poll::PollFlags::POLLOUT;
+            send_interest = Interest::WRITE;
         } else {
-            send_poll_flags = poll::PollFlags::empty();
+            send_interest = Interest::NONE;
         }
 
-        let mut poll_fds = enum_map! {
-            PollSlot::Substrate => poll::PollFd::new(io.substrate_socket_fd(), recv_poll_flags | send_poll_flags),
-            PollSlot::Tun => poll::PollFd::new(io.actor_tun_fd(), recv_poll_flags),
-            PollSlot::Requeue => poll::PollFd::new(io.requeue_fd(), recv_poll_flags),
-            PollSlot::MgmtSubstrate => poll::PollFd::new(io.mgmt_substrate_fd(), recv_poll_flags),
-            PollSlot::Returns => poll::PollFd::new(worker.return_q.poll_fd(), poll::PollFlags::POLLIN),
-        };
+        let mut wait_set = WaitSet::with_capacity(5);
+        let substrate = wait_set.push(io.substrate_socket_handle(), recv_interest | send_interest);
+        let tun = wait_set.push(io.actor_tun_handle(), recv_interest);
+        let requeue = wait_set.push(io.requeue_handle(), recv_interest);
+        let mgmt_substrate = wait_set.push(io.mgmt_substrate_handle(), recv_interest);
+        let returns = wait_set.push(worker.return_q.handle(), Interest::READ);
 
-        let _n = match poll::poll(poll_fds.as_mut_slice(), poll::PollTimeout::NONE)
-            .map_err(|err| std::io::Error::from_raw_os_error(err as i32))
-        {
-            Ok(n) => n,
+        let ready = match wait_set.wait(None) {
+            Ok(ready) => ready,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             ret @ Err(_) => ret.unwrap(),
         };
 
-        // Extracting the revents here allows us to drop the `PollFd`s, which hold
-        // references to things in `worker`, which we need `&mut` access to later.
-        let revents = poll_fds.map(|_, pfd| pfd.revents().unwrap());
+        // Dropping the wait set here releases its borrows of things in
+        // `worker`, which we need `&mut` access to below.  (`ready` is an
+        // owned snapshot of the results.)
+        drop(wait_set);
 
         // FAIRNESS
         //
@@ -132,41 +120,41 @@ fn fastpath_main(mut worker: FastpathWorker, mut io: FastpathIo) {
         // ensures that it doesn't get starved.
 
         // First, get any returned buffers, so we have them immediately to work with.
-        if revents[PollSlot::Returns].contains(poll::PollFlags::POLLIN) {
+        if ready.is_readable(returns) {
             worker
                 .return_q
                 .try_recv_many_returns(&mut worker.buffers, worker.config.buffer_count);
         }
 
         // Now, try to send queued PRIORITY packets, possibly freeing their buffers also.
-        if revents[PollSlot::Substrate].contains(poll::PollFlags::POLLOUT) {
+        if ready.is_writable(substrate) {
             io.process_substrate_socket_out(&mut worker);
         }
 
         // Next, read and process any substrate traffic from mgmt.  This is
         // typically/always marked PRIORITY, but even if not, it's low rate
         // and we don't want it to get starved.
-        if revents[PollSlot::MgmtSubstrate].contains(poll::PollFlags::POLLIN) {
+        if ready.is_readable(mgmt_substrate) {
             io.process_mgmt_substrate_in(&mut worker);
         }
 
         // Now, read and process any requeued agent traffic.  Typically this
         // is from mgmt.  It is not priority, but it is low rate, so we want
         // to process it first.
-        if revents[PollSlot::Requeue].contains(poll::PollFlags::POLLIN) {
+        if ready.is_readable(requeue) {
             io.process_requeue_in(&mut worker);
         }
 
         // Now we read and process agent traffic from the TUN device.
         // On the adapter, this may be high rate, so we process it after all low-rate sources.
         // On the node, this is likely low rate, so we process it before substrate traffic.
-        if revents[PollSlot::Tun].contains(poll::PollFlags::POLLIN) {
+        if ready.is_readable(tun) {
             io.process_actor_tun_in(&mut worker);
         }
 
         // Finally, read and process agent traffic from the substrate.
         // This is likely high rate, so process it after all other sources.
-        if revents[PollSlot::Substrate].contains(poll::PollFlags::POLLIN) {
+        if ready.is_readable(substrate) {
             // read from socket
             io.process_substrate_socket_in(&mut worker);
         }

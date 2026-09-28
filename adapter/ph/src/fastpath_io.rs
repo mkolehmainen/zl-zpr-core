@@ -3,11 +3,12 @@ use crate::config;
 use crate::counters::*;
 use crate::fastpath::{FastpathWorker, FastpathWorkerConfig};
 use crate::packet_queue;
+use crate::sys::wait::{WaitHandle, Waitable};
 use crate::sys::{TunPi, ZprTun};
 use crate::zprtun;
 use std::io::{ErrorKind, Result};
 use std::net::{SocketAddr, UdpSocket};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::AsFd;
 use std::sync::Arc;
 use zpr_utils::net_defs;
 
@@ -63,24 +64,24 @@ impl FastpathIo {
         }
     }
 
-    /// Substrate socket FD for polling.
-    pub fn substrate_socket_fd(&self) -> BorrowedFd<'_> {
-        self.substrate_socket.as_fd()
+    /// Substrate socket wait handle for the fastpath wait set.
+    pub fn substrate_socket_handle(&self) -> WaitHandle<'_> {
+        self.substrate_socket.as_fd().into()
     }
 
-    /// Actor TUN FD for polling.
-    pub fn actor_tun_fd(&self) -> BorrowedFd<'_> {
-        self.actor_tun.as_fd()
+    /// Actor TUN wait handle for the fastpath wait set.
+    pub fn actor_tun_handle(&self) -> WaitHandle<'_> {
+        self.actor_tun.as_fd().into()
     }
 
-    /// Requeue socket FD for polling.
-    pub fn requeue_fd(&self) -> BorrowedFd<'_> {
-        self.requeue_outq.poll_fd()
+    /// Requeue queue wait handle for the fastpath wait set.
+    pub fn requeue_handle(&self) -> WaitHandle<'_> {
+        self.requeue_outq.handle()
     }
 
-    /// Mgmt substrate FD for polling.
-    pub fn mgmt_substrate_fd(&self) -> BorrowedFd<'_> {
-        self.mgmt_substrate_outq.poll_fd()
+    /// Mgmt substrate queue wait handle for the fastpath wait set.
+    pub fn mgmt_substrate_handle(&self) -> WaitHandle<'_> {
+        self.mgmt_substrate_outq.handle()
     }
 
     /// Process an input-ready notification on the substrate socket (substrate ingress).
