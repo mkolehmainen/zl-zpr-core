@@ -3031,9 +3031,8 @@ impl LinkStateWrapper {
             // one is known. With non-expiring bootstrap auth there may be
             // none (or a far-future one): fall back to a window that yields
             // the bridge's own per-call bound in renewal_attempt_timeout.
-            data.auth_expires.unwrap_or_else(|| {
-                SystemTime::now() + 2 * config::OIDC_USER_INTERACTION_TIMEOUT
-            })
+            data.auth_expires
+                .unwrap_or_else(|| SystemTime::now() + 2 * config::OIDC_USER_INTERACTION_TIMEOUT)
         };
         self.send_renewal_credential_request(asm, auth_expires);
     }
@@ -3172,12 +3171,8 @@ impl LinkStateWrapper {
         // reject a partial set, so sending one would only waste a round
         // trip (K4).
         let ss_blob = if need_ss {
-            let ss = asm
-                .config
-                .get()
-                .bootstrap
-                .as_ref()
-                .and_then(|bs| match bs.authenticate_blob(&challenge_payload) {
+            let ss = asm.config.get().bootstrap.as_ref().and_then(|bs| {
+                match bs.authenticate_blob(&challenge_payload) {
                     Ok(blob) => Some(AuthBlob::SelfSigned(blob)),
                     Err(e) => {
                         warn!(target: LINK_STATE,
@@ -3185,7 +3180,8 @@ impl LinkStateWrapper {
                             asm.formatted_link_id(link_id));
                         None
                     }
-                });
+                }
+            });
             match ss {
                 Some(blob) => Some(blob),
                 None => {
@@ -3890,8 +3886,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let mut config = <config::Config as std::default::Default>::default();
-                let mut keypath =
-                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
                 keypath.push("tests");
                 keypath.push("data");
                 keypath.push("rsa-key.pem");
@@ -3955,8 +3950,7 @@ mod tests {
                 challenge[0..8].copy_from_slice(&payload.nonce);
                 challenge[8..16].copy_from_slice(&payload.ctime.to_bytes());
                 challenge[16..48].copy_from_slice(&payload.hmac);
-                let mut keypath =
-                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
                 keypath.push("tests");
                 keypath.push("data");
                 keypath.push("rsa-key.pem");
@@ -4515,8 +4509,7 @@ mod tests {
                 )
                 .unwrap();
 
-                let pkt = try_recv_egress(&mut egress_rx)
-                    .expect("the adapter must still answer");
+                let pkt = try_recv_egress(&mut egress_rx).expect("the adapter must still answer");
                 assert_eq!(pkt.body()[0], 143, "expected RenewAuthenticationResponse");
                 assert_eq!(
                     pkt.body()[10],
@@ -4591,10 +4584,8 @@ mod tests {
                 challenge[0..8].copy_from_slice(&challenge_payload.nonce);
                 challenge[8..16].copy_from_slice(&challenge_payload.ctime.to_bytes());
                 challenge[16..48].copy_from_slice(&challenge_payload.hmac);
-                let challenge_b64 = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    challenge,
-                );
+                let challenge_b64 =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge);
                 let ss = blobs
                     .iter()
                     .find_map(|b| match b {
@@ -5236,10 +5227,7 @@ mod tests {
                 ts: 12345,
                 cn: "test.cn.zpr".to_string(),
                 challenge: challenge_b64.clone(),
-                sig: base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    [2u8; 16],
-                ),
+                sig: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2u8; 16]),
             }),
             crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
                 blob_type: auth::BLOB_TYPE_OIDC.to_string(),
