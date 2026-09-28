@@ -3410,10 +3410,26 @@ impl LinkStateWrapper {
         // The set rule: exactly the namespaces recorded at auth time. A
         // link with no recorded set (authenticated before this change) is
         // held to the user-only set, the pre-existing OIDC behavior.
+        // ONE blob per namespace (Codex review, zl-zpr-core#45 P1): the set
+        // comparison alone cannot see a duplicate — two OIDC blobs still
+        // collapse to `{User}` — and the issuer pin below examines only one
+        // OIDC blob, so without this rule a second, differently-issued
+        // credential could ride along to the visa service unpinned.
         let expected = self
             .get_authenticated_namespaces()
             .unwrap_or_else(|| [auth::AuthNamespace::User].into());
         let got = auth::blob_namespaces(&blobs);
+        if blobs.len() != got.len() {
+            self.finish_renewal_failure(
+                asm,
+                AuthFailureReason::AgentError(format!(
+                    "renewal blob array carries a duplicate namespace ({} blobs, {} namespaces)",
+                    blobs.len(),
+                    got.len()
+                )),
+            );
+            return Ok(());
+        }
         if got != expected {
             self.finish_renewal_failure(
                 asm,
@@ -5256,6 +5272,77 @@ mod tests {
             }
             other => panic!("expected Oidc second, got {other:?}"),
         }
+    }
+
+    /// Codex review (zl-zpr-core#45, P1): a renewal reply carrying TWO OIDC
+    /// blobs — the first from the pinned issuer, the second from another —
+    /// must be rejected outright. The namespace SET comparison cannot see
+    /// the duplicate (both collapse to `{User}`), every blob is bound to
+    /// the same echoed challenge so the per-blob checks pass, and the
+    /// issuer pin used to validate only the FIRST OIDC blob while
+    /// `vst_blobs_for_renewal` forwarded both credentials to the visa
+    /// service. One blob per namespace is the rule.
+    #[tokio::test]
+    async fn test_node_renew_response_duplicate_oidc_blobs_rejected() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress_rx) = assembly_with_observable_egress();
+                let link_id = add_node_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+                lsm.test_set_state(LinkState::Active);
+                lsm.set_authenticated_namespaces([auth::AuthNamespace::User].into());
+                lsm.set_renewal_identity(super::RenewalIdentity {
+                    idp: test_idp(),
+                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
+                });
+
+                lsm.request_renewal_now(&asm);
+                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
+                let mut challenge = [0u8; 48];
+                challenge.copy_from_slice(&req_pkt.body()[12..60]);
+                let challenge_b64 =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge);
+
+                // Both blobs echo the correct challenge; only the first names
+                // the pinned issuer. The second must not ride along.
+                let blob = auth::encode_blobs(&[
+                    crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
+                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+                        issuer: "https://idp.test".to_string(),
+                        id_token: "renewed-id-token".to_string(),
+                        challenge: challenge_b64.clone(),
+                    }),
+                    crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
+                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+                        issuer: "https://evil.example".to_string(),
+                        id_token: "forged-id-token".to_string(),
+                        challenge: challenge_b64,
+                    }),
+                ]);
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
+                )
+                .unwrap();
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
+                    if !lsm.test_renewal_in_flight() {
+                        break;
+                    }
+                }
+                assert!(!lsm.test_renewal_in_flight());
+                match lsm.get_last_auth_failure() {
+                    Some(AuthFailureReason::AgentError(msg)) => assert!(
+                        msg.contains("duplicate"),
+                        "expected the duplicate-namespace rejection, got: {msg}"
+                    ),
+                    other => panic!("expected AgentError(duplicate ...), got {other:?}"),
+                }
+                assert_eq!(lsm.get_state(), LinkState::Active);
+            })
+            .await
     }
 
     /// R8 (zipline#66) step 4: a response with no outstanding request (no
