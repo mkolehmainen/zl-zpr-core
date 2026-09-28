@@ -620,11 +620,37 @@ impl VSConn {
                 Ok(())
             }
 
-            VS2Command::Reauthenticate(_req, resp_tx) => {
+            VS2Command::Reauthenticate(req, resp_tx) => {
                 debug!(target: VS_RPC, "VSConn: reauthenticate");
-                let retval = Err(VSApiError::CommandFailed(
-                    "reauthenticate not implemented".to_string(),
-                ));
+                // K2 (zipline#121): unlike Connect, this deliberately runs
+                // while already connected — the whole point is to re-prove
+                // ourselves on the session we already have. do_connect is
+                // called on the SAME vs_service bootstrap capability; the
+                // vs_handle is swapped only on success, and kept on failure
+                // (the VS re-auth deadline decides, not us). Commands are
+                // handled serially by this loop, so at most one
+                // re-authentication is ever in flight.
+                let retval = if !cmd_state.is_connected() {
+                    // Never connected: nothing to re-authenticate in place.
+                    Err(VSApiError::CommandFailed(
+                        "reauthenticate called but not connected to VS-API".to_string(),
+                    ))
+                } else {
+                    match self.do_connect(&cmd_state.vs_service, req).await {
+                        Ok(handle) => {
+                            info!(target: VS_RPC, "VS API reauthenticate succeeded; handle swapped");
+                            cmd_state.vs_handle = Some(handle);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            error!(
+                                target: VS_RPC,
+                                "VS API reauthenticate failed (keeping existing handle): {:?}", e
+                            );
+                            Err(e)
+                        }
+                    }
+                };
                 if let Err(e) = resp_tx.send(retval) {
                     error!(target: VS_RPC, "failed to send reauthenticate response: {:?}", e);
                 }

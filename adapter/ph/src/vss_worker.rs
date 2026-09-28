@@ -167,19 +167,6 @@ pub fn process_request_authentication(
     asm: &Arc<Assembly>,
     addrs: &[std::net::IpAddr],
 ) -> RequestAuthOutcome {
-    // RED stub (zipline#121): not yet implemented — accepts nothing.
-    let _ = (asm, addrs);
-    RequestAuthOutcome {
-        processed: 0,
-        start_self_reauth: false,
-    }
-}
-
-#[allow(dead_code)]
-fn process_request_authentication_impl(
-    asm: &Arc<Assembly>,
-    addrs: &[std::net::IpAddr],
-) -> RequestAuthOutcome {
     use std::sync::atomic::Ordering;
 
     let local_addrs = asm.get_local_zpr_addrs_std();
