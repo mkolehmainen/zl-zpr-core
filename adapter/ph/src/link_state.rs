@@ -2967,6 +2967,52 @@ impl LinkStateWrapper {
         data.last_auth_failure = Some(reason);
     }
 
+    /// N2 (zipline#122), node side: start an on-demand credential renewal
+    /// toward the docked adapter NOW, regardless of any deadline — the visa
+    /// service asked for a re-auth under the new policy (K1/K4), which is
+    /// orthogonal to expiry-driven renewal. Requires an Active
+    /// [LinkType::NodeToAdapter] link; sets `renewal_in_flight` (returning
+    /// without sending if an attempt is already in flight, which coalesces
+    /// repeated VS requests onto the outstanding attempt) and sends the ZDP
+    /// 142 request exactly as the deadline path does. N1's dispatcher
+    /// (`vss_worker::process_request_authentication`) reaches this through
+    /// `peer_table.find` on the actor address.
+    pub fn request_renewal_now(&self, asm: &Arc<Assembly>) {
+        let link_id = self.id;
+
+        if !matches!(self.link_type, LinkType::NodeToAdapter) {
+            warn!(target: LINK_STATE,
+                "{}: on-demand renewal requested on a non-node link; ignoring",
+                asm.formatted_link_id(link_id));
+            return;
+        }
+        if self.get_state() != LinkState::Active {
+            warn!(target: LINK_STATE,
+                "{}: on-demand renewal requested on a non-Active link; ignoring",
+                asm.formatted_link_id(link_id));
+            return;
+        }
+
+        let auth_expires = {
+            let mut data = self.locked_data.lock().unwrap();
+            if data.renewal_in_flight {
+                debug!(target: LINK_STATE,
+                    "{}: on-demand renewal coalesced onto the in-flight attempt",
+                    asm.formatted_link_id(link_id));
+                return;
+            }
+            data.renewal_in_flight = true;
+            // Bound the attempt by the remaining authentication window when
+            // one is known. With non-expiring bootstrap auth there may be
+            // none (or a far-future one): fall back to a window that yields
+            // the bridge's own per-call bound in renewal_attempt_timeout.
+            data.auth_expires.unwrap_or_else(|| {
+                SystemTime::now() + 2 * config::OIDC_USER_INTERACTION_TIMEOUT
+            })
+        };
+        self.send_renewal_credential_request(asm, auth_expires);
+    }
+
     /// R8 (zipline#66), node side: ask the adapter for a renewed credential
     /// over ZDP. Mints a fresh challenge exactly as
     /// [Self::send_init_authentication_request] does (so
@@ -3787,6 +3833,88 @@ mod tests {
                     peer.link_state_machine.get_authenticated_namespaces(),
                     Some([AuthNamespace::Device, AuthNamespace::User].into()),
                     "the node must record the verified blob set's namespaces"
+                );
+            })
+            .await
+    }
+
+    /// N2 (zipline#122) step 2: `request_renewal_now` on an Active
+    /// NodeToAdapter link sends a RenewAuthenticationRequest (142)
+    /// immediately — no deadline needed — and a second call while the
+    /// attempt is in flight is coalesced (no second request).
+    #[tokio::test]
+    async fn test_request_renewal_now_sends_142_and_coalesces() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress_rx) = assembly_with_observable_egress();
+                let link_id = add_node_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+                lsm.test_set_state(LinkState::Active);
+                // No renewal deadline, no renewal identity: a device-only
+                // link never has either once V1 ships, and the on-demand
+                // path must not require them.
+
+                lsm.request_renewal_now(&asm);
+                assert!(
+                    lsm.test_renewal_in_flight(),
+                    "an on-demand request must mark the renewal in flight"
+                );
+                let pkt = try_recv_egress(&mut egress_rx)
+                    .expect("an on-demand renewal request must be sent");
+                assert_eq!(pkt.metadata().egress_link_id, link_id);
+                assert_eq!(
+                    pkt.body()[0],
+                    142,
+                    "expected a RenewAuthenticationRequest (142)"
+                );
+
+                // While in flight: coalesced, no second packet.
+                lsm.request_renewal_now(&asm);
+                assert!(
+                    try_recv_egress(&mut egress_rx).is_none(),
+                    "a second on-demand request while in flight must be coalesced"
+                );
+            })
+            .await
+    }
+
+    /// N2 (zipline#122) step 2: `request_renewal_now` requires an Active
+    /// NodeToAdapter link — an adapter-side link and an inactive node link
+    /// both send nothing and claim nothing.
+    #[tokio::test]
+    async fn test_request_renewal_now_requires_active_node_to_adapter() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress_rx) = assembly_with_observable_egress();
+
+                // Adapter-side link, Active: wrong link type.
+                let adapter_link = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(adapter_link).unwrap();
+                    peer.link_state_machine.test_set_state(LinkState::Active);
+                    peer.link_state_machine.request_renewal_now(&asm);
+                    assert!(
+                        !peer.link_state_machine.test_renewal_in_flight(),
+                        "an adapter-side link must not start an on-demand renewal"
+                    );
+                }
+
+                // Node-side link still Helloing: wrong state.
+                let node_link = add_node_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(node_link).unwrap();
+                    peer.link_state_machine.test_set_state(LinkState::Helloing);
+                    peer.link_state_machine.request_renewal_now(&asm);
+                    assert!(
+                        !peer.link_state_machine.test_renewal_in_flight(),
+                        "a non-Active link must not start an on-demand renewal"
+                    );
+                }
+
+                assert!(
+                    try_recv_egress(&mut egress_rx).is_none(),
+                    "neither call may send a packet"
                 );
             })
             .await
