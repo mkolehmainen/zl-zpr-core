@@ -355,17 +355,14 @@ impl FastpathIo {
         );
     }
 
-    #[cfg(target_os = "linux")]
-    fn get_confirm_flag(pkt: &Packet) -> libc::c_int {
+    /// Send flags for a substrate egress packet: `MSG_CONFIRM` when the
+    /// packet's metadata asks for link-layer confirmation (a no-op off
+    /// Linux, where the flag does not exist).
+    fn get_confirm_flag(pkt: &Packet) -> batch_io::SendFlags {
         match pkt.metadata().flags & flags::CONFIRM != 0 {
-            true => libc::MSG_CONFIRM,
-            false => 0,
+            true => batch_io::SendFlags::confirm(),
+            false => batch_io::SendFlags::none(),
         }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn get_confirm_flag(_pkt: &Packet) -> libc::c_int {
-        0
     }
 }
 

@@ -2,8 +2,8 @@ use crate::fastpath::{FastpathWorker, FastpathWorkerConfig};
 use crate::fastpath_io::FastpathIo;
 use crate::packet_queue;
 use crate::prelude::*;
-use crate::sys::wait::{Interest, WaitSet, Waitable};
 use crate::sys::ZprTun;
+use crate::sys::wait::{Interest, WaitSet, Waitable};
 use std::net::UdpSocket;
 
 pub fn launch(

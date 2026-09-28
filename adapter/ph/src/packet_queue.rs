@@ -154,7 +154,6 @@ pub fn packet_queue<const BUFSIZE: usize>(depth: usize) -> (Sender<BUFSIZE>, Rec
 mod tests {
     use super::*;
     use bytes::BufMut;
-    use nix;
 
     #[test]
     fn test_empty_recv() {
