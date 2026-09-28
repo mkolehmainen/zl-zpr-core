@@ -8,3 +8,6 @@ completions/
 *.pcap
 __pycache__/
 *.pyc
+fuzz/artifacts/
+fuzz/coverage/
+/crash-*

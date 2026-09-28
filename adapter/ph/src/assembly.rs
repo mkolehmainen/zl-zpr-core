@@ -537,7 +537,7 @@ impl Assembly {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzzing"))]
 pub mod test {
 
     use super::*;
@@ -607,10 +607,12 @@ pub mod test {
 
     /// A `TunCtl` which reports exactly the addresses it was constructed with,
     /// so tests can model a TUN device that disagrees with our configuration.
+    #[cfg(test)]
     struct FakeTunCtl {
         addresses: Vec<IpAddr>,
     }
 
+    #[cfg(test)]
     impl TunCtl for FakeTunCtl {
         fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
             Ok(())
@@ -647,6 +649,7 @@ pub mod test {
     /// lands between our pre-install probe and the post-carrier re-check.
     /// `carriers` logs every `set_carrier` call so tests can assert an
     /// adapter that backed off did not leave its carrier up.
+    #[cfg(test)]
     pub struct RecordingTunCtl {
         pub routes: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
         pub fail_routes: bool,
@@ -656,6 +659,7 @@ pub mod test {
         pub carriers: Arc<std::sync::Mutex<Vec<bool>>>,
     }
 
+    #[cfg(test)]
     impl RecordingTunCtl {
         /// A recording instance plus the shared log the test asserts on.
         pub fn new(fail_routes: bool) -> (Self, Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) {
@@ -695,6 +699,7 @@ pub mod test {
         }
     }
 
+    #[cfg(test)]
     impl TunCtl for RecordingTunCtl {
         fn set_carrier(&self, carrier: bool) -> std::io::Result<()> {
             self.carriers.lock().unwrap().push(carrier);
@@ -741,6 +746,7 @@ pub mod test {
 
     /// Builds a test assembly whose local ZPR addresses are `zpr_addr` and
     /// whose TUN device carries `on_tun`.
+    #[cfg(test)]
     fn assembly_with_addrs(zpr_addr: &[&str], on_tun: &[&str]) -> Assembly {
         let parse = |v: &[&str]| -> Vec<IpAddr> { v.iter().map(|a| a.parse().unwrap()).collect() };
         let config = config::Config {
@@ -801,6 +807,7 @@ pub mod test {
     }
 
     impl TestAssemblyBuilder {
+        #[allow(dead_code)] // unused by the `ph` bin, which compiles this module but not the fuzz harness
         pub fn new() -> Self {
             Self::default()
         }
@@ -809,6 +816,7 @@ pub mod test {
     /// Test assembly able to key an AdapterToNode link: `process_start`
     /// hands the link to the key manager, which needs a noise keypair and a
     /// certificate exchange.
+    #[cfg(test)]
     fn keyable_adapter_assembly() -> Arc<Assembly> {
         let mut builder = TestAssemblyBuilder::new();
         builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
@@ -816,6 +824,7 @@ pub mod test {
         Arc::new(create_assembly(builder))
     }
 
+    #[cfg(test)]
     fn tether_addrs() -> (SubstrateAddr, ScopedIpAddr) {
         (
             SubstrateAddr::from(([127, 0, 0, 1], 9000)),
@@ -891,6 +900,7 @@ pub mod test {
             .await
     }
 
+    #[allow(dead_code)] // unused by the `ph` bin, which compiles this module but not the fuzz harness
     pub fn create_assembly(builder: TestAssemblyBuilder) -> Assembly {
         let ph_mode = builder.ph_mode.unwrap_or(PhMode::Adapter);
         let topology_config = builder.topology_config.unwrap_or_default();
@@ -991,6 +1001,7 @@ pub mod test {
         }
     }
 
+    #[cfg(test)]
     mod drop_peer_notify {
         //! Tests for zipline#21: revoking visas for a dying link must
         //! withdraw the streams from *surviving* peers by sending them an
