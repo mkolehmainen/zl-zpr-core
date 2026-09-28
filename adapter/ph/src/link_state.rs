@@ -1294,7 +1294,12 @@ impl LinkStateWrapper {
         for d_blob in &d_blobs {
             match d_blob {
                 AuthBlob::SelfSigned(ss_blob) => {
-                    if !self.check_self_signed_blob(asm, link_id, ss_blob) {
+                    if !self.check_self_signed_blob(
+                        asm,
+                        link_id,
+                        ss_blob,
+                        auth::MAX_BLOB_AGE_SECONDS,
+                    ) {
                         drop(locked_fsm);
                         return self.process_error_response(asm);
                     }
@@ -1356,11 +1361,18 @@ impl LinkStateWrapper {
         Ok(())
     }
 
+    /// Verify an SS blob's challenge: CN binding (when the peer presented a
+    /// cert), HMAC with this link's auth key, and freshness within
+    /// `max_age_seconds` — [auth::MAX_BLOB_AGE_SECONDS] at connect,
+    /// [auth::MAX_OIDC_BLOB_AGE_SECONDS] on the renewal path, where the SS
+    /// leg shares its challenge with an OIDC leg that may lawfully wait for
+    /// the noninteractive agent (Codex review, zl-zpr-core#45 P2).
     fn check_self_signed_blob(
         &self,
         asm: &Arc<Assembly>,
         link_id: LinkId,
         ss_blob: &ZdpSelfSignedBlob,
+        max_age_seconds: u64,
     ) -> bool {
         // Now check that the CN in the presented blob matches the CN the peer used to establish link.
         let Some(peer_state) = asm.peer_table.get(link_id) else {
@@ -1388,9 +1400,11 @@ impl LinkStateWrapper {
         // Adapters using self-generated keys present no certificate during
         // keying, so there is no cert CN to bind the blob to; the visa
         // service still authenticates the blob CN via the RSA signature.
-        if let Err(e) =
-            ss_blob.verify_blob_challenge(sa.peer_cert.as_ref().map(|c| c.get_cert()), &key)
-        {
+        if let Err(e) = ss_blob.verify_blob_challenge(
+            sa.peer_cert.as_ref().map(|c| c.get_cert()),
+            &key,
+            max_age_seconds,
+        ) {
             warn!(target: LINK_STATE, "{} challenge verification failed: {e}", asm.formatted_link_id(link_id));
             return false;
         }
@@ -3442,11 +3456,22 @@ impl LinkStateWrapper {
 
         // Per-blob checks: HMAC/age (and CN for SS) via the same verifiers
         // the connect path uses, plus byte-for-byte equality with THIS
-        // attempt's challenge.
+        // attempt's challenge. The SS leg is held to the OIDC freshness
+        // window here, not MAX_BLOB_AGE_SECONDS (Codex review,
+        // zl-zpr-core#45 P2): on a combined Device+User renewal both legs
+        // are bound to the SAME challenge, minted before the noninteractive
+        // agent's permitted wait, so the 120-second window would reject an
+        // otherwise timely reply. Replay is prevented by the byte-equality
+        // check against the single outstanding stashed challenge.
         for d_blob in &blobs {
             let (ok, blob_challenge) = match d_blob {
                 AuthBlob::SelfSigned(ss_blob) => (
-                    self.check_self_signed_blob(asm, link_id, ss_blob),
+                    self.check_self_signed_blob(
+                        asm,
+                        link_id,
+                        ss_blob,
+                        auth::MAX_OIDC_BLOB_AGE_SECONDS,
+                    ),
                     &ss_blob.challenge,
                 ),
                 AuthBlob::Oidc(oidc_blob) => (
@@ -5215,6 +5240,115 @@ mod tests {
                     Some(AuthFailureReason::AgentError(msg)) => assert!(
                         msg.contains("no visa service connection"),
                         "expected the reauthorize-step failure, got: {msg}"
+                    ),
+                    other => {
+                        panic!("expected AgentError(no visa service connection), got {other:?}")
+                    }
+                }
+                assert_eq!(lsm.get_state(), LinkState::Active);
+            })
+            .await
+    }
+
+    /// Codex review (zl-zpr-core#45, P2): a combined Device+User renewal
+    /// whose noninteractive agent answers after the 120-second SS window
+    /// but within the permitted 300-second agent wait must still verify.
+    /// The SS leg is bound to the SAME minted challenge as the OIDC leg,
+    /// and that challenge is issued before the agent wait, so on the
+    /// renewal path the SS leg must be held to the OIDC freshness window
+    /// (which covers the wait) — replay is already prevented by exact
+    /// byte-equality with the single outstanding stashed challenge.
+    #[tokio::test]
+    async fn test_node_renew_response_combined_ss_leg_survives_agent_wait() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress_rx) = assembly_with_observable_egress();
+                let link_id = add_node_peer(&asm);
+                asm.peer_table
+                    .set_security_association(link_id, crate::km::KmTransportSA::default())
+                    .unwrap();
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+                lsm.test_set_state(LinkState::Active);
+                lsm.set_authenticated_namespaces(
+                    [auth::AuthNamespace::Device, auth::AuthNamespace::User].into(),
+                );
+                lsm.set_renewal_identity(super::RenewalIdentity {
+                    idp: test_idp(),
+                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
+                });
+
+                // Mint a challenge whose ctime is 150 s in the past — the
+                // agent took 150 s to answer, allowed by the 300 s bound,
+                // beyond MAX_BLOB_AGE_SECONDS (120 s) but within
+                // MAX_OIDC_BLOB_AGE_SECONDS (330 s). HMAC-keyed with the
+                // dummy peer's auth key, and stashed as the outstanding
+                // attempt exactly as send_renewal_credential_request does.
+                let key = [42u8; crate::auth::AUTH_KEY_SIZE_BYTES];
+                let ctime = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    - 150;
+                let nonce = [9u8; 8];
+                let be_time = ctime.to_be_bytes();
+                let mut hasher = blake3::Hasher::new_keyed(&key);
+                hasher.update(&nonce);
+                hasher.update(&be_time);
+                let hmac = hasher.finalize();
+                let mut challenge = [0u8; 48];
+                challenge[0..8].copy_from_slice(&nonce);
+                challenge[8..16].copy_from_slice(&be_time);
+                challenge[16..48].copy_from_slice(hmac.as_bytes());
+                lsm.stash_renewal_challenge(challenge);
+                {
+                    let mut data = lsm.locked_data.lock().unwrap();
+                    data.renewal_in_flight = true;
+                }
+
+                let payload = auth::ZdpInitAuthenticationPayload {
+                    nonce,
+                    ctime: ctime.into(),
+                    hmac: hmac.into(),
+                };
+                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                keypath.push("tests");
+                keypath.push("data");
+                keypath.push("rsa-key.pem");
+                let bs = auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap();
+                let ss = bs.authenticate_blob(&payload).unwrap();
+                let blob = auth::encode_blobs(&[
+                    crate::auth::AuthBlob::SelfSigned(ss),
+                    crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
+                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+                        issuer: "https://idp.test".to_string(),
+                        id_token: "renewed-id-token".to_string(),
+                        challenge: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            challenge,
+                        ),
+                    }),
+                ]);
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
+                )
+                .unwrap();
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
+                    if !lsm.test_renewal_in_flight() {
+                        break;
+                    }
+                }
+                assert!(!lsm.test_renewal_in_flight());
+                // Reaching the reauthorize step (its no-vsconn failure in
+                // this test assembly) proves the SS leg's 150-second-old
+                // challenge was NOT rejected as too old.
+                match lsm.get_last_auth_failure() {
+                    Some(AuthFailureReason::AgentError(msg)) => assert!(
+                        msg.contains("no visa service connection"),
+                        "the timely combined renewal must reach reauthorize, got: {msg}"
                     ),
                     other => {
                         panic!("expected AgentError(no visa service connection), got {other:?}")
