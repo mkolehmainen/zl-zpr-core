@@ -2908,6 +2908,35 @@ impl LinkStateWrapper {
             }
         };
 
+        use zpr::vsapi_types as vst;
+        let blobs = vec![vst::AuthBlob::Oidc(vst::OidcBlob {
+            issuer,
+            id_token,
+            nonce,
+        })];
+        Self::submit_renewal_reauthorize(asm, link_id, link_uid, blobs).await;
+    }
+
+    /// Submit renewed credential blob(s) to the VS in ONE `reauthorize`
+    /// call (zipline#122, K3/K4) and settle the attempt: refreshed expiry
+    /// (clearing in-flight) on success, recorded failure (clearing
+    /// in-flight) otherwise. Shared by the agent-direct OIDC path (one
+    /// blob) and the ZDP multi-blob path. The caller has already checked
+    /// the link uid.
+    async fn submit_renewal_reauthorize(
+        asm: &Arc<Assembly>,
+        link_id: LinkId,
+        link_uid: u64,
+        blobs: Vec<zpr::vsapi_types::AuthBlob>,
+    ) {
+        let Some(peer) = asm.peer_table.get(link_id) else {
+            return; // link torn down while we waited
+        };
+        let lsm = &peer.link_state_machine;
+        if lsm.uid != link_uid {
+            return; // slab id reused by a new link
+        }
+
         let Some(vsconn) = asm.vsconn.as_ref() else {
             lsm.finish_renewal_failure(
                 asm,
@@ -2926,11 +2955,7 @@ impl LinkStateWrapper {
         use zpr::vsapi_types as vst;
         let req = vst::ReauthRequest {
             zpr_addr: std::net::IpAddr::from(actor_addr),
-            blobs: vec![vst::AuthBlob::Oidc(vst::OidcBlob {
-                issuer,
-                id_token,
-                nonce,
-            })],
+            blobs,
         };
         match vsconn.reauthorize(req).await {
             Ok(conn) => {
@@ -3309,13 +3334,16 @@ impl LinkStateWrapper {
         Ok(())
     }
 
-    /// R8 (zipline#66), node side: the adapter answered the renewal
-    /// credential request. Verify the returned blob against the stashed
-    /// challenge (HMAC with this link's auth key plus byte-for-byte
-    /// equality), then complete exactly as the agent-direct path does —
-    /// `reauthorize` (never `authorizeConnect`), refreshed expiry on
-    /// success, recorded failure otherwise. The link stays Active
-    /// throughout; a failed renewal leaves the existing expiry to the sweep.
+    /// R8 (zipline#66) / N2 (zipline#122), node side: the adapter answered
+    /// the renewal credential request. Verify the returned blob array
+    /// against the stashed challenge — the namespace set must EQUAL the set
+    /// the link authenticated with, and every blob must HMAC-verify with
+    /// this link's auth key and be bound byte-for-byte to the minted
+    /// challenge — then complete as the agent-direct path does, sending ALL
+    /// verified legs in one `reauthorize` (never `authorizeConnect`),
+    /// refreshed expiry on success, recorded failure otherwise. The link
+    /// stays Active throughout; a failed renewal leaves the existing expiry
+    /// to the sweep.
     fn process_renew_auth_response(
         &self,
         asm: &Arc<Assembly>,
@@ -3366,14 +3394,14 @@ impl LinkStateWrapper {
             }
         };
 
-        // Decode and verify: the blob's challenge must HMAC-verify with this
-        // link's auth key AND be byte-for-byte the one we minted for this
-        // attempt, so a response cannot smuggle a credential bound elsewhere.
-        let oidc_blob = match auth::decode_blobs(&blob_str) {
-            Ok(blobs) => blobs.into_iter().find_map(|b| match b {
-                AuthBlob::Oidc(oidc) => Some(oidc),
-                _ => None,
-            }),
+        // Decode and verify (zipline#122, K4): the blob array's namespace
+        // set must EQUAL the set the link authenticated with, every blob's
+        // challenge must HMAC-verify with this link's auth key, and every
+        // blob must be bound byte-for-byte to the challenge we minted for
+        // this attempt, so a response cannot smuggle a credential bound
+        // elsewhere.
+        let blobs = match auth::decode_blobs(&blob_str) {
+            Ok(blobs) => blobs,
             Err(e) => {
                 self.finish_renewal_failure(
                     asm,
@@ -3382,75 +3410,94 @@ impl LinkStateWrapper {
                 return Ok(());
             }
         };
-        let Some(oidc_blob) = oidc_blob else {
-            self.finish_renewal_failure(
-                asm,
-                AuthFailureReason::AgentError("renewal response carried no OIDC blob".to_string()),
-            );
-            return Ok(());
-        };
-        if !self.check_oidc_blob(asm, link_id, &oidc_blob) {
-            self.finish_renewal_failure(
-                asm,
-                AuthFailureReason::AgentError(
-                    "renewal blob challenge failed verification".to_string(),
-                ),
-            );
-            return Ok(());
-        }
-        let returned_challenge = BASE64_STANDARD
-            .decode(&oidc_blob.challenge)
-            .unwrap_or_default();
-        if returned_challenge != challenge {
-            self.finish_renewal_failure(
-                asm,
-                AuthFailureReason::AgentError(
-                    "renewal blob is bound to a different challenge".to_string(),
-                ),
-            );
-            return Ok(());
-        }
 
-        // Same guard as the original credential (stash_renewal_identity):
-        // the renewed one must come from the issuer the actor originally
-        // authenticated with.
-        let expected_issuer = self
-            .locked_data
-            .lock()
-            .unwrap()
-            .renewal_identity
-            .as_ref()
-            .map(|identity| identity.idp.issuer.clone());
-        if expected_issuer.as_deref() != Some(oidc_blob.issuer.as_str()) {
+        // The set rule: exactly the namespaces recorded at auth time. A
+        // link with no recorded set (authenticated before this change) is
+        // held to the user-only set, the pre-existing OIDC behavior.
+        let expected = self
+            .get_authenticated_namespaces()
+            .unwrap_or_else(|| [auth::AuthNamespace::User].into());
+        let got = auth::blob_namespaces(&blobs);
+        if got != expected {
             self.finish_renewal_failure(
                 asm,
                 AuthFailureReason::AgentError(format!(
-                    "renewed credential from unexpected issuer {}",
-                    oidc_blob.issuer
+                    "renewal blob namespace set {got:?} does not match the authenticated set {expected:?}"
                 )),
             );
             return Ok(());
         }
 
-        // Complete exactly as the agent-direct path: reauthorize with the
-        // fresh challenge-derived nonce. handle_renewal_reply refreshes
-        // auth_expires (clearing in-flight) on success and records the
-        // failure (clearing in-flight) otherwise.
+        // Per-blob checks: HMAC/age (and CN for SS) via the same verifiers
+        // the connect path uses, plus byte-for-byte equality with THIS
+        // attempt's challenge.
+        for d_blob in &blobs {
+            let (ok, blob_challenge) = match d_blob {
+                AuthBlob::SelfSigned(ss_blob) => (
+                    self.check_self_signed_blob(asm, link_id, ss_blob),
+                    &ss_blob.challenge,
+                ),
+                AuthBlob::Oidc(oidc_blob) => (
+                    self.check_oidc_blob(asm, link_id, oidc_blob),
+                    &oidc_blob.challenge,
+                ),
+            };
+            if !ok {
+                self.finish_renewal_failure(
+                    asm,
+                    AuthFailureReason::AgentError(
+                        "renewal blob challenge failed verification".to_string(),
+                    ),
+                );
+                return Ok(());
+            }
+            let returned_challenge = BASE64_STANDARD.decode(blob_challenge).unwrap_or_default();
+            if returned_challenge != challenge {
+                self.finish_renewal_failure(
+                    asm,
+                    AuthFailureReason::AgentError(
+                        "renewal blob is bound to a different challenge".to_string(),
+                    ),
+                );
+                return Ok(());
+            }
+        }
+
+        // Same guard as the original credential (stash_renewal_identity):
+        // a renewed OIDC leg must come from the issuer the actor
+        // originally authenticated with.
+        if let Some(oidc_blob) = blobs.iter().find_map(|b| match b {
+            AuthBlob::Oidc(oidc) => Some(oidc),
+            _ => None,
+        }) {
+            let expected_issuer = self
+                .locked_data
+                .lock()
+                .unwrap()
+                .renewal_identity
+                .as_ref()
+                .map(|identity| identity.idp.issuer.clone());
+            if expected_issuer.as_deref() != Some(oidc_blob.issuer.as_str()) {
+                self.finish_renewal_failure(
+                    asm,
+                    AuthFailureReason::AgentError(format!(
+                        "renewed credential from unexpected issuer {}",
+                        oidc_blob.issuer
+                    )),
+                );
+                return Ok(());
+            }
+        }
+
+        // Complete as the agent-direct path does, but with EVERY verified
+        // leg in one ReauthRequest (K3/K4). submit_renewal_reauthorize
+        // refreshes auth_expires (clearing in-flight) on success and
+        // records the failure (clearing in-flight) otherwise.
         let task_asm = asm.clone();
         let link_uid = self.uid;
-        let issuer = oidc_blob.issuer.clone();
-        let nonce = auth::oidc_nonce_for_challenge(&challenge);
-        let id_token = oidc_blob.id_token;
+        let vst_blobs = vst_blobs_for_renewal(&blobs);
         tokio::task::spawn_local(async move {
-            Self::handle_renewal_reply(
-                &task_asm,
-                link_id,
-                link_uid,
-                issuer,
-                nonce,
-                Ok(Ok(id_token)),
-            )
-            .await;
+            Self::submit_renewal_reauthorize(&task_asm, link_id, link_uid, vst_blobs).await;
         });
         Ok(())
     }
@@ -3472,6 +3519,39 @@ impl LinkStateWrapper {
 
         Ok(())
     }
+}
+
+/// Convert verified ph-side renewal blobs to VS-API blobs for a
+/// `ReauthRequest` (zipline#122, K3/K4): the SS leg maps
+/// cn/challenge/signature/timestamp as `build_connect_request` does at
+/// connect; the OIDC leg derives the nonce from the (already verified)
+/// challenge bytes. Order is preserved.
+fn vst_blobs_for_renewal(blobs: &[AuthBlob]) -> Vec<zpr::vsapi_types::AuthBlob> {
+    use zpr::vsapi_types as vst;
+    blobs
+        .iter()
+        .map(|blob| match blob {
+            AuthBlob::SelfSigned(ss) => vst::AuthBlob::SS(vst::SelfSignedBlob {
+                alg: vst::ChallengeAlg::RsaSha256Pkcs1v15,
+                challenge: BASE64_STANDARD.decode(&ss.challenge).unwrap_or_default(),
+                cn: ss.cn.clone(),
+                timestamp: ss.ts,
+                signature: BASE64_STANDARD.decode(&ss.sig).unwrap_or_default(),
+            }),
+            AuthBlob::Oidc(oidc) => {
+                let challenge_bytes = BASE64_STANDARD.decode(&oidc.challenge).unwrap_or_default();
+                let mut challenge = [0u8; 48];
+                if challenge_bytes.len() == 48 {
+                    challenge.copy_from_slice(&challenge_bytes);
+                }
+                vst::AuthBlob::Oidc(vst::OidcBlob {
+                    issuer: oidc.issuer.clone(),
+                    id_token: oidc.id_token.clone(),
+                    nonce: auth::oidc_nonce_for_challenge(&challenge),
+                })
+            }
+        })
+        .collect()
 }
 
 /// Collect OIDC identity-provider advertisements from the auth-services list:
@@ -4873,6 +4953,321 @@ mod tests {
                 }
             })
             .await
+    }
+
+    /// N2 (zipline#122) step 5: a renewal response whose blob set does not
+    /// EQUAL the namespace set the link authenticated with is rejected —
+    /// here the link authenticated SS+OIDC but the reply carries only the
+    /// OIDC leg. Failure recorded, in-flight cleared, link Active.
+    #[tokio::test]
+    async fn test_node_renew_response_set_mismatch_is_rejected() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress_rx) = assembly_with_observable_egress();
+                let link_id = add_node_peer(&asm);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+                lsm.test_set_state(LinkState::Active);
+                lsm.set_authenticated_namespaces(
+                    [auth::AuthNamespace::Device, auth::AuthNamespace::User].into(),
+                );
+                lsm.set_renewal_identity(super::RenewalIdentity {
+                    idp: test_idp(),
+                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
+                });
+
+                lsm.request_renewal_now(&asm);
+                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
+                let mut challenge = [0u8; 48];
+                challenge.copy_from_slice(&req_pkt.body()[12..60]);
+
+                // Only the OIDC leg comes back: {User} != {Device, User}.
+                let blob = auth::encode_blobs(&[crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
+                    blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+                    issuer: "https://idp.test".to_string(),
+                    id_token: "renewed-id-token".to_string(),
+                    challenge: base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        challenge,
+                    ),
+                })]);
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
+                )
+                .unwrap();
+
+                assert!(
+                    !lsm.test_renewal_in_flight(),
+                    "a rejected response must clear in-flight so the next tick retries"
+                );
+                match lsm.get_last_auth_failure() {
+                    Some(AuthFailureReason::AgentError(msg)) => assert!(
+                        msg.contains("namespace"),
+                        "expected the set-mismatch failure, got: {msg}"
+                    ),
+                    other => panic!("expected AgentError(namespace set), got {other:?}"),
+                }
+                assert_eq!(lsm.get_state(), LinkState::Active, "link must stay Active");
+            })
+            .await
+    }
+
+    /// N2 (zipline#122) step 5: an SS blob bound to a DIFFERENT challenge
+    /// than the outstanding one is rejected even though the wire header
+    /// echoes the right challenge and the blob's own HMAC is valid.
+    #[tokio::test]
+    async fn test_node_renew_response_wrong_challenge_ss_is_rejected() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress_rx) = assembly_with_observable_egress();
+                let link_id = add_node_peer(&asm);
+                asm.peer_table
+                    .set_security_association(link_id, crate::km::KmTransportSA::default())
+                    .unwrap();
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+                lsm.test_set_state(LinkState::Active);
+                lsm.set_authenticated_namespaces([auth::AuthNamespace::Device].into());
+
+                lsm.request_renewal_now(&asm);
+                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
+                let mut outstanding = [0u8; 48];
+                outstanding.copy_from_slice(&req_pkt.body()[12..60]);
+
+                // An SS blob whose embedded challenge is a DIFFERENT one,
+                // HMAC-valid with this link's auth key ([42; 32]).
+                let key = [42u8; auth::AUTH_KEY_SIZE_BYTES];
+                let other_payload = auth::ZdpInitAuthenticationPayload::new(&key);
+                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                keypath.push("tests");
+                keypath.push("data");
+                keypath.push("rsa-key.pem");
+                let bs = auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap();
+                let ss = bs.authenticate_blob(&other_payload).unwrap();
+                let blob = auth::encode_blobs(&[crate::auth::AuthBlob::SelfSigned(ss)]);
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedRenewAuthResponse(outstanding, Ok(blob)),
+                )
+                .unwrap();
+
+                assert!(!lsm.test_renewal_in_flight());
+                match lsm.get_last_auth_failure() {
+                    Some(AuthFailureReason::AgentError(msg)) => assert!(
+                        msg.contains("different challenge"),
+                        "expected the challenge-mismatch failure, got: {msg}"
+                    ),
+                    other => panic!("expected AgentError(different challenge), got {other:?}"),
+                }
+                assert_eq!(lsm.get_state(), LinkState::Active);
+            })
+            .await
+    }
+
+    /// N2 (zipline#122) step 5: a valid SS answer on a device-only link
+    /// passes every check and reaches the reauthorize step (the test
+    /// assembly has no VS connection, so it ends in exactly that recorded
+    /// failure — any verification failure would record a different one).
+    #[tokio::test]
+    async fn test_node_renew_response_valid_ss_reaches_reauthorize() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress_rx) = assembly_with_observable_egress();
+                let link_id = add_node_peer(&asm);
+                asm.peer_table
+                    .set_security_association(link_id, crate::km::KmTransportSA::default())
+                    .unwrap();
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+                lsm.test_set_state(LinkState::Active);
+                lsm.test_add_actor_address(zpr_utils::net_defs::IpAddress::new_from_std(
+                    &"10.9.8.7".parse::<IpAddr>().unwrap(),
+                ));
+                lsm.set_authenticated_namespaces([auth::AuthNamespace::Device].into());
+
+                lsm.request_renewal_now(&asm);
+                assert!(lsm.test_renewal_in_flight());
+                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
+                assert_eq!(req_pkt.body()[0], 142);
+                let mut challenge = [0u8; 48];
+                challenge.copy_from_slice(&req_pkt.body()[12..60]);
+
+                // The adapter signs the outstanding challenge.
+                let payload = auth::ZdpInitAuthenticationPayload {
+                    nonce: challenge[0..8].try_into().unwrap(),
+                    ctime: u64::from_be_bytes(challenge[8..16].try_into().unwrap()).into(),
+                    hmac: challenge[16..48].try_into().unwrap(),
+                };
+                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                keypath.push("tests");
+                keypath.push("data");
+                keypath.push("rsa-key.pem");
+                let bs = auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap();
+                let ss = bs.authenticate_blob(&payload).unwrap();
+                let blob = auth::encode_blobs(&[crate::auth::AuthBlob::SelfSigned(ss)]);
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
+                )
+                .unwrap();
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
+                    if !lsm.test_renewal_in_flight() {
+                        break;
+                    }
+                }
+                assert!(
+                    !lsm.test_renewal_in_flight(),
+                    "completion must clear the in-flight flag"
+                );
+                match lsm.get_last_auth_failure() {
+                    Some(AuthFailureReason::AgentError(msg)) => assert!(
+                        msg.contains("no visa service connection"),
+                        "expected the reauthorize-step failure, got: {msg}"
+                    ),
+                    other => {
+                        panic!("expected AgentError(no visa service connection), got {other:?}")
+                    }
+                }
+                assert_eq!(lsm.get_state(), LinkState::Active);
+            })
+            .await
+    }
+
+    /// N2 (zipline#122) step 5: a valid SS+OIDC answer on a link that
+    /// authenticated with both namespaces passes the set check and both
+    /// per-blob checks and reaches the reauthorize step.
+    #[tokio::test]
+    async fn test_node_renew_response_valid_ss_oidc_reaches_reauthorize() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress_rx) = assembly_with_observable_egress();
+                let link_id = add_node_peer(&asm);
+                asm.peer_table
+                    .set_security_association(link_id, crate::km::KmTransportSA::default())
+                    .unwrap();
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let lsm = &peer.link_state_machine;
+                lsm.test_set_state(LinkState::Active);
+                lsm.test_add_actor_address(zpr_utils::net_defs::IpAddress::new_from_std(
+                    &"10.9.8.7".parse::<IpAddr>().unwrap(),
+                ));
+                lsm.set_authenticated_namespaces(
+                    [auth::AuthNamespace::Device, auth::AuthNamespace::User].into(),
+                );
+                lsm.set_renewal_identity(super::RenewalIdentity {
+                    idp: test_idp(),
+                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
+                });
+
+                lsm.request_renewal_now(&asm);
+                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
+                let mut challenge = [0u8; 48];
+                challenge.copy_from_slice(&req_pkt.body()[12..60]);
+
+                let payload = auth::ZdpInitAuthenticationPayload {
+                    nonce: challenge[0..8].try_into().unwrap(),
+                    ctime: u64::from_be_bytes(challenge[8..16].try_into().unwrap()).into(),
+                    hmac: challenge[16..48].try_into().unwrap(),
+                };
+                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                keypath.push("tests");
+                keypath.push("data");
+                keypath.push("rsa-key.pem");
+                let bs = auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap();
+                let ss = bs.authenticate_blob(&payload).unwrap();
+                let blob = auth::encode_blobs(&[
+                    crate::auth::AuthBlob::SelfSigned(ss),
+                    crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
+                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+                        issuer: "https://idp.test".to_string(),
+                        id_token: "renewed-id-token".to_string(),
+                        challenge: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            challenge,
+                        ),
+                    }),
+                ]);
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
+                )
+                .unwrap();
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
+                    if !lsm.test_renewal_in_flight() {
+                        break;
+                    }
+                }
+                assert!(!lsm.test_renewal_in_flight());
+                match lsm.get_last_auth_failure() {
+                    Some(AuthFailureReason::AgentError(msg)) => assert!(
+                        msg.contains("no visa service connection"),
+                        "expected the reauthorize-step failure, got: {msg}"
+                    ),
+                    other => {
+                        panic!("expected AgentError(no visa service connection), got {other:?}")
+                    }
+                }
+                assert_eq!(lsm.get_state(), LinkState::Active);
+            })
+            .await
+    }
+
+    /// N2 (zipline#122) step 5: the ph-blob -> VS-API blob conversion for a
+    /// renewal reply maps the SS leg (cn/challenge/signature/timestamp) and
+    /// the OIDC leg (issuer/id_token/challenge-derived nonce) faithfully —
+    /// the ReauthRequest carries every leg (the "one ReauthRequest with all
+    /// blobs" half of K3/K4 that the no-vsconn integration tests above
+    /// cannot observe).
+    #[test]
+    fn test_vst_blobs_for_renewal_maps_both_legs() {
+        use zpr::vsapi_types as vst;
+        let challenge = [5u8; 48];
+        let challenge_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge);
+        let blobs = vec![
+            crate::auth::AuthBlob::SelfSigned(auth::ZdpSelfSignedBlob {
+                blob_type: auth::BLOB_TYPE_SS.to_string(),
+                ts: 12345,
+                cn: "test.cn.zpr".to_string(),
+                challenge: challenge_b64.clone(),
+                sig: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    [2u8; 16],
+                ),
+            }),
+            crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
+                blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+                issuer: "https://idp.test".to_string(),
+                id_token: "tok".to_string(),
+                challenge: challenge_b64,
+            }),
+        ];
+
+        let vst_blobs = super::vst_blobs_for_renewal(&blobs);
+        assert_eq!(vst_blobs.len(), 2, "every leg must be forwarded");
+        match &vst_blobs[0] {
+            vst::AuthBlob::SS(ss) => {
+                assert_eq!(ss.cn, "test.cn.zpr");
+                assert_eq!(ss.timestamp, 12345);
+                assert_eq!(ss.challenge, challenge.to_vec());
+                assert_eq!(ss.signature, vec![2u8; 16]);
+            }
+            other => panic!("expected SS first, got {other:?}"),
+        }
+        match &vst_blobs[1] {
+            vst::AuthBlob::Oidc(oidc) => {
+                assert_eq!(oidc.issuer, "https://idp.test");
+                assert_eq!(oidc.id_token, "tok");
+                assert_eq!(oidc.nonce, auth::oidc_nonce_for_challenge(&challenge));
+            }
+            other => panic!("expected Oidc second, got {other:?}"),
+        }
     }
 
     /// R8 (zipline#66) step 4: a response with no outstanding request (no
