@@ -156,8 +156,10 @@ pub struct RequestAuthOutcome {
 ///   ([Assembly::self_reauth_in_flight] stays set until that attempt
 ///   resolves; a coalesced address is still counted, because re-auth for it
 ///   *is* underway).
-/// - A docked adapter's address: N2's (zipline#122) on-demand renewal hook.
-///   Until N2 lands this is logged and skipped, NOT counted in `processed`.
+/// - A docked adapter's address: start the on-demand ZDP renewal on its
+///   link (zipline#122, [LinkStateWrapper::request_renewal_now]) — counted,
+///   and coalesced onto an in-flight renewal attempt if one is outstanding
+///   (a coalesced address is still counted: its re-auth is underway).
 /// - An unknown address: skipped and not counted.
 ///
 /// Sets [Assembly::self_reauth_in_flight] when it decides to start a self
@@ -196,14 +198,18 @@ pub fn process_request_authentication(
                 .any(|a| *a == addr_ip)
         });
         match docked_link {
-            Some((link_id, _peer)) => {
-                // A docked adapter: N2 (zipline#122) adds the on-demand ZDP
-                // 142 renewal hook. Until it lands, log and skip — NOT
-                // counted, so the VS knows re-auth was not started (K1).
+            Some((link_id, peer)) => {
+                // A docked adapter (zipline#122, K1/K4): start the on-demand
+                // ZDP renewal on its link. request_renewal_now claims
+                // `renewal_in_flight` (coalescing onto an outstanding
+                // attempt), so re-auth for this address is underway either
+                // way — count it.
                 let link_id = link_id.get();
-                warn!(target: VSS_RPC,
-                    "request_auth: adapter re-auth for {addr} on {} not yet supported (zipline#122); skipping",
+                info!(target: VSS_RPC,
+                    "request_auth: starting on-demand re-auth for {addr} on {}",
                     asm.formatted_link_id(link_id));
+                peer.link_state_machine.request_renewal_now(asm);
+                processed += 1;
             }
             None => {
                 // Unknown address: skipped, not counted (K1).
@@ -361,6 +367,25 @@ mod tests {
         link_id.get()
     }
 
+    /// Like [add_active_peer_with_actor] but node-side (NodeToAdapter), the
+    /// link type the on-demand renewal hook (zipline#122) requires.
+    fn add_node_peer_with_actor(asm: &Arc<Assembly>, actor: IpAddr) -> zpr::packet_info::LinkId {
+        let entry = asm.peer_table.vacant_entry().unwrap();
+        let link_id = entry.key();
+        let ps = peer_table::test::create_dummy_peer_state(
+            link_id,
+            LinkType::NodeToAdapter,
+            SubstrateAddr::from(([127, 0, 0, 1], 9200 + link_id.get() as u16)),
+            net_defs::ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2).into()),
+        );
+        entry.insert(ps);
+        let peer = asm.peer_table.get(link_id.get()).unwrap();
+        peer.link_state_machine.test_set_state(LinkState::Active);
+        peer.link_state_machine
+            .test_add_actor_address(IpAddress::new_from_std(&actor));
+        link_id.get()
+    }
+
     /// C5 (zipline#45): revoke_auth for an actor docked here terminates the
     /// actor's link via the existing close path; an unknown address is a
     /// no-op — both count as processed in the ack.
@@ -486,22 +511,27 @@ mod tests {
             .await
     }
 
-    /// zipline#121: until N2 (zipline#122) lands its on-demand hook, a
-    /// docked adapter's address is logged and skipped — NOT counted in the
-    /// ack — and the adapter's link, its actor and the visa table are left
-    /// untouched.
+    /// zipline#122 (N2): a docked adapter's address in a
+    /// `requestAuthentication` starts an on-demand ZDP renewal on the
+    /// adapter's link — counted in the ack (K1) — while the link stays
+    /// Active and visas are untouched. A second request while the renewal
+    /// is in flight is coalesced but still counted: re-auth IS underway.
     #[tokio::test]
-    async fn test_request_auth_adapter_address_skipped_until_n2_and_untouched() {
+    async fn test_request_auth_adapter_address_starts_renewal_and_is_counted() {
         use crate::visa_table::tests::new_vsapi_visa_tcp_default;
         use std::time::{Duration, SystemTime};
 
         LocalSet::new()
             .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
+                let mut builder = TestAssemblyBuilder::new();
+                builder.mgmt_substrate_egress =
+                    Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
+                let asm = Arc::new(create_assembly(builder));
                 let own: IpAddr = "10.1.1.1".parse().unwrap();
                 let docked: IpAddr = "10.9.8.7".parse().unwrap();
                 asm.set_local_zpr_addrs([own]);
-                let link_id = add_active_peer_with_actor(&asm, docked);
+                let link_id = add_node_peer_with_actor(&asm, docked);
                 asm.visa_table
                     .write()
                     .unwrap()
@@ -513,27 +543,44 @@ mod tests {
 
                 let outcome = process_request_authentication(&asm, &[docked]);
                 assert_eq!(
-                    outcome.processed, 0,
-                    "an adapter address is skipped and not counted until N2 (zipline#122)"
+                    outcome.processed, 1,
+                    "an adapter address with a started renewal counts in the ack (K1)"
                 );
                 assert!(!outcome.start_self_reauth);
+                let peer = asm.peer_table.get(link_id).unwrap();
                 assert!(
-                    !asm.self_reauth_in_flight
-                        .load(std::sync::atomic::Ordering::SeqCst),
-                    "an adapter address must not claim the self re-auth flag"
+                    peer.link_state_machine.test_renewal_in_flight(),
+                    "the adapter's link must have a renewal in flight"
+                );
+                let pkt = egress_rx
+                    .try_recv(vec![0u8; 2048].into_boxed_slice())
+                    .expect("a RenewAuthenticationRequest must go out");
+                assert_eq!(
+                    pkt.body()[0],
+                    142,
+                    "expected a RenewAuthenticationRequest (142)"
                 );
                 assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
+                    peer.link_state_machine.get_state(),
                     LinkState::Active,
-                    "the adapter's link must be untouched"
+                    "the adapter's link must stay Active"
                 );
                 assert!(
                     asm.visa_table.read().unwrap().table.contains_key(&77),
                     "visas must be untouched"
+                );
+
+                // Coalescing: a second request is counted but sends nothing.
+                let second = process_request_authentication(&asm, &[docked]);
+                assert_eq!(
+                    second.processed, 1,
+                    "a coalesced adapter address still counts: its re-auth is underway"
+                );
+                assert!(
+                    egress_rx
+                        .try_recv(vec![0u8; 2048].into_boxed_slice())
+                        .is_err(),
+                    "no second request while the renewal is in flight"
                 );
             })
             .await
