@@ -200,16 +200,27 @@ pub fn process_request_authentication(
         match docked_link {
             Some((link_id, peer)) => {
                 // A docked adapter (zipline#122, K1/K4): start the on-demand
-                // ZDP renewal on its link. request_renewal_now claims
-                // `renewal_in_flight` (coalescing onto an outstanding
-                // attempt), so re-auth for this address is underway either
-                // way — count it.
+                // ZDP renewal on its link. Count only what actually started:
+                // Accepted (new attempt) and Coalesced (already underway)
+                // count; Ignored — the link left `Active` during shutdown
+                // while still holding its actor address, so the state guard
+                // refused — must not be acknowledged as underway (Codex
+                // review, zl-zpr-core#45).
                 let link_id = link_id.get();
-                info!(target: VSS_RPC,
-                    "request_auth: starting on-demand re-auth for {addr} on {}",
-                    asm.formatted_link_id(link_id));
-                peer.link_state_machine.request_renewal_now(asm);
-                processed += 1;
+                match peer.link_state_machine.request_renewal_now(asm) {
+                    crate::link_state::RenewalStart::Accepted
+                    | crate::link_state::RenewalStart::Coalesced => {
+                        info!(target: VSS_RPC,
+                            "request_auth: on-demand re-auth underway for {addr} on {}",
+                            asm.formatted_link_id(link_id));
+                        processed += 1;
+                    }
+                    crate::link_state::RenewalStart::Ignored => {
+                        debug!(target: VSS_RPC,
+                            "request_auth: {addr} resolves to {} but no renewal could start; not counted",
+                            asm.formatted_link_id(link_id));
+                    }
+                }
             }
             None => {
                 // Unknown address: skipped, not counted (K1).
@@ -581,6 +592,49 @@ mod tests {
                         .try_recv(vec![0u8; 2048].into_boxed_slice())
                         .is_err(),
                     "no second request while the renewal is in flight"
+                );
+            })
+            .await
+    }
+
+    /// Codex review (zl-zpr-core#45, P2): a docked link that has left
+    /// `Active` (shutdown race) but still retains its actor address must
+    /// NOT be counted in the ack — `request_renewal_now`'s state guard
+    /// returns without sending, so no re-authentication attempt started
+    /// and reporting one as underway would be a lie.
+    #[tokio::test]
+    async fn test_request_auth_non_active_docked_link_not_counted() {
+        LocalSet::new()
+            .run_until(async {
+                let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
+                let mut builder = TestAssemblyBuilder::new();
+                builder.mgmt_substrate_egress =
+                    Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
+                let asm = Arc::new(create_assembly(builder));
+                let own: IpAddr = "10.1.1.1".parse().unwrap();
+                let docked: IpAddr = "10.9.8.7".parse().unwrap();
+                asm.set_local_zpr_addrs([own]);
+                let link_id = add_node_peer_with_actor(&asm, docked);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                // The link is being torn down: it has left Active but its
+                // actor address is still in the table.
+                peer.link_state_machine.test_set_state(LinkState::Closing);
+
+                let outcome = process_request_authentication(&asm, &[docked]);
+                assert_eq!(
+                    outcome.processed, 0,
+                    "an ignored renewal (state guard) must not count as underway"
+                );
+                assert!(!outcome.start_self_reauth);
+                assert!(
+                    !peer.link_state_machine.test_renewal_in_flight(),
+                    "no renewal attempt may be in flight on a non-Active link"
+                );
+                assert!(
+                    egress_rx
+                        .try_recv(vec![0u8; 2048].into_boxed_slice())
+                        .is_err(),
+                    "no request may go out on a non-Active link"
                 );
             })
             .await

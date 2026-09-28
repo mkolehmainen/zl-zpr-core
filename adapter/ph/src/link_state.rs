@@ -197,6 +197,22 @@ pub struct OidcCredentialRequest {
 /// Handle to the AuthAgent registered for a link via startLink.
 pub type AuthAgentHandle = tokio::sync::mpsc::UnboundedSender<OidcCredentialRequest>;
 
+/// What [LinkStateWrapper::request_renewal_now] did with an on-demand
+/// renewal request (Codex review, zl-zpr-core#45): the VSS dispatcher's ack
+/// counts a re-auth as underway only when an attempt was actually started
+/// (`Accepted`) or is already outstanding (`Coalesced`); an `Ignored`
+/// request — wrong link type, or a link that left `Active` during shutdown
+/// while still holding its actor address — started nothing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RenewalStart {
+    /// A new renewal attempt was started (ZDP 142 sent).
+    Accepted,
+    /// An attempt is already in flight; this request coalesced onto it.
+    Coalesced,
+    /// The state guard refused: no attempt is underway for this request.
+    Ignored,
+}
+
 /// The identity a link's actor originally authenticated with, stashed at
 /// auth time so silent renewal (zipline#45) can re-prove against the SAME
 /// issuer. On renewal failure the adapter/user reconnects and re-picks from
@@ -3011,25 +3027,30 @@ impl LinkStateWrapper {
     /// service asked for a re-auth under the new policy (K1/K4), which is
     /// orthogonal to expiry-driven renewal. Requires an Active
     /// [LinkType::NodeToAdapter] link; sets `renewal_in_flight` (returning
-    /// without sending if an attempt is already in flight, which coalesces
-    /// repeated VS requests onto the outstanding attempt) and sends the ZDP
-    /// 142 request exactly as the deadline path does. N1's dispatcher
-    /// (`vss_worker::process_request_authentication`) reaches this through
-    /// `peer_table.find` on the actor address.
-    pub fn request_renewal_now(&self, asm: &Arc<Assembly>) {
+    /// [RenewalStart::Coalesced] without sending if an attempt is already in
+    /// flight, which coalesces repeated VS requests onto the outstanding
+    /// attempt) and sends the ZDP 142 request exactly as the deadline path
+    /// does. N1's dispatcher (`vss_worker::process_request_authentication`)
+    /// reaches this through `peer_table.find` on the actor address and
+    /// counts only [RenewalStart::Accepted] / [RenewalStart::Coalesced] in
+    /// its ack — an [RenewalStart::Ignored] request started nothing (Codex
+    /// review, zl-zpr-core#45): a link leaving `Active` during shutdown may
+    /// still hold its actor address, and acknowledging a re-auth that never
+    /// began would misreport it as underway.
+    pub fn request_renewal_now(&self, asm: &Arc<Assembly>) -> RenewalStart {
         let link_id = self.id;
 
         if !matches!(self.link_type, LinkType::NodeToAdapter) {
             warn!(target: LINK_STATE,
                 "{}: on-demand renewal requested on a non-node link; ignoring",
                 asm.formatted_link_id(link_id));
-            return;
+            return RenewalStart::Ignored;
         }
         if self.get_state() != LinkState::Active {
             warn!(target: LINK_STATE,
                 "{}: on-demand renewal requested on a non-Active link; ignoring",
                 asm.formatted_link_id(link_id));
-            return;
+            return RenewalStart::Ignored;
         }
 
         let auth_expires = {
@@ -3038,7 +3059,7 @@ impl LinkStateWrapper {
                 debug!(target: LINK_STATE,
                     "{}: on-demand renewal coalesced onto the in-flight attempt",
                     asm.formatted_link_id(link_id));
-                return;
+                return RenewalStart::Coalesced;
             }
             data.renewal_in_flight = true;
             // Bound the attempt by the remaining authentication window when
@@ -3049,6 +3070,7 @@ impl LinkStateWrapper {
                 .unwrap_or_else(|| SystemTime::now() + 2 * config::OIDC_USER_INTERACTION_TIMEOUT)
         };
         self.send_renewal_credential_request(asm, auth_expires);
+        RenewalStart::Accepted
     }
 
     /// R8 (zipline#66), node side: ask the adapter for a renewed credential
