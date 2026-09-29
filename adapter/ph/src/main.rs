@@ -50,7 +50,6 @@ mod pki;
 mod prelude;
 mod queues;
 mod sample_ring;
-#[cfg(not(feature = "capnp-ancillary"))]
 mod set_capture_file_worker;
 mod signal_worker;
 #[cfg(unix)]
@@ -274,7 +273,6 @@ fn main() -> ExitCode {
 
     // The capture socket exists only where capture is supported (plan D7);
     // elsewhere setCaptureFile answers Unsupported.
-    #[cfg(not(feature = "capnp-ancillary"))]
     let capture_socket = if sys::capture_supported() {
         match socket_access::bind_owned_listener("capture", &config.capture_path, &socket_plan) {
             Ok(socket) => Some(Arc::new(socket)),
@@ -750,7 +748,6 @@ fn main() -> ExitCode {
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(mgmt_dispatch_worker::launch(asm.clone(), md_outq, mhd_outq));
     js.spawn_local(adapter_manager_worker::launch(asm.clone(), am_outq));
-    #[cfg(not(feature = "capnp-ancillary"))]
     if let Some(capture_socket) = capture_socket {
         js.spawn_local(set_capture_file_worker::launch(asm.clone(), capture_socket));
     }
