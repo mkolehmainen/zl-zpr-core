@@ -834,6 +834,53 @@ fi
 fi
 
 #
+# Leg 4 — node key removed: the node is disconnected
+#
+
+if [[ "$PASS" == 0 ]] then
+echo
+echo "LEG 4: install a policy lacking the node's bootstrap key"
+
+if ! install_policy "$PREGEN/$POLICY_NO_NODE_BIN"; then
+  echo "ERROR: leg-4 policy install failed"
+  PASS=1
+fi
+fi
+
+if [[ "$PASS" == 0 ]] then
+# Same end-to-end discipline as leg 3: the node must ATTEMPT its in-place
+# self re-auth and fail it (the VS refuses the challenge signature of a key
+# no longer in policy).
+if ! wait_for_log "$REAUTH_WAIT" node.log "self re-authentication with the visa service failed"; then
+  echo "ERROR: the node never attempted (or never failed) its self re-auth"
+  grep -iE "re-auth|request_auth" node.log | tail -n 20 || true
+  PASS=1
+else
+  echo "the node's self re-auth was refused under the new policy:"
+  grep -E "self re-authentication with the visa service failed" node.log | head -n 2
+fi
+fi
+
+if [[ "$PASS" == 0 ]] then
+# The sweep disconnects the node (and with it, its docked adapters) within
+# the same deadline + sweep-period bound.
+if ! wait_for_log "$REVOKE_WAIT" vs.log \
+    "reauth sweep: node $NODE_ZPR_ADDR did not re-authenticate under vinst .* by the deadline; disconnecting it"; then
+  echo "ERROR: the sweep never disconnected the node within ${REVOKE_WAIT}s"
+  grep -E "reauth sweep" vs.log | tail -n 20 || true
+  PASS=1
+else
+  echo "sweep disconnected the node:"
+  grep -E "reauth sweep: node $NODE_ZPR_ADDR" vs.log | head -n 2
+fi
+
+if ! grep -qE "disconnect actor at $NODE_ZPR_ADDR for reason Admin" vs.log; then
+  echo "ERROR: no Admin disconnect was recorded for the node"
+  grep -E "disconnect actor" vs.log | tail -n 5 || true
+  PASS=1
+fi
+fi
+
 #
 # Check stats
 #
