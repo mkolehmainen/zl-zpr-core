@@ -63,7 +63,8 @@ pub struct Config {
 /// every buffer to the pool once it has been written or discarded.
 pub async fn launch(_config: Config, asm: Arc<Assembly>, mut queue: CaptureReceiver) {
     // TODO: batch processing (only take lock once per batch)
-    while let Some(captured) = queue.recv().await {
+    loop {
+        let captured = queue.recv().await;
         let mut state = asm.capture_worker.inner.lock().await;
 
         if let Some(savefile) = state.savefile.as_mut() {

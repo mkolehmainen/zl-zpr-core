@@ -5,7 +5,9 @@ use crate::packet::{self, Packet, PacketBuffer};
 use crate::packet_queue;
 use crate::test_packet::*;
 use crate::two_way_queue;
+use std::collections::VecDeque;
 use std::result::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::mpsc;
@@ -150,9 +152,16 @@ type CaptureBuffer = Box<[u8; config::PACKET_BUFFER_SIZE]>;
 const MAX_CAPTURE_LEN: usize =
     config::PACKET_BUFFER_SIZE - std::mem::size_of::<crate::pcap_writer::PcaprecHdr>();
 
-/// Free list shared by the datapath (which takes buffers) and the capture
-/// worker (which gives them back).
-type CapturePool = Arc<Mutex<Vec<CaptureBuffer>>>;
+/// State shared by the datapath (`Capture`) and the capture worker
+/// (`CaptureReceiver`).  Both collections are allocated at full capacity up
+/// front and there are exactly as many buffers as each can hold, so pushing
+/// never grows either one: nothing here allocates after `capture_queue`.
+struct CaptureShared {
+    /// Buffers ready for the datapath to fill.
+    free: Vec<CaptureBuffer>,
+    /// Filled buffers waiting for the worker, oldest first.
+    filled: VecDeque<CapturedPacket>,
+}
 
 /// A captured packet on its way to the capture worker: a pool buffer and
 /// the number of bytes of it in use.
@@ -174,14 +183,16 @@ impl CapturedPacket {
 /// Why a pool (zipline#129): the datapath does no heap allocation per
 /// packet, and capture must not be the exception.  (The AF_UNIX socketpair
 /// this replaces didn't allocate in `ph` either; the kernel did the copy.)
-/// Every buffer is allocated here, once, and cycles datapath -> worker ->
-/// pool -> datapath.  The channel carrying filled buffers is a bounded
-/// tokio mpsc, which recycles its internal blocks rather than allocating
-/// per message -- the same property `packet_queue` relies on.  The cost is
-/// `depth * PACKET_BUFFER_SIZE` bytes held for the life of the process
-/// (3 MB with the default topology), whether or not capture is in use.
+/// Every buffer, and the storage of both queues that hold them, is
+/// allocated here, once; buffers then cycle datapath -> worker -> pool ->
+/// datapath.  A tokio mpsc is deliberately NOT used for the filled side:
+/// its bounded channel limits the message count but allocates storage
+/// blocks lazily on the sending thread, i.e. on the datapath (PR #47
+/// review).  The cost is `depth * PACKET_BUFFER_SIZE` bytes held for the
+/// life of the process (3 MB with the default topology), whether or not
+/// capture is in use.
 pub fn capture_queue(depth: usize) -> (Capture, CaptureReceiver) {
-    let pool: Vec<CaptureBuffer> = (0..depth)
+    let free: Vec<CaptureBuffer> = (0..depth)
         .map(|_| {
             // Built via Vec so the 12 KB buffer is never on the stack.
             vec![0u8; config::PACKET_BUFFER_SIZE]
@@ -190,23 +201,33 @@ pub fn capture_queue(depth: usize) -> (Capture, CaptureReceiver) {
                 .expect("vec has exactly PACKET_BUFFER_SIZE bytes")
         })
         .collect();
-    let pool = Arc::new(Mutex::new(pool));
-    // The channel has room for every buffer in the pool, so a send can
-    // only fail if the worker is gone.
-    let (sender, receiver) = mpsc::channel(depth.max(1));
+    let shared = Arc::new(Mutex::new(CaptureShared {
+        free,
+        filled: VecDeque::with_capacity(depth),
+    }));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let worker_gone = Arc::new(AtomicBool::new(false));
     (
         Capture {
-            sender,
-            pool: pool.clone(),
+            shared: shared.clone(),
+            notify: notify.clone(),
+            worker_gone: worker_gone.clone(),
         },
-        CaptureReceiver { receiver, pool },
+        CaptureReceiver {
+            shared,
+            notify,
+            worker_gone,
+        },
     )
 }
 
 /// Capture will intercept packets in the PH and dump them into a file for debugging purposes
 pub struct Capture {
-    sender: mpsc::Sender<CapturedPacket>,
-    pool: CapturePool,
+    shared: Arc<Mutex<CaptureShared>>,
+    /// Wakes the capture worker when a buffer is queued.
+    notify: Arc<tokio::sync::Notify>,
+    /// Set when the `CaptureReceiver` is dropped.
+    worker_gone: Arc<AtomicBool>,
 }
 
 impl Capture {
@@ -215,8 +236,8 @@ impl Capture {
     /// actual packet length, or than a capture buffer holds, it is reduced
     /// accordingly.)
     /// Never blocks and never allocates: if no pool buffer is free right now
-    /// (all in flight, or another fastpath thread holds the pool lock) the
-    /// packet is not captured and `Full` is returned.
+    /// (all in flight, or another thread holds the queue lock) the packet is
+    /// not captured and `Full` is returned.
     ///
     /// NOTE: the packet is not modified; `&mut` is kept so callers need not
     /// change.
@@ -226,16 +247,21 @@ impl Capture {
         timestamp: SystemTime,
         incl_len: usize,
     ) -> Result<(), TryEnqueueError> {
+        if self.worker_gone.load(Ordering::Relaxed) {
+            panic!("capture channel closed");
+        }
+
         let body = packet.body();
         let incl_len = incl_len.min(body.len()).min(MAX_CAPTURE_LEN);
 
         // `try_lock` rather than `lock`: the datapath must not wait on
-        // another thread.  Contention is treated like an empty pool.
-        let buf = match self.pool.try_lock() {
-            Ok(mut pool) => pool.pop(),
-            Err(_) => None,
+        // another thread.  Contention is treated like an empty pool.  The
+        // copy is done under the lock so the buffer moves free -> filled in
+        // one critical section; it is at most one packet's worth of bytes.
+        let Ok(mut shared) = self.shared.try_lock() else {
+            return Err(TryEnqueueError::Full(()));
         };
-        let Some(mut buf) = buf else {
+        let Some(mut buf) = shared.free.pop() else {
             return Err(TryEnqueueError::Full(()));
         };
 
@@ -244,40 +270,52 @@ impl Capture {
         buf[..hdr_len].copy_from_slice(zerocopy::IntoBytes::as_bytes(&hdr));
         buf[hdr_len..hdr_len + incl_len].copy_from_slice(&body[..incl_len]);
 
-        match self.sender.try_send(CapturedPacket {
+        // Cannot grow: `filled` has room for every buffer in the pool.
+        shared.filled.push_back(CapturedPacket {
             buf,
             len: hdr_len + incl_len,
-        }) {
-            Ok(()) => Ok(()),
-            // Unreachable while the channel is as deep as the pool, but if
-            // it happens, give the buffer back rather than leak it.
-            Err(TrySendError::Full(pkt)) => {
-                self.pool.lock().unwrap().push(pkt.buf);
-                Err(TryEnqueueError::Full(()))
-            }
-            Err(TrySendError::Closed(_)) => panic!("capture channel closed"),
-        }
+        });
+        drop(shared);
+        // Stores a permit if the worker is not waiting yet, so the wakeup
+        // is not lost; does not allocate.
+        self.notify.notify_one();
+        Ok(())
     }
 }
 
 /// Worker side of the capture queue (see `capture_queue`).
 pub struct CaptureReceiver {
-    receiver: mpsc::Receiver<CapturedPacket>,
-    pool: CapturePool,
+    shared: Arc<Mutex<CaptureShared>>,
+    notify: Arc<tokio::sync::Notify>,
+    worker_gone: Arc<AtomicBool>,
 }
 
 impl CaptureReceiver {
-    /// Wait for the next captured packet.  `None` once every `Capture` is
-    /// gone.
-    pub async fn recv(&mut self) -> Option<CapturedPacket> {
-        self.receiver.recv().await
+    /// Wait for the next captured packet.
+    pub async fn recv(&mut self) -> CapturedPacket {
+        loop {
+            if let Some(packet) = self.shared.lock().unwrap().filled.pop_front() {
+                return packet;
+            }
+            self.notify.notified().await;
+        }
     }
 
     /// Return a packet's buffer to the pool so the datapath can reuse it.
     /// Every packet from `recv` must come back here, or capture capacity
     /// shrinks.
     pub fn recycle(&self, packet: CapturedPacket) {
-        self.pool.lock().unwrap().push(packet.buf);
+        // Cannot grow: `free` was allocated with room for every buffer.
+        self.shared.lock().unwrap().free.push(packet.buf);
+    }
+}
+
+impl Drop for CaptureReceiver {
+    /// Tell the datapath the worker is gone, so capturing fails loudly
+    /// (as the socketpair's closed peer did) instead of silently draining
+    /// the pool.
+    fn drop(&mut self) {
+        self.worker_gone.store(true, Ordering::Relaxed);
     }
 }
 
@@ -482,7 +520,7 @@ mod tests {
 
         assert!(capture.try_enqueue_packet(&mut pkt, ts, 5).is_ok());
 
-        let captured = receiver.recv().await.unwrap();
+        let captured = receiver.recv().await;
         let record = captured.data();
         assert_eq!(record.len(), HDR_LEN + 5);
         assert_eq!(header_fields(record), (5, 14, 1_000, 2));
@@ -502,7 +540,7 @@ mod tests {
                 .is_ok()
         );
 
-        let captured = receiver.recv().await.unwrap();
+        let captured = receiver.recv().await;
         assert_eq!(header_fields(captured.data()).0, 5);
         assert_eq!(&captured.data()[HDR_LEN..], b"short");
     }
@@ -521,13 +559,65 @@ mod tests {
         ));
 
         // Giving one buffer back makes room for exactly one more.
-        let captured = receiver.recv().await.unwrap();
+        let captured = receiver.recv().await;
         receiver.recycle(captured);
         assert!(capture.try_enqueue_packet(&mut pkt, now, 1).is_ok());
         assert!(matches!(
             capture.try_enqueue_packet(&mut pkt, now, 1),
             Err(TryEnqueueError::Full(()))
         ));
+    }
+
+    /// A worker already waiting in `recv` is woken by an enqueue from
+    /// another (fastpath) thread.
+    #[tokio::test]
+    async fn waiting_worker_is_woken_by_enqueue_from_another_thread() {
+        let (capture, mut receiver) = capture_queue(1);
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut pkt = packet_with_body(b"wake");
+            assert!(
+                capture
+                    .try_enqueue_packet(&mut pkt, SystemTime::now(), 4)
+                    .is_ok()
+            );
+            capture // keep the sender alive until the packet is queued
+        });
+
+        let captured = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("the waiting worker must be woken");
+        assert_eq!(&captured.data()[HDR_LEN..], b"wake");
+        producer.join().unwrap();
+    }
+
+    /// The no-allocation invariant: cycling many more packets than the pool
+    /// holds never grows either queue's storage (PR #47 review).
+    #[tokio::test]
+    async fn cycling_packets_never_grows_queue_storage() {
+        let depth = 4;
+        let (capture, mut receiver) = capture_queue(depth);
+        let capacities = |r: &CaptureReceiver| {
+            let shared = r.shared.lock().unwrap();
+            (shared.free.capacity(), shared.filled.capacity())
+        };
+        let before = capacities(&receiver);
+        let mut pkt = packet_with_body(b"cycle");
+
+        for _ in 0..10 {
+            for _ in 0..depth {
+                assert!(
+                    capture
+                        .try_enqueue_packet(&mut pkt, SystemTime::now(), 5)
+                        .is_ok()
+                );
+            }
+            for _ in 0..depth {
+                let captured = receiver.recv().await;
+                receiver.recycle(captured);
+            }
+        }
+        assert_eq!(capacities(&receiver), before);
     }
 
     #[test]
