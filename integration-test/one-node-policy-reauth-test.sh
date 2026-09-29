@@ -689,6 +689,88 @@ fi
 fi
 
 #
+# Leg 2 — OIDC survival: one more install; the re-auth is a SILENT refresh
+#
+
+if [[ "$PASS" == 0 ]] then
+echo
+echo "LEG 2: OIDC survival (install-driven re-auth is a back-channel refresh)"
+
+# Snapshot adapter1's IdP endpoints. The install-driven re-auth must move
+# the token-endpoint count (a back-channel refresh-token POST) and must NOT
+# move the authorization-endpoint count (a browser leg would mean the user
+# is re-prompted on every policy install — the symptom zipline#118 removes).
+AUTH_REQS_BEFORE=$(auth_requests idp-zpr-a.log)
+TOKEN_REQS_BEFORE=$(token_requests idp-zpr-a.log)
+echo "idp-zpr-a so far: GET /auth=$AUTH_REQS_BEFORE POST /token=$TOKEN_REQS_BEFORE"
+
+if ! install_policy "$PREGEN/$POLICY_BIN"; then
+  echo "ERROR: leg-2 policy install failed"
+  PASS=1
+fi
+fi
+
+if [[ "$PASS" == 0 ]] then
+# Everyone re-auths once more (counts ratchet to 4).
+if ! wait_for_log_count "$REAUTH_WAIT" vs.log \
+    "reauthorized adapter .* at address $A_ZPR_ADDR " 4; then
+  echo "ERROR: leg 2: adapter1's OIDC reauthorize never landed"
+  grep -iE "renew|re-authenticat|AuthAgent" adapter1.log | tail -n 20 || true
+  PASS=1
+fi
+if ! wait_for_log_count "$REAUTH_WAIT" node.log \
+    "self re-authentication with the visa service succeeded" 4; then
+  echo "ERROR: leg 2: the node's self re-auth never landed"
+  PASS=1
+fi
+fi
+
+if [[ "$PASS" == 0 ]] then
+AUTH_REQS_AFTER=$(auth_requests idp-zpr-a.log)
+TOKEN_REQS_AFTER=$(token_requests idp-zpr-a.log)
+if (( AUTH_REQS_AFTER != AUTH_REQS_BEFORE )); then
+  echo "ERROR: adapter1 hit the authorization endpoint during the install re-auth ($AUTH_REQS_BEFORE -> $AUTH_REQS_AFTER): the user was re-prompted"
+  PASS=1
+fi
+if (( TOKEN_REQS_AFTER <= TOKEN_REQS_BEFORE )); then
+  echo "ERROR: adapter1's IdP saw no back-channel refresh during the install re-auth (POST /token $TOKEN_REQS_BEFORE -> $TOKEN_REQS_AFTER)"
+  PASS=1
+fi
+
+# The agent must still be resident: the refresh only exists while it lives.
+for AGENT_PID in ${AGENT_PIDS[@]+"${AGENT_PIDS[@]}"}; do
+  if ! kill -0 "$AGENT_PID" 2> /dev/null; then
+    echo "ERROR: an auth-agent process ($AGENT_PID) exited during the install legs"
+    PASS=1
+  fi
+done
+
+# Traffic still flows after four installs.
+if ! ping_test
+then
+  echo "ERROR: traffic stopped after the leg-2 install"
+  PASS=1
+fi
+fi
+
+if [[ "$PASS" == 0 ]] then
+# Every obligation so far was satisfied by every connected actor and pruned
+# (one line per obligation, four installs so far), and nothing was revoked.
+if ! wait_for_log_count 90 vs.log \
+    "satisfied by all connected actors, pruning" 4; then
+  echo "ERROR: the sweep never pruned all four satisfied obligations"
+  grep -E "reauth sweep" vs.log | tail -n 20 || true
+  PASS=1
+fi
+if grep -qE "by the deadline" vs.log; then
+  echo "ERROR: something was revoked during the survival legs:"
+  grep -E "by the deadline" vs.log | head -n 5
+  PASS=1
+fi
+fi
+
+#
+#
 # Check stats
 #
 
