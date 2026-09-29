@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2
+OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2 policy-reauth.bin2 policy-reauth-no-adapter2.bin2 policy-reauth-no-node.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
@@ -57,6 +57,21 @@ oidc-renewal.bin2: oidc-renewal.zplc oidc-test.zpl oidc-test-seed-jwks.json
 # check catches the difference.
 oidc-file-interplay.bin2: oidc-file-interplay.zpl oidc-file-interplay.zplc oidc-test-seed-jwks.json
 	$(ZPLC) -c oidc-file-interplay.zplc -k $(KEY) -f v2 -o $@ oidc-file-interplay.zpl
+
+# Policy-install re-authentication fixtures (zipline#124). One ZPL, three
+# configs: the base policy plus two variants whose only difference is a
+# removed [bootstrap] key (adapter2's for leg 3, the node's for leg 4) —
+# the same one-source trick oidc-renewal.bin2 plays on oidc-test.zpl. Same
+# omitted-`service` warning as oidc-test; expected. Needs zplc >= 0.20.0
+# (the policy version the visa service accepts, zipline#114).
+policy-reauth.bin2: policy-reauth.zplc policy-reauth.zpl oidc-test-seed-jwks.json
+	$(ZPLC) -c policy-reauth.zplc -k $(KEY) -f v2 -o $@ policy-reauth.zpl
+
+policy-reauth-no-adapter2.bin2: policy-reauth-no-adapter2.zplc policy-reauth.zpl oidc-test-seed-jwks.json
+	$(ZPLC) -c policy-reauth-no-adapter2.zplc -k $(KEY) -f v2 -o $@ policy-reauth.zpl
+
+policy-reauth-no-node.bin2: policy-reauth-no-node.zplc policy-reauth.zpl oidc-test-seed-jwks.json
+	$(ZPLC) -c policy-reauth-no-node.zplc -k $(KEY) -f v2 -o $@ policy-reauth.zpl
 
 # oidc + zpr-attr/1 interplay fixture (zipline#81): oidc-file-interplay with
 # the file decorator replaced by the networked attribute service. Needs
