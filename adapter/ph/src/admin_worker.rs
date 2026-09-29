@@ -1554,6 +1554,53 @@ mod test {
             .await
     }
 
+    /// With the fd-passing `capnp-ancillary` transport gone (zipline#134),
+    /// `setCaptureFile` is never served over the admin RPC. Both error
+    /// paths of the new contract: where capture is unsupported it answers
+    /// Unimplemented/"not available on this platform" (plan D7, as
+    /// before); where capture IS supported it fails pointing the caller
+    /// at the capture socket (`capture.sock`), through which unix capture
+    /// keeps working.
+    #[tokio::test]
+    async fn test_set_capture_file_never_served_over_admin_rpc() {
+        LocalSet::new()
+            .run_until(async {
+                // Path 1: capture unsupported -> capture_unsupported().
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
+                    asm: asm.clone(),
+                    agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    capture_supported: false,
+                });
+                let err = match service.set_capture_file_request().send().promise.await {
+                    Ok(_) => panic!("setCaptureFile must fail where capture is unsupported"),
+                    Err(err) => err,
+                };
+                assert_eq!(err.kind, capnp::ErrorKind::Unimplemented);
+                assert!(
+                    err.extra
+                        .contains("capture is not available on this platform"),
+                    "unexpected error: {err}"
+                );
+
+                // Path 2: capture supported -> redirect to the capture socket.
+                let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
+                    asm,
+                    agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    capture_supported: true,
+                });
+                let err = match service.set_capture_file_request().send().promise.await {
+                    Ok(_) => panic!("setCaptureFile must not be served over the admin RPC"),
+                    Err(err) => err,
+                };
+                assert!(
+                    err.extra.contains("capture.sock"),
+                    "the error must point at the capture socket: {err}"
+                );
+            })
+            .await
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_start_link_rpc_wakes_idle_tether_and_registers_agent() {
         LocalSet::new()
