@@ -20,6 +20,7 @@ use std::io;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 
+use crate::logging::targets::STARTUP;
 use admin_api::SocketOwner;
 use nix::unistd::{Gid, Uid, chown};
 
@@ -96,6 +97,26 @@ pub fn bind_socket(desc: &str, path: &Path) -> io::Result<UnixListener> {
     }
     let listener = UnixListener::bind(path).map_err(|e| explain("failed to bind", e))?;
     listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// Bind `desc`'s socket at `path` (see [bind_socket]), hand it to tokio and
+/// apply `plan` to it. A failure to apply the plan is logged, not fatal:
+/// the socket still works for root (zipline#39). Must be called inside a
+/// tokio runtime.
+pub fn bind_owned_listener(
+    desc: &str,
+    path: &Path,
+    plan: &SocketAccess,
+) -> io::Result<tokio::net::UnixListener> {
+    let listener = tokio::net::UnixListener::from_std(bind_socket(desc, path)?)?;
+    tracing::info!(target: STARTUP, "{desc} socket bound to {path:?}");
+    if let Err(e) = apply_socket_access(path, plan) {
+        tracing::warn!(
+            target: STARTUP,
+            "failed to set ownership/mode on {desc} socket {path:?}: {e}"
+        );
+    }
     Ok(listener)
 }
 

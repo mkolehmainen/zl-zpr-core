@@ -43,6 +43,8 @@ pub mod sample_ring;
 #[cfg(not(feature = "capnp-ancillary"))]
 pub mod set_capture_file_worker;
 pub mod signal_worker;
+#[cfg(unix)]
+pub mod socket_access;
 pub mod special_peers;
 pub mod sys;
 pub mod tc;

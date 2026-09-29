@@ -8,7 +8,6 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::process;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::*;
@@ -245,21 +244,10 @@ fn main() -> ExitCode {
     // create control socket
     //
 
-    let control_socket = match socket_access::bind_socket("control", &config.control_path)
-        .and_then(UnixListener::from_std)
-    {
-        Ok(socket) => socket,
-        Err(e) => {
-            error!(target: STARTUP, "{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    info!(target: STARTUP, "control socket bound to {:?}", config.control_path);
-
-    // zipline#39: hand the socket to whoever should drive ph-cli. Owner known
+    // zipline#39: hand the sockets to whoever should drive ph-cli. Owner known
     // (sudo/pkexec): chown to that user, mode 0600. Owner unknown (systemd):
     // group "zpr" with mode 0660 when the group exists; otherwise leave the
-    // socket exactly as before and warn once.
+    // sockets exactly as before and warn once.
     let socket_plan = socket_access::plan_socket_access(
         config.socket_owner.as_ref(),
         socket_access::system_user_primary_gid,
@@ -273,33 +261,29 @@ fn main() -> ExitCode {
             socket_access::FALLBACK_GROUP
         );
     }
-    if let Err(e) = socket_access::apply_socket_access(&config.control_path, &socket_plan) {
-        warn!(
-            target: STARTUP,
-            "failed to set ownership/mode on control socket {:?}: {e}", config.control_path
-        );
-    }
 
-    #[cfg(not(feature = "capnp-ancillary"))]
-    let capture_socket = {
-        let capture_socket = match socket_access::bind_socket("capture", &config.capture_path)
-            .and_then(UnixListener::from_std)
-        {
-            Ok(socket) => Arc::new(socket),
+    let control_listener =
+        match sys::control::ControlListener::bind(&config.control_path, &socket_plan) {
+            Ok(listener) => listener,
             Err(e) => {
                 error!(target: STARTUP, "{e}");
                 return ExitCode::FAILURE;
             }
         };
-        info!(target: STARTUP, "capture socket bound to {:?}", config.capture_path);
-        // zipline#39: same ownership/mode treatment as the control socket.
-        if let Err(e) = socket_access::apply_socket_access(&config.capture_path, &socket_plan) {
-            warn!(
-                target: STARTUP,
-                "failed to set ownership/mode on capture socket {:?}: {e}", config.capture_path
-            );
+
+    // The capture socket exists only where capture is supported (plan D7);
+    // elsewhere setCaptureFile answers Unsupported.
+    #[cfg(not(feature = "capnp-ancillary"))]
+    let capture_socket = if sys::capture_supported() {
+        match socket_access::bind_owned_listener("capture", &config.capture_path, &socket_plan) {
+            Ok(socket) => Some(Arc::new(socket)),
+            Err(e) => {
+                error!(target: STARTUP, "{e}");
+                return ExitCode::FAILURE;
+            }
         }
-        capture_socket
+    } else {
+        None
     };
 
     //
@@ -766,11 +750,10 @@ fn main() -> ExitCode {
     js.spawn_local(mgmt_dispatch_worker::launch(asm.clone(), md_outq, mhd_outq));
     js.spawn_local(adapter_manager_worker::launch(asm.clone(), am_outq));
     #[cfg(not(feature = "capnp-ancillary"))]
-    js.spawn_local(set_capture_file_worker::launch(
-        asm.clone(),
-        capture_socket.clone(),
-    ));
-    js.spawn_local(admin_worker::launch(asm.clone(), control_socket));
+    if let Some(capture_socket) = capture_socket {
+        js.spawn_local(set_capture_file_worker::launch(asm.clone(), capture_socket));
+    }
+    js.spawn_local(admin_worker::launch(asm.clone(), control_listener));
     js.spawn_local(km_multiplexor::launch_signal_worker(
         asm.clone(),
         km_sig_outq,

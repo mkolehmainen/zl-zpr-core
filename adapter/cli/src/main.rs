@@ -2,6 +2,7 @@
 //! Note: at this moment the program can only handle one-word commands, so
 //! when a command is multiple words, this program assumes the spaces are replaced
 //! with a '-' on the command line
+mod control;
 mod main_args;
 mod oidc;
 mod rusty_helper;
@@ -214,7 +215,11 @@ async fn process_command(
         return oidc_login_task(idp, nonce, no_browser).await;
     }
 
-    let sock = tokio::net::UnixStream::connect(socket).await?;
+    let sock = control::connect(socket).await?;
+
+    #[cfg(not(feature = "capnp-ancillary"))]
+    let (reader, writer) = tokio::io::split(sock);
+    #[cfg(feature = "capnp-ancillary")]
     let (reader, writer) = sock.into_split();
 
     #[cfg(not(feature = "capnp-ancillary"))]
