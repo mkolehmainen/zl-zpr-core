@@ -594,6 +594,101 @@ fi
 fi
 
 #
+# Leg 1 — RSA survival: three installs of the same policy, continuous ping
+#
+
+# The same .bin2 re-installed is NOT a no-op: every hot install advances the
+# policy generation (vinst) and records a re-auth obligation for it
+# (zipline#123) — content dedup applies only across a VS restart. Keeping the
+# content identical isolates the machinery under test: nothing about the
+# RULES changes, so any disturbance can only come from the re-auth path.
+CONT_PING_LOG=cont-ping.log
+
+if [[ "$PASS" == 0 ]] then
+echo
+echo "LEG 1: RSA survival across three policy installs"
+
+# Continuous boundary ping (adapter1 -> adapter2) for the whole leg. The
+# assertion is ZERO loss: the node's self re-auth is in-place (zipline#121)
+# and the adapters' renewals ride the existing links (zipline#122), so not
+# one packet may drop while three installs go by.
+sudo ip netns exec zpr-a ping -i 0.2 "$B_ZPR_ADDR" > "$CONT_PING_LOG" 2>&1 &
+sleep 2
+
+for I in 1 2 3; do
+  if ! install_policy "$PREGEN/$POLICY_BIN"; then
+    echo "ERROR: policy install $I failed"
+    PASS=1; break
+  fi
+  # Counts ratchet: install i is only done when the i-th line of each kind
+  # is in the log, so the equality checks below can attribute exactly one
+  # re-auth of each kind to each install.
+  if ! wait_for_log_count "$REAUTH_WAIT" node.log \
+      "self re-authentication with the visa service succeeded" "$I"; then
+    echo "ERROR: install $I: the node's self re-auth never landed"
+    grep -iE "re-auth|request_auth" node.log | tail -n 20 || true
+    PASS=1; break
+  fi
+  if ! wait_for_log_count "$REAUTH_WAIT" vs.log \
+      "reauthorized adapter .* at address $B_ZPR_ADDR " "$I"; then
+    echo "ERROR: install $I: adapter2's SS (bootstrap RSA) reauthorize never landed"
+    grep -E "reauthorize|reauthorized" vs.log | tail -n 20 || true
+    PASS=1; break
+  fi
+  if ! wait_for_log_count "$REAUTH_WAIT" vs.log \
+      "reauthorized adapter .* at address $A_ZPR_ADDR " "$I"; then
+    echo "ERROR: install $I: adapter1's OIDC reauthorize never landed"
+    grep -E "reauthorize|reauthorized" vs.log | tail -n 20 || true
+    PASS=1; break
+  fi
+  echo "install $I: node self re-auth + both adapter reauthorizes landed"
+done
+fi
+
+# Stop the continuous ping (leg-1 scope) whether the leg passed or not, and
+# give ping a moment to flush its summary.
+sudo pkill -SIGINT -f "ping -i 0.2 $B_ZPR_ADDR" || true
+sleep 2
+
+if [[ "$PASS" == 0 ]] then
+# Exactly one re-auth of each kind per install — a fourth one would mean
+# something other than the installs drove a re-auth (the fixture's OIDC
+# lifetimes are sized so the renewal clock cannot fire, see the header).
+NODE_REAUTHS=$(count_log node.log "self re-authentication with the visa service succeeded")
+A2_REAUTHS=$(count_log vs.log "reauthorized adapter .* at address $B_ZPR_ADDR ")
+if (( NODE_REAUTHS != 3 )); then
+  echo "ERROR: expected exactly 3 node self re-auths after 3 installs, found $NODE_REAUTHS"
+  PASS=1
+fi
+if (( A2_REAUTHS != 3 )); then
+  echo "ERROR: expected exactly 3 adapter2 reauthorizes after 3 installs, found $A2_REAUTHS"
+  PASS=1
+fi
+
+# The re-signed policy re-approved everyone: nothing was rejected.
+if grep -qE "reauthorize failed" vs.log; then
+  echo "ERROR: the visa service rejected a reauthorization during leg 1:"
+  grep -E "reauthorize failed" vs.log | head -n 5
+  PASS=1
+fi
+
+# Zero loss on the boundary ping.
+PING_TX=$(sed -n 's/^\([0-9]\+\) packets transmitted.*/\1/p' "$CONT_PING_LOG" | head -n 1)
+PING_RX=$(sed -n 's/^[0-9]\+ packets transmitted, \([0-9]\+\) received.*/\1/p' "$CONT_PING_LOG" | head -n 1)
+if [ -z "$PING_TX" ] || [ -z "$PING_RX" ] || (( PING_TX == 0 )); then
+  echo "ERROR: the continuous ping produced no summary:"
+  tail -n 5 "$CONT_PING_LOG" || true
+  PASS=1
+elif (( PING_RX != PING_TX )); then
+  echo "ERROR: the continuous ping dropped packets across the installs: $PING_RX/$PING_TX"
+  tail -n 5 "$CONT_PING_LOG" || true
+  PASS=1
+else
+  echo "continuous ping across three installs: $PING_RX/$PING_TX, zero loss"
+fi
+fi
+
+#
 # Check stats
 #
 
