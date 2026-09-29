@@ -122,9 +122,14 @@ REAUTH_DEADLINE=60
 # real latency); generous for slow CI runners.
 REAUTH_WAIT=60
 
-# How long the revocation legs wait for the sweep to act: the 60 s deadline
-# plus one sweep period (MIN_VISA_LIFETIME, 30 s), plus slack.
-REVOKE_WAIT=180
+# How long the revocation legs allow the sweep to act, measured FROM THE
+# POLICY INSTALL: the 60 s deadline plus one sweep period (MIN_VISA_LIFETIME,
+# 30 s), plus a small explicit slack for the install RPC and log flushing.
+# The wait is anchored at the install (LEG{3,4}_INSTALL_TS), not started
+# fresh after the rejection check — a fresh 180 s wait on top of the earlier
+# waits would pass revocations far beyond the configured bound.
+SWEEP_PERIOD=30
+REVOKE_SLACK=15
 
 if [ ! -e "$VS_BIN" ]; then
   echo "vs binary not found, expected it at $VS_BIN"
@@ -287,6 +292,14 @@ function assert_unreachable() {
     return 1
   fi
   return 0
+}
+
+# Seconds remaining until the revocation bound for an install recorded at
+# $1 (a $SECONDS snapshot taken just before install_policy): the configured
+# reauth_deadline, plus one sweep period, plus REVOKE_SLACK. May be <= 0 if
+# the intervening checks already overran the bound.
+function revoke_budget() {
+  echo $(( $1 + REAUTH_DEADLINE + SWEEP_PERIOD + REVOKE_SLACK - SECONDS ))
 }
 
 # Run vs-admin against the admin API from inside the zpr-vs netns.
@@ -807,6 +820,8 @@ if [[ "$PASS" == 0 ]] then
 echo
 echo "LEG 3: install a policy lacking adapter2's bootstrap key"
 
+# Anchor the revocation bound HERE: the deadline clock starts at the install.
+LEG3_INSTALL_TS=$SECONDS
 if ! install_policy "$PREGEN/$POLICY_NO_ADAPTER2_BIN"; then
   echo "ERROR: leg-3 policy install failed"
   PASS=1
@@ -829,14 +844,20 @@ fi
 fi
 
 if [[ "$PASS" == 0 ]] then
-# The sweep revokes adapter2 within reauth_deadline + one sweep period.
-if ! wait_for_log "$REVOKE_WAIT" vs.log \
+# The sweep revokes adapter2 within reauth_deadline + one sweep period,
+# measured from the INSTALL — the earlier rejection check already consumed
+# part of that budget, so the wait must not restart the clock.
+LEG3_BUDGET=$(revoke_budget "$LEG3_INSTALL_TS")
+if (( LEG3_BUDGET <= 0 )); then
+  echo "ERROR: the revocation bound ($((REAUTH_DEADLINE + SWEEP_PERIOD + REVOKE_SLACK))s from the install) elapsed before this check ran"
+  PASS=1
+elif ! wait_for_log "$LEG3_BUDGET" vs.log \
     "reauth sweep: adapter $B_ZPR_ADDR did not re-authenticate under vinst .* by the deadline; revoked"; then
-  echo "ERROR: the sweep never revoked adapter2 within ${REVOKE_WAIT}s"
+  echo "ERROR: the sweep never revoked adapter2 within $((REAUTH_DEADLINE + SWEEP_PERIOD + REVOKE_SLACK))s of the install"
   grep -E "reauth sweep" vs.log | tail -n 20 || true
   PASS=1
 else
-  echo "sweep revoked adapter2:"
+  echo "sweep revoked adapter2 within bound ($(( SECONDS - LEG3_INSTALL_TS ))s after the install):"
   grep -E "reauth sweep: adapter $B_ZPR_ADDR" vs.log | head -n 2
 fi
 
@@ -873,6 +894,8 @@ if [[ "$PASS" == 0 ]] then
 echo
 echo "LEG 4: install a policy lacking the node's bootstrap key"
 
+# Anchor the revocation bound HERE, as in leg 3.
+LEG4_INSTALL_TS=$SECONDS
 if ! install_policy "$PREGEN/$POLICY_NO_NODE_BIN"; then
   echo "ERROR: leg-4 policy install failed"
   PASS=1
@@ -895,14 +918,18 @@ fi
 
 if [[ "$PASS" == 0 ]] then
 # The sweep disconnects the node (and with it, its docked adapters) within
-# the same deadline + sweep-period bound.
-if ! wait_for_log "$REVOKE_WAIT" vs.log \
+# the same deadline + sweep-period bound, measured from the leg-4 install.
+LEG4_BUDGET=$(revoke_budget "$LEG4_INSTALL_TS")
+if (( LEG4_BUDGET <= 0 )); then
+  echo "ERROR: the disconnection bound ($((REAUTH_DEADLINE + SWEEP_PERIOD + REVOKE_SLACK))s from the install) elapsed before this check ran"
+  PASS=1
+elif ! wait_for_log "$LEG4_BUDGET" vs.log \
     "reauth sweep: node $NODE_ZPR_ADDR did not re-authenticate under vinst .* by the deadline; disconnecting it"; then
-  echo "ERROR: the sweep never disconnected the node within ${REVOKE_WAIT}s"
+  echo "ERROR: the sweep never disconnected the node within $((REAUTH_DEADLINE + SWEEP_PERIOD + REVOKE_SLACK))s of the install"
   grep -E "reauth sweep" vs.log | tail -n 20 || true
   PASS=1
 else
-  echo "sweep disconnected the node:"
+  echo "sweep disconnected the node within bound ($(( SECONDS - LEG4_INSTALL_TS ))s after the install):"
   grep -E "reauth sweep: node $NODE_ZPR_ADDR" vs.log | head -n 2
 fi
 
