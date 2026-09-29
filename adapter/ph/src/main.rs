@@ -96,27 +96,6 @@ use zpr::addrs::{
 use zpr::packet_info::{DOCK_LINK_ID, LOCAL_ACTOR_LINK_ID};
 use zpr::vsapi_types::AuthServicesList;
 
-/// Creates a nonblocking local socket pair suitable for transferring
-/// PACKET_BUFFER_SIZE-sized messages.
-fn packet_buffer_socket_pair(
-    queue_size: usize,
-) -> std::io::Result<(
-    std::os::unix::net::UnixDatagram,
-    std::os::unix::net::UnixDatagram,
-)> {
-    // NOTE: ideally we'd use SOCK_SEQPACKET for reliable delivery, but it
-    // isn't supported on macOS, and Linux provides reliable delivery
-    // with SOCK_DGRAM.
-    let (a, b) = socket2::Socket::pair(socket2::Domain::UNIX, socket2::Type::DGRAM, None)?;
-    a.set_send_buffer_size(queue_size * config::PACKET_BUFFER_SIZE)?;
-    a.set_recv_buffer_size(queue_size * config::PACKET_BUFFER_SIZE)?;
-    b.set_send_buffer_size(queue_size * config::PACKET_BUFFER_SIZE)?;
-    b.set_recv_buffer_size(queue_size * config::PACKET_BUFFER_SIZE)?;
-    a.set_nonblocking(true)?;
-    b.set_nonblocking(true)?;
-    Ok((a.into(), b.into()))
-}
-
 fn main() -> ExitCode {
     let system_start_time = std::time::Instant::now();
 
@@ -242,8 +221,7 @@ fn main() -> ExitCode {
 
     let topology_config = config::TopologyConfig::default();
 
-    let (cap_inq, cap_outq) =
-        packet_buffer_socket_pair(topology_config.capture_queue_size).unwrap();
+    let (cap_inq, cap_outq) = queues::capture_queue(topology_config.capture_queue_size);
     let (md_inq_factory, md_outq) =
         two_way_queue::two_way_queue(topology_config.mgmt_dispatch_queue_size);
     let (mhd_inq, mhd_outq) = mpsc::channel(topology_config.mgmt_dispatch_queue_size);
@@ -642,7 +620,7 @@ fn main() -> ExitCode {
         vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
         deferred_vs_connect: Mutex::new(None),
         self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
-        capture_queue: Capture::new(cap_inq),
+        capture_queue: cap_inq,
         capture_worker: CaptureWorker::new(),
         flow_control: FlowControl::new(),
         counters: Default::default(),
@@ -858,7 +836,7 @@ fn main() -> ExitCode {
             batch_size: asm.topology_config.capture_batch_size,
         },
         asm.clone(),
-        tokio::net::UnixDatagram::from_std(cap_outq).unwrap(),
+        cap_outq,
     ));
 
     if ph_mode == PhMode::Node {

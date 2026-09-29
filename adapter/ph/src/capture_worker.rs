@@ -1,9 +1,9 @@
 use crate::logging::targets::CAPTURE;
 use crate::pcap_writer::*;
 use crate::prelude::*;
+use crate::queues::CaptureReceiver;
 use std::io;
 use tokio::fs::File;
-use tokio::net::UnixDatagram;
 use tokio::sync::Mutex;
 
 pub struct CaptureWorker {
@@ -59,18 +59,18 @@ pub struct Config {
     pub batch_size: usize,
 }
 
-pub async fn launch(_config: Config, asm: Arc<Assembly>, queue: UnixDatagram) {
-    let mut buf = [0u8; config::PACKET_BUFFER_SIZE];
-
+/// Drain the capture queue into the open capture file (if any), returning
+/// every buffer to the pool once it has been written or discarded.
+pub async fn launch(_config: Config, asm: Arc<Assembly>, mut queue: CaptureReceiver) {
     // TODO: batch processing (only take lock once per batch)
-    while let Ok(size) = queue.recv(&mut buf).await {
+    while let Some(captured) = queue.recv().await {
         let mut state = asm.capture_worker.inner.lock().await;
 
         if let Some(savefile) = state.savefile.as_mut() {
             // Write the packets out.  If the queue is empty, force a flush
             // to make sure these packets get written out in timely fashion.
             // TODO: use poll to determine queue emptiness
-            match savefile_write_batch(savefile, &[&buf[..size]], true).await {
+            match savefile_write_batch(savefile, &[captured.data()], true).await {
                 Ok(()) => (),
 
                 Err(err) => {
@@ -84,6 +84,8 @@ pub async fn launch(_config: Config, asm: Arc<Assembly>, queue: UnixDatagram) {
                 }
             }
         }
+        drop(state);
+        queue.recycle(captured);
     }
 }
 

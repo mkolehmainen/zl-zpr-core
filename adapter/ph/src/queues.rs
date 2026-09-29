@@ -5,11 +5,8 @@ use crate::packet::{self, Packet, PacketBuffer};
 use crate::packet_queue;
 use crate::test_packet::*;
 use crate::two_way_queue;
-use bytes::Buf;
-use libc;
-use std::io::ErrorKind;
-use std::os::unix::net::UnixDatagram;
 use std::result::Result;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -145,63 +142,142 @@ impl ActorOutputRequeue {
     }
 }
 
+/// One capture buffer: a pcap record header followed by (a prefix of) a
+/// packet.  Sized to hold the largest packet the datapath carries.
+type CaptureBuffer = Box<[u8; config::PACKET_BUFFER_SIZE]>;
+
+/// Largest packet prefix that fits in a `CaptureBuffer` after its header.
+const MAX_CAPTURE_LEN: usize =
+    config::PACKET_BUFFER_SIZE - std::mem::size_of::<crate::pcap_writer::PcaprecHdr>();
+
+/// Free list shared by the datapath (which takes buffers) and the capture
+/// worker (which gives them back).
+type CapturePool = Arc<Mutex<Vec<CaptureBuffer>>>;
+
+/// A captured packet on its way to the capture worker: a pool buffer and
+/// the number of bytes of it in use.
+pub struct CapturedPacket {
+    buf: CaptureBuffer,
+    len: usize,
+}
+
+impl CapturedPacket {
+    /// The pcap record: `PcaprecHdr` followed by the captured bytes.
+    pub fn data(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// Create the capture queue: the datapath-side `Capture` and the
+/// worker-side `CaptureReceiver`, sharing a pool of `depth` buffers.
+///
+/// Why a pool (zipline#129): the datapath does no heap allocation per
+/// packet, and capture must not be the exception.  (The AF_UNIX socketpair
+/// this replaces didn't allocate in `ph` either; the kernel did the copy.)
+/// Every buffer is allocated here, once, and cycles datapath -> worker ->
+/// pool -> datapath.  The channel carrying filled buffers is a bounded
+/// tokio mpsc, which recycles its internal blocks rather than allocating
+/// per message -- the same property `packet_queue` relies on.  The cost is
+/// `depth * PACKET_BUFFER_SIZE` bytes held for the life of the process
+/// (3 MB with the default topology), whether or not capture is in use.
+pub fn capture_queue(depth: usize) -> (Capture, CaptureReceiver) {
+    let pool: Vec<CaptureBuffer> = (0..depth)
+        .map(|_| {
+            // Built via Vec so the 12 KB buffer is never on the stack.
+            vec![0u8; config::PACKET_BUFFER_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("vec has exactly PACKET_BUFFER_SIZE bytes")
+        })
+        .collect();
+    let pool = Arc::new(Mutex::new(pool));
+    // The channel has room for every buffer in the pool, so a send can
+    // only fail if the worker is gone.
+    let (sender, receiver) = mpsc::channel(depth.max(1));
+    (
+        Capture {
+            sender,
+            pool: pool.clone(),
+        },
+        CaptureReceiver { receiver, pool },
+    )
+}
+
 /// Capture will intercept packets in the PH and dump them into a file for debugging purposes
 pub struct Capture {
-    sender: UnixDatagram,
+    sender: mpsc::Sender<CapturedPacket>,
+    pool: CapturePool,
 }
 
 impl Capture {
-    /// `sender` must be set nonblocking
-    pub fn new(sender: UnixDatagram) -> Self {
-        Self { sender }
-    }
-
     /// Try to send a packet to the capture system.
     /// Only `incl_len` bytes will be captured.  (If this is larger than the
-    /// actual packet length, it is reduced accordingly.)
-    /// Does not block.
+    /// actual packet length, or than a capture buffer holds, it is reduced
+    /// accordingly.)
+    /// Never blocks and never allocates: if no pool buffer is free right now
+    /// (all in flight, or another fastpath thread holds the pool lock) the
+    /// packet is not captured and `Full` is returned.
     ///
-    /// NOTE: requires mut reference to the packet, but the packet is
-    /// materially unchanged.  Simply, a 16-byte header is briefly added to
-    /// and then removed from it.
+    /// NOTE: the packet is not modified; `&mut` is kept so callers need not
+    /// change.
     pub fn try_enqueue_packet(
         &self,
         packet: &mut Packet,
         timestamp: SystemTime,
         incl_len: usize,
     ) -> Result<(), TryEnqueueError> {
-        let incl_len = std::cmp::min(incl_len, packet.remaining());
+        let body = packet.body();
+        let incl_len = incl_len.min(body.len()).min(MAX_CAPTURE_LEN);
 
-        let hdr = crate::pcap_writer::PcaprecHdr::new(timestamp, incl_len, packet.remaining());
+        // `try_lock` rather than `lock`: the datapath must not wait on
+        // another thread.  Contention is treated like an empty pool.
+        let buf = match self.pool.try_lock() {
+            Ok(mut pool) => pool.pop(),
+            Err(_) => None,
+        };
+        let Some(mut buf) = buf else {
+            return Err(TryEnqueueError::Full(()));
+        };
 
-        // temporarily add header
-        // TODO: instead of requiring a &mut Packet,
-        // we can instead accept any &[u8] and use vectored send
-        // once we it becomes stable
-        packet.push_header(&hdr);
+        let hdr = crate::pcap_writer::PcaprecHdr::new(timestamp, incl_len, body.len());
+        let hdr_len = std::mem::size_of_val(&hdr);
+        buf[..hdr_len].copy_from_slice(zerocopy::IntoBytes::as_bytes(&hdr));
+        buf[hdr_len..hdr_len + incl_len].copy_from_slice(&body[..incl_len]);
 
-        // does not block, as we know the socket is nonblocking
-        let res = self.sender.send(
-            &packet.body()[..std::mem::size_of::<crate::pcap_writer::PcaprecHdr>() + incl_len],
-        );
-
-        // remove temporary header
-        packet.advance(std::mem::size_of::<crate::pcap_writer::PcaprecHdr>());
-
-        match res {
-            Ok(_) => Ok(()),
-
-            Err(err) => match err.kind() {
-                ErrorKind::WouldBlock => Err(TryEnqueueError::Full(())),
-                ErrorKind::ConnectionRefused | ErrorKind::BrokenPipe => {
-                    panic!("capture channel closed")
-                }
-                _ => match err.raw_os_error() {
-                    Some(libc::ENOBUFS) => Err(TryEnqueueError::Full(())),
-                    _ => panic!("unrecoverable I/O error: {}", err),
-                },
-            },
+        match self.sender.try_send(CapturedPacket {
+            buf,
+            len: hdr_len + incl_len,
+        }) {
+            Ok(()) => Ok(()),
+            // Unreachable while the channel is as deep as the pool, but if
+            // it happens, give the buffer back rather than leak it.
+            Err(TrySendError::Full(pkt)) => {
+                self.pool.lock().unwrap().push(pkt.buf);
+                Err(TryEnqueueError::Full(()))
+            }
+            Err(TrySendError::Closed(_)) => panic!("capture channel closed"),
         }
+    }
+}
+
+/// Worker side of the capture queue (see `capture_queue`).
+pub struct CaptureReceiver {
+    receiver: mpsc::Receiver<CapturedPacket>,
+    pool: CapturePool,
+}
+
+impl CaptureReceiver {
+    /// Wait for the next captured packet.  `None` once every `Capture` is
+    /// gone.
+    pub async fn recv(&mut self) -> Option<CapturedPacket> {
+        self.receiver.recv().await
+    }
+
+    /// Return a packet's buffer to the pool so the datapath can reuse it.
+    /// Every packet from `recv` must come back here, or capture capacity
+    /// shrinks.
+    pub fn recycle(&self, packet: CapturedPacket) {
+        self.pool.lock().unwrap().push(packet.buf);
     }
 }
 
@@ -370,5 +446,96 @@ impl AdapterManagerFactory {
         AdapterManager {
             sender: self.0.make(ret_q),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pcap_writer::PcaprecHdr;
+    use bytes::BufMut;
+    use std::time::{Duration, UNIX_EPOCH};
+    use zerocopy::FromBytes;
+
+    const HDR_LEN: usize = std::mem::size_of::<PcaprecHdr>();
+
+    /// A packet whose body is `body`, with no headroom.
+    fn packet_with_body(body: &[u8]) -> Packet {
+        let mut pkt = Packet::new(vec![0u8; config::PACKET_BUFFER_SIZE].into(), 0);
+        pkt.put(body);
+        pkt
+    }
+
+    /// The (incl_len, orig_len, ts_sec, ts_usec) fields of a record's header.
+    fn header_fields(record: &[u8]) -> (u32, u32, u32, u32) {
+        // PcaprecHdr is four native-endian u32s: ts_sec, ts_usec, incl_len, orig_len.
+        let ([ts_sec, ts_usec, incl_len, orig_len], _) =
+            <[u32; 4]>::read_from_prefix(record).unwrap();
+        (incl_len, orig_len, ts_sec, ts_usec)
+    }
+
+    #[tokio::test]
+    async fn enqueued_packet_arrives_as_pcap_record() {
+        let (capture, mut receiver) = capture_queue(4);
+        let mut pkt = packet_with_body(b"hello, capture");
+        let ts = UNIX_EPOCH + Duration::new(1_000, 2_000);
+
+        assert!(capture.try_enqueue_packet(&mut pkt, ts, 5).is_ok());
+
+        let captured = receiver.recv().await.unwrap();
+        let record = captured.data();
+        assert_eq!(record.len(), HDR_LEN + 5);
+        assert_eq!(header_fields(record), (5, 14, 1_000, 2));
+        assert_eq!(&record[HDR_LEN..], b"hello");
+        // The packet itself is untouched.
+        assert_eq!(pkt.body(), b"hello, capture");
+    }
+
+    #[tokio::test]
+    async fn incl_len_is_clamped_to_packet_length() {
+        let (capture, mut receiver) = capture_queue(1);
+        let mut pkt = packet_with_body(b"short");
+
+        assert!(
+            capture
+                .try_enqueue_packet(&mut pkt, SystemTime::now(), 1_000)
+                .is_ok()
+        );
+
+        let captured = receiver.recv().await.unwrap();
+        assert_eq!(header_fields(captured.data()).0, 5);
+        assert_eq!(&captured.data()[HDR_LEN..], b"short");
+    }
+
+    #[tokio::test]
+    async fn exhausted_pool_reports_full_until_a_buffer_is_recycled() {
+        let (capture, mut receiver) = capture_queue(2);
+        let mut pkt = packet_with_body(b"x");
+        let now = SystemTime::now();
+
+        assert!(capture.try_enqueue_packet(&mut pkt, now, 1).is_ok());
+        assert!(capture.try_enqueue_packet(&mut pkt, now, 1).is_ok());
+        assert!(matches!(
+            capture.try_enqueue_packet(&mut pkt, now, 1),
+            Err(TryEnqueueError::Full(()))
+        ));
+
+        // Giving one buffer back makes room for exactly one more.
+        let captured = receiver.recv().await.unwrap();
+        receiver.recycle(captured);
+        assert!(capture.try_enqueue_packet(&mut pkt, now, 1).is_ok());
+        assert!(matches!(
+            capture.try_enqueue_packet(&mut pkt, now, 1),
+            Err(TryEnqueueError::Full(()))
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "capture channel closed")]
+    fn enqueue_after_worker_gone_panics() {
+        let (capture, receiver) = capture_queue(1);
+        drop(receiver);
+        let mut pkt = packet_with_body(b"x");
+        let _ = capture.try_enqueue_packet(&mut pkt, SystemTime::now(), 1);
     }
 }
