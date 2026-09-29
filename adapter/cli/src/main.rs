@@ -8,21 +8,31 @@ mod oidc;
 mod rusty_helper;
 
 use crate::main_args::{CaptureCommands, CliCommand, CmdlineArgs, Commands, LinkCommands};
+#[cfg(unix)]
 use admin_api::rpc_commands::RpcCommands;
 use admin_api::v1 as cli;
 use clap::Parser;
 use cli::cmd_line_inter as svc;
 use rustyline::{CompletionType, Config, Editor, error::ReadlineError, history::FileHistory};
+#[cfg(unix)]
 use std::fs::OpenOptions;
+use std::io::Error;
+#[cfg(unix)]
 use std::io::prelude::*;
-use std::io::{BufReader, Error, IoSlice};
+#[cfg(unix)]
+use std::io::{BufReader, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+// The capture path passes the opened file's fd over SCM_RIGHTS; unix only
+// (capture is Unsupported on Windows, plan D7 / zipline#130).
+#[cfg(unix)]
 use std::os::fd::AsFd;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use thiserror::Error;
 use tokio::time::{Duration, sleep};
 use tokio_util::compat::*;
+#[cfg(unix)]
 use zpr_ext::std::os::unix::net::{SocketAncillary, UnixStreamExt};
 
 #[cfg(feature = "pcap")]
@@ -834,6 +844,7 @@ async fn get_node_addr_task(service: svc::Client) -> Result<(), CliError> {
 /// Opens a capture file, sends a message to the RPC worker to prepare to receive
 /// the file descriptor, upon receiving correct response, sends the fd as
 /// ancillary data, and awaits response again.
+#[cfg(unix)]
 #[allow(dead_code)]
 fn handle_set_capture_file(file_path: String, cap_socket: &PathBuf) -> Result<(), CliError> {
     let file = OpenOptions::new()
@@ -877,6 +888,17 @@ fn handle_set_capture_file(file_path: String, cap_socket: &PathBuf) -> Result<()
     println!("{response}");
 
     Ok(())
+}
+
+/// Capture is not available on Windows (plan D7): the fd-passing design
+/// has no cheap equivalent there, so the whole path answers Unsupported.
+/// The server side (`setCaptureFile` RPC) answers the same.
+#[cfg(windows)]
+fn handle_set_capture_file(_file_path: String, _cap_socket: &PathBuf) -> Result<(), CliError> {
+    Err(CliError::OsError(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "capture is not available on this platform",
+    )))
 }
 
 /// Opens capture file, sets appropriate capture program, waits a designated

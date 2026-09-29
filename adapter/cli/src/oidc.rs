@@ -767,8 +767,16 @@ async fn login_flow(
 /// hence this pre-flight check (zipline#46). macOS `open` talks to the
 /// window server directly, so the display-variable leg is Linux-only.
 fn browser_unavailable() -> Option<&'static str> {
+    // Root/elevation check: unix asks the euid. On Windows there is no
+    // root-owned-browser hazard of the same shape; the full elevation check
+    // via the process token is C4's scope (zipline#131), so no pre-flight
+    // block applies here yet.
+    #[cfg(unix)]
+    let is_root = nix::unistd::geteuid().is_root();
+    #[cfg(windows)]
+    let is_root = false;
     browser_unavailable_for(
-        nix::unistd::geteuid().is_root(),
+        is_root,
         std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some(),
     )
 }

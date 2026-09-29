@@ -1,27 +1,41 @@
 //! Waiting for readiness on multiple OS objects.
 //!
 //! This is the platform seam for the fastpath's readiness wait (master plan
-//! `docs/plans/2026-09-28-windows.md`, task C1; umbrella zipline#126). On
-//! unix a [`WaitHandle`] wraps a [`BorrowedFd`] and [`WaitSet::wait`] is
-//! `poll(2)`; a future Windows arm (zipline#130) wraps a HANDLE and waits
-//! with `WaitForMultipleObjects`. Only the unix arm exists today; like
-//! `sys::posix::notify`, the module is deliberately not `cfg`-gated —
-//! gating is zipline#130's job.
+//! `docs/plans/2026-09-28-windows.md`, tasks C1/C3; umbrella zipline#126).
+//! On unix a [`WaitHandle`] wraps a [`BorrowedFd`] and [`WaitSet::wait`] is
+//! `poll(2)`; on Windows (zipline#130) it wraps a HANDLE and
+//! [`WaitSet::wait`] is `WaitForMultipleObjects`, with the substrate UDP
+//! socket represented by a [`SocketWaitable`] — an Event bound to the
+//! socket with `WSAEventSelect(FD_READ)`.
 
-use nix::poll;
 use std::io::Result;
 use std::ops::BitOr;
-use std::os::fd::BorrowedFd;
 use std::time::Duration;
+
+#[cfg(unix)]
+use nix::poll;
+#[cfg(unix)]
+use std::os::fd::BorrowedFd;
+
+#[cfg(windows)]
+use std::marker::PhantomData;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    INFINITE, WaitForMultipleObjects, WaitForSingleObject,
+};
 
 /// An opaque handle to an OS object whose readiness can be awaited in a
 /// [`WaitSet`].
 ///
 /// On unix this wraps a [`BorrowedFd`]; it carries the same lifetime, so a
 /// `WaitHandle` can never outlive the object it watches.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub struct WaitHandle<'a>(BorrowedFd<'a>);
 
+#[cfg(unix)]
 impl<'a> WaitHandle<'a> {
     /// The underlying file descriptor (unix arm only).
     pub(crate) fn as_fd(&self) -> BorrowedFd<'a> {
@@ -29,9 +43,36 @@ impl<'a> WaitHandle<'a> {
     }
 }
 
+#[cfg(unix)]
 impl<'a> From<BorrowedFd<'a>> for WaitHandle<'a> {
     fn from(fd: BorrowedFd<'a>) -> Self {
         Self(fd)
+    }
+}
+
+/// An opaque handle to an OS object whose readiness can be awaited in a
+/// [`WaitSet`].
+///
+/// On Windows this wraps a waitable HANDLE (a manual-reset Event, or
+/// Wintun's read-wait event). Win32 HANDLEs carry no lifetime of their own,
+/// so the phantom borrow re-attaches one: a `WaitHandle` produced by
+/// [`Waitable::handle`] cannot outlive the object that owns the HANDLE.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub struct WaitHandle<'a>(HANDLE, PhantomData<&'a ()>);
+
+#[cfg(windows)]
+impl<'a> WaitHandle<'a> {
+    /// Wrap a raw Event HANDLE. Crate-private: the caller chooses the
+    /// lifetime, so it must be tied to the HANDLE's owning object at the
+    /// call site (as [`Waitable::handle`] implementations do).
+    pub(crate) fn from_event(event: HANDLE) -> Self {
+        Self(event, PhantomData)
+    }
+
+    /// The underlying HANDLE (Windows arm only).
+    pub(crate) fn as_handle(&self) -> HANDLE {
+        self.0
     }
 }
 
@@ -58,6 +99,7 @@ impl Interest {
     pub const WRITE: Self = Self(2);
 
     /// The unix `poll(2)` events these interests correspond to.
+    #[cfg(unix)]
     fn poll_flags(self) -> poll::PollFlags {
         let mut flags = poll::PollFlags::empty();
         if self.0 & Self::READ.0 != 0 {
@@ -100,6 +142,10 @@ impl Ready {
     }
 }
 
+/// Maximum number of entries in a `WaitSet` (width of the `Ready` bitmasks;
+/// also comfortably under Windows' MAXIMUM_WAIT_OBJECTS of 64).
+const MAX_ENTRIES: usize = 32;
+
 /// A set of [`WaitHandle`]s to wait on simultaneously.
 ///
 /// Entries are registered with [`push`](Self::push), which returns the index
@@ -110,13 +156,12 @@ impl Ready {
 /// At most 32 entries per set (the `Ready` bitmask width); `push` panics
 /// beyond that. The unix arm's `wait` is exactly the `nix::poll::poll` call
 /// the fastpath previously made inline.
+#[cfg(unix)]
 pub struct WaitSet<'a> {
     entries: Vec<poll::PollFd<'a>>,
 }
 
-/// Maximum number of entries in a `WaitSet` (width of the `Ready` bitmasks).
-const MAX_ENTRIES: usize = 32;
-
+#[cfg(unix)]
 impl<'a> WaitSet<'a> {
     /// Create an empty wait set with room for `capacity` entries.
     pub fn with_capacity(capacity: usize) -> Self {
@@ -167,6 +212,275 @@ impl<'a> WaitSet<'a> {
     }
 }
 
+/// A set of [`WaitHandle`]s to wait on simultaneously — Windows arm
+/// (zipline#130, plan D3).
+///
+/// `wait` is `WaitForMultipleObjects` over the entries whose interest is
+/// not [`Interest::NONE`] (a parked `NONE` entry must not wake the wait, so
+/// it is not passed to the kernel — the unix arm gets the same effect from
+/// an empty `PollFlags`). `WaitForMultipleObjects` reports only the
+/// lowest-index signaled handle, so after it returns, every *other* armed
+/// handle is probed with a zero-timeout `WaitForSingleObject`. The sources
+/// here are level-signaled — manual-reset Events ([`super::notify::Notify`],
+/// `WSAEventSelect` events, Wintun's read-wait event) stay signaled until
+/// explicitly consumed — so a still-pending source is seen by the probe,
+/// giving `poll(2)`'s report-everything semantics.
+///
+/// A signaled entry is reported under the interest(s) it registered:
+/// `WaitForMultipleObjects` itself carries no read/write distinction — the
+/// direction lives in how the handle was armed (`FD_READ` on a
+/// [`SocketWaitable`], a posted `Notify`), not in the wait.
+#[cfg(windows)]
+pub struct WaitSet<'a> {
+    /// (handle, registered interest); `NONE` entries keep their slot (for
+    /// index stability) but are skipped by `wait`.
+    entries: Vec<(WaitHandle<'a>, Interest)>,
+}
+
+#[cfg(windows)]
+impl<'a> WaitSet<'a> {
+    /// Create an empty wait set with room for `capacity` entries.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Register `handle` with the given `interest`. Returns the index this
+    /// entry is reported under in [`Ready`].
+    ///
+    /// Panics if the set already holds [`MAX_ENTRIES`] entries.
+    pub fn push(&mut self, handle: WaitHandle<'a>, interest: Interest) -> usize {
+        let index = self.entries.len();
+        assert!(index < MAX_ENTRIES, "WaitSet overflow");
+        self.entries.push((handle, interest));
+        index
+    }
+
+    /// Block until at least one armed entry is signaled or `timeout`
+    /// elapses (`None` = wait forever), and report which entries are ready.
+    ///
+    /// A timeout expiry reports an empty [`Ready`].
+    pub fn wait(&mut self, timeout: Option<Duration>) -> Result<Ready> {
+        let timeout_ms: u32 = match timeout {
+            None => INFINITE,
+            Some(duration) => duration
+                .as_millis()
+                .try_into()
+                .expect("WaitSet timeout exceeds the platform maximum"),
+        };
+
+        // Arm only the entries with a real interest, remembering which
+        // WaitSet index each armed handle belongs to.
+        let mut handles: Vec<HANDLE> = Vec::with_capacity(self.entries.len());
+        let mut indices: Vec<usize> = Vec::with_capacity(self.entries.len());
+        for (index, (handle, interest)) in self.entries.iter().enumerate() {
+            if *interest != Interest::NONE {
+                handles.push(handle.as_handle());
+                indices.push(index);
+            }
+        }
+
+        let mut ready = Ready::default();
+        if handles.is_empty() {
+            // Nothing armed: nothing can become ready. poll(2) over
+            // event-less entries just sleeps for the timeout; do the same.
+            match timeout {
+                Some(duration) => std::thread::sleep(duration),
+                // An infinite wait with nothing armed would deadlock;
+                // no fastpath call site builds such a set. Fail loudly
+                // rather than hang.
+                None => panic!("WaitSet::wait forever with no armed entries"),
+            }
+            return Ok(ready);
+        }
+
+        // SAFETY: `handles` holds live HANDLEs — each WaitHandle's phantom
+        // borrow keeps its owner alive for the life of this set.
+        let rc = unsafe {
+            WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout_ms)
+        };
+        if rc == WAIT_TIMEOUT {
+            return Ok(ready);
+        }
+        if rc == WAIT_FAILED || rc >= WAIT_OBJECT_0 + handles.len() as u32 {
+            // WAIT_ABANDONED_* applies to mutexes only, never to the Events
+            // waited on here; anything that is not a signaled index is an
+            // error.
+            return Err(std::io::Error::last_os_error());
+        }
+        let first = (rc - WAIT_OBJECT_0) as usize;
+
+        // Report every signaled entry, not just the lowest: probe the rest
+        // with a zero timeout (level-signaled sources stay signaled).
+        for (pos, (&handle, &index)) in handles.iter().zip(indices.iter()).enumerate() {
+            let signaled = if pos == first {
+                true
+            } else {
+                // SAFETY: same liveness argument as above.
+                unsafe { WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 }
+            };
+            if signaled {
+                let interest = self.entries[index].1;
+                if interest.0 & Interest::READ.0 != 0 {
+                    ready.readable |= 1 << index;
+                }
+                if interest.0 & Interest::WRITE.0 != 0 {
+                    ready.writable |= 1 << index;
+                }
+            }
+        }
+        Ok(ready)
+    }
+}
+
+/// The substrate UDP socket as a [`Waitable`] — Windows arm (plan D3).
+///
+/// Wraps a manual-reset WSA Event bound to the socket with
+/// `WSAEventSelect(FD_READ)`: the event signals when data arrives.
+/// `FD_READ` re-arming is edge-like — after a wake, [`reset`](Self::reset)
+/// must be called (it runs `WSAEnumNetworkEvents`, which clears the event
+/// and re-enables `FD_READ` recording) once the ready data has been
+/// drained, or a subsequent arrival may not re-signal; the Windows batch_io
+/// engine (zipline#131) owns that call in its receive path.
+#[cfg(windows)]
+pub struct SocketWaitable {
+    socket: windows_sys::Win32::Networking::WinSock::SOCKET,
+    /// A WSAEVENT (an event HANDLE spelled as isize in windows-sys).
+    event: windows_sys::Win32::Networking::WinSock::WSAEVENT,
+}
+
+#[cfg(windows)]
+impl SocketWaitable {
+    /// Bind a fresh WSA Event to `socket` with `WSAEventSelect(FD_READ)`.
+    ///
+    /// Side effect inherent to `WSAEventSelect`: the socket is switched to
+    /// non-blocking mode — which the fastpath requires anyway.
+    ///
+    /// The `SocketWaitable` borrows no lifetime from the socket, so the
+    /// caller must keep the socket alive as long as the waitable (the
+    /// fastpath owns both in one struct).
+    #[allow(dead_code)] // wired into fastpath_io by the C4 engine (zipline#131)
+    pub fn new(socket: &std::net::UdpSocket) -> Result<Self> {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{FD_READ, WSACreateEvent, WSAEventSelect};
+
+        let raw = socket.as_raw_socket() as windows_sys::Win32::Networking::WinSock::SOCKET;
+        // SAFETY: WSACreateEvent allocates a fresh manual-reset event owned
+        // by this SocketWaitable (closed in Drop). WSAEVENT is an event
+        // HANDLE spelled as isize; 0 is WSA_INVALID_EVENT.
+        let event = unsafe { WSACreateEvent() };
+        if event == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: raw is a live socket (borrowed for this call) and event a
+        // live WSA event handle.
+        if unsafe { WSAEventSelect(raw, event, FD_READ as i32) } != 0 {
+            let err = std::io::Error::last_os_error();
+            // SAFETY: event was created above and is not otherwise shared.
+            unsafe { windows_sys::Win32::Networking::WinSock::WSACloseEvent(event) };
+            return Err(err);
+        }
+        Ok(Self { socket: raw, event })
+    }
+
+    /// Acknowledge a wake: `WSAEnumNetworkEvents` clears the event and
+    /// re-enables `FD_READ` recording. Call after every wait that reported
+    /// this socket ready, once the ready data has been drained (zipline#131
+    /// wires this into the receive path).
+    #[allow(dead_code)]
+    pub fn reset(&self) -> Result<()> {
+        use windows_sys::Win32::Networking::WinSock::{WSAEnumNetworkEvents, WSANETWORKEVENTS};
+        // SAFETY: plain output struct, fully written by the call on success.
+        let mut events: WSANETWORKEVENTS = unsafe { std::mem::zeroed() };
+        // SAFETY: socket and event are the live pair bound in new().
+        if unsafe { WSAEnumNetworkEvents(self.socket, self.event, &mut events) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SocketWaitable {
+    fn drop(&mut self) {
+        // SAFETY: event was created by WSACreateEvent in new() and is owned
+        // by this SocketWaitable.
+        unsafe { windows_sys::Win32::Networking::WinSock::WSACloseEvent(self.event) };
+    }
+}
+
+#[cfg(windows)]
+impl Waitable for SocketWaitable {
+    fn handle(&self) -> WaitHandle<'_> {
+        // WSAEVENT is an event HANDLE spelled as isize; the wait arm needs
+        // the pointer spelling.
+        WaitHandle::from_event(self.event as HANDLE)
+    }
+}
+
+/// Something batch_io can target: anything that can name the [`WaitHandle`]
+/// its I/O readiness is reported on.
+///
+/// On unix every `AsFd` type qualifies (the handle is the fd itself), so
+/// batch_io call sites keep passing sockets and TUNs directly. On Windows
+/// the handle is an Event owned elsewhere, so only the types that actually
+/// carry one implement this — see the impls beside `SocketWaitable` and the
+/// Windows `ZprTun`.
+pub trait AsWaitSource {
+    fn as_wait_handle(&self) -> WaitHandle<'_>;
+}
+
+#[cfg(unix)]
+impl<T: std::os::fd::AsFd> AsWaitSource for T {
+    fn as_wait_handle(&self) -> WaitHandle<'_> {
+        self.as_fd().into()
+    }
+}
+
+/// The Windows batch_io engine does not exist yet (zipline#131, plan D5);
+/// engine auto-selection already fails before any I/O call could reach a
+/// socket. This impl exists so shared call sites (`fastpath_io`, batch_io
+/// tests) that name a `UdpSocket` as their target still compile.
+#[cfg(windows)]
+impl AsWaitSource for std::net::UdpSocket {
+    fn as_wait_handle(&self) -> WaitHandle<'_> {
+        unreachable!("no Windows batch_io engine yet (zipline#131)")
+    }
+}
+
+#[cfg(windows)]
+impl AsWaitSource for SocketWaitable {
+    fn as_wait_handle(&self) -> WaitHandle<'_> {
+        self.handle()
+    }
+}
+
+#[cfg(windows)]
+impl AsWaitSource for crate::sys::ZprTun {
+    fn as_wait_handle(&self) -> WaitHandle<'_> {
+        self.handle()
+    }
+}
+
+/// `Arc<ZprTun>` mirrors std's `impl AsFd for Arc<T>`, which is what lets
+/// the unix blanket impl accept `&Arc<ZprTun>` at the fastpath call sites.
+#[cfg(windows)]
+impl AsWaitSource for std::sync::Arc<crate::sys::ZprTun> {
+    fn as_wait_handle(&self) -> WaitHandle<'_> {
+        self.as_ref().handle()
+    }
+}
+
+/// References forward, mirroring std's `impl AsFd for &T` that the unix
+/// blanket impl picks up.
+#[cfg(windows)]
+impl<T: AsWaitSource + ?Sized> AsWaitSource for &T {
+    fn as_wait_handle(&self) -> WaitHandle<'_> {
+        (**self).as_wait_handle()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Interest, WaitSet};
@@ -175,7 +489,8 @@ mod tests {
     use std::time::Duration;
 
     /// Two `Notify`s in a `WaitSet`; post one; `wait` reports exactly that
-    /// one ready. (zipline#128 acceptance test.)
+    /// one ready. (zipline#128 acceptance test; also valid on the Windows
+    /// arm, where `Notify` is a manual-reset Event.)
     #[test]
     fn waitset_reports_only_posted_notify() {
         let notify1 = Notify::new().unwrap();
