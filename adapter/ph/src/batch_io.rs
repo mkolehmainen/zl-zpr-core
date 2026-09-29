@@ -10,8 +10,72 @@ use libc;
 use nix::sys::socket::{self, AddressFamily, SockaddrLike, SockaddrStorage};
 use std::io::Result;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd};
 use zpr_utils::net_defs::{ScopedIpAddr, ScopedIpv6Addr};
+
+use crate::sys::wait::WaitHandle;
+
+/// Flags for socket send operations, as a platform-neutral newtype over the
+/// OS flag bits (unix: the `MSG_*` bits of `sendmsg(2)`'s `flags` argument).
+///
+/// The constructors for flags that exist only on some platforms are no-ops
+/// elsewhere, so callers need no `#[cfg]` of their own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SendFlags(libc::c_int);
+
+impl SendFlags {
+    /// No flags.
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    /// `MSG_CONFIRM`: tell the link layer that forward progress happened
+    /// (suppresses unicast ARP/NDP re-validation). Linux only; a no-op
+    /// elsewhere.
+    #[cfg(target_os = "linux")]
+    pub const fn confirm() -> Self {
+        Self(libc::MSG_CONFIRM)
+    }
+
+    /// `MSG_CONFIRM` does not exist on this platform; no flags.
+    #[cfg(not(target_os = "linux"))]
+    pub const fn confirm() -> Self {
+        Self(0)
+    }
+
+    /// `MSG_DONTWAIT`: this send completes immediately instead of blocking.
+    /// Linux only (elsewhere the sockets are already non-blocking, or the
+    /// platform has no such flag); a no-op off Linux.
+    ///
+    /// Not yet called: the unix engines apply `MSG_DONTWAIT` internally
+    /// (zipline#117), so this constructor exists for the Windows engine
+    /// (zipline#131) and for callers that need it explicitly.
+    #[allow(dead_code)]
+    #[cfg(target_os = "linux")]
+    pub const fn dontwait() -> Self {
+        Self(libc::MSG_DONTWAIT)
+    }
+
+    /// `MSG_DONTWAIT` is not used on this platform; no flags.
+    #[allow(dead_code)]
+    #[cfg(not(target_os = "linux"))]
+    pub const fn dontwait() -> Self {
+        Self(0)
+    }
+
+    /// The raw OS flag bits.
+    fn bits(self) -> libc::c_int {
+        self.0
+    }
+}
+
+impl std::ops::BitOr for SendFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
 
 pub struct ReceivedPacket {
     #[allow(dead_code)]
@@ -72,42 +136,42 @@ trait BatchIoImpl {
 
     fn try_write_batch<'a>(
         &mut self,
-        fd: BorrowedFd<'_>,
+        handle: WaitHandle<'_>,
         bufs: &mut dyn Iterator<Item = &'a [u8]>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize>;
 
     fn try_read_buf_batch<'a>(
         &mut self,
-        fd: BorrowedFd<'_>,
+        handle: WaitHandle<'_>,
         bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize>;
 
     fn try_send_to_batch<'a>(
         &mut self,
-        fd: BorrowedFd<'_>,
-        bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, libc::c_int)>,
+        handle: WaitHandle<'_>,
+        bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, SendFlags)>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize>;
 
     fn try_send_to_from_batch<'a>(
         &mut self,
-        fd: BorrowedFd<'_>,
-        bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, libc::c_int)>,
+        handle: WaitHandle<'_>,
+        bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, SendFlags)>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize>;
 
     fn try_recv_buf_from_batch<'a>(
         &mut self,
-        fd: BorrowedFd<'_>,
+        handle: WaitHandle<'_>,
         bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
         results: &mut Vec<Result<ReceivedPacket>>,
     ) -> Result<usize>;
 
     fn try_recv_buf_from_to_batch<'a>(
         &mut self,
-        fd: BorrowedFd<'_>,
+        handle: WaitHandle<'_>,
         bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
         results: &mut Vec<Result<ReceivedPacket>>,
     ) -> Result<usize>;
@@ -117,7 +181,8 @@ trait BatchIoImpl {
 mod io_uring {
     //! io_uring(7)-based implementation.  Only available for Linux.
 
-    use super::{BatchIoImpl, ReceivedPacket, sockaddr_to_socket_addr};
+    use super::{BatchIoImpl, ReceivedPacket, SendFlags, sockaddr_to_socket_addr};
+    use crate::sys::wait::WaitHandle;
     use bytes::BufMut;
     use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
     use libc;
@@ -914,58 +979,71 @@ mod io_uring {
 
         fn try_write_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
+            handle: WaitHandle<'_>,
             bufs: &mut dyn Iterator<Item = &'a [u8]>,
             results: &mut Vec<Result<usize>>,
         ) -> Result<usize> {
-            self.do_batch_op(TryWriteBatchOp::new(), fd, bufs, results)
+            self.do_batch_op(TryWriteBatchOp::new(), handle.as_fd(), bufs, results)
         }
 
         fn try_read_buf_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
+            handle: WaitHandle<'_>,
             bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
             results: &mut Vec<Result<usize>>,
         ) -> Result<usize> {
-            self.do_batch_op(TryReadBufBatchOp::new(), fd, bufs, results)
+            self.do_batch_op(TryReadBufBatchOp::new(), handle.as_fd(), bufs, results)
         }
 
         fn try_send_to_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
-            bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, libc::c_int)>,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, SendFlags)>,
             results: &mut Vec<Result<usize>>,
         ) -> Result<usize> {
-            self.do_batch_op(TrySendToBatchOp::new(), fd, bufs, results)
+            self.do_batch_op(
+                TrySendToBatchOp::new(),
+                handle.as_fd(),
+                &mut bufs.map(|(buf, addr, flags)| (buf, addr, flags.bits())),
+                results,
+            )
         }
 
         fn try_send_to_from_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
-            bufs: &mut dyn Iterator<
-                Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, libc::c_int),
-            >,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, SendFlags)>,
             results: &mut Vec<Result<usize>>,
         ) -> Result<usize> {
-            self.do_batch_op(TrySendToFromBatchOp::new(), fd, bufs, results)
+            self.do_batch_op(
+                TrySendToFromBatchOp::new(),
+                handle.as_fd(),
+                &mut bufs.map(|(buf, dst, src, flags)| (buf, dst, src, flags.bits())),
+                results,
+            )
         }
 
         fn try_recv_buf_from_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
+            handle: WaitHandle<'_>,
             bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
             results: &mut Vec<Result<ReceivedPacket>>,
         ) -> Result<usize> {
-            self.do_batch_op(TryRecvBufFromBatchOp::new(), fd, bufs, results)
+            self.do_batch_op(TryRecvBufFromBatchOp::new(), handle.as_fd(), bufs, results)
         }
 
         fn try_recv_buf_from_to_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
+            handle: WaitHandle<'_>,
             bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
             results: &mut Vec<Result<ReceivedPacket>>,
         ) -> Result<usize> {
-            self.do_batch_op(TryRecvBufFromToBatchOp::new(), fd, bufs, results)
+            self.do_batch_op(
+                TryRecvBufFromToBatchOp::new(),
+                handle.as_fd(),
+                bufs,
+                results,
+            )
         }
     }
 
@@ -1127,6 +1205,7 @@ mod posix_unbatched {
     //! Unbatched implementation using POSIX primitives.
 
     use super::*;
+    use crate::sys::wait::WaitHandle;
     use bytes::BufMut;
     use nix::cmsg_space;
     use nix::sys::socket::{
@@ -1211,13 +1290,13 @@ mod posix_unbatched {
 
         fn try_write_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
+            handle: WaitHandle<'_>,
             bufs: &mut dyn Iterator<Item = &'a [u8]>,
             results: &mut Vec<Result<usize>>,
         ) -> Result<usize> {
             Self::do_batch_op(
                 |fd, buf| unistd::write(fd, buf).map_err(errno_to_error),
-                fd,
+                handle.as_fd(),
                 bufs,
                 results,
             )
@@ -1225,7 +1304,7 @@ mod posix_unbatched {
 
         fn try_read_buf_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
+            handle: WaitHandle<'_>,
             bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
             results: &mut Vec<Result<usize>>,
         ) -> Result<usize> {
@@ -1239,7 +1318,7 @@ mod posix_unbatched {
                     unsafe { buf.advance_mut(amt as usize) };
                     Ok(amt)
                 },
-                fd,
+                handle.as_fd(),
                 bufs,
                 results,
             )
@@ -1247,21 +1326,21 @@ mod posix_unbatched {
 
         fn try_send_to_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
-            bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, libc::c_int)>,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, SendFlags)>,
             results: &mut Vec<Result<usize>>,
         ) -> Result<usize> {
             Self::do_batch_op(
-                |fd, (buf, addr, flags)| {
+                |fd, (buf, addr, flags): (_, _, SendFlags)| {
                     socket::sendto(
                         fd.as_raw_fd(),
                         buf,
                         &SockaddrStorage::from(addr),
-                        MsgFlags::from_bits_retain(flags),
+                        MsgFlags::from_bits_retain(flags.bits()),
                     )
                     .map_err(errno_to_error)
                 },
-                fd,
+                handle.as_fd(),
                 bufs,
                 results,
             )
@@ -1269,21 +1348,19 @@ mod posix_unbatched {
 
         fn try_send_to_from_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
-            bufs: &mut dyn Iterator<
-                Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, libc::c_int),
-            >,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, SendFlags)>,
             results: &mut Vec<Result<usize>>,
         ) -> Result<usize> {
             Self::do_batch_op(
-                |fd, (buf, dst, src, flags)| match src {
+                |fd, (buf, dst, src, flags): (_, _, _, SendFlags)| match src {
                     Some(src) => {
                         scoped_ip_addr_to_cmsg!(cmsg: &src);
                         socket::sendmsg(
                             fd.as_raw_fd(),
                             &[IoSlice::new(buf)],
                             &[cmsg],
-                            MsgFlags::from_bits_retain(flags),
+                            MsgFlags::from_bits_retain(flags.bits()),
                             Some(&SockaddrStorage::from(dst)),
                         )
                         .map_err(errno_to_error)
@@ -1293,11 +1370,11 @@ mod posix_unbatched {
                         fd.as_raw_fd(),
                         buf,
                         &SockaddrStorage::from(dst),
-                        MsgFlags::from_bits_retain(flags),
+                        MsgFlags::from_bits_retain(flags.bits()),
                     )
                     .map_err(errno_to_error),
                 },
-                fd,
+                handle.as_fd(),
                 bufs,
                 results,
             )
@@ -1305,7 +1382,7 @@ mod posix_unbatched {
 
         fn try_recv_buf_from_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
+            handle: WaitHandle<'_>,
             bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
             results: &mut Vec<Result<ReceivedPacket>>,
         ) -> Result<usize> {
@@ -1336,7 +1413,7 @@ mod posix_unbatched {
                         destination: None,
                     })
                 },
-                fd,
+                handle.as_fd(),
                 bufs,
                 results,
             )
@@ -1344,7 +1421,7 @@ mod posix_unbatched {
 
         fn try_recv_buf_from_to_batch<'a>(
             &mut self,
-            fd: BorrowedFd<'_>,
+            handle: WaitHandle<'_>,
             bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
             results: &mut Vec<Result<ReceivedPacket>>,
         ) -> Result<usize> {
@@ -1377,7 +1454,7 @@ mod posix_unbatched {
                         destination,
                     })
                 },
-                fd,
+                handle.as_fd(),
                 bufs,
                 results,
             )
@@ -1491,7 +1568,7 @@ impl BatchIo {
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize> {
         self.0
-            .try_write_batch(fd.as_fd(), &mut bufs.into_iter(), results)
+            .try_write_batch(fd.as_fd().into(), &mut bufs.into_iter(), results)
     }
 
     pub fn try_read_buf_batch<'a, B>(
@@ -1504,7 +1581,7 @@ impl BatchIo {
         B: BufMut + 'a,
     {
         self.0.try_read_buf_batch(
-            fd.as_fd(),
+            fd.as_fd().into(),
             &mut bufs.into_iter().map(|b| b as &mut dyn BufMut),
             results,
         )
@@ -1514,21 +1591,21 @@ impl BatchIo {
     pub fn try_send_to_batch<'a>(
         &mut self,
         fd: impl AsFd,
-        bufs: impl IntoIterator<Item = (&'a [u8], SocketAddr, libc::c_int)>,
+        bufs: impl IntoIterator<Item = (&'a [u8], SocketAddr, SendFlags)>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize> {
         self.0
-            .try_send_to_batch(fd.as_fd(), &mut bufs.into_iter(), results)
+            .try_send_to_batch(fd.as_fd().into(), &mut bufs.into_iter(), results)
     }
 
     pub fn try_send_to_from_batch<'a>(
         &mut self,
         fd: impl AsFd,
-        bufs: impl IntoIterator<Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, libc::c_int)>,
+        bufs: impl IntoIterator<Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, SendFlags)>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize> {
         self.0
-            .try_send_to_from_batch(fd.as_fd(), &mut bufs.into_iter(), results)
+            .try_send_to_from_batch(fd.as_fd().into(), &mut bufs.into_iter(), results)
     }
 
     #[allow(dead_code)]
@@ -1542,7 +1619,7 @@ impl BatchIo {
         B: BufMut + 'a,
     {
         self.0.try_recv_buf_from_batch(
-            fd.as_fd(),
+            fd.as_fd().into(),
             &mut bufs.into_iter().map(|b| b as &mut dyn BufMut),
             results,
         )
@@ -1558,7 +1635,7 @@ impl BatchIo {
         B: BufMut + 'a,
     {
         self.0.try_recv_buf_from_to_batch(
-            fd.as_fd(),
+            fd.as_fd().into(),
             &mut bufs.into_iter().map(|b| b as &mut dyn BufMut),
             results,
         )
@@ -1673,7 +1750,8 @@ mod tests {
 
             let n = bio.try_send_to_batch(
                 &inq,
-                msgs.iter().map(|msg| (msg.as_bytes(), dest, 0x000)),
+                msgs.iter()
+                    .map(|msg| (msg.as_bytes(), dest, SendFlags::none())),
                 &mut results,
             );
             assert!(n.unwrap() >= nmsgs);
@@ -1858,7 +1936,11 @@ mod tests {
             let mut results = Vec::new();
 
             let n = bio
-                .try_send_to_batch(&inq, (0..nmsgs).map(|_| (&msg[..], dest, 0)), &mut results)
+                .try_send_to_batch(
+                    &inq,
+                    (0..nmsgs).map(|_| (&msg[..], dest, SendFlags::none())),
+                    &mut results,
+                )
                 .unwrap();
 
             assert!(
