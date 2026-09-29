@@ -770,6 +770,70 @@ fi
 fi
 
 #
+# Leg 3 — adapter key removed: adapter2 is revoked, adapter1 unaffected
+#
+
+if [[ "$PASS" == 0 ]] then
+echo
+echo "LEG 3: install a policy lacking adapter2's bootstrap key"
+
+if ! install_policy "$PREGEN/$POLICY_NO_ADAPTER2_BIN"; then
+  echo "ERROR: leg-3 policy install failed"
+  PASS=1
+fi
+fi
+
+if [[ "$PASS" == 0 ]] then
+# The removal must be exercised END TO END (the zipline#104 lesson): it is
+# not enough that adapter2 goes away — it must have PRESENTED its key under
+# the new generation and been REJECTED. The VS logs the rejection.
+if ! wait_for_log "$REAUTH_WAIT" vs.log "reauthorize failed for actor $B_ZPR_ADDR "; then
+  echo "ERROR: adapter2 never presented its (removed) key, or the VS never rejected it"
+  echo "       (a revocation without a rejected attempt exercises nothing)"
+  grep -E "reauthorize" vs.log | tail -n 10 || true
+  PASS=1
+else
+  echo "the VS rejected adapter2's re-auth under the new policy:"
+  grep -E "reauthorize failed for actor $B_ZPR_ADDR " vs.log | head -n 2
+fi
+fi
+
+if [[ "$PASS" == 0 ]] then
+# The sweep revokes adapter2 within reauth_deadline + one sweep period.
+if ! wait_for_log "$REVOKE_WAIT" vs.log \
+    "reauth sweep: adapter $B_ZPR_ADDR did not re-authenticate under vinst .* by the deadline; revoked"; then
+  echo "ERROR: the sweep never revoked adapter2 within ${REVOKE_WAIT}s"
+  grep -E "reauth sweep" vs.log | tail -n 20 || true
+  PASS=1
+else
+  echo "sweep revoked adapter2:"
+  grep -E "reauth sweep: adapter $B_ZPR_ADDR" vs.log | head -n 2
+fi
+
+# The node must NOT have been disconnected: it re-authenticated fine.
+if grep -qE "disconnecting it" vs.log; then
+  echo "ERROR: the node was disconnected during leg 3:"
+  grep -E "reauth sweep: node" vs.log | head -n 5
+  PASS=1
+fi
+fi
+
+if [[ "$PASS" == 0 ]] then
+# adapter1 is unaffected: its user still reaches PingableVs across the
+# boundary — while adapter2, revoked and its visas dropped, is unreachable.
+if ! sudo ip netns exec zpr-a ping -q -c 5 -w 10 "$VS_ZPR_ADDR"; then
+  echo "ERROR: adapter1's traffic stopped when adapter2 was revoked"
+  PASS=1
+fi
+if sudo ip netns exec zpr-a ping -q -c 3 -w 5 "$B_ZPR_ADDR"; then
+  echo "ERROR: traffic still flows to adapter2 after its revocation"
+  PASS=1
+else
+  echo "adapter1 unaffected; adapter2 unreachable, as expected"
+fi
+fi
+
+#
 #
 # Check stats
 #
