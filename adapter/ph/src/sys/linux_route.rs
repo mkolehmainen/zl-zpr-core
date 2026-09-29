@@ -4,9 +4,10 @@
 //! whose route loses to another live interface docks, activates, and then
 //! silently receives no traffic. This module holds the pure logic for the
 //! refuse-to-start / refuse-to-activate check: a parser for Linux
-//! `ip -6 route show <prefix>` output, and the platform-neutral conflict
-//! decision shared with the macOS path (whose `route -n get` parsing lives
-//! in [`super::macos_route`]).
+//! `ip -6 route show <prefix>` output, a parser for Windows
+//! `netsh interface ipv6 show route` output (zipline#130), and the
+//! platform-neutral conflict decision shared with the macOS path (whose
+//! `route -n get` parsing lives in [`super::macos_route`]).
 //!
 //! Platform-neutral on purpose: compiled on every OS so the logic stays
 //! unit-testable from a Linux build, same pattern as `sys::macos_route`.
@@ -28,14 +29,15 @@ pub struct ConflictingIf {
 
 /// Which platform's liveness rule to apply in [`route_owner_conflict`].
 ///
-/// One variant is inevitably never constructed at runtime on any given OS
+/// Variants are inevitably never constructed at runtime on any given OS
 /// (each platform builds only its own query path); the unit tests construct
-/// both, hence the `allow(dead_code)`.
+/// all of them, hence the `allow(dead_code)`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     Linux,
     MacOs,
+    Windows,
 }
 
 /// Parse `ip -6 route show <prefix>` output into the interfaces carrying
@@ -73,12 +75,75 @@ pub fn parse_route_show(stdout: &str) -> Vec<RouteOwner> {
     owners
 }
 
+/// Parse `netsh interface ipv6 show route` output into the interfaces
+/// carrying `prefix` (zipline#130).
+///
+/// The table looks like (verbatim Windows 11 capture, including the ragged
+/// column alignment of long-prefix rows — the `/128` row below overruns its
+/// column, so this parser is token-based, never position-based):
+///
+/// ```text
+/// Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name
+/// -------  --------  ---  ------------------------  ---  ------------------------
+/// No       System    256  ::1/128                     1  Loopback Pseudo-Interface 1
+/// No       System    256  fe80::9780:ee81:8cc0:1adf/128    4  Ethernet
+/// ```
+///
+/// A data row is: publish, type, metric, prefix, interface index, then the
+/// gateway/interface name — which may contain spaces, so it is everything
+/// after the index token. Rows are recognized by shape (token 4 numeric,
+/// token 3 containing `/`), which skips the header, the dashed rule, and
+/// blank lines without hardcoding any (locale-dependent) header text. Only
+/// rows whose prefix equals `prefix` are reported.
+///
+/// `netsh` reports no liveness flag, so `linkdown` is always false: on
+/// Windows a route's owner is treated as live by existence, same rule as
+/// macOS (see [`route_owner_conflict`]).
+///
+/// Locale robustness (plan open question 2): the shape-based row test avoids
+/// matching header words, but column *order* still follows the localized
+/// template. If a non-English locale proves unparsable, the documented
+/// upgrade path is `Get-NetRoute -AddressFamily IPv6 | ConvertTo-Json` via
+/// PowerShell, whose field names are locale-invariant.
+///
+/// Called at runtime only by the Windows query path; compiled (and tested)
+/// everywhere, hence the dead-code allowance on other targets.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_netsh_route_show(stdout: &str, prefix: &str) -> Vec<RouteOwner> {
+    let mut owners = Vec::new();
+    for line in stdout.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        // publish, type, met, prefix, idx, name... — at least 6 tokens.
+        if tokens.len() < 6 {
+            continue;
+        }
+        // Shape check: the prefix column contains a '/', the index column is
+        // numeric. The dashed rule and header rows fail both.
+        if !tokens[3].contains('/') || tokens[4].parse::<u32>().is_err() {
+            continue;
+        }
+        if tokens[3] != prefix {
+            continue;
+        }
+        // The interface name is every remaining token, spaces preserved.
+        let ifname = tokens[5..].join(" ");
+        owners.push(RouteOwner {
+            ifname,
+            linkdown: false,
+        });
+    }
+    owners
+}
+
 /// Decide whether any of `owners` conflicts with our TUN `our_ifname`.
 ///
 /// - A route on our own interface is never a conflict (the `tun_if`
 ///   pre-provisioned case).
 /// - macOS: any route on another interface is a conflict — a utun exists
 ///   only while its process holds it, so the owner is live by existence.
+/// - Windows: same existence rule as macOS — `netsh` reports no liveness
+///   flag, and a Wintun adapter normally exists only while its process
+///   holds it (zipline#130).
 /// - Linux: another interface counts only when it is up with carrier; a
 ///   `linkdown` route (stale persistent TUN, nobody attached) must not
 ///   block startup.
@@ -93,8 +158,9 @@ pub fn route_owner_conflict(
         .filter(|owner| owner.ifname != our_ifname)
         .find(|owner| match platform {
             // A utun exists only while its process holds it: existence is
-            // liveness.
-            Platform::MacOs => true,
+            // liveness. Wintun adapters follow the same rule, and netsh
+            // reports no liveness flag anyway.
+            Platform::MacOs | Platform::Windows => true,
             // A linkdown interface (persistent TUN, nobody attached) holds
             // only a stale route; it cannot be receiving ZPR traffic.
             Platform::Linux => !owner.linkdown,
@@ -326,6 +392,131 @@ fd5a:5052::/32 dev tunB metric 1024 pref medium
             Some(ConflictingIf {
                 ifname: "tun10".into()
             })
+        );
+    }
+
+    // ---- parse_netsh_route_show fixtures (zipline#130) ----
+    //
+    // `netsh interface ipv6 show route` output, captured verbatim from a
+    // real Windows 11 box (posted by the operator on zipline#130). Note the
+    // ragged column alignment of the /128 row: the long prefix overruns its
+    // column, so the parser must be token-based, not position-based.
+
+    /// The real Windows 11 capture. No ZPR route present.
+    const NETSH_WIN11_BASELINE: &str = "
+Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name
+-------  --------  ---  ------------------------  ---  ------------------------
+No       System    256  ::1/128                     1  Loopback Pseudo-Interface 1
+No       System    256  fe80::/64                   4  Ethernet
+No       System    256  fe80::9780:ee81:8cc0:1adf/128    4  Ethernet
+No       System    256  ff00::/8                    1  Loopback Pseudo-Interface 1
+No       System    256  ff00::/8                    4  Ethernet
+";
+
+    /// The same table with ZPR internal-network routes added the way ph
+    /// installs them (`netsh interface ipv6 add route fd5a:5052::/32 <if>`):
+    /// one on our own Wintun adapter (`zpr`), and — for the conflict cases —
+    /// one on a second adapter with a spaced name.
+    const NETSH_WIN11_ZPR_OURS: &str = "
+Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name
+-------  --------  ---  ------------------------  ---  ------------------------
+No       System    256  ::1/128                     1  Loopback Pseudo-Interface 1
+No       Manual    256  fd5a:5052::/32              7  zpr
+No       System    256  fe80::/64                   4  Ethernet
+No       System    256  ff00::/8                    4  Ethernet
+";
+
+    const NETSH_WIN11_ZPR_OTHER: &str = "
+Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name
+-------  --------  ---  ------------------------  ---  ------------------------
+No       System    256  ::1/128                     1  Loopback Pseudo-Interface 1
+No       Manual    256  fd5a:5052::/32              9  ZPR Adapter 2
+No       System    256  fe80::/64                   4  Ethernet
+";
+
+    #[test]
+    fn netsh_parse_baseline_has_no_zpr_owner() {
+        // The real capture: five routes, none for the ZPR prefix.
+        assert_eq!(
+            parse_netsh_route_show(NETSH_WIN11_BASELINE, "fd5a:5052::/32"),
+            Vec::<RouteOwner>::new()
+        );
+    }
+
+    #[test]
+    fn netsh_parse_survives_ragged_128_row() {
+        // The /128 row overruns its column (verbatim from the Windows 11
+        // capture); the parser must still attribute it to `Ethernet`, and
+        // must still see the rows after it.
+        let owners = parse_netsh_route_show(NETSH_WIN11_BASELINE, "fe80::9780:ee81:8cc0:1adf/128");
+        assert_eq!(
+            owners,
+            vec![RouteOwner {
+                ifname: "Ethernet".into(),
+                linkdown: false
+            }]
+        );
+    }
+
+    #[test]
+    fn netsh_parse_keeps_spaces_in_interface_names() {
+        let owners = parse_netsh_route_show(NETSH_WIN11_BASELINE, "::1/128");
+        assert_eq!(
+            owners,
+            vec![RouteOwner {
+                ifname: "Loopback Pseudo-Interface 1".into(),
+                linkdown: false
+            }]
+        );
+    }
+
+    #[test]
+    fn netsh_parse_duplicate_prefix_reports_every_owner() {
+        // ff00::/8 appears once per interface in the capture.
+        let owners = parse_netsh_route_show(NETSH_WIN11_BASELINE, "ff00::/8");
+        assert_eq!(
+            owners,
+            vec![
+                RouteOwner {
+                    ifname: "Loopback Pseudo-Interface 1".into(),
+                    linkdown: false
+                },
+                RouteOwner {
+                    ifname: "Ethernet".into(),
+                    linkdown: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_own_adapter_route_is_no_conflict() {
+        let owners = parse_netsh_route_show(NETSH_WIN11_ZPR_OURS, "fd5a:5052::/32");
+        assert_eq!(
+            route_owner_conflict(&owners, "zpr", Platform::Windows),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_other_adapter_route_is_a_conflict() {
+        // netsh output carries no liveness flag, so any other owner
+        // conflicts (existence semantics, like macOS).
+        let owners = parse_netsh_route_show(NETSH_WIN11_ZPR_OTHER, "fd5a:5052::/32");
+        assert_eq!(
+            route_owner_conflict(&owners, "zpr", Platform::Windows),
+            Some(ConflictingIf {
+                ifname: "ZPR Adapter 2".into()
+            })
+        );
+    }
+
+    #[test]
+    fn windows_no_route_is_no_conflict() {
+        let owners = parse_netsh_route_show(NETSH_WIN11_BASELINE, "fd5a:5052::/32");
+        assert_eq!(
+            route_owner_conflict(&owners, "zpr", Platform::Windows),
+            None
         );
     }
 }
