@@ -354,11 +354,14 @@ impl Config {
     /// and are left untouched.
     pub fn apply_socket_owner(&mut self, owner: Option<SocketOwner>) {
         if let Some(ref owner) = owner {
+            // Same owner-id spelling as admin_api::current_user_id, which
+            // is what a same-user ph-cli derives its path from.
+            let owner_id = owner.uid.to_string();
             if self.control_path_derived {
-                self.control_path = control_socket_path(Some(owner.uid));
+                self.control_path = control_socket_path(Some(&owner_id));
             }
             if self.capture_path_derived {
-                self.capture_path = capture_socket_path(Some(owner.uid));
+                self.capture_path = capture_socket_path(Some(&owner_id));
             }
         }
         self.socket_owner = owner;
@@ -368,6 +371,9 @@ impl Config {
     /// owner) for each still-derived socket path, so `check_valid`'s
     /// parent-directory check passes without pre-provisioning (zipline#39).
     /// Explicit paths keep today's contract: their parent must already exist.
+    /// Unix only: on Windows the control channel is a named pipe, with no
+    /// directory to create (plan D6).
+    #[cfg(unix)]
     pub fn prepare_socket_dirs(&self) -> Result<(), ArgsError> {
         use std::os::unix::fs::PermissionsExt;
         for (path, derived) in [
@@ -1088,8 +1094,8 @@ mod test {
             uid: 1234,
             gid: Some(1234),
         }));
-        assert_eq!(config.control_path, control_socket_path(Some(1234)));
-        assert_eq!(config.capture_path, capture_socket_path(Some(1234)));
+        assert_eq!(config.control_path, control_socket_path(Some("1234")));
+        assert_eq!(config.capture_path, capture_socket_path(Some("1234")));
         assert_eq!(
             config.socket_owner,
             Some(SocketOwner {
@@ -1145,6 +1151,7 @@ mod test {
     /// paths, so config validation passes even though the parent did not
     /// pre-exist (zipline#39). Uses the current euid so the chown is a no-op
     /// permitted without root.
+    #[cfg(unix)]
     #[test]
     fn test_prepare_socket_dirs_creates_derived_parent() {
         let tstamp = SystemTime::now()
@@ -1189,6 +1196,7 @@ mod test {
     /// Explicit socket paths are left alone by `prepare_socket_dirs`: a
     /// missing parent stays missing and still fails validation, exactly as
     /// today (zipline#39).
+    #[cfg(unix)]
     #[test]
     fn test_prepare_socket_dirs_leaves_explicit_paths_alone() {
         let tstamp = SystemTime::now()

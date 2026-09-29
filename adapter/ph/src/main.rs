@@ -8,7 +8,6 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::process;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::*;
@@ -54,6 +53,7 @@ mod sample_ring;
 #[cfg(not(feature = "capnp-ancillary"))]
 mod set_capture_file_worker;
 mod signal_worker;
+#[cfg(unix)]
 mod socket_access;
 mod special_peers;
 mod sys;
@@ -95,27 +95,6 @@ use zpr::addrs::{
 };
 use zpr::packet_info::{DOCK_LINK_ID, LOCAL_ACTOR_LINK_ID};
 use zpr::vsapi_types::AuthServicesList;
-
-/// Creates a nonblocking local socket pair suitable for transferring
-/// PACKET_BUFFER_SIZE-sized messages.
-fn packet_buffer_socket_pair(
-    queue_size: usize,
-) -> std::io::Result<(
-    std::os::unix::net::UnixDatagram,
-    std::os::unix::net::UnixDatagram,
-)> {
-    // NOTE: ideally we'd use SOCK_SEQPACKET for reliable delivery, but it
-    // isn't supported on macOS, and Linux provides reliable delivery
-    // with SOCK_DGRAM.
-    let (a, b) = socket2::Socket::pair(socket2::Domain::UNIX, socket2::Type::DGRAM, None)?;
-    a.set_send_buffer_size(queue_size * config::PACKET_BUFFER_SIZE)?;
-    a.set_recv_buffer_size(queue_size * config::PACKET_BUFFER_SIZE)?;
-    b.set_send_buffer_size(queue_size * config::PACKET_BUFFER_SIZE)?;
-    b.set_recv_buffer_size(queue_size * config::PACKET_BUFFER_SIZE)?;
-    a.set_nonblocking(true)?;
-    b.set_nonblocking(true)?;
-    Ok((a.into(), b.into()))
-}
 
 fn main() -> ExitCode {
     let system_start_time = std::time::Instant::now();
@@ -242,8 +221,7 @@ fn main() -> ExitCode {
 
     let topology_config = config::TopologyConfig::default();
 
-    let (cap_inq, cap_outq) =
-        packet_buffer_socket_pair(topology_config.capture_queue_size).unwrap();
+    let (cap_inq, cap_outq) = queues::capture_queue(topology_config.capture_queue_size);
     let (md_inq_factory, md_outq) =
         two_way_queue::two_way_queue(topology_config.mgmt_dispatch_queue_size);
     let (mhd_inq, mhd_outq) = mpsc::channel(topology_config.mgmt_dispatch_queue_size);
@@ -267,21 +245,10 @@ fn main() -> ExitCode {
     // create control socket
     //
 
-    let control_socket = match socket_access::bind_socket("control", &config.control_path)
-        .and_then(UnixListener::from_std)
-    {
-        Ok(socket) => socket,
-        Err(e) => {
-            error!(target: STARTUP, "{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    info!(target: STARTUP, "control socket bound to {:?}", config.control_path);
-
-    // zipline#39: hand the socket to whoever should drive ph-cli. Owner known
+    // zipline#39: hand the sockets to whoever should drive ph-cli. Owner known
     // (sudo/pkexec): chown to that user, mode 0600. Owner unknown (systemd):
     // group "zpr" with mode 0660 when the group exists; otherwise leave the
-    // socket exactly as before and warn once.
+    // sockets exactly as before and warn once.
     let socket_plan = socket_access::plan_socket_access(
         config.socket_owner.as_ref(),
         socket_access::system_user_primary_gid,
@@ -295,33 +262,29 @@ fn main() -> ExitCode {
             socket_access::FALLBACK_GROUP
         );
     }
-    if let Err(e) = socket_access::apply_socket_access(&config.control_path, &socket_plan) {
-        warn!(
-            target: STARTUP,
-            "failed to set ownership/mode on control socket {:?}: {e}", config.control_path
-        );
-    }
 
-    #[cfg(not(feature = "capnp-ancillary"))]
-    let capture_socket = {
-        let capture_socket = match socket_access::bind_socket("capture", &config.capture_path)
-            .and_then(UnixListener::from_std)
-        {
-            Ok(socket) => Arc::new(socket),
+    let control_listener =
+        match sys::control::ControlListener::bind(&config.control_path, &socket_plan) {
+            Ok(listener) => listener,
             Err(e) => {
                 error!(target: STARTUP, "{e}");
                 return ExitCode::FAILURE;
             }
         };
-        info!(target: STARTUP, "capture socket bound to {:?}", config.capture_path);
-        // zipline#39: same ownership/mode treatment as the control socket.
-        if let Err(e) = socket_access::apply_socket_access(&config.capture_path, &socket_plan) {
-            warn!(
-                target: STARTUP,
-                "failed to set ownership/mode on capture socket {:?}: {e}", config.capture_path
-            );
+
+    // The capture socket exists only where capture is supported (plan D7);
+    // elsewhere setCaptureFile answers Unsupported.
+    #[cfg(not(feature = "capnp-ancillary"))]
+    let capture_socket = if sys::capture_supported() {
+        match socket_access::bind_owned_listener("capture", &config.capture_path, &socket_plan) {
+            Ok(socket) => Some(Arc::new(socket)),
+            Err(e) => {
+                error!(target: STARTUP, "{e}");
+                return ExitCode::FAILURE;
+            }
         }
-        capture_socket
+    } else {
+        None
     };
 
     //
@@ -642,7 +605,7 @@ fn main() -> ExitCode {
         vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
         deferred_vs_connect: Mutex::new(None),
         self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
-        capture_queue: Capture::new(cap_inq),
+        capture_queue: cap_inq,
         capture_worker: CaptureWorker::new(),
         flow_control: FlowControl::new(),
         counters: Default::default(),
@@ -788,11 +751,10 @@ fn main() -> ExitCode {
     js.spawn_local(mgmt_dispatch_worker::launch(asm.clone(), md_outq, mhd_outq));
     js.spawn_local(adapter_manager_worker::launch(asm.clone(), am_outq));
     #[cfg(not(feature = "capnp-ancillary"))]
-    js.spawn_local(set_capture_file_worker::launch(
-        asm.clone(),
-        capture_socket.clone(),
-    ));
-    js.spawn_local(admin_worker::launch(asm.clone(), control_socket));
+    if let Some(capture_socket) = capture_socket {
+        js.spawn_local(set_capture_file_worker::launch(asm.clone(), capture_socket));
+    }
+    js.spawn_local(admin_worker::launch(asm.clone(), control_listener));
     js.spawn_local(km_multiplexor::launch_signal_worker(
         asm.clone(),
         km_sig_outq,
@@ -858,7 +820,7 @@ fn main() -> ExitCode {
             batch_size: asm.topology_config.capture_batch_size,
         },
         asm.clone(),
-        tokio::net::UnixDatagram::from_std(cap_outq).unwrap(),
+        cap_outq,
     ));
 
     if ph_mode == PhMode::Node {

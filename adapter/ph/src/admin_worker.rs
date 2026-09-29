@@ -11,6 +11,8 @@ use crate::link_state::{
 use crate::logging;
 use crate::logging::{levels, targets};
 use crate::prelude::*;
+use crate::sys;
+use crate::sys::control::ControlListener;
 use crate::test_packet::TestPacketMetrics;
 use crate::zdp::TerminateReason;
 use admin_api::rpc_commands::RpcCommands;
@@ -22,85 +24,114 @@ use hdrhistogram::Histogram;
 use std::cell::RefCell;
 use std::f64::consts::SQRT_2;
 use std::fmt::Write;
-use std::io::Error;
-use std::io::IoSliceMut;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{BufReader, BufWriter};
 use tokio::sync::oneshot::error::RecvError;
 use tokio::task::JoinSet;
 use tokio::time::interval;
 use tokio_util::compat::*;
-use zpr_ext::std::os::unix::net::{AncillaryData, SocketAncillary};
-use zpr_ext::tokio::net::*;
 
+/// Accept control connections forever, serving the admin RPC on each.
 pub async fn launch_capnp(
     asm: Arc<Assembly>,
-    listener: UnixListener,
+    listener: ControlListener,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let (sock, _addr) = listener.accept().await?;
-
-        let (reader, writer) = sock.into_split();
+        let stream = listener.accept().await?;
 
         #[cfg(not(feature = "capnp-ancillary"))]
-        let network = capnp_rpc::twoparty::VatNetwork::new(
-            tokio::io::BufReader::new(reader).compat(),
-            tokio::io::BufWriter::new(writer).compat_write(),
-            capnp_rpc::rpc_twoparty_capnp::Side::Server,
-            capnp::message::ReaderOptions::new(),
-        );
+        let network = byte_stream_network(stream, capnp_rpc::rpc_twoparty_capnp::Side::Server);
 
-        //use an FD-passing transport instead of a plain byte stream.
+        // Use an FD-passing transport instead of a plain byte stream.
         #[cfg(feature = "capnp-ancillary")]
-        let network = capnp_rpc::twoparty::io::VatNetwork::new_with_fds(
-            capnp_futures::io::tokio::UnixFdStream::new(reader),
-            capnp_futures::io::tokio::UnixFdStream::new(writer),
-            1,
-            capnp_rpc::rpc_twoparty_capnp::Side::Server,
-            capnp::message::ReaderOptions::new(),
-        );
+        let network = {
+            let (reader, writer) = stream.into_split();
+            Box::new(capnp_rpc::twoparty::io::VatNetwork::new_with_fds(
+                capnp_futures::io::tokio::UnixFdStream::new(reader),
+                capnp_futures::io::tokio::UnixFdStream::new(writer),
+                1,
+                capnp_rpc::rpc_twoparty_capnp::Side::Server,
+                capnp::message::ReaderOptions::new(),
+            ))
+        };
 
-        let agent_registrations = Rc::new(RefCell::new(Vec::new()));
-        let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
-            asm: asm.clone(),
-            agent_registrations: agent_registrations.clone(),
-        });
-
-        let rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), Some(service.clone().client));
-        let cleanup_asm = asm.clone();
-        tokio::task::spawn_local(async move {
-            let err = rpc_system.await;
-            // This admin RPC connection is gone. Any AuthAgent registered
-            // over it is dead too: clear each link's agent slot (unless a
-            // newer agent has since replaced it) so renewal logic and
-            // showLink report the true state (zipline#45).
-            for (link_id, handle) in agent_registrations.borrow_mut().drain(..) {
-                if let Some(peer) = cleanup_asm.peer_table.get(link_id) {
-                    if peer.link_state_machine.clear_auth_agent_if(&handle) {
-                        debug!(
-                            target: RPC,
-                            "AuthAgent for {} unregistered (admin connection closed)",
-                            cleanup_asm.formatted_link_id(link_id)
-                        );
-                    }
-                }
-            }
-            err
-        });
+        serve_connection(asm.clone(), network, sys::capture_supported());
     }
 }
 
-pub async fn launch(asm: Arc<Assembly>, listener: UnixListener) {
+/// The two-party Cap'n Proto network over any byte stream: the control
+/// channel's transport (unix socket today, named pipe on Windows) is
+/// invisible above this point.
+fn byte_stream_network<S>(
+    stream: S,
+    side: capnp_rpc::rpc_twoparty_capnp::Side,
+) -> Box<capnp_rpc::twoparty::VatNetwork<Compat<BufReader<tokio::io::ReadHalf<S>>>>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+{
+    let (reader, writer) = tokio::io::split(stream);
+    Box::new(capnp_rpc::twoparty::VatNetwork::new(
+        BufReader::new(reader).compat(),
+        BufWriter::new(writer).compat_write(),
+        side,
+        capnp::message::ReaderOptions::new(),
+    ))
+}
+
+/// Serve the admin RPC on one connection's `network`, on a local task.
+/// When the connection closes, any AuthAgent registered over it is
+/// unregistered (zipline#45).
+fn serve_connection(
+    asm: Arc<Assembly>,
+    network: Box<dyn capnp_rpc::VatNetwork<capnp_rpc::rpc_twoparty_capnp::Side>>,
+    capture_supported: bool,
+) {
+    let agent_registrations = Rc::new(RefCell::new(Vec::new()));
+    let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
+        asm: asm.clone(),
+        agent_registrations: agent_registrations.clone(),
+        capture_supported,
+    });
+
+    let rpc_system = capnp_rpc::RpcSystem::new(network, Some(service.clone().client));
+    tokio::task::spawn_local(async move {
+        let err = rpc_system.await;
+        // This admin RPC connection is gone. Any AuthAgent registered
+        // over it is dead too: clear each link's agent slot (unless a
+        // newer agent has since replaced it) so renewal logic and
+        // showLink report the true state (zipline#45).
+        for (link_id, handle) in agent_registrations.borrow_mut().drain(..) {
+            if let Some(peer) = asm.peer_table.get(link_id) {
+                if peer.link_state_machine.clear_auth_agent_if(&handle) {
+                    debug!(
+                        target: RPC,
+                        "AuthAgent for {} unregistered (admin connection closed)",
+                        asm.formatted_link_id(link_id)
+                    );
+                }
+            }
+        }
+        err
+    });
+}
+
+/// Run the admin RPC server until the control listener fails.
+pub async fn launch(asm: Arc<Assembly>, listener: ControlListener) {
     match launch_capnp(asm.clone(), listener).await {
         Ok(()) => (),
         Err(e) => error!(target: RPC, "RPC System error: {}", e),
     };
+}
+
+/// The error `setCaptureFile` returns where capture is not supported
+/// (plan D7).
+fn capture_unsupported() -> capnp::Error {
+    capnp::Error::unimplemented("capture is not available on this platform".to_string())
 }
 
 struct AdminServiceImpl {
@@ -112,6 +143,10 @@ struct AdminServiceImpl {
     /// reflects reality again (zipline#45). Guarded clearing: a NEWER agent
     /// registered over another connection is left in place.
     agent_registrations: Rc<RefCell<Vec<(u32, AuthAgentHandle)>>>,
+    /// Whether `setCaptureFile` may open a capture file here
+    /// ([sys::capture_supported]; injected so tests can exercise the
+    /// unsupported path on unix).
+    capture_supported: bool,
 }
 
 impl svc::Server for AdminServiceImpl {
@@ -197,6 +232,9 @@ impl svc::Server for AdminServiceImpl {
         _: svc::SetCaptureFileParams,
         _: svc::SetCaptureFileResults,
     ) -> Result<(), capnp::Error> {
+        if !self.capture_supported {
+            return Err(capture_unsupported());
+        }
         Err(capnp::Error::unimplemented(
             "method cmd_line_inter::Server::set_capture_file not implemented".to_string(),
         ))
@@ -210,6 +248,9 @@ impl svc::Server for AdminServiceImpl {
         mut results: svc::SetCaptureFileResults,
     ) -> Result<(), capnp::Error> {
         info!(target: RPC, "Set capture file procedure initiated");
+        if !self.capture_supported {
+            return Err(capture_unsupported());
+        }
         let capture_file = params.get()?.get_capture_file()?;
         let fd = capture_file.client.get_fd().await?;
         let results_builder = results.get().init_result();
@@ -725,43 +766,6 @@ fn values_from_hist(hist_name: &str, units: &str, hist: &Histogram<u64>) -> Stri
     let _ = write!(&mut values, "\n");
 
     values
-}
-
-// Takes in ancillary data, extracts the file descriptor, and creates a file using the
-// fd
-async fn set_capture_file(asm: &Assembly, ancillary: SocketAncillary<'_>) -> String {
-    info!(target: RPC, "Setting capture file");
-    // Get the ancillary data
-    let anc_message = ancillary.into_messages().nth(0).unwrap();
-    // Get the SCM rights from the ancillary data
-    if let AncillaryData::ScmRights(mut scm_rights) = anc_message.unwrap() {
-        debug!(target: RPC, "SCM Rights exist");
-        // See if there's actually data in the scm_rights, if yes try to open a
-        // capture file, otherwise report failure to open file
-        match scm_rights.nth(0) {
-            Some(fd) => {
-                let std_file = std::fs::File::from(fd.try_into_owned().unwrap()); // tokio::fs::File doesn't implement From<OwnedFd>
-                let tokio_file = File::from(std_file);
-                match asm.capture_worker.open_capture_file(tokio_file).await {
-                    Ok(()) => {
-                        debug!(target: RPC, "Capture file opened");
-                        format!("Capture file opened\n")
-                    }
-                    Err(err) => {
-                        debug!(target: RPC, "Error opening Capture file: {}\n", err);
-                        format!("Error opening Capture file: {}\n", err)
-                    }
-                }
-            }
-            None => {
-                debug!(target: RPC, "Error opening Capture file: no ancillary data received\n");
-                format!("Error opening Capture file: no ancillary data received\n")
-            }
-        }
-    } else {
-        debug!(target: RPC, "Error opening Capture file: no ancillary data received\n");
-        format!("Error opening Capture file: no ancillary data received\n")
-    }
 }
 
 /// Bridge a Cap'n Proto [cli::auth_agent::Client] onto the channel-based
@@ -1490,6 +1494,66 @@ mod test {
     /// started with `--auto-connect=false` parks in — must register the
     /// supplied AuthAgent on the link and start it (Inactive -> Keying),
     /// exactly as on a restarted link today.
+    /// The admin RPC is served over any byte stream (zipline#129): here an
+    /// in-memory duplex stands in for the unix socket / named pipe, and a
+    /// client on the other end completes an `echo` round trip.
+    #[tokio::test]
+    async fn test_admin_rpc_round_trips_over_any_byte_stream() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let (client_end, server_end) = tokio::io::duplex(4096);
+                serve_connection(
+                    asm,
+                    byte_stream_network(server_end, capnp_rpc::rpc_twoparty_capnp::Side::Server),
+                    true,
+                );
+
+                let mut client_rpc = capnp_rpc::RpcSystem::new(
+                    byte_stream_network(client_end, capnp_rpc::rpc_twoparty_capnp::Side::Client),
+                    None,
+                );
+                let service: svc::Client =
+                    client_rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+                tokio::task::spawn_local(client_rpc);
+
+                service
+                    .echo_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("echo over a duplex stream must succeed");
+            })
+            .await
+    }
+
+    /// Where capture is unsupported (plan D7), `setCaptureFile` fails with
+    /// Unimplemented and says why, before looking at its arguments.
+    #[tokio::test]
+    async fn test_set_capture_file_unsupported_when_capture_unavailable() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
+                    asm,
+                    agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    capture_supported: false,
+                });
+
+                let err = match service.set_capture_file_request().send().promise.await {
+                    Ok(_) => panic!("setCaptureFile must fail where capture is unsupported"),
+                    Err(err) => err,
+                };
+                assert_eq!(err.kind, capnp::ErrorKind::Unimplemented);
+                assert!(
+                    err.extra
+                        .contains("capture is not available on this platform"),
+                    "unexpected error: {err}"
+                );
+            })
+            .await
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_start_link_rpc_wakes_idle_tether_and_registers_agent() {
         LocalSet::new()
@@ -1524,6 +1588,7 @@ mod test {
                 let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
                     asm: asm.clone(),
                     agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    capture_supported: true,
                 });
                 let agent: cli::auth_agent::Client = capnp_rpc::new_client(FakeAuthAgent {
                     id_token: "FAKE.JWT.TOKEN".to_string(),

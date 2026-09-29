@@ -1648,7 +1648,6 @@ mod tests {
     use bytes::BufMut;
     use std::io::Result;
     use std::net::UdpSocket;
-    use std::os::unix::net::UnixDatagram;
     use std::time::Duration;
 
     #[test]
@@ -1656,7 +1655,7 @@ mod tests {
         for engine in ENGINES {
             // FIXME: we need to test EAGAIN behavior... possibly by first filling queue, then draining a few
 
-            let (inq, outq) = UnixDatagram::pair().unwrap();
+            let (inq, outq) = connected_udp_pair().unwrap();
             inq.set_nonblocking(true).unwrap();
             outq.set_read_timeout(Some(Duration::from_millis(100)))
                 .unwrap();
@@ -1691,7 +1690,7 @@ mod tests {
     #[test]
     fn test_read() {
         for engine in ENGINES {
-            let (inq, outq) = UnixDatagram::pair().unwrap();
+            let (inq, outq) = connected_udp_pair().unwrap();
             inq.set_nonblocking(true).unwrap();
             outq.set_read_timeout(Some(Duration::from_millis(100)))
                 .unwrap();
@@ -2102,6 +2101,17 @@ mod tests {
         *state ^= *state >> 7;
         *state ^= *state << 17;
         *state
+    }
+
+    /// Two localhost UDP sockets connected to each other: a portable
+    /// stand-in for a datagram socketpair, so the TUN-side `read`/`write`
+    /// batch calls can be exercised without AF_UNIX (zipline#129).
+    fn connected_udp_pair() -> Result<(UdpSocket, UdpSocket)> {
+        let a = udp_socket()?;
+        let b = udp_socket()?;
+        a.connect(b.local_addr()?)?;
+        b.connect(a.local_addr()?)?;
+        Ok((a, b))
     }
 
     fn udp_socket() -> Result<UdpSocket> {

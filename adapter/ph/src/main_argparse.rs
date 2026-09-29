@@ -124,6 +124,7 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
     config.apply_socket_owner(admin_api::resolve_socket_owner(|key| {
         std::env::var(key).ok()
     }));
+    #[cfg(unix)]
     config.prepare_socket_dirs()?;
     if let Err(e) = config.check_valid(ph_mode) {
         return Err(e);

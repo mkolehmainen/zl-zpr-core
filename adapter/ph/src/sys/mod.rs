@@ -26,7 +26,16 @@ pub(crate) mod macos_route;
 pub(crate) mod linux_route;
 
 pub(crate) mod posix;
+pub use self::posix::control;
 pub use self::posix::notify;
+
+/// Whether this platform can capture packets to a file.  Capture hands `ph`
+/// a file descriptor over SCM_RIGHTS, so `ph` never opens a user-chosen
+/// path as root; there is no equivalent on Windows yet (plan D7), so there
+/// `setCaptureFile` answers Unsupported instead.
+pub const fn capture_supported() -> bool {
+    cfg!(unix)
+}
 
 // Readiness waiting over multiple OS objects (fds today, HANDLEs when the
 // Windows arm lands in zipline#130). See `docs/plans/2026-09-28-windows.md`.

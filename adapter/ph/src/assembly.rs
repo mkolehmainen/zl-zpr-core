@@ -923,8 +923,8 @@ pub mod test {
                 .unwrap_or_else(|| visa_table::VisaTable::new()),
         );
         let capture_queue = builder.capture_queue.unwrap_or_else(|| {
-            let (cq_inq, _cq_outq) = std::os::unix::net::UnixDatagram::pair().unwrap();
-            Capture::new(cq_inq)
+            let (cq_inq, _cq_outq) = crate::queues::capture_queue(1);
+            cq_inq
         });
         let capture_worker = builder
             .capture_worker

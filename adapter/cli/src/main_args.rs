@@ -34,19 +34,22 @@ pub fn resolve_sockets(
     explicit_control: Option<PathBuf>,
     explicit_capture: Option<PathBuf>,
 ) -> Result<(PathBuf, PathBuf), String> {
+    let user_id = admin_api::current_user_id()
+        .map_err(|e| format!("cannot determine the current user id: {e}"))?;
     resolve_sockets_with(
         explicit_control,
         explicit_capture,
-        nix::unistd::geteuid().as_raw(),
+        &user_id,
         admin_api::socket_is_live,
     )
 }
 
-/// Testable core of [resolve_sockets]: euid and liveness predicate injected.
+/// Testable core of [resolve_sockets]: the caller's user id (as
+/// [admin_api::current_user_id] spells it) and liveness predicate injected.
 pub fn resolve_sockets_with<F>(
     explicit_control: Option<PathBuf>,
     explicit_capture: Option<PathBuf>,
-    euid: u32,
+    user_id: &str,
     exists: F,
 ) -> Result<(PathBuf, PathBuf), String>
 where
@@ -55,7 +58,7 @@ where
     let explicit_control_given = explicit_control.is_some();
     let control = choose_socket_path(
         explicit_control,
-        control_socket_path(Some(euid)),
+        control_socket_path(Some(user_id)),
         control_socket_path(None),
         &exists,
     )?;
@@ -69,7 +72,7 @@ where
         // paths side by side), never an error — commands that do not touch
         // the capture socket must still run (zipline#39 review).
         None if explicit_control_given => {
-            let per_uid = capture_socket_path(Some(euid));
+            let per_uid = capture_socket_path(Some(user_id));
             let shared = capture_socket_path(None);
             if exists(&per_uid) {
                 per_uid
@@ -336,7 +339,7 @@ mod tests {
         let (control, capture) = resolve_sockets_with(
             Some(PathBuf::from("/x/control.sock")),
             Some(PathBuf::from("/y/capture.sock")),
-            1000,
+            "1000",
             |_: &Path| false,
         )
         .unwrap();
@@ -349,9 +352,9 @@ mod tests {
     /// the same directory (zipline#39).
     #[test]
     fn per_uid_socket_preferred() {
-        let per_uid = control_socket_path(Some(1000));
+        let per_uid = control_socket_path(Some("1000"));
         let (control, capture) =
-            resolve_sockets_with(None, None, 1000, |p: &Path| p == per_uid.as_path()).unwrap();
+            resolve_sockets_with(None, None, "1000", |p: &Path| p == per_uid.as_path()).unwrap();
         assert_eq!(control, per_uid);
         assert_eq!(capture, per_uid.parent().unwrap().join("capture.sock"));
     }
@@ -362,7 +365,7 @@ mod tests {
     fn shared_socket_fallback() {
         let shared = control_socket_path(None);
         let (control, capture) =
-            resolve_sockets_with(None, None, 1000, |p: &Path| p == shared.as_path()).unwrap();
+            resolve_sockets_with(None, None, "1000", |p: &Path| p == shared.as_path()).unwrap();
         assert_eq!(control, shared);
         assert_eq!(capture, shared.parent().unwrap().join("capture.sock"));
     }
@@ -370,9 +373,9 @@ mod tests {
     /// With no socket anywhere the error names both paths tried (zipline#39).
     #[test]
     fn missing_sockets_error_names_paths() {
-        let err = resolve_sockets_with(None, None, 1000, |_: &Path| false)
+        let err = resolve_sockets_with(None, None, "1000", |_: &Path| false)
             .expect_err("no socket exists, resolution must fail");
-        let per_uid = control_socket_path(Some(1000));
+        let per_uid = control_socket_path(Some("1000"));
         let shared = control_socket_path(None);
         assert!(
             err.contains(per_uid.to_str().unwrap()),
@@ -391,7 +394,7 @@ mod tests {
         let (control, capture) = resolve_sockets_with(
             None,
             Some(PathBuf::from("/y/capture.sock")),
-            1000,
+            "1000",
             |p: &Path| p == shared.as_path(),
         )
         .unwrap();
@@ -405,11 +408,11 @@ mod tests {
     /// `/tmp/capture.sock` (zipline#39 review).
     #[test]
     fn explicit_control_searches_capture_per_uid() {
-        let cap = capture_socket_path(Some(1000));
+        let cap = capture_socket_path(Some("1000"));
         let (control, capture) = resolve_sockets_with(
             Some(PathBuf::from("/x/control.sock")),
             None,
-            1000,
+            "1000",
             |p: &Path| p == cap.as_path(),
         )
         .unwrap();
@@ -428,7 +431,7 @@ mod tests {
         let (control, capture) = resolve_sockets_with(
             Some(PathBuf::from("/x/control.sock")),
             None,
-            1000,
+            "1000",
             |p: &Path| p == cap.as_path(),
         )
         .unwrap();
@@ -448,7 +451,7 @@ mod tests {
         let (control, capture) = resolve_sockets_with(
             Some(PathBuf::from("/x/control.sock")),
             None,
-            1000,
+            "1000",
             |_: &Path| false,
         )
         .unwrap();
