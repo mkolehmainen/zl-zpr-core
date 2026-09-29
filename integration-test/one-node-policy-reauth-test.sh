@@ -259,6 +259,36 @@ function wait_for_log_count() {
   return 1
 }
 
+# Assert an address is COMPLETELY unreachable from a netns. ping's exit code
+# cannot carry this: with `-c 3`, exit 1 means "fewer than three replies",
+# which includes one or two replies arriving — i.e. traffic still passing.
+# So parse the summary and require ZERO received packets. Exit codes >= 2 are
+# execution errors (bad netns, resolution, sockets), reported as such rather
+# than read as unreachability.
+# $1 = netns, $2 = address. Returns 0 iff ping ran and zero replies arrived.
+function assert_unreachable() {
+  local NETNS=$1
+  local ADDR=$2
+  local OUT RC RECEIVED
+  OUT=$(sudo ip netns exec "$NETNS" ping -q -c 3 -w 5 "$ADDR" 2>&1) && RC=0 || RC=$?
+  if (( RC >= 2 )); then
+    echo "ERROR: ping to $ADDR from $NETNS failed to execute (exit $RC):"
+    echo "$OUT"
+    return 1
+  fi
+  RECEIVED=$(sed -nE 's/.* transmitted, ([0-9]+) (packets )?received.*/\1/p' <<< "$OUT")
+  if [[ -z "$RECEIVED" ]]; then
+    echo "ERROR: could not parse the ping summary for $ADDR:"
+    echo "$OUT"
+    return 1
+  fi
+  if (( RECEIVED != 0 )); then
+    echo "ERROR: $RECEIVED of 3 pings to $ADDR were answered"
+    return 1
+  fi
+  return 0
+}
+
 # Run vs-admin against the admin API from inside the zpr-vs netns.
 function vs_admin() {
   sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" \
@@ -825,8 +855,10 @@ if ! sudo ip netns exec zpr-a ping -q -c 5 -w 10 "$VS_ZPR_ADDR"; then
   echo "ERROR: adapter1's traffic stopped when adapter2 was revoked"
   PASS=1
 fi
-if sudo ip netns exec zpr-a ping -q -c 3 -w 5 "$B_ZPR_ADDR"; then
-  echo "ERROR: traffic still flows to adapter2 after its revocation"
+# adapter2 must be COMPLETELY unreachable — zero replies, not merely "fewer
+# than three" (which is all ping's exit code can distinguish).
+if ! assert_unreachable zpr-a "$B_ZPR_ADDR"; then
+  echo "ERROR: traffic still flows to adapter2 after its revocation (or the probe failed; see above)"
   PASS=1
 else
   echo "adapter1 unaffected; adapter2 unreachable, as expected"
