@@ -2407,8 +2407,11 @@ mod tests {
             allow_offline_access: false,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let blocker = browser_unavailable_for(false, false)
-            .expect("test forces the headless leg of the predicate");
+        // Force the root leg: it blocks on every OS, whereas the
+        // no-DISPLAY leg is Linux-only (macOS `open` needs no DISPLAY), so
+        // forcing that leg made this test fail on macOS.
+        let blocker = browser_unavailable_for(true, false)
+            .expect("test forces the blocked leg of the predicate");
         let login_task = tokio::spawn(async move {
             let mut sink = move |m: &str| {
                 let _ = tx.send(m.to_string());
@@ -2435,7 +2438,7 @@ mod tests {
             "fallback did not print the URL: {fallback_msg}"
         );
         assert!(
-            fallback_msg.contains("DISPLAY"),
+            fallback_msg.contains(blocker),
             "fallback lacks the one-line explanation: {fallback_msg}"
         );
         let auth_url = fallback_msg.split_whitespace().last().unwrap().to_string();
