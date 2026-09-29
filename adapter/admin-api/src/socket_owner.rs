@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 
+#[cfg(unix)]
 use crate::data_home::get_data_home;
 
 /// The user a control/capture socket should belong to.
@@ -73,30 +74,53 @@ where
 /// connect. `/var/run/zpr` is `get_data_home`'s own no-environment fallback,
 /// is root-writable (ph creates `<base>/<uid>` chowned to the owner), and
 /// being tmpfs-backed on modern hosts clears stale sockets on reboot.
+#[cfg(unix)]
 pub const PER_UID_SOCKET_BASE: &str = "/var/run/zpr";
 
 /// The directory holding a known owner's sockets:
-/// [`PER_UID_SOCKET_BASE`]`/<uid>/`.
-pub fn owner_socket_dir(uid: u32) -> PathBuf {
-    PathBuf::from(PER_UID_SOCKET_BASE).join(uid.to_string())
+/// [`PER_UID_SOCKET_BASE`]`/<owner_id>/`. On unix `owner_id` is the
+/// decimal uid (see [crate::current_user_id]).
+#[cfg(unix)]
+pub fn owner_socket_dir(owner_id: &str) -> PathBuf {
+    PathBuf::from(PER_UID_SOCKET_BASE).join(owner_id)
 }
 
-/// Default control socket path for the given owner: per-uid when the owner
-/// is known, the shared `<data_home>/control.sock` when it is not.
-pub fn control_socket_path(owner_uid: Option<u32>) -> PathBuf {
-    socket_path(owner_uid, "control.sock")
+/// Default control channel path for the given owner: per-owner when the
+/// owner is known, the shared path when it is not. `owner_id` is what
+/// [crate::current_user_id] returns for that user (a decimal uid on unix, a
+/// SID string on Windows), so `ph` and `ph-cli` derive the same path.
+///
+/// * unix: `/var/run/zpr/<uid>/control.sock`, or `<data_home>/control.sock`.
+/// * Windows: the named pipe `\\.\pipe\zpr-control-<sid>`, or
+///   `\\.\pipe\zpr-control` (plan D6/D9).
+pub fn control_socket_path(owner_id: Option<&str>) -> PathBuf {
+    socket_path(owner_id, "control")
 }
 
 /// Default capture socket path; same derivation as [control_socket_path].
-pub fn capture_socket_path(owner_uid: Option<u32>) -> PathBuf {
-    socket_path(owner_uid, "capture.sock")
+/// (Windows has no capture channel yet (plan D7); the name is reserved.)
+pub fn capture_socket_path(owner_id: Option<&str>) -> PathBuf {
+    socket_path(owner_id, "capture")
 }
 
-// Shared derivation for both sockets.
-fn socket_path(owner_uid: Option<u32>, name: &str) -> PathBuf {
-    match owner_uid {
-        Some(uid) => owner_socket_dir(uid).join(name),
-        None => get_data_home().join(name),
+// Shared derivation for both sockets, unix arm: `<name>.sock` in the
+// owner's directory or the data home.
+#[cfg(unix)]
+fn socket_path(owner_id: Option<&str>, name: &str) -> PathBuf {
+    let file = format!("{name}.sock");
+    match owner_id {
+        Some(id) => owner_socket_dir(id).join(file),
+        None => get_data_home().join(file),
+    }
+}
+
+// Shared derivation for both sockets, Windows arm: a named pipe, which
+// lives in the pipe namespace rather than the filesystem.
+#[cfg(windows)]
+fn socket_path(owner_id: Option<&str>, name: &str) -> PathBuf {
+    match owner_id {
+        Some(sid) => PathBuf::from(format!(r"\\.\pipe\zpr-{name}-{sid}")),
+        None => PathBuf::from(format!(r"\\.\pipe\zpr-{name}")),
     }
 }
 
@@ -107,8 +131,23 @@ fn socket_path(owner_uid: Option<u32>, name: &str) -> PathBuf {
 /// file at the preferred per-uid path must not shadow a live server at the
 /// shared path. This is the predicate `ph-cli` injects into
 /// [choose_socket_path] — a probe connect, not an `exists()` check.
+#[cfg(unix)]
 pub fn socket_is_live(path: &std::path::Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+/// Whether a live packet handler is accepting connections on the named
+/// pipe `path`: opening a pipe client succeeds only while a server
+/// instance is listening. (A server whose every instance is busy also
+/// probes not-live, so the named-pipe server in zipline#130 must always
+/// keep a free instance waiting.)
+#[cfg(windows)]
+pub fn socket_is_live(path: &std::path::Path) -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .is_ok()
 }
 
 /// Which socket path a client (`ph-cli`) should use, given an optional
@@ -255,19 +294,47 @@ mod test {
 
     /// Owner known: per-uid path `/var/run/zpr/<uid>/control.sock`.
     /// Owner unknown: today's shared `<data_home>/control.sock`.
+    #[cfg(unix)]
     #[test]
     fn socket_paths_derive_from_owner() {
         let dh = get_data_home();
         assert_eq!(
-            control_socket_path(Some(1000)),
+            control_socket_path(Some("1000")),
             Path::new("/var/run/zpr/1000/control.sock")
         );
         assert_eq!(control_socket_path(None), dh.join("control.sock"));
         assert_eq!(
-            capture_socket_path(Some(1000)),
+            capture_socket_path(Some("1000")),
             Path::new("/var/run/zpr/1000/capture.sock")
         );
         assert_eq!(capture_socket_path(None), dh.join("capture.sock"));
+    }
+
+    /// Windows: owner known is a per-SID named pipe, owner unknown the
+    /// shared pipe (plan D6/D9).
+    #[cfg(windows)]
+    #[test]
+    fn socket_paths_derive_from_owner() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        assert_eq!(
+            control_socket_path(Some(sid)),
+            Path::new(r"\\.\pipe\zpr-control-S-1-5-21-1-2-3-1001")
+        );
+        assert_eq!(
+            control_socket_path(None),
+            Path::new(r"\\.\pipe\zpr-control")
+        );
+        assert_eq!(
+            capture_socket_path(Some(sid)),
+            Path::new(r"\\.\pipe\zpr-capture-S-1-5-21-1-2-3-1001")
+        );
+    }
+
+    /// Nothing listens on a made-up pipe name.
+    #[cfg(windows)]
+    #[test]
+    fn missing_pipe_is_not_live() {
+        assert!(!socket_is_live(Path::new(r"\\.\pipe\zpr-test-nonexistent")));
     }
 
     /// The per-uid base is a fixed location, never derived from the process
@@ -276,24 +343,27 @@ mod test {
     /// so any environment-derived base makes the two sides disagree and the
     /// advertised sudo-to-unprivileged workflow cannot connect (zipline#39
     /// review).
+    #[cfg(unix)]
     #[test]
     fn per_uid_base_is_environment_independent() {
-        assert_eq!(owner_socket_dir(1000), Path::new("/var/run/zpr/1000"));
+        assert_eq!(owner_socket_dir("1000"), Path::new("/var/run/zpr/1000"));
         assert_eq!(PER_UID_SOCKET_BASE, "/var/run/zpr");
     }
 
     /// The drift regression this issue exists to prevent: the path `ph`
     /// derives for a resolved owner uid is identical to the path `ph-cli`
     /// derives for its own euid when they are the same user.
+    #[cfg(unix)]
     #[test]
     fn ph_and_ph_cli_agree_on_per_uid_path() {
-        let uid = 4321u32; // ph resolved SUDO_UID=4321; ph-cli geteuid()==4321
-        let ph_side = control_socket_path(Some(uid));
-        let cli_side = owner_socket_dir(uid).join("control.sock");
+        // ph resolved SUDO_UID=4321 and formats it; ph-cli's
+        // current_user_id() is the same euid, formatted the same way.
+        let ph_side = control_socket_path(Some(&4321u32.to_string()));
+        let cli_side = owner_socket_dir("4321").join("control.sock");
         assert_eq!(ph_side, cli_side);
         assert_eq!(
-            capture_socket_path(Some(uid)),
-            owner_socket_dir(uid).join("capture.sock")
+            capture_socket_path(Some(&4321u32.to_string())),
+            owner_socket_dir("4321").join("capture.sock")
         );
     }
 
@@ -351,6 +421,7 @@ mod test {
 
     /// A socket path with a live listener probes as live (zipline#39
     /// review: liveness, not existence, selects the socket).
+    #[cfg(unix)]
     #[test]
     fn live_listener_probes_live() {
         let dir = temp_dir("live");
@@ -363,6 +434,7 @@ mod test {
     /// A stale socket file — left behind by a dead ph that never got to
     /// unlink it — must NOT probe live, or it shadows a live server at the
     /// fallback path (zipline#39 review).
+    #[cfg(unix)]
     #[test]
     fn stale_socket_file_is_not_live() {
         let dir = temp_dir("stale");
@@ -381,6 +453,7 @@ mod test {
     }
 
     /// A missing path is not live.
+    #[cfg(unix)]
     #[test]
     fn missing_path_is_not_live() {
         assert!(!socket_is_live(Path::new(
@@ -388,6 +461,7 @@ mod test {
         )));
     }
 
+    #[cfg(unix)]
     // A unique temp dir for socket tests (paths must stay short: sun_path).
     fn temp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
