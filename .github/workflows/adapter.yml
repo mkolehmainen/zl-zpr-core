@@ -40,21 +40,42 @@ env:
 
 jobs:
   # Build and upload ph
+  # Windows support (zipline#132): ph's default feature set builds on Windows —
+  # io-uring is a Linux-target-gated dependency, so defaults are portable
+  # (verified by the msvc cross-check quoted in the PR). Windows is a separate
+  # job call (build-ph-windows below) only because Cargo emits ph.exe there and
+  # the reusable workflow uses an explicit package-path verbatim — a single job
+  # call cannot vary the path per matrix OS.
   build-ph:
     name: PH
-    uses: org-zpr/zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.3
+    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
     with:
       name: 'ph'
       path: './adapter/ph'
       package: true
       package-path: './target/debug/ph'
+      runs-on: "['ubuntu-latest', 'macos-latest']"
+      needs-capnp: true
+    secrets: inherit
+
+  # Build and upload ph on Windows (zipline#132): identical to build-ph except
+  # runs-on and the .exe suffix on package-path. See the comment above.
+  build-ph-windows:
+    name: PH
+    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
+    with:
+      name: 'ph'
+      path: './adapter/ph'
+      package: true
+      package-path: './target/debug/ph.exe'
+      runs-on: "['windows-latest']"
       needs-capnp: true
     secrets: inherit
 
   # Build and upload ph-cli
   build-ph-cli:
     name: PH CLI
-    uses: org-zpr/zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.3
+    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
     with:
       name: 'ph-cli'
       path: './adapter/cli'
@@ -65,14 +86,31 @@ jobs:
       needs-capnp: true
     secrets: inherit
 
+  # Build and upload ph-cli on Windows (zipline#132). Separate job call so the
+  # Linux job above stays byte-identical: on Windows the pcap default feature
+  # is off (--no-default-features, plan D13) and libpcap is not installed.
+  build-ph-cli-windows:
+    name: PH CLI
+    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
+    with:
+      name: 'ph-cli'
+      path: './adapter/cli'
+      package: true
+      package-path: './target/debug/ph-cli.exe'
+      runs-on: "['windows-latest']"
+      needs-capnp: true
+      no-default-features: true
+    secrets: inherit
+
   # Test ph, check for warnings, and check formatting
   test-ph:
     name: PH
-    needs: [build-ph]
-    uses: org-zpr/zpr-dev-tools/.github/workflows/rust-test.yml@v1.3
+    needs: [build-ph, build-ph-windows]
+    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-test.yml@v1.5
     with:
       name: 'ph'
       path: './adapter/ph'
+      runs-on: "['ubuntu-latest', 'macos-latest', 'windows-latest']"
       needs-capnp: true
     secrets: inherit
 
@@ -80,13 +118,26 @@ jobs:
   test-ph-cli:
     name: PH CLI
     needs: [build-ph-cli]
-    uses: org-zpr/zpr-dev-tools/.github/workflows/rust-test.yml@v1.3
+    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-test.yml@v1.5
     with:
       name: 'ph-cli'
       path: './adapter/cli'
       runs-on: "['ubuntu-latest']"
       needs-libpcap: true
       needs-capnp: true
+    secrets: inherit
+
+  # Test ph-cli on Windows (zipline#132); pairs with build-ph-cli-windows.
+  test-ph-cli-windows:
+    name: PH CLI
+    needs: [build-ph-cli-windows]
+    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-test.yml@v1.5
+    with:
+      name: 'ph-cli'
+      path: './adapter/cli'
+      runs-on: "['windows-latest']"
+      needs-capnp: true
+      no-default-features: true
     secrets: inherit
 
   # Integration tests

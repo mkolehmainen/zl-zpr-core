@@ -917,7 +917,9 @@ pub fn get_noise_cn(certificate_file: &Path) -> Result<String, ArgsError> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_deserialize_adapter_config() {

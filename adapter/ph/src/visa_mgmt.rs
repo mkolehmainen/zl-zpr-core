@@ -324,7 +324,7 @@ mod tests {
     fn test_insert_visa_without_egress_link_is_stored() {
         use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
         use crate::visa_table::VisaTable;
-        use crate::visa_table::tests::new_vsapi_visa_tcp_default;
+        use crate::visa_table::tests::{never_expires, new_vsapi_visa_tcp_default};
 
         let mut builder = TestAssemblyBuilder::new();
         builder.visa_table = Some(VisaTable::new());
@@ -332,8 +332,7 @@ mod tests {
 
         let visa_id = 4242;
         // No peers exist, so the visa's destination has no egress link.
-        let visa =
-            new_vsapi_visa_tcp_default(visa_id, chrono::DateTime::<chrono::Utc>::MAX_UTC.into());
+        let visa = new_vsapi_visa_tcp_default(visa_id, never_expires());
         assert!(
             asm.find_egress_link(visa.dock_pep.as_ref().unwrap().dest_addr.into())
                 .is_none()

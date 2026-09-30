@@ -2051,6 +2051,10 @@ mod tests {
     use std::net::UdpSocket;
     use std::time::Duration;
 
+    /// Unix only: drives `try_write_batch` through a UDP socket, but on
+    /// Windows that op targets the TUN only (the socket half is covered by
+    /// the `test_windows_socket_half_*` tests).
+    #[cfg(unix)]
     #[test]
     fn test_write() {
         for engine in ENGINES {
@@ -2088,6 +2092,10 @@ mod tests {
         }
     }
 
+    /// Unix only: drives `try_read_buf_batch` through a UDP socket, but on
+    /// Windows that op targets the TUN only (the socket half is covered by
+    /// the `test_windows_socket_half_*` tests).
+    #[cfg(unix)]
     #[test]
     fn test_read() {
         for engine in ENGINES {
@@ -2241,6 +2249,9 @@ mod tests {
         }
     }
 
+    /// Unix only: needs `set_recv_packet_info` and checks the pktinfo
+    /// destination, which the Windows engine does not provide (plan D5).
+    #[cfg(unix)]
     #[test]
     fn test_recv_to() {
         for engine in ENGINES {
@@ -2361,6 +2372,11 @@ mod tests {
         }
     }
 
+    /// Unix only: the stall this guards against is an op left in flight by
+    /// a batching engine.  `windows_unbatched` is a loop of non-blocking
+    /// `recv_from` calls with nothing in flight, so on Windows the test only
+    /// measures scheduler preemption, which on a loaded VM exceeds STALL.
+    #[cfg(unix)]
     #[test]
     fn test_recv_stress_no_stall() {
         // zipline#117: a batch receive on an empty or partly-filled socket
@@ -2497,6 +2513,8 @@ mod tests {
         }
     }
 
+    /// Minimal PRNG for `test_recv_stress_no_stall`'s send jitter.
+    #[cfg(unix)]
     fn xorshift(state: &mut u64) -> u64 {
         *state ^= *state << 13;
         *state ^= *state >> 7;
