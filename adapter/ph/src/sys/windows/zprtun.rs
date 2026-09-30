@@ -122,11 +122,6 @@ impl ZprTun {
         }])
     }
 
-    /// The adapter (interface) name, as netsh addresses it.
-    pub fn get_name(&self) -> &str {
-        &self.name
-    }
-
     /// Receive one packet from the Wintun ring without blocking.
     ///
     /// `Ok(None)` means the ring is empty. (Consumed by the Windows

@@ -15,13 +15,23 @@ pub struct PcapWriter<W: AsyncWrite> {
 
 // see <https://wiki.wireshark.org/Development/LibpcapFileFormat> for format details
 
+// The file-header items below are used only by `PcapWriter::open`, which
+// only the unix capture path reaches (capture is unix-only, plan D7:
+// `setCaptureFile` answers `Unimplemented` on Windows). The record-level
+// types (`PcaprecHdr`) and write methods stay unconditional: the capture
+// worker and queues use them on every platform.
+#[cfg(unix)]
 const PCAP_HDR_MAGIC_NUMBER: u32 = 0xa1b2c3d4;
+#[cfg(unix)]
 const PCAP_HDR_VERSION_MAJOR: u16 = 2;
+#[cfg(unix)]
 const PCAP_HDR_VERSION_MINOR: u16 = 4;
 
 /// Maximum size packet which may be captured.
+#[cfg(unix)]
 pub const MAX_SNAPLEN: usize = 1 << 18;
 
+#[cfg(unix)]
 #[derive(IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 struct PcapHdr {
@@ -102,6 +112,10 @@ pub mod linktype {
 
 impl<W: AsyncWrite + Unpin> PcapWriter<W> {
     /// "Open" a new PCAP writer, using the specified async writer as the destination.
+    ///
+    /// Unix-only: the sole caller is `CaptureWorker::open_capture_file`,
+    /// reached via the `capture.sock` fd-passing path (plan D7).
+    #[cfg(unix)]
     pub async fn open(writer: W, linktype: u32) -> io::Result<Self> {
         let mut writer = BufWriter::new(writer);
 

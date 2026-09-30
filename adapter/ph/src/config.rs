@@ -80,6 +80,9 @@ pub const OIDC_USER_INTERACTION_TIMEOUT: std::time::Duration = std::time::Durati
 /// How long to wait when we expect the VS to have to talk to external auth services.
 pub const VS_AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// SCM_RIGHTS ancillary buffer for `capture.sock` (`set_capture_file_worker`),
+/// which is unix-only (plan D7).
+#[cfg(unix)]
 pub const ANCILLARY_BUFFER_SIZE: usize = 128;
 
 const DEFAULT_BUFFER_COUNT: usize = 512; // should be at least 5x batch size; see fastpath_worker.rs for explanation

@@ -1551,7 +1551,13 @@ mod std_udp {
         Ok(completed)
     }
 
-    /// Connected-mode send (the `try_write_batch` leg).
+    /// Connected-mode send (the shape of the posix engines'
+    /// `try_write_batch` socket leg). No runtime caller on Windows — the
+    /// Windows engine's `try_write_batch` targets the Wintun ring, not the
+    /// socket — but kept so `std_udp` stays a complete socket half
+    /// mirroring `posix_unbatched`'s legs, and it is exercised on every OS
+    /// by `test_windows_socket_half_send_recv_connected`.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn send_batch<'a>(
         socket: &UdpSocket,
         bufs: &mut dyn Iterator<Item = &'a [u8]>,
@@ -1560,7 +1566,12 @@ mod std_udp {
         do_batch_op(|socket, buf| socket.send(buf), socket, bufs, results)
     }
 
-    /// Connected-mode receive (the `try_read_buf_batch` leg).
+    /// Connected-mode receive (the shape of the posix engines'
+    /// `try_read_buf_batch` socket leg). Same status as [`send_batch`]:
+    /// no runtime caller on Windows (TUN-ring leg), kept for the complete
+    /// socket half and exercised on every OS by
+    /// `test_windows_socket_half_send_recv_connected`.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn recv_batch<'a>(
         socket: &UdpSocket,
         bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
