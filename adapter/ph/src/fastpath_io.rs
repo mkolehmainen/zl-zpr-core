@@ -3,6 +3,8 @@ use crate::config;
 use crate::counters::*;
 use crate::fastpath::{FastpathWorker, FastpathWorkerConfig};
 use crate::packet_queue;
+#[cfg(windows)]
+use crate::sys::wait::SocketWaitable;
 use crate::sys::wait::{AsWaitSource, WaitHandle, Waitable};
 use crate::sys::{TunPi, ZprTun};
 use crate::zprtun;
@@ -18,6 +20,11 @@ pub struct FastpathIo {
     batch_io: BatchIo,
     actor_tun: Arc<ZprTun>,
     substrate_socket: UdpSocket,
+    /// The substrate socket's waitable Event (`WSAEventSelect(FD_READ)`,
+    /// plan D3): the socket itself is not waitable on Windows. Owned here
+    /// beside the socket it is bound to.
+    #[cfg(windows)]
+    substrate_waitable: SocketWaitable,
     pub requeue_outq: packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
     pub mgmt_substrate_outq: packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
 
@@ -54,6 +61,9 @@ impl FastpathIo {
                 .instantiate(config.batch_size)
                 .unwrap(),
             actor_tun,
+            #[cfg(windows)]
+            substrate_waitable: SocketWaitable::new(&substrate_socket)
+                .expect("unable to bind a wait event to the substrate socket"),
             substrate_socket,
             requeue_outq,
             mgmt_substrate_outq,
@@ -64,8 +74,19 @@ impl FastpathIo {
     }
 
     /// Substrate socket wait handle for the fastpath wait set.
+    ///
+    /// Unix: the socket's own fd. Windows: the socket is not waitable, so
+    /// this is its [`SocketWaitable`]'s Event (plan D3) — distinct from the
+    /// I/O-target handle `process_substrate_socket_in` passes to batch_io.
     pub fn substrate_socket_handle(&self) -> WaitHandle<'_> {
-        self.substrate_socket.as_wait_handle()
+        #[cfg(unix)]
+        {
+            self.substrate_socket.as_wait_handle()
+        }
+        #[cfg(windows)]
+        {
+            self.substrate_waitable.handle()
+        }
     }
 
     /// Actor TUN wait handle for the fastpath wait set.
@@ -85,6 +106,18 @@ impl FastpathIo {
 
     /// Process an input-ready notification on the substrate socket (substrate ingress).
     pub fn process_substrate_socket_in(&mut self, worker: &mut FastpathWorker) {
+        // Acknowledge the wake BEFORE draining (Windows, plan D3):
+        // `WSAEnumNetworkEvents` clears the Event and the FD_READ record.
+        // Cleared first, a datagram that arrives mid-drain is either
+        // consumed by this drain or re-posts FD_READ after the final
+        // WouldBlock recv re-enables it. Cleared after, a datagram arriving
+        // between the last recv and the clear would leave data buffered
+        // with FD_READ posting disabled — a lost wakeup.
+        #[cfg(windows)]
+        self.substrate_waitable
+            .reset()
+            .expect("WSAEnumNetworkEvents failed on the substrate socket");
+
         let _nbufs = worker.get_fresh_packets(worker.config.batch_size, &mut self.packets);
 
         self.io_results.clear();

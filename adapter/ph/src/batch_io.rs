@@ -1495,9 +1495,362 @@ mod posix_unbatched {
     }
 }
 
-// The engine registration macro is consumed only where at least one engine
-// exists (all unix today; zipline#131 adds the Windows engine).
-#[cfg_attr(windows, allow(unused_macros))]
+/// The socket half of the Windows engine (plan D5): unbatched non-blocking
+/// `send`/`recv`/`send_to`/`recv_from` on a `std::net::UdpSocket`.
+///
+/// std-only, so it compiles — and its unit tests run — on every OS; only
+/// the `windows_unbatched` engine calls it at runtime. No
+/// `WSARecvMsg`/`IP_PKTINFO`: an end-user adapter is single-homed for our
+/// purposes, so the receive path reports the socket's own bound address as
+/// the destination, and the send path ignores the caller-chosen source
+/// address. Ceiling stated once here for the whole half: multi-homed hosts
+/// and address change while running are not handled on Windows.
+///
+/// Batch semantics mirror `posix_unbatched::do_batch_op` (which emulates
+/// `sendmmsg(2)`): the first item's failure is returned as the batch error;
+/// a later item's failure ends the batch early with the successes so far.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+mod std_udp {
+    use super::{ReceivedPacket, SendFlags};
+    use bytes::BufMut;
+    use std::io::Result;
+    use std::net::{SocketAddr, UdpSocket};
+    use zpr_ext::std::mem::slice_assume_init_mut;
+    use zpr_utils::net_defs::{ScopedIpAddr, ScopedIpv6Addr};
+
+    /// `posix_unbatched::do_batch_op`'s loop shape, on a socket instead of
+    /// an fd.
+    fn do_batch_op<Item, Res>(
+        mut op: impl FnMut(&UdpSocket, Item) -> Result<Res>,
+        socket: &UdpSocket,
+        items: &mut dyn Iterator<Item = Item>,
+        results: &mut Vec<Result<Res>>,
+    ) -> Result<usize> {
+        let mut completed = 0;
+        for item in items {
+            let res = op(socket, item);
+            if let Err(err) = res {
+                // emulate behavior of sendmmsg(2)
+                if completed == 0 {
+                    return Err(err);
+                }
+                break;
+            }
+            results.push(res);
+            completed += 1;
+        }
+        Ok(completed)
+    }
+
+    /// Connected-mode send (the `try_write_batch` leg).
+    pub fn send_batch<'a>(
+        socket: &UdpSocket,
+        bufs: &mut dyn Iterator<Item = &'a [u8]>,
+        results: &mut Vec<Result<usize>>,
+    ) -> Result<usize> {
+        do_batch_op(|socket, buf| socket.send(buf), socket, bufs, results)
+    }
+
+    /// Connected-mode receive (the `try_read_buf_batch` leg).
+    pub fn recv_batch<'a>(
+        socket: &UdpSocket,
+        bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
+        results: &mut Vec<Result<usize>>,
+    ) -> Result<usize> {
+        do_batch_op(
+            |socket, buf| {
+                // SAFETY: We will only be writing to the chunk.
+                let chunk = unsafe { slice_assume_init_mut(buf.chunk_mut().as_uninit_slice_mut()) };
+                let amt = socket.recv(chunk)?;
+                // SAFETY: We know we've written the given number of bytes in the BufMut.
+                unsafe { buf.advance_mut(amt) };
+                Ok(amt)
+            },
+            socket,
+            bufs,
+            results,
+        )
+    }
+
+    /// Unconnected send to explicit destinations. `SendFlags` carries no
+    /// Windows flag bits (`std::net` exposes none), so it is accepted and
+    /// ignored.
+    pub fn send_to_batch<'a>(
+        socket: &UdpSocket,
+        bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, SendFlags)>,
+        results: &mut Vec<Result<usize>>,
+    ) -> Result<usize> {
+        do_batch_op(
+            |socket, (buf, addr, _flags)| socket.send_to(buf, addr),
+            socket,
+            bufs,
+            results,
+        )
+    }
+
+    /// Send with a caller-chosen source address: no pktinfo on this half
+    /// (plan D5), so the source is ignored and the OS picks as it would for
+    /// a plain `send_to` — correct for a single-homed host, the stated
+    /// ceiling above.
+    pub fn send_to_from_batch<'a>(
+        socket: &UdpSocket,
+        bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, SendFlags)>,
+        results: &mut Vec<Result<usize>>,
+    ) -> Result<usize> {
+        do_batch_op(
+            |socket, (buf, dst, _src, _flags)| socket.send_to(buf, dst),
+            socket,
+            bufs,
+            results,
+        )
+    }
+
+    /// Receive with peer addresses. With `with_dest`, the destination is
+    /// the socket's own bound address (no pktinfo — single-homed ceiling
+    /// above), resolved once per batch.
+    pub fn recv_from_batch<'a>(
+        socket: &UdpSocket,
+        bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
+        results: &mut Vec<Result<ReceivedPacket>>,
+        with_dest: bool,
+    ) -> Result<usize> {
+        let destination = if with_dest {
+            Some(local_scoped_addr(socket)?)
+        } else {
+            None
+        };
+        do_batch_op(
+            |socket, buf| {
+                // SAFETY: We will only be writing to the chunk.
+                let chunk = unsafe { slice_assume_init_mut(buf.chunk_mut().as_uninit_slice_mut()) };
+                match socket.recv_from(chunk) {
+                    Ok((size, source)) => {
+                        // SAFETY: We know we've written the given number of bytes in the BufMut.
+                        unsafe { buf.advance_mut(size) };
+                        Ok(ReceivedPacket {
+                            size,
+                            truncated: false,
+                            source: Some(source),
+                            destination,
+                        })
+                    }
+                    // Windows reports an oversized datagram as WSAEMSGSIZE
+                    // (10040) — the buffer holds the truncated head and the
+                    // rest is discarded. Map it to `truncated`, which the
+                    // fastpath drops and counts, the same as MSG_TRUNC on
+                    // unix. (The peer address is lost with the error; the
+                    // truncated path never reads it.)
+                    #[cfg(windows)]
+                    Err(err) if err.raw_os_error() == Some(10040) => {
+                        let size = chunk.len();
+                        // SAFETY: WSAEMSGSIZE fills the whole buffer before
+                        // failing; it is all initialized.
+                        unsafe { buf.advance_mut(size) };
+                        Ok(ReceivedPacket {
+                            size,
+                            truncated: true,
+                            source: None,
+                            destination,
+                        })
+                    }
+                    Err(err) => Err(err),
+                }
+            },
+            socket,
+            bufs,
+            results,
+        )
+    }
+
+    /// The socket's bound address as the `ScopedIpAddr` the fastpath
+    /// expects for a packet's destination.
+    fn local_scoped_addr(socket: &UdpSocket) -> Result<ScopedIpAddr> {
+        Ok(match socket.local_addr()? {
+            SocketAddr::V4(a) => ScopedIpAddr::V4(*a.ip()),
+            SocketAddr::V6(a) => ScopedIpAddr::V6(ScopedIpv6Addr::new(*a.ip(), a.scope_id())),
+        })
+    }
+}
+
+#[cfg(windows)]
+mod windows_unbatched {
+    //! Unbatched implementation for Windows (plan D5, zipline#131).
+    //!
+    //! Socket side: the `std_udp` half (non-blocking `std::net::UdpSocket`,
+    //! no pktinfo — see `std_udp`'s module docs for the stated ceiling).
+    //! TUN side: the Wintun ring, via `ZprTun::try_receive` /
+    //! `ZprTun::send` (`WintunReceivePacket` / `WintunAllocateSendPacket` +
+    //! `WintunSendPacket`), which half an operation targets is carried by
+    //! the [`WaitTarget`] inside the `WaitHandle`: `read`/`write` reach the
+    //! TUN ring, `send_to`/`recv_from` reach the socket.
+
+    use super::{BatchIoImpl, ReceivedPacket, SendFlags, std_udp};
+    use crate::sys::wait::{WaitHandle, WaitTarget};
+    use bytes::BufMut;
+    use std::io::Result;
+    use std::net::SocketAddr;
+    use zpr_utils::net_defs::ScopedIpAddr;
+
+    pub struct BatchIo {}
+
+    impl BatchIo {
+        pub const ENGINE_NAME: &'static str = "windows_unbatched";
+
+        pub const MAX_ENTRIES: usize = 1024;
+
+        pub fn detect_support() -> bool {
+            // std sockets and the Wintun ring are always available.
+            true
+        }
+
+        pub fn new(_entries: usize) -> Result<Self> {
+            Ok(Self {})
+        }
+    }
+
+    /// The socket an I/O op targets; a TUN handle here is a caller bug.
+    fn expect_socket<'a>(handle: WaitHandle<'a>, op: &str) -> &'a std::net::UdpSocket {
+        match handle.target() {
+            WaitTarget::Socket(socket) => socket,
+            _ => panic!("windows_unbatched: {op} targets the substrate socket"),
+        }
+    }
+
+    /// The TUN an I/O op targets; a socket handle here is a caller bug.
+    fn expect_tun<'a>(handle: WaitHandle<'a>, op: &str) -> &'a crate::sys::ZprTun {
+        match handle.target() {
+            WaitTarget::Tun(tun) => tun,
+            _ => panic!("windows_unbatched: {op} targets the TUN"),
+        }
+    }
+
+    /// `std_udp::do_batch_op`'s loop shape for the TUN ring legs.
+    fn do_tun_batch_op<Item, Res>(
+        mut op: impl FnMut(&crate::sys::ZprTun, Item) -> Result<Res>,
+        tun: &crate::sys::ZprTun,
+        items: &mut dyn Iterator<Item = Item>,
+        results: &mut Vec<Result<Res>>,
+    ) -> Result<usize> {
+        let mut completed = 0;
+        for item in items {
+            let res = op(tun, item);
+            if let Err(err) = res {
+                // emulate behavior of sendmmsg(2), as the other engines do
+                if completed == 0 {
+                    return Err(err);
+                }
+                break;
+            }
+            results.push(res);
+            completed += 1;
+        }
+        Ok(completed)
+    }
+
+    impl BatchIoImpl for BatchIo {
+        fn engine_name(&self) -> &'static str {
+            Self::ENGINE_NAME
+        }
+
+        /// TUN egress: commit each packet to the Wintun send ring.
+        fn try_write_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = &'a [u8]>,
+            results: &mut Vec<Result<usize>>,
+        ) -> Result<usize> {
+            let tun = expect_tun(handle, "try_write_batch");
+            do_tun_batch_op(
+                |tun, buf: &[u8]| tun.send(buf).map(|()| buf.len()),
+                tun,
+                bufs,
+                results,
+            )
+        }
+
+        /// TUN ingress: drain the Wintun receive ring. An empty ring ends
+        /// the batch (`WouldBlock` first, per the sendmmsg(2) emulation all
+        /// engines share); the fastpath re-arms on the read-wait event.
+        fn try_read_buf_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
+            results: &mut Vec<Result<usize>>,
+        ) -> Result<usize> {
+            let tun = expect_tun(handle, "try_read_buf_batch");
+            do_tun_batch_op(
+                |tun, buf: &mut dyn BufMut| match tun.try_receive()? {
+                    Some(packet) => {
+                        let body = packet.bytes();
+                        // An oversized frame cannot arrive: the ring frame
+                        // limit (u16) is far under the packet buffer size.
+                        buf.put_slice(body);
+                        Ok(body.len())
+                    }
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "Wintun receive ring empty",
+                    )),
+                },
+                tun,
+                bufs,
+                results,
+            )
+        }
+
+        fn try_send_to_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, SendFlags)>,
+            results: &mut Vec<Result<usize>>,
+        ) -> Result<usize> {
+            std_udp::send_to_batch(expect_socket(handle, "try_send_to_batch"), bufs, results)
+        }
+
+        fn try_send_to_from_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, SendFlags)>,
+            results: &mut Vec<Result<usize>>,
+        ) -> Result<usize> {
+            std_udp::send_to_from_batch(
+                expect_socket(handle, "try_send_to_from_batch"),
+                bufs,
+                results,
+            )
+        }
+
+        fn try_recv_buf_from_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
+            results: &mut Vec<Result<ReceivedPacket>>,
+        ) -> Result<usize> {
+            std_udp::recv_from_batch(
+                expect_socket(handle, "try_recv_buf_from_batch"),
+                bufs,
+                results,
+                false,
+            )
+        }
+
+        fn try_recv_buf_from_to_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
+            results: &mut Vec<Result<ReceivedPacket>>,
+        ) -> Result<usize> {
+            std_udp::recv_from_batch(
+                expect_socket(handle, "try_recv_buf_from_to_batch"),
+                bufs,
+                results,
+                true,
+            )
+        }
+    }
+}
+
+// The engine registration macro: consumed by every arm of ENGINES.
 macro_rules! bio {
     ($m:tt) => {
         BatchIoEngine {
@@ -1514,9 +1867,8 @@ const ENGINES: &[BatchIoEngine] = &[
     bio!(io_uring),
     #[cfg(unix)]
     bio!(posix_unbatched),
-    // Windows: no engine yet — zipline#131 adds `windows_unbatched`
-    // (plan D5). Until then ENGINES is empty there and auto-selection
-    // fails at runtime; everything still compiles.
+    #[cfg(windows)]
+    bio!(windows_unbatched),
 ];
 
 /// List of available engine names.  Does not include automatic selection.
@@ -2127,6 +2479,131 @@ mod tests {
         *state ^= *state >> 7;
         *state ^= *state << 17;
         *state
+    }
+
+    /// The Windows engine's socket half (`std_udp`, plan D5) is std-only,
+    /// so it compiles and runs on every OS: send a batch from one localhost
+    /// socket to another, receive it back, and check payloads and peer
+    /// addresses (zipline#131 step 1).
+    #[test]
+    fn test_windows_socket_half_send_to_recv_from_to() {
+        let sender = udp_socket().unwrap();
+        let receiver = udp_socket().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+
+        let dest = receiver.local_addr().unwrap();
+        let nmsgs = 16;
+        let msgs: Vec<String> = (0..nmsgs).map(|i| format!("This is message {i}")).collect();
+
+        // Send the batch.
+        let mut send_results = Vec::new();
+        let n = std_udp::send_to_batch(
+            &sender,
+            &mut msgs
+                .iter()
+                .map(|msg| (msg.as_bytes(), dest, SendFlags::none())),
+            &mut send_results,
+        )
+        .unwrap();
+        assert_eq!(n, nmsgs);
+        for (i, res) in send_results.iter().enumerate() {
+            assert_eq!(*res.as_ref().unwrap(), msgs[i].len());
+        }
+
+        // Receive it back, with the destination (the receiver's own bound
+        // address: the socket half has no pktinfo, plan D5).
+        let mut bufs = vec![Vec::with_capacity(64); nmsgs];
+        let mut recv_results = Vec::new();
+        let mut nrecv = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while nrecv < nmsgs {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "datagrams lost: got {nrecv} of {nmsgs}"
+            );
+            match std_udp::recv_from_batch(
+                &receiver,
+                &mut bufs[nrecv..].iter_mut().map(|b| b as &mut dyn BufMut),
+                &mut recv_results,
+                true,
+            ) {
+                Ok(n) => nrecv += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                Err(err) => panic!("batch receive failed: {err}"),
+            }
+        }
+
+        let sender_addr = sender.local_addr().unwrap();
+        let expect_dest = match receiver.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => ScopedIpAddr::V4(*a.ip()),
+            std::net::SocketAddr::V6(a) => ScopedIpAddr::V6(
+                zpr_utils::net_defs::ScopedIpv6Addr::new(*a.ip(), a.scope_id()),
+            ),
+        };
+        for (i, res) in recv_results.iter().enumerate() {
+            let packet = res.as_ref().unwrap();
+            assert_eq!(packet.size, msgs[i].len());
+            assert!(!packet.truncated);
+            assert_eq!(packet.source, Some(sender_addr), "wrong peer address");
+            assert_eq!(
+                packet.destination,
+                Some(expect_dest),
+                "destination must be the receiver's bound address"
+            );
+            assert_eq!(bufs[i].as_slice(), msgs[i].as_bytes());
+        }
+    }
+
+    /// The socket half's connected-mode `send`/`recv` legs (the shape the
+    /// generic engine tests use `try_write_batch`/`try_read_buf_batch` in),
+    /// portable for the same reason as above.
+    #[test]
+    fn test_windows_socket_half_send_recv_connected() {
+        let (inq, outq) = connected_udp_pair().unwrap();
+        inq.set_nonblocking(true).unwrap();
+        outq.set_nonblocking(true).unwrap();
+
+        let nmsgs = 16;
+        let msgs: Vec<String> = (0..nmsgs).map(|i| format!("This is message {i}")).collect();
+
+        let mut send_results = Vec::new();
+        let n = std_udp::send_batch(
+            &inq,
+            &mut msgs.iter().map(|msg| msg.as_bytes()),
+            &mut send_results,
+        )
+        .unwrap();
+        assert_eq!(n, nmsgs);
+
+        let mut bufs = vec![Vec::with_capacity(64); nmsgs];
+        let mut recv_results = Vec::new();
+        let mut nrecv = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while nrecv < nmsgs {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "datagrams lost: got {nrecv} of {nmsgs}"
+            );
+            match std_udp::recv_batch(
+                &outq,
+                &mut bufs[nrecv..].iter_mut().map(|b| b as &mut dyn BufMut),
+                &mut recv_results,
+            ) {
+                Ok(n) => nrecv += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                Err(err) => panic!("batch receive failed: {err}"),
+            }
+        }
+
+        for (i, res) in recv_results.iter().enumerate() {
+            assert_eq!(*res.as_ref().unwrap(), msgs[i].len());
+            assert_eq!(bufs[i].as_slice(), msgs[i].as_bytes());
+        }
     }
 
     /// Two localhost UDP sockets connected to each other: a portable
