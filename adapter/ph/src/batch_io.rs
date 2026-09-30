@@ -1509,7 +1509,7 @@ mod posix_unbatched {
 /// Batch semantics mirror `posix_unbatched::do_batch_op` (which emulates
 /// `sendmmsg(2)`): the first item's failure is returned as the batch error;
 /// a later item's failure ends the batch early with the successes so far.
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code))]
 mod std_udp {
     use super::{ReceivedPacket, SendFlags};
     use bytes::BufMut;
