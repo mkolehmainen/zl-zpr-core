@@ -43,7 +43,12 @@ const RING_CAPACITY: u32 = 0x40_0000;
 pub struct ZprTun {
     /// Keeps the driver loaded for the life of the device.
     _wintun: wintun::Wintun,
-    adapter: Arc<wintun::Adapter>,
+    /// Explicit hold on the adapter device. The `session` also holds an
+    /// `Arc` to it internally, so nothing reads this field since the
+    /// unwireable `delete(self)` was dropped (PR #51 review) — it stays to
+    /// document that the device outlives every session-independent user
+    /// (netsh helpers address it by name while the ring may be shut down).
+    _adapter: Arc<wintun::Adapter>,
     session: Arc<wintun::Session>,
     /// The adapter name (config `tun_if` or [`DEFAULT_ADAPTER_NAME`]), as
     /// netsh commands address it.
@@ -110,7 +115,7 @@ impl ZprTun {
 
         Ok(vec![ZprTun {
             _wintun: wintun,
-            adapter,
+            _adapter: adapter,
             session,
             name,
             mtx: std::sync::Mutex::new(()),
