@@ -416,8 +416,9 @@ Cross-checking from Linux without a Windows box:
    release.
 
 Ctrl-C shuts down gracefully and deletes the Wintun adapter; a second Ctrl-C
-hard-exits. After a crash or hard kill, a stale adapter named `zpr` may
-remain — the next `ph.exe` startup deletes it.
+hard-exits. After a crash or hard kill, a stale adapter may remain, named
+with a suffix (`zpr 1`, so `Get-NetAdapter -Name zpr` does not show it) — the
+next `ph.exe` startup deletes it (`WinTun: Removed orphaned adapter "zpr 1"`).
 
 `ph.exe` does not need to be code-signed to run from an elevated console
 (`wintun.dll` is signed by WireGuard LLC); verified on Windows 11 with
