@@ -511,6 +511,17 @@ pub mod tests {
     use zpr_utils::net_defs;
     use zpr_utils::net_defs::ip_number;
 
+    /// A visa expiry that will not arrive during a test run.  Deliberately
+    /// not `DateTime::<Utc>::MAX_UTC`: Windows `SystemTime` (a FILETIME) cannot
+    /// represent that, and the conversion panics.
+    pub fn never_expires() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(100 * 365 * 24 * 60 * 60)
+    }
+
+    /// A visa expiry already in the past.  `UNIX_EPOCH` rather than
+    /// `DateTime::<Utc>::MIN_UTC`, for the same Windows reason as `never_expires`.
+    pub const ALREADY_EXPIRED: SystemTime = UNIX_EPOCH;
+
     /// Create a new vsapi_types::Visa, only having to specify the id and the expiration
     pub fn new_vsapi_visa_tcp_default(issuer_id: u64, expires: SystemTime) -> vsapi_types::Visa {
         vsapi_types::Visa::new(
@@ -540,8 +551,8 @@ pub mod tests {
         let visa2 = 67890;
         let visa3 = 234;
         let mut visa_table = asm.visa_table.write().unwrap();
-        let v1 = new_vsapi_visa_tcp_default(visa1 as u64, DateTime::<Utc>::MIN_UTC.into()); // An element that will timeout immediately
-        let v2 = new_vsapi_visa_tcp_default(visa2 as u64, DateTime::<Utc>::MAX_UTC.into()); // An element that won't timeout
+        let v1 = new_vsapi_visa_tcp_default(visa1 as u64, ALREADY_EXPIRED); // An element that will timeout immediately
+        let v2 = new_vsapi_visa_tcp_default(visa2 as u64, never_expires()); // An element that won't timeout
         let v3 = new_vsapi_visa_tcp_default(visa3 as u64, (Utc::now() + one_second).into()); // An element that will time out in a second
         let _ = visa_table.insert_visa(v1);
         let _ = visa_table.insert_visa(v2);
@@ -620,7 +631,7 @@ pub mod tests {
         assert_eq!(2, peer_state.pft.len());
 
         let mut visa_table = asm.visa_table.write().unwrap();
-        let v1 = new_vsapi_visa_tcp_default(visa1 as u64, DateTime::<Utc>::MAX_UTC.into()); // An element that won't timeout
+        let v1 = new_vsapi_visa_tcp_default(visa1 as u64, never_expires()); // An element that won't timeout
         let v2 = new_vsapi_visa_tcp_default(visa2 as u64, (Utc::now() + one_second).into()); // An element that will time out in a second
         let _ = visa_table.insert_visa(v1);
         let _ = visa_table.insert_visa(v2);
@@ -663,7 +674,7 @@ pub mod tests {
 
         let visa_id = 1000;
         let mut visa_table = asm.visa_table.write().unwrap();
-        let v = new_vsapi_visa_tcp_default(visa_id as u64, DateTime::<Utc>::MAX_UTC.into());
+        let v = new_vsapi_visa_tcp_default(visa_id as u64, never_expires());
         let _ = visa_table.insert_visa(v);
 
         let peer_state = asm.peer_table.get(link_a).unwrap();
@@ -712,7 +723,7 @@ pub mod tests {
 
         let visa_id = 200;
         let mut visa_table = asm.visa_table.write().unwrap();
-        let v = new_vsapi_visa_tcp_default(visa_id as u64, DateTime::<Utc>::MAX_UTC.into());
+        let v = new_vsapi_visa_tcp_default(visa_id as u64, never_expires());
         let _ = visa_table.insert_visa(v);
 
         let peer_b = asm.peer_table.get(link_b).unwrap();
@@ -761,7 +772,7 @@ pub mod tests {
 
         let visa_id = 3000;
         let mut visa_table = asm.visa_table.write().unwrap();
-        let v = new_vsapi_visa_tcp_default(visa_id as u64, DateTime::<Utc>::MAX_UTC.into());
+        let v = new_vsapi_visa_tcp_default(visa_id as u64, never_expires());
         let _ = visa_table.insert_visa(v);
 
         let peer_a = asm.peer_table.get(link_a).unwrap();
@@ -824,7 +835,7 @@ pub mod tests {
 
         let visa_id = 3000;
         let mut visa_table = asm.visa_table.write().unwrap();
-        let v = new_vsapi_visa_tcp_default(visa_id as u64, DateTime::<Utc>::MAX_UTC.into());
+        let v = new_vsapi_visa_tcp_default(visa_id as u64, never_expires());
         let _ = visa_table.insert_visa(v);
 
         let peer_a = asm.peer_table.get(link_a).unwrap();
@@ -961,7 +972,7 @@ pub mod tests {
 
         let visa1 = make_tcp_visa(1000, &client1_addr, 0, &service_addr, 80, 100, expires_ms);
         let visa2 = make_tcp_visa(1001, &client2_addr, 0, &service_addr, 80, 100, expires_ms);
-        let v1 = new_vsapi_visa_tcp_default(12345, DateTime::<Utc>::MAX_UTC.into());
+        let v1 = new_vsapi_visa_tcp_default(12345, never_expires());
         let _ = visa_table.insert_visa(v1);
 
         let vid = visa_table.insert_visa(visa1).unwrap();

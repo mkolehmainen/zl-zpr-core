@@ -2071,6 +2071,10 @@ mod tests {
     use std::net::UdpSocket;
     use std::time::Duration;
 
+    /// Unix only: drives `try_write_batch` through a UDP socket, but on
+    /// Windows that op targets the TUN only (the socket half is covered by
+    /// the `test_windows_socket_half_*` tests).
+    #[cfg(unix)]
     #[test]
     fn test_write() {
         for engine in ENGINES {
@@ -2108,6 +2112,10 @@ mod tests {
         }
     }
 
+    /// Unix only: drives `try_read_buf_batch` through a UDP socket, but on
+    /// Windows that op targets the TUN only (the socket half is covered by
+    /// the `test_windows_socket_half_*` tests).
+    #[cfg(unix)]
     #[test]
     fn test_read() {
         for engine in ENGINES {

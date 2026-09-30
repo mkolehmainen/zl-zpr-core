@@ -1061,9 +1061,10 @@ pub mod test {
         use crate::packet_queue;
         use crate::peer_table::test::create_dummy_peer_state;
         use crate::visa_table::VisaTable;
-        use crate::visa_table::tests::new_vsapi_visa_tcp_default;
+        use crate::visa_table::tests::{
+            ALREADY_EXPIRED, never_expires, new_vsapi_visa_tcp_default,
+        };
         use crate::zdp;
-        use chrono::{DateTime, Utc};
         use std::net::Ipv4Addr;
         use zpr_utils::net_defs;
 
@@ -1112,7 +1113,7 @@ pub mod test {
 
             let visa_id = 3000;
             let mut visa_table = asm.visa_table.write().unwrap();
-            let v = new_vsapi_visa_tcp_default(visa_id as u64, DateTime::<Utc>::MAX_UTC.into());
+            let v = new_vsapi_visa_tcp_default(visa_id as u64, never_expires());
             let _ = visa_table.insert_visa(v);
 
             let peer_a = asm.peer_table.get(link_a).unwrap();
@@ -1255,7 +1256,7 @@ pub mod test {
             let visa_id = 3000;
             let mut visa_table = asm.visa_table.write().unwrap();
             // Already expired
-            let v = new_vsapi_visa_tcp_default(visa_id as u64, DateTime::<Utc>::MIN_UTC.into());
+            let v = new_vsapi_visa_tcp_default(visa_id as u64, ALREADY_EXPIRED);
             let _ = visa_table.insert_visa(v);
 
             let peer = asm.peer_table.get(link_id).unwrap();
