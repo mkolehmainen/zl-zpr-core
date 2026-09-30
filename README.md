@@ -89,6 +89,14 @@ files for each side. [`docs/SETUP.md`](docs/SETUP.md) walks through all of
 it by hand and ends with a reference for the control socket and certificate
 verification.
 
+`ph adapter` also runs on Windows 10/11: `ph.exe adapter -c adapter.toml`
+from an elevated (Administrator) console, with the signed `wintun.dll` from
+[wintun.net](https://www.wintun.net) next to `ph.exe`. `ph-cli.exe` talks to
+it over a named pipe instead of the unix socket. Nodes stay on Linux, and
+packet capture is not available on Windows. See
+[`integration-test/windows-smoke.md`](integration-test/windows-smoke.md) for
+an end-to-end walkthrough against a Linux node.
+
 ### Integration tests
 
 `integration-test/` runs the same setup end to end, with no hand
