@@ -352,6 +352,81 @@ group grants exactly that, so treat it accordingly: it is not a low-privilege
 convenience group.
 
 
+## Windows
+
+`ph adapter` runs on Windows 10/11 x64. The adapter role only: it creates a
+Wintun interface, docks to a Linux node, and carries this machine's own
+traffic, exactly like `sudo ph adapter -c x.toml` on Linux.
+
+**Not supported on Windows** (deliberately, in this release):
+
+* the **node role** — `ph node` compiles but is unsupported and untested;
+  nodes stay on Linux,
+* **packet capture to a file** — `ph-cli capture set-file` returns
+  `Unsupported`,
+* a **Windows service or installer** — `ph.exe` is started by hand from an
+  elevated console,
+* **multi-homed hosts and address changes while running** — the substrate
+  address is configured or discovered once at startup,
+* **`ph-cli` filter compilation** — the `pcap` feature is off on Windows, so
+  capture filter strings cannot be compiled there.
+
+### Build prerequisites
+
+Building on Windows natively:
+
+1. Visual Studio Build Tools with the "Desktop development with C++"
+   workload (MSVC + Windows SDK + CMake).
+2. Rust via [rustup](https://rustup.rs) (defaults to
+   `x86_64-pc-windows-msvc`).
+3. [NASM](https://nasm.us) (`choco install -y nasm`) — required by
+   `aws-lc-rs`.
+4. Cap'n Proto (`choco install -y capnproto`) — `capnp.exe` must be on
+   `PATH`.
+
+Then:
+
+```powershell
+cargo build -p ph
+cargo build -p ph-cli --no-default-features   # pcap off on Windows
+```
+
+Cross-checking from Linux without a Windows box:
+`cargo xwin check -p ph -p ph-cli --target x86_64-pc-windows-msvc`
+(build errors only — it compiles no test code and links nothing).
+
+### Running
+
+1. Download the signed `wintun.dll` (x64) from
+   [wintun.net](https://www.wintun.net) and place it **in the same directory
+   as `ph.exe`**. It is loaded at runtime; without it `ph` exits at startup.
+2. Write an adapter config as on Linux (same TOML schema; see the adapter
+   examples above). Windows-style paths in double-quoted TOML strings need
+   escaped backslashes — prefer single-quoted literals: `ca_file = 'C:\zpr\ca.crt'`.
+3. Start from an **elevated** (Run as administrator) console — Wintun device
+   creation requires it:
+
+   ```powershell
+   .\ph.exe adapter -c adapter.toml
+   ```
+
+4. `ph-cli.exe` (also elevated, same user) talks to it over a named pipe
+   (`\\.\pipe\zpr-control-<sid>`) instead of the unix socket; commands are
+   unchanged. A non-elevated `ph-cli` cannot reach an elevated `ph` in this
+   release.
+
+Ctrl-C shuts down gracefully and deletes the Wintun adapter; a second Ctrl-C
+hard-exits. After a crash or hard kill, a stale adapter named `zpr` may
+remain — the next `ph.exe` startup deletes it.
+
+`ph.exe` does not need to be code-signed to run from an elevated console
+(`wintun.dll` is signed by WireGuard LLC); verified on Windows 11 with
+Defender SmartScreen at defaults.
+
+For an end-to-end walkthrough against a Linux node and visa service, see
+[`integration-test/windows-smoke.md`](../integration-test/windows-smoke.md).
+
+
 ## Certificate and peer verification reference
 
 ### Local certificate (`certificate_file` / `name`)
