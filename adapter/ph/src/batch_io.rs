@@ -50,26 +50,6 @@ impl SendFlags {
         Self(0)
     }
 
-    /// `MSG_DONTWAIT`: this send completes immediately instead of blocking.
-    /// Linux only (elsewhere the sockets are already non-blocking, or the
-    /// platform has no such flag); a no-op off Linux.
-    ///
-    /// Not yet called: the unix engines apply `MSG_DONTWAIT` internally
-    /// (zipline#117), so this constructor exists for the Windows engine
-    /// (zipline#131) and for callers that need it explicitly.
-    #[allow(dead_code)]
-    #[cfg(target_os = "linux")]
-    pub const fn dontwait() -> Self {
-        Self(libc::MSG_DONTWAIT)
-    }
-
-    /// `MSG_DONTWAIT` is not used on this platform; no flags.
-    #[allow(dead_code)]
-    #[cfg(not(target_os = "linux"))]
-    pub const fn dontwait() -> Self {
-        Self(0)
-    }
-
     /// The raw OS flag bits.
     ///
     /// Consumed by the unix engines only; the Windows engine (zipline#131)
