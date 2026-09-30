@@ -34,6 +34,23 @@ pub trait TunCtl: Sync {
     /// (zipline#88).
     fn add_route(&self, dest: IpAddr, prefix_len: u8) -> Result<()>;
 
+    /// Tear the TUN device down on graceful shutdown, releasing whatever
+    /// state outlives the process on this platform (zipline#130).
+    ///
+    /// Linux and macOS TUNs are process-scoped — the kernel reaps the
+    /// interface, its addresses and its routes when the fd closes — so
+    /// their teardown is a no-op. On Windows the Wintun adapter and its
+    /// netsh address/route state persist until explicitly deleted, and
+    /// the graceful path ends in `process::exit(0)`, which skips
+    /// destructors; without this call the adapter is orphaned until a
+    /// later startup's stale-adapter delete happens to reap it.
+    ///
+    /// Called at most once, after the peers are down. Best-effort:
+    /// callers log a failure and continue exiting.
+    fn teardown(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Report the name of another **live** interface that already carries
     /// the route for `dest/prefix_len`, if any (zipline#101).
     ///
@@ -74,6 +91,15 @@ impl TunCtl for TunCtlImpl {
     }
     fn add_route(&self, dest: IpAddr, prefix_len: u8) -> Result<()> {
         self.tun.add_route(dest, prefix_len)
+    }
+    /// Windows only: the Wintun session is shut down so the ring quiesces;
+    /// see `sys/windows/zprtun.rs` for why the adapter device itself is
+    /// removed by the OS at process exit rather than from here. The unix
+    /// platforms keep the trait's no-op default — their TUNs are
+    /// process-scoped and the kernel reaps everything.
+    #[cfg(windows)]
+    fn teardown(&self) -> Result<()> {
+        self.tun.teardown()
     }
     fn route_owner_conflict(&self, dest: IpAddr, prefix_len: u8) -> Result<Option<String>> {
         self.tun.route_owner_conflict(dest, prefix_len)

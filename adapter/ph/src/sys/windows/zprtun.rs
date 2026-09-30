@@ -331,26 +331,42 @@ impl ZprTun {
             .map_err(|_| std::io::Error::other("Mutex lock failed"))
     }
 
-    /// Delete the adapter (graceful-exit leg of the lifecycle decision).
+    /// Graceful-exit teardown (plan open question 2, operator-approved:
+    /// fresh-create / stale-delete / delete-on-exit; wired per PR #51
+    /// review).
     ///
-    /// Consumes the device; the session is shut down first so a blocked
-    /// reader wakes. Callers that exit uncleanly skip this and rely on the
-    /// next startup's stale-adapter delete.
-    #[allow(dead_code)]
-    pub fn delete(self) -> std::io::Result<()> {
-        let ZprTun {
-            adapter, session, ..
-        } = self;
-        let _ = session.shutdown();
-        drop(session);
-        match Arc::try_unwrap(adapter) {
-            Ok(adapter) => adapter
-                .delete()
-                .map_err(|e| std::io::Error::other(e.to_string())),
-            Err(_) => Err(std::io::Error::other(
-                "cannot delete Wintun adapter: still shared",
-            )),
-        }
+    /// Shuts the Wintun session down (`WintunGetReadWaitEvent` consumers
+    /// wake, blocked `receive_blocking` calls error out) so the ring
+    /// quiesces before exit. The adapter device itself is deliberately NOT
+    /// closed from here, for two reasons that are worth recording:
+    ///
+    /// - It cannot be done soundly today. `wintun::Adapter` is removed by
+    ///   `WintunCloseAdapter` only when its last `Arc` drops, the `Session`
+    ///   holds one of those `Arc`s, and the fastpath worker thread — which
+    ///   `process::exit` kills without unwinding — waits on this session's
+    ///   read event every loop iteration via [`Waitable`]. Dropping the
+    ///   session or adapter out from under it would be a use-after-free of
+    ///   live driver handles. (This is also why the old `delete(self)`
+    ///   could never be called: it needed sole ownership of a `ZprTun`
+    ///   that is `Arc`-shared with the fastpath for the process lifetime.)
+    /// - It does not need to be. Wintun creates adapters via
+    ///   `SwDeviceCreate` with the default handle-bound lifetime, so the
+    ///   OS removes the device — and its interface-keyed netsh
+    ///   address/route state — when the process's handle closes, which
+    ///   happens on every exit path including `process::exit(0)`.
+    ///   Destructors are irrelevant to that; the close is kernel-side.
+    ///   The startup stale-adapter delete covers what remains (power
+    ///   loss / crash where no handle close ran, leaving a phantom
+    ///   device).
+    ///
+    /// Explicit in-process deletion becomes wireable once the Windows
+    /// datapath engine gives fastpath workers a stop signal (zipline#131);
+    /// until then this hook plus OS handle-close semantics implement
+    /// delete-on-exit.
+    pub fn teardown(&self) -> std::io::Result<()> {
+        self.session
+            .shutdown()
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 
