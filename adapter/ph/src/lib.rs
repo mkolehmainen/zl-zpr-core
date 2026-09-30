@@ -40,6 +40,8 @@ pub mod peer_table;
 pub mod pki;
 pub mod prelude;
 pub mod sample_ring;
+// Capture hands fds over SCM_RIGHTS; unix only (plan D7).
+#[cfg(unix)]
 pub mod set_capture_file_worker;
 pub mod signal_worker;
 #[cfg(unix)]

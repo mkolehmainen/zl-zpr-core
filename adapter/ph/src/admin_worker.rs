@@ -39,7 +39,7 @@ use tokio_util::compat::*;
 /// Accept control connections forever, serving the admin RPC on each.
 pub async fn launch_capnp(
     asm: Arc<Assembly>,
-    listener: ControlListener,
+    mut listener: ControlListener,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let stream = listener.accept().await?;

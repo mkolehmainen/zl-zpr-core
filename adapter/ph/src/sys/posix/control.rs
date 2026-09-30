@@ -27,7 +27,10 @@ impl ControlListener {
     }
 
     /// Wait for the next control connection.
-    pub async fn accept(&self) -> io::Result<ControlStream> {
+    ///
+    /// `&mut self` for parity with the Windows arm, whose accept must
+    /// replace the consumed pipe instance (zipline#130).
+    pub async fn accept(&mut self) -> io::Result<ControlStream> {
         let (stream, _addr) = self.listener.accept().await?;
         Ok(stream)
     }

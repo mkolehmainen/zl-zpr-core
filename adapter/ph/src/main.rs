@@ -50,6 +50,8 @@ mod pki;
 mod prelude;
 mod queues;
 mod sample_ring;
+// Capture hands fds over SCM_RIGHTS; unix only (plan D7).
+#[cfg(unix)]
 mod set_capture_file_worker;
 mod signal_worker;
 #[cfg(unix)]
@@ -85,6 +87,8 @@ use pki::load_cert;
 use queues::*;
 use sys::ZprTun;
 use tun_ctl::TunCtl;
+// `new_unspec` (the AF_UNSPEC disconnect) is unix-gated in zpr-ext 0.6.0.
+#[cfg(unix)]
 use zpr_ext::socket2::SockAddrExt;
 use zpr_utils::net_defs::SocketAddrExt;
 
@@ -247,12 +251,15 @@ fn main() -> ExitCode {
     // zipline#39: hand the sockets to whoever should drive ph-cli. Owner known
     // (sudo/pkexec): chown to that user, mode 0600. Owner unknown (systemd):
     // group "zpr" with mode 0660 when the group exists; otherwise leave the
-    // sockets exactly as before and warn once.
+    // sockets exactly as before and warn once. Unix only: on Windows access
+    // control is the named pipe's DACL (zipline#130, plan D6).
+    #[cfg(unix)]
     let socket_plan = socket_access::plan_socket_access(
         config.socket_owner.as_ref(),
         socket_access::system_user_primary_gid,
         socket_access::system_group_gid,
     );
+    #[cfg(unix)]
     if socket_plan == socket_access::SocketAccess::Unchanged && config.socket_owner.is_none() {
         warn!(
             target: STARTUP,
@@ -262,17 +269,21 @@ fn main() -> ExitCode {
         );
     }
 
-    let control_listener =
-        match sys::control::ControlListener::bind(&config.control_path, &socket_plan) {
-            Ok(listener) => listener,
-            Err(e) => {
-                error!(target: STARTUP, "{e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    #[cfg(unix)]
+    let control_bind = sys::control::ControlListener::bind(&config.control_path, &socket_plan);
+    #[cfg(windows)]
+    let control_bind = sys::control::ControlListener::bind(&config.control_path);
+    let control_listener = match control_bind {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!(target: STARTUP, "{e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // The capture socket exists only where capture is supported (plan D7);
-    // elsewhere setCaptureFile answers Unsupported.
+    // elsewhere setCaptureFile answers Unsupported and no worker runs.
+    #[cfg(unix)]
     let capture_socket = if sys::capture_supported() {
         match socket_access::bind_owned_listener("capture", &config.capture_path, &socket_plan) {
             Ok(socket) => Some(Arc::new(socket)),
@@ -398,9 +409,15 @@ fn main() -> ExitCode {
         .unwrap();
 
         socket.set_nonblocking(true).unwrap();
+        // pktinfo and SO_REUSEPORT are unix-only; the Windows datapath
+        // (zipline#131, plan D5) is single-socket/single-homed and needs
+        // neither. Gated so the msvc cross-check compiles (zipline#130);
+        // the real Windows substrate setup lands with the engine in #131.
+        #[cfg(unix)]
         batch_io::set_recv_packet_info(&socket, true).unwrap();
 
         // SO_REUSEPORT allows us to open multiple sockets for the same 5-tuple
+        #[cfg(unix)]
         socket.set_reuse_port(true).unwrap();
 
         // First bind to our self address.
@@ -467,6 +484,10 @@ fn main() -> ExitCode {
 
                 // Now drop the connection.  We will still specify it manually
                 // for each packet sent (and it's an error to do both).
+                // Unix only: `new_unspec` is unix-gated in zpr-ext 0.6.0,
+                // and the Windows datapath (zipline#131) recreates the
+                // socket instead of the AF_UNSPEC disconnect dance.
+                #[cfg(unix)]
                 match socket.connect(&socket2::SockAddr::new_unspec()) {
                     Ok(()) => (),
                     Err(err) if err.raw_os_error() == Some(libc::EAFNOSUPPORT) => (),
@@ -748,6 +769,7 @@ fn main() -> ExitCode {
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(mgmt_dispatch_worker::launch(asm.clone(), md_outq, mhd_outq));
     js.spawn_local(adapter_manager_worker::launch(asm.clone(), am_outq));
+    #[cfg(unix)]
     if let Some(capture_socket) = capture_socket {
         js.spawn_local(set_capture_file_worker::launch(asm.clone(), capture_socket));
     }

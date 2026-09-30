@@ -12,6 +12,13 @@ pub use self::macos::TunPiImpl;
 #[cfg(target_os = "macos")]
 pub use self::macos::ZprTun;
 
+#[cfg(windows)]
+pub(crate) mod windows;
+#[cfg(windows)]
+pub use self::windows::TunPiImpl;
+#[cfg(windows)]
+pub use self::windows::ZprTun;
+
 // Pure decision logic for the macOS route path. Compiled on every OS so it
 // stays unit-testable from Linux builds; only macOS code calls it at runtime.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -25,9 +32,19 @@ pub(crate) mod macos_route;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod linux_route;
 
+// POSIX arms of the control channel and the Notify wakeup object
+// (zipline#130: Windows provides the same two modules from sys/windows).
+#[cfg(unix)]
 pub(crate) mod posix;
+#[cfg(unix)]
 pub use self::posix::control;
+#[cfg(unix)]
 pub use self::posix::notify;
+
+#[cfg(windows)]
+pub use self::windows::control;
+#[cfg(windows)]
+pub use self::windows::notify;
 
 /// Whether this platform can capture packets to a file.  Capture hands `ph`
 /// a file descriptor over SCM_RIGHTS, so `ph` never opens a user-chosen

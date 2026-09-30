@@ -7,12 +7,19 @@
 
 use bytes::BufMut;
 use libc;
+#[cfg(unix)]
 use nix::sys::socket::{self, AddressFamily, SockaddrLike, SockaddrStorage};
 use std::io::Result;
-use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(unix)]
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd};
-use zpr_utils::net_defs::{ScopedIpAddr, ScopedIpv6Addr};
+use zpr_utils::net_defs::ScopedIpAddr;
+#[cfg(unix)]
+use zpr_utils::net_defs::ScopedIpv6Addr;
 
+use crate::sys::wait::AsWaitSource;
 use crate::sys::wait::WaitHandle;
 
 /// Flags for socket send operations, as a platform-neutral newtype over the
@@ -64,6 +71,10 @@ impl SendFlags {
     }
 
     /// The raw OS flag bits.
+    ///
+    /// Consumed by the unix engines only; the Windows engine (zipline#131)
+    /// has no sendmsg-style flags argument.
+    #[cfg_attr(windows, allow(dead_code))]
     fn bits(self) -> libc::c_int {
         self.0
     }
@@ -85,6 +96,7 @@ pub struct ReceivedPacket {
     pub destination: Option<ScopedIpAddr>,
 }
 
+#[cfg(unix)]
 fn sockaddr_to_socket_addr(sa: SockaddrStorage) -> Option<SocketAddr> {
     match sa.family()? {
         AddressFamily::Inet => Some(SocketAddr::V4((*sa.as_sockaddr_in().unwrap()).into())),
@@ -93,10 +105,12 @@ fn sockaddr_to_socket_addr(sa: SockaddrStorage) -> Option<SocketAddr> {
     }
 }
 
+#[cfg(unix)]
 fn errno_to_error(errno: nix::errno::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(errno as i32)
 }
 
+#[cfg(unix)]
 fn pktinfo_from_ipv4addr(addr: &Ipv4Addr) -> libc::in_pktinfo {
     libc::in_pktinfo {
         ipi_ifindex: 0,
@@ -107,6 +121,7 @@ fn pktinfo_from_ipv4addr(addr: &Ipv4Addr) -> libc::in_pktinfo {
     }
 }
 
+#[cfg(unix)]
 fn pktinfo_from_scoped_ipv6addr(addr: &ScopedIpv6Addr) -> libc::in6_pktinfo {
     libc::in6_pktinfo {
         ipi6_addr: libc::in6_addr {
@@ -118,6 +133,9 @@ fn pktinfo_from_scoped_ipv6addr(addr: &ScopedIpv6Addr) -> libc::in6_pktinfo {
 
 /// Enable the reception of packet info on a socket.  Required for
 /// `try_recv_buf_from_to_batch()` to return the destination address.
+/// Unix only: the Windows engine has no pktinfo path (plan D5) — an
+/// end-user adapter is single-homed for our purposes.
+#[cfg(unix)]
 pub fn set_recv_packet_info(fd: &impl AsFd, enable: bool) -> std::io::Result<()> {
     match socket::getsockname::<SockaddrStorage>(fd.as_fd().as_raw_fd())?.family() {
         Some(AddressFamily::Inet) => {
@@ -1201,6 +1219,7 @@ mod io_uring {
     }
 }
 
+#[cfg(unix)]
 mod posix_unbatched {
     //! Unbatched implementation using POSIX primitives.
 
@@ -1476,6 +1495,9 @@ mod posix_unbatched {
     }
 }
 
+// The engine registration macro is consumed only where at least one engine
+// exists (all unix today; zipline#131 adds the Windows engine).
+#[cfg_attr(windows, allow(unused_macros))]
 macro_rules! bio {
     ($m:tt) => {
         BatchIoEngine {
@@ -1490,7 +1512,11 @@ macro_rules! bio {
 const ENGINES: &[BatchIoEngine] = &[
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     bio!(io_uring),
+    #[cfg(unix)]
     bio!(posix_unbatched),
+    // Windows: no engine yet — zipline#131 adds `windows_unbatched`
+    // (plan D5). Until then ENGINES is empty there and auto-selection
+    // fails at runtime; everything still compiles.
 ];
 
 /// List of available engine names.  Does not include automatic selection.
@@ -1563,17 +1589,17 @@ impl BatchIo {
 
     pub fn try_write_batch<'a>(
         &mut self,
-        fd: impl AsFd,
+        fd: impl AsWaitSource,
         bufs: impl IntoIterator<Item = &'a [u8]>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize> {
         self.0
-            .try_write_batch(fd.as_fd().into(), &mut bufs.into_iter(), results)
+            .try_write_batch(fd.as_wait_handle(), &mut bufs.into_iter(), results)
     }
 
     pub fn try_read_buf_batch<'a, B>(
         &mut self,
-        fd: impl AsFd,
+        fd: impl AsWaitSource,
         bufs: impl IntoIterator<Item = &'a mut B>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize>
@@ -1581,7 +1607,7 @@ impl BatchIo {
         B: BufMut + 'a,
     {
         self.0.try_read_buf_batch(
-            fd.as_fd().into(),
+            fd.as_wait_handle(),
             &mut bufs.into_iter().map(|b| b as &mut dyn BufMut),
             results,
         )
@@ -1590,28 +1616,28 @@ impl BatchIo {
     #[allow(dead_code)]
     pub fn try_send_to_batch<'a>(
         &mut self,
-        fd: impl AsFd,
+        fd: impl AsWaitSource,
         bufs: impl IntoIterator<Item = (&'a [u8], SocketAddr, SendFlags)>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize> {
         self.0
-            .try_send_to_batch(fd.as_fd().into(), &mut bufs.into_iter(), results)
+            .try_send_to_batch(fd.as_wait_handle(), &mut bufs.into_iter(), results)
     }
 
     pub fn try_send_to_from_batch<'a>(
         &mut self,
-        fd: impl AsFd,
+        fd: impl AsWaitSource,
         bufs: impl IntoIterator<Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, SendFlags)>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize> {
         self.0
-            .try_send_to_from_batch(fd.as_fd().into(), &mut bufs.into_iter(), results)
+            .try_send_to_from_batch(fd.as_wait_handle(), &mut bufs.into_iter(), results)
     }
 
     #[allow(dead_code)]
     pub fn try_recv_buf_from_batch<'a, B>(
         &mut self,
-        fd: impl AsFd,
+        fd: impl AsWaitSource,
         bufs: impl IntoIterator<Item = &'a mut B>,
         results: &mut Vec<Result<ReceivedPacket>>,
     ) -> Result<usize>
@@ -1619,7 +1645,7 @@ impl BatchIo {
         B: BufMut + 'a,
     {
         self.0.try_recv_buf_from_batch(
-            fd.as_fd().into(),
+            fd.as_wait_handle(),
             &mut bufs.into_iter().map(|b| b as &mut dyn BufMut),
             results,
         )
@@ -1627,7 +1653,7 @@ impl BatchIo {
 
     pub fn try_recv_buf_from_to_batch<'a, B>(
         &mut self,
-        fd: impl AsFd,
+        fd: impl AsWaitSource,
         bufs: impl IntoIterator<Item = &'a mut B>,
         results: &mut Vec<Result<ReceivedPacket>>,
     ) -> Result<usize>
@@ -1635,7 +1661,7 @@ impl BatchIo {
         B: BufMut + 'a,
     {
         self.0.try_recv_buf_from_to_batch(
-            fd.as_fd().into(),
+            fd.as_wait_handle(),
             &mut bufs.into_iter().map(|b| b as &mut dyn BufMut),
             results,
         )

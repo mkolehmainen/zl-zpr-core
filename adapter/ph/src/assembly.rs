@@ -140,6 +140,13 @@ impl Assembly {
             PhMode::Node => self.shutdown_node().await,
             PhMode::Adapter => self.shutdown_adapter().await,
         }
+        // Tear the TUN device down last, after the peers are gone
+        // (zipline#130): on Windows this quiesces the Wintun session; the
+        // unix TUNs are process-scoped and their teardown is a no-op.
+        // Best-effort — the process is exiting either way.
+        if let Err(e) = self.tun_ctl.teardown() {
+            error!(target: STARTUP, "TUN teardown failed during shutdown: {e}");
+        }
     }
 
     // The node quickly sends Terminate Indications
@@ -663,6 +670,7 @@ pub mod test {
         pub late_conflict: Option<String>,
         pub probes: Arc<std::sync::atomic::AtomicUsize>,
         pub carriers: Arc<std::sync::Mutex<Vec<bool>>>,
+        pub teardowns: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[cfg(test)]
@@ -678,6 +686,7 @@ pub mod test {
                     late_conflict: None,
                     probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     carriers: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    teardowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 },
                 routes,
             )
@@ -747,6 +756,11 @@ pub mod test {
                 }
             }
             Ok(None)
+        }
+        fn teardown(&self) -> std::io::Result<()> {
+            self.teardowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -836,6 +850,34 @@ pub mod test {
             SubstrateAddr::from(([127, 0, 0, 1], 9000)),
             ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2).into()),
         )
+    }
+
+    /// Graceful shutdown must tear the TUN device down after the peers are
+    /// dropped (zipline#130, PR #51 review): the signal path ends in
+    /// `process::exit(0)`, which skips destructors, so on Windows an
+    /// unwired teardown orphans the Wintun adapter and its netsh
+    /// address/route state until a later startup reaps them.
+    #[tokio::test]
+    async fn test_shutdown_tears_down_tun() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tun_ctl, _routes) = RecordingTunCtl::new(false);
+                let teardowns = tun_ctl.teardowns.clone();
+                let mut builder = TestAssemblyBuilder::default();
+                // Node mode: shutdown_node over an empty peer table
+                // returns immediately (adapter mode's disconnect wait
+                // assumes the local actor peer exists).
+                builder.ph_mode = Some(PhMode::Node);
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                asm.shutdown().await;
+                assert_eq!(
+                    teardowns.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "graceful shutdown must call TunCtl::teardown exactly once"
+                );
+            })
+            .await
     }
 
     /// `start_tether` with `auto_start = false` (zipline#28: adapter started

@@ -3,12 +3,11 @@ use crate::config;
 use crate::counters::*;
 use crate::fastpath::{FastpathWorker, FastpathWorkerConfig};
 use crate::packet_queue;
-use crate::sys::wait::{WaitHandle, Waitable};
+use crate::sys::wait::{AsWaitSource, WaitHandle, Waitable};
 use crate::sys::{TunPi, ZprTun};
 use crate::zprtun;
 use std::io::{ErrorKind, Result};
 use std::net::{SocketAddr, UdpSocket};
-use std::os::fd::AsFd;
 use std::sync::Arc;
 use zpr_utils::net_defs;
 
@@ -66,12 +65,12 @@ impl FastpathIo {
 
     /// Substrate socket wait handle for the fastpath wait set.
     pub fn substrate_socket_handle(&self) -> WaitHandle<'_> {
-        self.substrate_socket.as_fd().into()
+        self.substrate_socket.as_wait_handle()
     }
 
     /// Actor TUN wait handle for the fastpath wait set.
     pub fn actor_tun_handle(&self) -> WaitHandle<'_> {
-        self.actor_tun.as_fd().into()
+        self.actor_tun.as_wait_handle()
     }
 
     /// Requeue queue wait handle for the fastpath wait set.
@@ -263,7 +262,7 @@ impl FastpathIo {
         let n = self
             .batch_io
             .try_write_batch(
-                &self.actor_tun.as_fd(),
+                &self.actor_tun,
                 worker.actor_input_q.iter().map(|pkt| pkt.body()),
                 &mut self.io_results,
             )
