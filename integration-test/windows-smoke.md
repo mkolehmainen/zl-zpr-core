@@ -11,8 +11,8 @@ Two machines:
 * **Linux host** — runs the node, the visa service and one Linux adapter
   (`adapter1`), all inside the existing integration-test Docker image with
   `--network host`, so nothing needs to be installed on the host beyond Docker
-  and the built binaries. `adapter1` runs in its own network namespace inside
-  the container (see 1b for why).
+  and the built binaries. The visa service and `adapter1` each run in their
+  own network namespace inside the container (see 1b for why).
 * **Windows 11 VM** (or physical box) on the same network as the Linux host —
   runs `ph.exe adapter` from an elevated PowerShell. The VM must be able to
   reach the Linux host's LAN IP directly (bridged networking, or libvirt NAT
@@ -209,53 +209,48 @@ docker run --rm -it --privileged --network host \
 
 Everything below runs in that container shell (root, host network).
 
+The node runs in the host network namespace, so the VM reaches it at
+`$HOST_LAN_IP:5000`. The visa service (with its valkey and adapter) and
+`adapter1` each get their own network namespace, joined to the host by a
+veth pair, the same layout `lib/common_funcs.sh` builds for the
+integration tests. They cannot share the node's namespace: the node's
+traffic to the visa service's ZPR address would then be delivered locally
+with the wrong source address (the visa service rejects it: "zpr addr does
+not match connection source"), and `ph adapter` refuses to start when
+another interface already routes the ZPR prefix ("running two adapters on
+one host is not supported").
+
 ```sh
 cd "$WORK"
+
+# Namespaces for the visa service and adapter1, each on a veth /24 to the
+# host namespace, with a default route back so the node's advertised
+# $HOST_LAN_IP is reachable from inside.
+ip netns add zpr-vs; ip netns add zpr-a
+ip -n zpr-vs link set lo up; ip -n zpr-a link set lo up
+ip link add veth-zpr-vs type veth peer veth0 netns zpr-vs
+ip link add veth-zpr-a type veth peer veth0 netns zpr-a
+ip addr add 10.0.0.1/24 dev veth-zpr-vs; ip link set veth-zpr-vs up
+ip addr add 10.0.1.1/24 dev veth-zpr-a;  ip link set veth-zpr-a up
+ip -n zpr-vs addr add 10.0.0.2/24 dev veth0; ip -n zpr-vs link set veth0 up
+ip -n zpr-a  addr add 10.0.1.2/24 dev veth0; ip -n zpr-a  link set veth0 up
+ip -n zpr-vs route add default via 10.0.0.1
+ip -n zpr-a  route add default via 10.0.1.1
 
 # TUN interfaces. Pre-creating them (with the address already set) works
 # around the known Linux TUN bug described in docs/SETUP.md — required
 # whenever zpr_addr is specified.
-#
-# One adapter per network namespace: when an adapter activates, it installs
-# the fd5a:5052::/32 route on its TUN, and a second adapter starting in the
-# same namespace then refuses to run because another live interface already
-# owns that route (the single-adapter-per-host guard,
-# `adapter/ph/src/main.rs`). The integration tests avoid this by giving the
-# VS and every adapter a namespace of its own
-# (`integration-test/lib/common_funcs.sh`, create_network); this runbook
-# does the minimal version: the node and the VS adapter stay in the
-# container's root namespace, and adapter1 gets its own namespace (zpr-a1),
-# joined to the root namespace by a veth pair so it can reach the node's
-# dock port.
-
-# Root namespace: node TUN and VS-adapter TUN.
 ip tuntap add name tun-n mode tun multi_queue
 ip link set tun-n mtu 1400 && ip link set tun-n up
 ip addr add fd5a:5052::2 peer fd5a:5052::1 dev tun-n
 
-ip tuntap add name tun-v mode tun multi_queue
-ip link set tun-v mtu 1400 && ip link set tun-v up
-ip addr add fd5a:5052::1 peer fd5a:5052::2 dev tun-v
+ip -n zpr-vs tuntap add name tun0 mode tun multi_queue
+ip -n zpr-vs link set tun0 mtu 1400 && ip -n zpr-vs link set tun0 up
+ip -n zpr-vs addr add fd5a:5052::1 peer fd5a:5052::2 dev tun0
 
-# adapter1's namespace, its veth link to the root namespace, and its TUN.
-# 10.200.0.0/24 is the substrate leg between the namespaces: adapter1
-# reaches the node at 10.200.0.1:5000, on-link, so no extra routes are
-# needed. (The veth leg gets a /24, not peer addressing — a /32 local
-# address on an ARP-capable device never answers ARP; see the comment in
-# common_funcs.sh.)
-ip netns add zpr-a1
-ip -n zpr-a1 link set lo up
-ip link add veth-a1h type veth peer name veth-a1
-ip link set veth-a1 netns zpr-a1
-ip addr add 10.200.0.1/24 dev veth-a1h
-ip link set veth-a1h up
-ip -n zpr-a1 addr add 10.200.0.2/24 dev veth-a1
-ip -n zpr-a1 link set veth-a1 up
-
-ip -n zpr-a1 tuntap add name tun-a1 mode tun multi_queue
-ip -n zpr-a1 link set tun-a1 mtu 1400
-ip -n zpr-a1 link set tun-a1 up
-ip -n zpr-a1 addr add fd5a:5052:8888::1:1 peer fd5a:5052::/32 dev tun-a1
+ip -n zpr-a tuntap add name tun0 mode tun multi_queue
+ip -n zpr-a link set tun0 mtu 1400 && ip -n zpr-a link set tun0 up
+ip -n zpr-a addr add fd5a:5052:8888::1:1 peer fd5a:5052::/32 dev tun0
 
 mkdir -p /var/run/zpr
 
@@ -264,9 +259,10 @@ PH=<zl-zpr-core>/target/debug/ph
 PHCLI=<zl-zpr-core>/target/debug/ph-cli
 VS=<zl-zpr-visaservice>/target/debug/vs
 
-valkey-server --save '' --appendonly no >valkey.log 2>&1 &
+ip netns exec zpr-vs valkey-server --save '' --appendonly no >valkey.log 2>&1 &
+sleep 1
 
-"$VS" -c vs-config.toml --clear-state windows-smoke.bin2 >vs.log 2>&1 &
+ip netns exec zpr-vs "$VS" -c vs-config.toml --clear-state windows-smoke.bin2 >vs.log 2>&1 &
 sleep 2
 
 "$PH" node -l all=INFO \
@@ -278,35 +274,31 @@ sleep 2
   --tun-if tun-n --zpr-addr fd5a:5052::2 >node.log 2>&1 &
 sleep 2
 
-"$PH" adapter -l all=INFO \
+ip netns exec zpr-vs "$PH" adapter -l all=INFO \
   --control-path "$WORK/vs-adapter.sock" --capture-path "$WORK/vs-adapter-cap.sock" \
   --ca-file ca.crt --certificate-file vs.zpr.crt --private-key-file vs.zpr.key \
   --bootstrap-key actorvs-rsa.key \
-  --tun-if tun-v --node-addr 127.0.0.1:5000 --zpr-addr fd5a:5052::1 \
+  --tun-if tun0 --node-addr 10.0.0.1:5000 --zpr-addr fd5a:5052::1 \
   >vs-adapter.log 2>&1 &
-sleep 3
+sleep 5
 
-# adapter1, inside its namespace. It docks to the node over the veth leg
-# (10.200.0.1), not loopback — loopback in zpr-a1 is not the node's.
-ip netns exec zpr-a1 "$PH" adapter -l all=INFO \
+ip netns exec zpr-a "$PH" adapter -l all=INFO \
   --control-path "$WORK/adapter1.sock" --capture-path "$WORK/adapter1-cap.sock" \
   --ca-file ca.crt --bootstrap-key adapter1-rsa.key --name adapter1 \
-  --tun-if tun-a1 --node-addr 10.200.0.1:5000 --zpr-addr fd5a:5052:8888::1:1 \
+  --tun-if tun0 --node-addr 10.0.1.1:5000 --zpr-addr fd5a:5052:8888::1:1 \
   >adapter1.log 2>&1 &
-sleep 3
+sleep 5
 
-# The HTTP service the Windows adapter will fetch from — inside zpr-a1,
-# where fd5a:5052:8888::1:1 lives.
-ip netns exec zpr-a1 python3 -m http.server 8080 --bind fd5a:5052:8888::1:1 >http.log 2>&1 &
+# The HTTP service the Windows adapter will fetch from.
+ip netns exec zpr-a python3 -m http.server 8080 --bind fd5a:5052:8888::1:1 >http.log 2>&1 &
 
-# Sanity: adapter1 docked and its link is up. ph-cli talks over a unix
-# socket, which is not network-namespaced, so it runs from the root
-# namespace as-is.
+# Sanity: adapter1 docked and its link is up. (The control socket is a
+# filesystem path, so ph-cli needs no netns.)
 "$PHCLI" -p "$WORK/adapter1.sock" link show
 ```
 
-Expect `link show` to report link 1 up/authenticated. If not, read
-`adapter1.log` and `node.log`.
+Expect `link show` to report one link `(Active)`. If not, read
+`adapter1.log`, `vs-adapter.log` and `node.log`.
 
 ## 2. Windows side
 
@@ -338,8 +330,12 @@ cd C:\zpr-smoke
 .\ph.exe adapter -c adapter.toml
 ```
 
-Expected startup: a `Wintun adapter 'zpr'` line in the log, the address and
-route applied via `netsh`, then a docked link to the node. The console keeps
+Expected startup: `WinTun: Creating adapter` in the log (plus `Removed
+orphaned adapter` if a previous run was hard-killed), `Using packet I/O
+engine windows_unbatched`, then `dock link granted ZPR addresses
+[... fd5a:5052:8888::4:1 ...], becoming ACTIVE`. Repeated `Packet dropped
+becuase TTL reached 0` lines are the OS's hop-limit-1 multicast (neighbour
+discovery and the like) and are expected; the Linux adapters log them too. The console keeps
 running; leave it and open a **second elevated PowerShell** for the checks.
 
 ## 3. Checks (second elevated PowerShell)
@@ -363,15 +359,25 @@ curl.exe -6 -sS "http://[fd5a:5052:8888::1:1]:8080/" | Select-Object -First 5
 
 Pass criteria:
 
-* `link show` reports the link up and authenticated; `counters` answers over
+* `link show` reports the dock link `(Active)`; `counters` answers over
   the pipe (numbers are non-zero after the pings).
 * `ping -6` gets replies from `fd5a:5052:8888::1:1` (0% loss).
 * The HTTP fetch returns the `http.server` directory listing.
 
-Optionally verify the reverse direction from the Linux container — from
-adapter1's namespace, where its TUN lives:
-`ip netns exec zpr-a1 ping -6 -c 4 fd5a:5052:8888::4:1`
-(allowed by `allow A1 to access WPing`).
+Optionally verify the reverse direction from the Linux container:
+`ip netns exec zpr-a ping -6 -c 4 fd5a:5052:8888::4:1` (allowed by `allow A1
+to access WPing`). Windows puts the `zpr` adapter on the Public network
+profile, where Windows Defender Firewall drops inbound ICMPv6 echo requests,
+so this fails until you allow them on that interface. ZPR has delivered the
+packets by then: the `Inbound Packets Sent` counter in `ph-cli counters`
+still rises.
+
+```powershell
+New-NetFirewallRule -DisplayName zpr-smoke-icmpv6 -Direction Inbound `
+  -Protocol ICMPv6 -IcmpType 128 -InterfaceAlias zpr -Action Allow
+# ... ping from Linux ...
+Remove-NetFirewallRule -DisplayName zpr-smoke-icmpv6
+```
 
 ## 4. Graceful shutdown
 
@@ -385,18 +391,19 @@ Get-NetAdapter -Name zpr        # expect: no matching adapter / error
 
 A leftover `zpr` adapter here is a failure (the delete-on-exit path in
 `sys/windows/zprtun.rs` did not run). Note: after a hard kill (not Ctrl-C) a
-stale adapter is expected and is reaped by the next `ph.exe` startup.
+stale adapter is expected (Windows names it `zpr 1`, so check `Get-NetAdapter`
+without `-Name`) and is reaped by the next `ph.exe` startup (`Removed
+orphaned adapter "zpr 1"`).
 
 ## 5. Teardown (Linux)
 
-In the container shell: `kill %1 %2 %3 %4 %5 %6` (or just exit the container
-— host networking means the TUNs in the root namespace must be removed
-explicitly; zpr-a1 and everything in it, including tun-a1 and the veth pair,
-die with the container):
+In the container shell: `kill %1 %2 %3 %4 %5 %6`. Host networking means the
+node's TUN and the veth pairs live in the host namespace, so remove them
+explicitly before leaving (deleting a namespace deletes the interfaces inside
+it and its veth peer):
 
 ```sh
-ip link del tun-n; ip link del tun-v
-ip netns del zpr-a1
+ip netns del zpr-vs; ip netns del zpr-a; ip link del tun-n
 exit
 rm -rf "$WORK"
 ```
