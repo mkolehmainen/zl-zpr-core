@@ -11,7 +11,8 @@ Two machines:
 * **Linux host** — runs the node, the visa service and one Linux adapter
   (`adapter1`), all inside the existing integration-test Docker image with
   `--network host`, so nothing needs to be installed on the host beyond Docker
-  and the built binaries.
+  and the built binaries. `adapter1` runs in its own network namespace inside
+  the container (see 1b for why).
 * **Windows 11 VM** (or physical box) on the same network as the Linux host —
   runs `ph.exe adapter` from an elevated PowerShell. The VM must be able to
   reach the Linux host's LAN IP directly (bridged networking, or libvirt NAT
@@ -214,6 +215,20 @@ cd "$WORK"
 # TUN interfaces. Pre-creating them (with the address already set) works
 # around the known Linux TUN bug described in docs/SETUP.md — required
 # whenever zpr_addr is specified.
+#
+# One adapter per network namespace: when an adapter activates, it installs
+# the fd5a:5052::/32 route on its TUN, and a second adapter starting in the
+# same namespace then refuses to run because another live interface already
+# owns that route (the single-adapter-per-host guard,
+# `adapter/ph/src/main.rs`). The integration tests avoid this by giving the
+# VS and every adapter a namespace of its own
+# (`integration-test/lib/common_funcs.sh`, create_network); this runbook
+# does the minimal version: the node and the VS adapter stay in the
+# container's root namespace, and adapter1 gets its own namespace (zpr-a1),
+# joined to the root namespace by a veth pair so it can reach the node's
+# dock port.
+
+# Root namespace: node TUN and VS-adapter TUN.
 ip tuntap add name tun-n mode tun multi_queue
 ip link set tun-n mtu 1400 && ip link set tun-n up
 ip addr add fd5a:5052::2 peer fd5a:5052::1 dev tun-n
@@ -222,9 +237,25 @@ ip tuntap add name tun-v mode tun multi_queue
 ip link set tun-v mtu 1400 && ip link set tun-v up
 ip addr add fd5a:5052::1 peer fd5a:5052::2 dev tun-v
 
-ip tuntap add name tun-a1 mode tun multi_queue
-ip link set tun-a1 mtu 1400 && ip link set tun-a1 up
-ip addr add fd5a:5052:8888::1:1 peer fd5a:5052::/32 dev tun-a1
+# adapter1's namespace, its veth link to the root namespace, and its TUN.
+# 10.200.0.0/24 is the substrate leg between the namespaces: adapter1
+# reaches the node at 10.200.0.1:5000, on-link, so no extra routes are
+# needed. (The veth leg gets a /24, not peer addressing — a /32 local
+# address on an ARP-capable device never answers ARP; see the comment in
+# common_funcs.sh.)
+ip netns add zpr-a1
+ip -n zpr-a1 link set lo up
+ip link add veth-a1h type veth peer name veth-a1
+ip link set veth-a1 netns zpr-a1
+ip addr add 10.200.0.1/24 dev veth-a1h
+ip link set veth-a1h up
+ip -n zpr-a1 addr add 10.200.0.2/24 dev veth-a1
+ip -n zpr-a1 link set veth-a1 up
+
+ip -n zpr-a1 tuntap add name tun-a1 mode tun multi_queue
+ip -n zpr-a1 link set tun-a1 mtu 1400
+ip -n zpr-a1 link set tun-a1 up
+ip -n zpr-a1 addr add fd5a:5052:8888::1:1 peer fd5a:5052::/32 dev tun-a1
 
 mkdir -p /var/run/zpr
 
@@ -255,17 +286,22 @@ sleep 2
   >vs-adapter.log 2>&1 &
 sleep 3
 
-"$PH" adapter -l all=INFO \
+# adapter1, inside its namespace. It docks to the node over the veth leg
+# (10.200.0.1), not loopback — loopback in zpr-a1 is not the node's.
+ip netns exec zpr-a1 "$PH" adapter -l all=INFO \
   --control-path "$WORK/adapter1.sock" --capture-path "$WORK/adapter1-cap.sock" \
   --ca-file ca.crt --bootstrap-key adapter1-rsa.key --name adapter1 \
-  --tun-if tun-a1 --node-addr 127.0.0.1:5000 --zpr-addr fd5a:5052:8888::1:1 \
+  --tun-if tun-a1 --node-addr 10.200.0.1:5000 --zpr-addr fd5a:5052:8888::1:1 \
   >adapter1.log 2>&1 &
 sleep 3
 
-# The HTTP service the Windows adapter will fetch from.
-python3 -m http.server 8080 --bind fd5a:5052:8888::1:1 >http.log 2>&1 &
+# The HTTP service the Windows adapter will fetch from — inside zpr-a1,
+# where fd5a:5052:8888::1:1 lives.
+ip netns exec zpr-a1 python3 -m http.server 8080 --bind fd5a:5052:8888::1:1 >http.log 2>&1 &
 
-# Sanity: adapter1 docked and its link is up.
+# Sanity: adapter1 docked and its link is up. ph-cli talks over a unix
+# socket, which is not network-namespaced, so it runs from the root
+# namespace as-is.
 "$PHCLI" -p "$WORK/adapter1.sock" link show
 ```
 
@@ -332,8 +368,10 @@ Pass criteria:
 * `ping -6` gets replies from `fd5a:5052:8888::1:1` (0% loss).
 * The HTTP fetch returns the `http.server` directory listing.
 
-Optionally verify the reverse direction from the Linux container:
-`ping -6 -c 4 fd5a:5052:8888::4:1` (allowed by `allow A1 to access WPing`).
+Optionally verify the reverse direction from the Linux container — from
+adapter1's namespace, where its TUN lives:
+`ip netns exec zpr-a1 ping -6 -c 4 fd5a:5052:8888::4:1`
+(allowed by `allow A1 to access WPing`).
 
 ## 4. Graceful shutdown
 
@@ -352,10 +390,13 @@ stale adapter is expected and is reaped by the next `ph.exe` startup.
 ## 5. Teardown (Linux)
 
 In the container shell: `kill %1 %2 %3 %4 %5 %6` (or just exit the container
-— host networking means the TUNs must be removed explicitly):
+— host networking means the TUNs in the root namespace must be removed
+explicitly; zpr-a1 and everything in it, including tun-a1 and the veth pair,
+die with the container):
 
 ```sh
-ip link del tun-n; ip link del tun-v; ip link del tun-a1
+ip link del tun-n; ip link del tun-v
+ip netns del zpr-a1
 exit
 rm -rf "$WORK"
 ```
