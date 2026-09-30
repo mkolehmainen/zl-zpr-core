@@ -794,15 +794,31 @@ fn browser_unavailable_for(is_root: bool, has_display: bool) -> Option<&'static 
     }
 }
 
-/// Launch the platform browser on `url` (no external crate: `xdg-open` on
-/// Linux, `open` on macOS).
+/// The per-OS browser launcher: program plus fixed leading arguments (the
+/// URL is appended after them). Pure so tests can pin every arm from any
+/// host. `os` is `std::env::consts::OS` at the real call site.
+///
+/// Windows gets `rundll32 url.dll,FileProtocolHandler <url>` — the
+/// documented no-console way to hand a URL to the default browser without
+/// `cmd start`'s quoting hazards. It must never fall through to
+/// `xdg-open`, which is normally absent on Windows: `browser_unavailable`
+/// reports launching as possible there, so the fallthrough turned every
+/// default-browser login into a launch error (PR #51 review).
+fn browser_launch_command(os: &str) -> (&'static str, &'static [&'static str]) {
+    match os {
+        "macos" => ("open", &[]),
+        "windows" => ("rundll32", &["url.dll,FileProtocolHandler"]),
+        _ => ("xdg-open", &[]),
+    }
+}
+
+/// Launch the platform browser on `url` (no external crate: `open` on
+/// macOS, `rundll32 url.dll,FileProtocolHandler` on Windows, `xdg-open`
+/// elsewhere — see [`browser_launch_command`]).
 fn open_in_browser(url: &str) -> Result<(), OidcCliError> {
-    let program = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
+    let (program, args) = browser_launch_command(std::env::consts::OS);
     Command::new(program)
+        .args(args)
         .arg(url)
         .spawn()
         .map(|_| ())
@@ -2378,6 +2394,29 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// The launcher command is per-OS: `open` on macOS, `rundll32
+    /// url.dll,FileProtocolHandler` on Windows, `xdg-open` elsewhere.
+    /// Windows must never fall through to `xdg-open` — it is normally
+    /// absent there, so browser login would always fail after
+    /// `browser_unavailable` said launching could work (PR #51 review).
+    #[test]
+    fn test_browser_launch_command_per_os() {
+        assert_eq!(browser_launch_command("macos"), ("open", &[] as &[&str]));
+        assert_eq!(
+            browser_launch_command("windows"),
+            ("rundll32", &["url.dll,FileProtocolHandler"] as &[&str])
+        );
+        assert_eq!(
+            browser_launch_command("linux"),
+            ("xdg-open", &[] as &[&str])
+        );
+        // Any other unix (freebsd, ...) also gets xdg-open.
+        assert_eq!(
+            browser_launch_command("freebsd"),
+            ("xdg-open", &[] as &[&str])
+        );
     }
 
     /// The pure browser-availability predicate: root and (on Linux) a
