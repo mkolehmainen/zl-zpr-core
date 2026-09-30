@@ -2261,6 +2261,9 @@ mod tests {
         }
     }
 
+    /// Unix only: needs `set_recv_packet_info` and checks the pktinfo
+    /// destination, which the Windows engine does not provide (plan D5).
+    #[cfg(unix)]
     #[test]
     fn test_recv_to() {
         for engine in ENGINES {
