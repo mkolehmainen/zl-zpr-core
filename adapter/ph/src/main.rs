@@ -401,7 +401,10 @@ fn main() -> ExitCode {
     let mut substrate_sockets: Vec<std::net::UdpSocket> = Vec::new();
 
     for _i in 0..topology_config.fastpath_concurrency {
-        let socket = socket2::Socket::new(
+        // `mut` is consumed by the Windows disconnect-by-recreation arm
+        // below; the unix arms never reassign it.
+        #[cfg_attr(unix, allow(unused_mut))]
+        let mut socket = socket2::Socket::new(
             socket2::Domain::for_address(config.self_addr),
             socket2::Type::DGRAM,
             None,
@@ -492,6 +495,31 @@ fn main() -> ExitCode {
                     Ok(()) => (),
                     Err(err) if err.raw_os_error() == Some(libc::EAFNOSUPPORT) => (),
                     res => res.expect("unable to disconnect socket"),
+                }
+
+                // Windows (zipline#131, plan D5/C4): UDP dissociation via an
+                // AF_UNSPEC connect is not reliably supported, so recreate
+                // the socket instead — deterministic, and cheap at startup.
+                // `config.self_addr` now carries the OS-chosen address and
+                // port from the probe above, so the fresh socket binds to
+                // exactly what the temp one discovered (no SO_REUSEPORT on
+                // Windows, but the old socket is dropped before the bind).
+                #[cfg(windows)]
+                {
+                    drop(socket);
+                    socket = socket2::Socket::new(
+                        socket2::Domain::for_address(config.self_addr),
+                        socket2::Type::DGRAM,
+                        None,
+                    )
+                    .unwrap();
+                    socket.set_nonblocking(true).unwrap();
+                    socket
+                        .bind(&socket2::SockAddr::from(config.self_addr))
+                        .expect(&format!(
+                            "unable to re-bind to self_addr ({})",
+                            config.self_addr
+                        ));
                 }
 
                 // Disconnecting above weirdly also drops the local-address binding!
