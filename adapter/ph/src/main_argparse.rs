@@ -159,6 +159,9 @@ where
     Ok(ac)
 }
 
+// The TOML fixtures below splice temp-file paths into `'$PLACEHOLDER'`
+// single-quoted (literal) strings: a Windows path such as `C:\Users\...` in a
+// double-quoted TOML string would be parsed as `\U` escapes.
 #[cfg(test)]
 mod test {
 
@@ -340,12 +343,12 @@ mod test {
     fn test_main_args_argparse_adapter_config() {
         let mut tomltxt = r#"
         [global]
-        control_path = "$CONTROLFILE"
-        capture_path = "$CAPTUREFILE"
+        control_path = '$CONTROLFILE'
+        capture_path = '$CAPTUREFILE'
         self_addr = "192.168.0.1:12345"
-        ca_file = "$CAFILE"
-        certificate_file = "$CERTFILE"
-        private_key_file = "$PKFILE"
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
         tun_if = "tun23"
         zpr_addr = [ "10.0.0.1" ]
         logging = [ ["link_state", "DEBUG"] ]
@@ -439,9 +442,9 @@ mod test {
         control_path = "/tmp/control.sock"
         capture_path = "/tmp/capture.sock"
         self_addr = "192.168.0.1:12345"
-        ca_file = "$CAFILE"
-        certificate_file = "$CERTFILE"
-        private_key_file = "$PKFILE"
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
         tun_if = "tun23"
 
         [adapter]
@@ -493,11 +496,11 @@ mod test {
     fn test_main_args_argparse_adapter_config_override_globs() {
         let mut tomltxt = r#"
         [global]
-        control_path = "$CONTROLFILE"
-        capture_path = "$CAPTUREFILE"
-        ca_file = "$CAFILE"
-        certificate_file = "$CERTFILE"
-        private_key_file = "$PKFILE"
+        control_path = '$CONTROLFILE'
+        capture_path = '$CAPTUREFILE'
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
         zpr_addr = [ "10.0.0.1" ]
 
         [adapter]
@@ -576,9 +579,9 @@ mod test {
         // Not quite minimal since we need to set control path to make CI happy.
         let mut tomltxt = r#"
         [global]
-        ca_file = "$CAFILE"
-        certificate_file = "$CERTFILE"
-        private_key_file = "$PKFILE"
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
         capture_path = "/tmp/capture.sock"
         zpr_addr = [ "10.0.0.1" ]
@@ -640,9 +643,9 @@ mod test {
     fn test_main_args_argparse_adapter_auto_connect() {
         let base_toml = r#"
         [global]
-        ca_file = "$CAFILE"
-        certificate_file = "$CERTFILE"
-        private_key_file = "$PKFILE"
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
         capture_path = "/tmp/capture.sock"
         zpr_addr = [ "10.0.0.1" ]
@@ -715,9 +718,9 @@ mod test {
         // Not quite minimal since we need to set control path to make CI happy.
         let mut tomltxt = r#"
         [global]
-        ca_file = "$CAFILE"
-        certificate_file = "$CERTFILE"
-        private_key_file = "$PKFILE"
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
         capture_path = "/tmp/capture.sock"
         zpr_addr = [ "10.0.0.1" ]
@@ -865,9 +868,9 @@ mod test {
     fn test_main_args_argparse_node_advertised_addr_cli_overrides_config() {
         let mut tomltxt = r#"
         [global]
-        ca_file = "$CAFILE"
-        certificate_file = "$CERTFILE"
-        private_key_file = "$PKFILE"
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
         capture_path = "/tmp/capture.sock"
         self_addr = "0.0.0.0:12345"
@@ -958,8 +961,8 @@ mod test {
     fn test_main_args_argparse_adapter_key_in_env() {
         let mut tomltxt = r#"
         [global]
-        ca_file = "$CAFILE"
-        certificate_file = "$CERTFILE"
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
         control_path = "/tmp/control.sock"
         capture_path = "/tmp/capture.sock"
         zpr_addr = [ "10.0.0.1" ]
@@ -1005,8 +1008,8 @@ mod test {
     fn test_adapter_no_ca_file_passes_validation() {
         let mut tomltxt = r#"
         [global]
-        certificate_file = "$CERTFILE"
-        private_key_file = "$PKFILE"
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
         capture_path = "/tmp/capture.sock"
 
@@ -1036,7 +1039,7 @@ mod test {
     fn test_adapter_no_cert_with_name_passes_validation() {
         let mut tomltxt = r#"
         [global]
-        private_key_file = "$PKFILE"
+        private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
         capture_path = "/tmp/capture.sock"
 
@@ -1065,7 +1068,7 @@ mod test {
     fn test_adapter_no_cert_no_name_fails_validation() {
         let mut tomltxt = r#"
         [global]
-        private_key_file = "$PKFILE"
+        private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
         capture_path = "/tmp/capture.sock"
 
@@ -1095,7 +1098,7 @@ mod test {
     fn test_adapter_cli_name_overrides_config_name() {
         let mut tomltxt = r#"
         [global]
-        private_key_file = "$PKFILE"
+        private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
         capture_path = "/tmp/capture.sock"
 
@@ -1132,13 +1135,13 @@ mod test {
 
         let mut tomltxt = r#"
         [global]
-        private_key_file = "$PKFILE"
+        private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
         capture_path = "/tmp/capture.sock"
 
         [adapter]
         node_addr = "192.168.0.2:5000"
-        bootstrap_key = "$BSKEY"
+        bootstrap_key = '$BSKEY'
         "#;
 
         let pk_file = TempFile::touch();
