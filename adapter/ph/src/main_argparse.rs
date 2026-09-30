@@ -174,6 +174,17 @@ mod test {
         path: String,
     }
 
+    /// Rewrite `/tmp/...` socket paths onto [`env::temp_dir`] so test
+    /// fixtures run on Windows too (config validation requires the parent
+    /// directory to exist, and `/tmp` only exists on unix). Forward slashes
+    /// keep the result valid inside a TOML basic string on every OS —
+    /// Windows APIs accept them.
+    fn portable_tmp_paths(contents: &str) -> String {
+        let tmp = env::temp_dir();
+        let tmp = tmp.to_str().unwrap().trim_end_matches(['/', '\\']);
+        contents.replace("/tmp/", &format!("{}/", tmp.replace('\\', "/")))
+    }
+
     impl Drop for TempFile {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
@@ -191,6 +202,12 @@ mod test {
             aws_lc_rs::rand::fill(&mut buf).unwrap();
             let num = u32::from_be_bytes(buf);
             let path = dir.join(format!("org_zpr_ph_test_main_{}_{}.toml", num, tstamp));
+            // The templates name sockets under /tmp, which exists on every
+            // unix but not on Windows — and config validation requires the
+            // socket paths' parent directory to exist. Rewrite them onto the
+            // OS temp dir so the same templates run everywhere
+            // (zipline#131 step 7).
+            let contents = portable_tmp_paths(contents);
             fs::write(&path, contents).expect("Unable to write file");
             TempFile {
                 path: path.to_str().unwrap().to_string(),
@@ -749,6 +766,8 @@ mod test {
         let cert_file_fname = String::from(cert_file.get_path().to_str().unwrap());
         let pk_file = TempFile::touch();
         let pk_file_fname = String::from(pk_file.get_path().to_str().unwrap());
+        let control_sock = portable_tmp_paths("/tmp/control.sock");
+        let capture_sock = portable_tmp_paths("/tmp/capture.sock");
 
         let args = vec![
             "ph",
@@ -760,9 +779,9 @@ mod test {
             "--private-key-file",
             &pk_file_fname,
             "--control-path",
-            "/tmp/control.sock",
+            &control_sock,
             "--capture-path",
-            "/tmp/capture.sock",
+            &capture_sock,
             "--zpr-addr",
             "10.0.0.1",
         ];
@@ -799,6 +818,8 @@ mod test {
         let cert_file_fname = String::from(cert_file.get_path().to_str().unwrap());
         let pk_file = TempFile::touch();
         let pk_file_fname = String::from(pk_file.get_path().to_str().unwrap());
+        let control_sock = portable_tmp_paths("/tmp/control.sock");
+        let capture_sock = portable_tmp_paths("/tmp/capture.sock");
 
         let args = vec![
             "ph",
@@ -810,9 +831,9 @@ mod test {
             "--private-key-file",
             &pk_file_fname,
             "--control-path",
-            "/tmp/control.sock",
+            &control_sock,
             "--capture-path",
-            "/tmp/capture.sock",
+            &capture_sock,
             "--zpr-addr",
             "10.0.0.1",
             "--self-addr",
@@ -899,6 +920,8 @@ mod test {
         let cert_file_fname = String::from(cert_file.get_path().to_str().unwrap());
         let pk_file = TempFile::touch();
         let pk_file_fname = String::from(pk_file.get_path().to_str().unwrap());
+        let control_sock = portable_tmp_paths("/tmp/control.sock");
+        let capture_sock = portable_tmp_paths("/tmp/capture.sock");
 
         let args = vec![
             "ph",
@@ -910,9 +933,9 @@ mod test {
             "--private-key-file",
             &pk_file_fname,
             "--control-path",
-            "/tmp/control.sock",
+            &control_sock,
             "--capture-path",
-            "/tmp/capture.sock",
+            &capture_sock,
             "--zpr-addr",
             "10.0.0.1",
             "--advertised-substrate-addr",

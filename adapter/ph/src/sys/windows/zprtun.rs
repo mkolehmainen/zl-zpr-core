@@ -131,7 +131,6 @@ impl ZprTun {
     ///
     /// `Ok(None)` means the ring is empty. (Consumed by the Windows
     /// batch_io engine, zipline#131.)
-    #[allow(dead_code)]
     pub fn try_receive(&self) -> std::io::Result<Option<wintun::Packet>> {
         self.session
             .try_receive()
@@ -140,8 +139,15 @@ impl ZprTun {
 
     /// Send one packet: allocate a slot in the send ring, fill it, commit.
     /// (Consumed by the Windows batch_io engine, zipline#131.)
-    #[allow(dead_code)]
+    ///
+    /// A full send ring surfaces as `WouldBlock`, the same shape as a
+    /// `write(2)` on a busy unix TUN, so the fastpath's egress tally counts
+    /// it as a drop instead of panicking (Wintun reports it as
+    /// `ERROR_BUFFER_OVERFLOW`).
     pub fn send(&self, body: &[u8]) -> std::io::Result<()> {
+        /// winerror.h `ERROR_BUFFER_OVERFLOW`: `WintunAllocateSendPacket`'s
+        /// documented "send ring is full" error.
+        const ERROR_BUFFER_OVERFLOW: i32 = 111;
         let len: u16 = body
             .len()
             .try_into()
@@ -149,7 +155,12 @@ impl ZprTun {
         let mut packet = self
             .session
             .allocate_send_packet(len)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .map_err(|e| match e {
+                wintun::Error::Io(io) if io.raw_os_error() == Some(ERROR_BUFFER_OVERFLOW) => {
+                    std::io::Error::new(std::io::ErrorKind::WouldBlock, "Wintun send ring full")
+                }
+                e => std::io::Error::other(e.to_string()),
+            })?;
         packet.bytes_mut().copy_from_slice(body);
         self.session.send_packet(packet);
         Ok(())

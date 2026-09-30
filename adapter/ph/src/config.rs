@@ -88,10 +88,13 @@ const DEFAULT_DATAPATH_QUEUE_SIZE: usize = 256;
 const DEFAULT_MGMT_QUEUE_SIZE: usize = 128; // should be at least 2x batch size to avoid oscillating behavior
 const DEFAULT_SERVICE_QUEUE_SIZE: usize = 128;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 const DEFAULT_WORKER_CONCURRENCY: usize = 4;
 
-#[cfg(target_os = "macos")]
+/// One fastpath worker on macOS (single-queue utun) and on Windows
+/// (single-queue Wintun session, and no SO_REUSEPORT to spread the
+/// substrate socket across workers — zipline#131, plan C4).
+#[cfg(any(target_os = "macos", windows))]
 const DEFAULT_WORKER_CONCURRENCY: usize = 1;
 
 pub const DEFAULT_KEEP_ALIVE_PERIOD: std::time::Duration = std::time::Duration::from_secs(3);

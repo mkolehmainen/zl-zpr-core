@@ -14,4 +14,4 @@ pub use socket_owner::{
     SocketOwner, capture_socket_path, choose_socket_path, control_socket_path,
     resolve_socket_owner, socket_is_live,
 };
-pub use user_id::current_user_id;
+pub use user_id::{current_user_id, is_elevated};

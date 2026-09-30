@@ -3,6 +3,8 @@ use crate::config;
 use crate::counters::*;
 use crate::fastpath::{FastpathWorker, FastpathWorkerConfig};
 use crate::packet_queue;
+#[cfg(windows)]
+use crate::sys::wait::SocketWaitable;
 use crate::sys::wait::{AsWaitSource, WaitHandle, Waitable};
 use crate::sys::{TunPi, ZprTun};
 use crate::zprtun;
@@ -18,6 +20,11 @@ pub struct FastpathIo {
     batch_io: BatchIo,
     actor_tun: Arc<ZprTun>,
     substrate_socket: UdpSocket,
+    /// The substrate socket's waitable Event (`WSAEventSelect(FD_READ)`,
+    /// plan D3): the socket itself is not waitable on Windows. Owned here
+    /// beside the socket it is bound to.
+    #[cfg(windows)]
+    substrate_waitable: SocketWaitable,
     pub requeue_outq: packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
     pub mgmt_substrate_outq: packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
 
@@ -54,6 +61,9 @@ impl FastpathIo {
                 .instantiate(config.batch_size)
                 .unwrap(),
             actor_tun,
+            #[cfg(windows)]
+            substrate_waitable: SocketWaitable::new(&substrate_socket)
+                .expect("unable to bind a wait event to the substrate socket"),
             substrate_socket,
             requeue_outq,
             mgmt_substrate_outq,
@@ -64,8 +74,19 @@ impl FastpathIo {
     }
 
     /// Substrate socket wait handle for the fastpath wait set.
+    ///
+    /// Unix: the socket's own fd. Windows: the socket is not waitable, so
+    /// this is its [`SocketWaitable`]'s Event (plan D3) — distinct from the
+    /// I/O-target handle `process_substrate_socket_in` passes to batch_io.
     pub fn substrate_socket_handle(&self) -> WaitHandle<'_> {
-        self.substrate_socket.as_wait_handle()
+        #[cfg(unix)]
+        {
+            self.substrate_socket.as_wait_handle()
+        }
+        #[cfg(windows)]
+        {
+            self.substrate_waitable.handle()
+        }
     }
 
     /// Actor TUN wait handle for the fastpath wait set.
@@ -85,6 +106,18 @@ impl FastpathIo {
 
     /// Process an input-ready notification on the substrate socket (substrate ingress).
     pub fn process_substrate_socket_in(&mut self, worker: &mut FastpathWorker) {
+        // Acknowledge the wake BEFORE draining (Windows, plan D3):
+        // `WSAEnumNetworkEvents` clears the Event and the FD_READ record.
+        // Cleared first, a datagram that arrives mid-drain is either
+        // consumed by this drain or re-posts FD_READ after the final
+        // WouldBlock recv re-enables it. Cleared after, a datagram arriving
+        // between the last recv and the clear would leave data buffered
+        // with FD_READ posting disabled — a lost wakeup.
+        #[cfg(windows)]
+        self.substrate_waitable
+            .reset()
+            .expect("WSAEnumNetworkEvents failed on the substrate socket");
+
         let _nbufs = worker.get_fresh_packets(worker.config.batch_size, &mut self.packets);
 
         self.io_results.clear();
@@ -259,14 +292,12 @@ impl FastpathIo {
 
         // (Try to) send packets.
         self.io_results.clear();
-        let n = self
-            .batch_io
-            .try_write_batch(
-                &self.actor_tun,
-                worker.actor_input_q.iter().map(|pkt| pkt.body()),
-                &mut self.io_results,
-            )
-            .expect("unrecoverable TUN error");
+        let n = tun_write_batch_sent(self.batch_io.try_write_batch(
+            &self.actor_tun,
+            worker.actor_input_q.iter().map(|pkt| pkt.body()),
+            &mut self.io_results,
+        ))
+        .expect("unrecoverable TUN error");
 
         // Tally results.
         let mut dropped = worker.actor_input_q.len() - n;
@@ -369,6 +400,22 @@ fn is_ip(pi: TunPi) -> bool {
     pi.proto == net_defs::ethertype::IP || pi.proto == net_defs::ethertype::IPV6
 }
 
+/// Classify a TUN write's batch-level result (zipline#131 PR #52 review
+/// round 1, thread 2): a first-item `WouldBlock` is ordinary backpressure
+/// — on Windows, `ZprTun::send` maps a full Wintun send ring
+/// (`ERROR_BUFFER_OVERFLOW`) to `WouldBlock`, and the batch loop returns a
+/// first-item error as the batch error (the sendmmsg(2) emulation all
+/// engines share). It must reach the drop tally as "zero packets sent",
+/// not kill the fastpath. Everything else stays fatal to the caller.
+/// Same shape as the substrate egress leg's `WouldBlock => 0` arm in
+/// `process_substrate_egress_queue`.
+fn tun_write_batch_sent(res: Result<usize>) -> Result<usize> {
+    match res {
+        Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(0),
+        res => res,
+    }
+}
+
 fn clear_flowinfo(addr: &mut SocketAddr) {
     match addr {
         SocketAddr::V4(_) => (),
@@ -401,5 +448,45 @@ fn batch_process_packet_queue(
                 panic!("unrecoverable I/O error {err:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tun_write_batch_sent;
+    use std::io::{Error, ErrorKind};
+
+    /// zipline#131 PR #52 review round 1 (thread 2): a batch-level
+    /// `WouldBlock` from the TUN write — the Wintun send ring full on the
+    /// FIRST packet of a batch — is ordinary backpressure and must come
+    /// back as "zero sent" (the whole batch then reaches the drop tally),
+    /// not as an error the caller's `expect` turns into a fastpath panic.
+    #[test]
+    fn tun_write_first_item_wouldblock_is_zero_sent() {
+        let res = tun_write_batch_sent(Err(Error::new(
+            ErrorKind::WouldBlock,
+            "Wintun send ring full",
+        )));
+        assert_eq!(
+            res.unwrap(),
+            0,
+            "a first-item WouldBlock must be nonfatal backpressure"
+        );
+    }
+
+    /// A successful batch result passes through unchanged.
+    #[test]
+    fn tun_write_success_passes_through() {
+        assert_eq!(tun_write_batch_sent(Ok(7)).unwrap(), 7);
+    }
+
+    /// Anything that is not `WouldBlock` stays a batch-level error, so the
+    /// caller's `expect("unrecoverable TUN error")` still fires on a real
+    /// TUN failure.
+    #[test]
+    fn tun_write_real_error_stays_fatal() {
+        let err =
+            tun_write_batch_sent(Err(Error::new(ErrorKind::BrokenPipe, "TUN gone"))).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
     }
 }

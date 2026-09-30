@@ -401,7 +401,10 @@ fn main() -> ExitCode {
     let mut substrate_sockets: Vec<std::net::UdpSocket> = Vec::new();
 
     for _i in 0..topology_config.fastpath_concurrency {
-        let socket = socket2::Socket::new(
+        // `mut` is consumed by the Windows disconnect-by-recreation arm
+        // below; the unix arms never reassign it.
+        #[cfg_attr(unix, allow(unused_mut))]
+        let mut socket = socket2::Socket::new(
             socket2::Domain::for_address(config.self_addr),
             socket2::Type::DGRAM,
             None,
@@ -494,6 +497,31 @@ fn main() -> ExitCode {
                     res => res.expect("unable to disconnect socket"),
                 }
 
+                // Windows (zipline#131, plan D5/C4): UDP dissociation via an
+                // AF_UNSPEC connect is not reliably supported, so recreate
+                // the socket instead — deterministic, and cheap at startup.
+                // `config.self_addr` now carries the OS-chosen address and
+                // port from the probe above, so the fresh socket binds to
+                // exactly what the temp one discovered (no SO_REUSEPORT on
+                // Windows, but the old socket is dropped before the bind).
+                #[cfg(windows)]
+                {
+                    drop(socket);
+                    socket = socket2::Socket::new(
+                        socket2::Domain::for_address(config.self_addr),
+                        socket2::Type::DGRAM,
+                        None,
+                    )
+                    .unwrap();
+                    socket.set_nonblocking(true).unwrap();
+                    socket
+                        .bind(&socket2::SockAddr::from(config.self_addr))
+                        .expect(&format!(
+                            "unable to re-bind to self_addr ({})",
+                            config.self_addr
+                        ));
+                }
+
                 // Disconnecting above weirdly also drops the local-address binding!
                 // (Possible Linux bug?)  So now we need to re-bind.
                 // Enable on Linux only, because this does not seem to be needed
@@ -509,6 +537,21 @@ fn main() -> ExitCode {
                 // Now the temp socket will go out of scope and close;
                 // we've re-bound no longer need it.
             }
+        }
+
+        // Windows (zipline#131 PR #52 review round 1): the datapath has no
+        // per-datagram destination info (no WSARecvMsg/IP_PKTINFO, plan
+        // D5), so a socket still wildcard-bound here — a node with a
+        // wildcard self_addr, which the adapter-only probe above never
+        // rebinds — would record 0.0.0.0/:: as every packet's interface
+        // address and trip the fastpath's unspecified-address assertion
+        // on the first response. Reject the configuration at startup with
+        // the fix in the message.
+        #[cfg(windows)]
+        {
+            let bound = socket.local_addr().unwrap().as_socket().unwrap();
+            batch_io::windows_substrate_bind_check(bound)
+                .expect("substrate socket configuration unusable on Windows");
         }
 
         substrate_sockets.push(socket.into());

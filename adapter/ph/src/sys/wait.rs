@@ -51,15 +51,49 @@ impl<'a> From<BorrowedFd<'a>> for WaitHandle<'a> {
 }
 
 /// An opaque handle to an OS object whose readiness can be awaited in a
-/// [`WaitSet`].
+/// [`WaitSet`], or that batch I/O can be performed on (zipline#131).
 ///
-/// On Windows this wraps a waitable HANDLE (a manual-reset Event, or
-/// Wintun's read-wait event). Win32 HANDLEs carry no lifetime of their own,
-/// so the phantom borrow re-attaches one: a `WaitHandle` produced by
-/// [`Waitable::handle`] cannot outlive the object that owns the HANDLE.
+/// On Windows a handle names one of three kinds of object, because —
+/// unlike a unix fd — no single Win32 object is both waitable and an I/O
+/// target:
+///
+/// - an **Event** HANDLE (a manual-reset Event, Wintun's read-wait event,
+///   or a [`SocketWaitable`]'s `WSAEventSelect` event): waitable, no I/O;
+/// - the substrate **socket** itself: the Windows batch_io engine's I/O
+///   target. Not directly waitable — pushing it into a [`WaitSet`] panics;
+///   the fastpath waits on its [`SocketWaitable`]'s Event instead;
+/// - the Wintun **TUN** device: the engine's ring I/O target, waitable
+///   through its read-wait event.
+///
+/// Win32 HANDLEs carry no lifetime of their own, so the phantom borrow
+/// re-attaches one: a `WaitHandle` produced by [`Waitable::handle`] or
+/// [`AsWaitSource::as_wait_handle`] cannot outlive the object it names.
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug)]
-pub struct WaitHandle<'a>(HANDLE, PhantomData<&'a ()>);
+#[derive(Clone, Copy)]
+pub struct WaitHandle<'a>(WaitTarget<'a>, PhantomData<&'a ()>);
+
+/// What a Windows [`WaitHandle`] names: see the type documentation.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) enum WaitTarget<'a> {
+    /// A waitable Event HANDLE.
+    Event(HANDLE),
+    /// The substrate UDP socket, as the batch_io engine's I/O target.
+    Socket(&'a std::net::UdpSocket),
+    /// The Wintun TUN device, as the batch_io engine's ring I/O target.
+    Tun(&'a crate::sys::ZprTun),
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for WaitHandle<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            WaitTarget::Event(e) => write!(f, "WaitHandle::Event({e:?})"),
+            WaitTarget::Socket(_) => write!(f, "WaitHandle::Socket"),
+            WaitTarget::Tun(_) => write!(f, "WaitHandle::Tun"),
+        }
+    }
+}
 
 #[cfg(windows)]
 impl<'a> WaitHandle<'a> {
@@ -67,12 +101,42 @@ impl<'a> WaitHandle<'a> {
     /// lifetime, so it must be tied to the HANDLE's owning object at the
     /// call site (as [`Waitable::handle`] implementations do).
     pub(crate) fn from_event(event: HANDLE) -> Self {
-        Self(event, PhantomData)
+        Self(WaitTarget::Event(event), PhantomData)
     }
 
-    /// The underlying HANDLE (Windows arm only).
-    pub(crate) fn as_handle(&self) -> HANDLE {
+    /// Name the substrate socket as a batch I/O target (zipline#131).
+    pub(crate) fn from_socket(socket: &'a std::net::UdpSocket) -> Self {
+        Self(WaitTarget::Socket(socket), PhantomData)
+    }
+
+    /// Name the TUN device as a batch I/O target (zipline#131).
+    pub(crate) fn from_tun(tun: &'a crate::sys::ZprTun) -> Self {
+        Self(WaitTarget::Tun(tun), PhantomData)
+    }
+
+    /// What this handle names (Windows arm only; consumed by the
+    /// `windows_unbatched` batch_io engine).
+    pub(crate) fn target(&self) -> WaitTarget<'a> {
         self.0
+    }
+
+    /// The waitable Event HANDLE (Windows arm only).
+    ///
+    /// Panics on a [`WaitTarget::Socket`] handle: the socket itself is not
+    /// waitable — wait on its [`SocketWaitable`] instead (the fastpath
+    /// does; see `FastpathIo::substrate_socket_wait_handle`).
+    pub(crate) fn as_handle(&self) -> HANDLE {
+        match self.0 {
+            WaitTarget::Event(event) => event,
+            WaitTarget::Tun(tun) => match tun.handle().0 {
+                WaitTarget::Event(event) => event,
+                _ => unreachable!("ZprTun's Waitable yields an Event"),
+            },
+            WaitTarget::Socket(_) => panic!(
+                "a bare socket is not waitable on Windows; \
+                 wait on its SocketWaitable's Event instead"
+            ),
+        }
     }
 }
 
@@ -360,7 +424,6 @@ impl SocketWaitable {
     /// The `SocketWaitable` borrows no lifetime from the socket, so the
     /// caller must keep the socket alive as long as the waitable (the
     /// fastpath owns both in one struct).
-    #[allow(dead_code)] // wired into fastpath_io by the C4 engine (zipline#131)
     pub fn new(socket: &std::net::UdpSocket) -> Result<Self> {
         use std::os::windows::io::AsRawSocket;
         use windows_sys::Win32::Networking::WinSock::{FD_READ, WSACreateEvent, WSAEventSelect};
@@ -388,7 +451,6 @@ impl SocketWaitable {
     /// re-enables `FD_READ` recording. Call after every wait that reported
     /// this socket ready, once the ready data has been drained (zipline#131
     /// wires this into the receive path).
-    #[allow(dead_code)]
     pub fn reset(&self) -> Result<()> {
         use windows_sys::Win32::Networking::WinSock::{WSAEnumNetworkEvents, WSANETWORKEVENTS};
         // SAFETY: plain output struct, fully written by the call on success.
@@ -438,14 +500,13 @@ impl<T: std::os::fd::AsFd> AsWaitSource for T {
     }
 }
 
-/// The Windows batch_io engine does not exist yet (zipline#131, plan D5);
-/// engine auto-selection already fails before any I/O call could reach a
-/// socket. This impl exists so shared call sites (`fastpath_io`, batch_io
-/// tests) that name a `UdpSocket` as their target still compile.
+/// The socket names itself as the engine's I/O target (zipline#131). Not
+/// waitable — the fastpath waits on the socket's [`SocketWaitable`], and
+/// [`WaitHandle::as_handle`] panics on this handle.
 #[cfg(windows)]
 impl AsWaitSource for std::net::UdpSocket {
     fn as_wait_handle(&self) -> WaitHandle<'_> {
-        unreachable!("no Windows batch_io engine yet (zipline#131)")
+        WaitHandle::from_socket(self)
     }
 }
 
@@ -456,10 +517,12 @@ impl AsWaitSource for SocketWaitable {
     }
 }
 
+/// The TUN names itself as the engine's ring I/O target (zipline#131);
+/// as a wait entry it resolves to its read-wait event ([`Waitable`]).
 #[cfg(windows)]
 impl AsWaitSource for crate::sys::ZprTun {
     fn as_wait_handle(&self) -> WaitHandle<'_> {
-        self.handle()
+        WaitHandle::from_tun(self)
     }
 }
 
@@ -468,7 +531,7 @@ impl AsWaitSource for crate::sys::ZprTun {
 #[cfg(windows)]
 impl AsWaitSource for std::sync::Arc<crate::sys::ZprTun> {
     fn as_wait_handle(&self) -> WaitHandle<'_> {
-        self.as_ref().handle()
+        WaitHandle::from_tun(self.as_ref())
     }
 }
 

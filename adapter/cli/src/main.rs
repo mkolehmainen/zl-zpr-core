@@ -35,7 +35,10 @@ use tokio_util::compat::*;
 #[cfg(unix)]
 use zpr_ext::std::os::unix::net::{SocketAncillary, UnixStreamExt};
 
-#[cfg(feature = "pcap")]
+// The pcap-consuming code is additionally gated off Windows (plan D13):
+// filter-string compilation would need the Npcap SDK, so a Windows build
+// uses `--no-default-features` and the paths below answer Unsupported.
+#[cfg(all(feature = "pcap", not(windows)))]
 use {
     cbpf_rs,
     pcap::{Capture, Linktype},
@@ -69,7 +72,7 @@ enum CliError {
     #[error("Feature Not Enabled: {0}")]
     FeatureNotEnabled(String),
 
-    #[cfg(feature = "pcap")]
+    #[cfg(all(feature = "pcap", not(windows)))]
     #[error("Pcap error: {0}")]
     CaptureError(#[from] pcap::Error),
 }
@@ -252,9 +255,14 @@ async fn process_command(
                     }
                 }
                 Commands::Capture(capture) => match capture.command {
-                    CaptureCommands::SetFile { file_path } => {
-                        handle_set_capture_file(file_path, cap_socket)?;
-                    }
+                    CaptureCommands::SetFile { file_path } => match capture_file_route() {
+                        CaptureFileRoute::CaptureSocket => {
+                            handle_set_capture_file(file_path, cap_socket)?;
+                        }
+                        CaptureFileRoute::AdminRpc => {
+                            set_capture_file_via_rpc(service).await?;
+                        }
+                    },
                     CaptureCommands::CloseFile => close_capture_file_task(service).await?,
                     CaptureCommands::FlushFile => flush_capture_file_task(service).await?,
                     CaptureCommands::SetProgram { program } => {
@@ -555,7 +563,7 @@ async fn flush_capture_file_task(service: svc::Client) -> Result<(), CliError> {
 /// need to use the pcap library, and can just have knowledge of the serialized
 /// format and use exclusively cbpf-rs
 // TODO change parameters of set cap prog to take the actual bpf vals instead of string
-#[cfg(feature = "pcap")]
+#[cfg(all(feature = "pcap", not(windows)))]
 async fn set_capture_program_task(service: svc::Client, program: String) -> Result<(), CliError> {
     let capture = Capture::dead(Linktype::USER0)?;
     let program = capture.compile(&program, true)?;
@@ -591,7 +599,9 @@ async fn set_capture_program_task(service: svc::Client, program: String) -> Resu
     Ok(())
 }
 
-#[cfg(not(feature = "pcap"))]
+/// Filter-string compilation is unavailable without pcap, and on Windows
+/// regardless of features (plan D13: no Npcap in this release).
+#[cfg(not(all(feature = "pcap", not(windows))))]
 async fn set_capture_program_task(_service: svc::Client, _program: String) -> Result<(), CliError> {
     Err(CliError::FeatureNotEnabled(
         "packet capture (pcap)".to_string(),
@@ -615,7 +625,10 @@ async fn capture_sequence_task(
     cap_socket: &PathBuf,
 ) -> Result<(), CliError> {
     let sleep_time = Duration::new(time, 0);
-    handle_set_capture_file(file_path, cap_socket)?;
+    match capture_file_route() {
+        CaptureFileRoute::CaptureSocket => handle_set_capture_file(file_path, cap_socket)?,
+        CaptureFileRoute::AdminRpc => set_capture_file_via_rpc(service.clone()).await?,
+    }
     set_capture_program_task(service.clone(), program).await?;
 
     let handler = Arc::new(CtrlcHandle::new());
@@ -841,6 +854,45 @@ async fn get_node_addr_task(service: svc::Client) -> Result<(), CliError> {
     }
 }
 
+/// How `capture set-file` / `capture sequence` deliver the capture file to
+/// ph on this platform (zipline#131 step 5 / the #129 carryover).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureFileRoute {
+    /// unix: open the file here and pass the fd over `capture.sock` with
+    /// SCM_RIGHTS, so root-running ph never opens a user-chosen path.
+    CaptureSocket,
+    /// Windows: no capture socket exists (plan D7). Call the admin RPC's
+    /// `setCaptureFile`, which answers `Unimplemented: capture is not
+    /// available on this platform` — ph's authoritative message.
+    AdminRpc,
+}
+
+/// The platform's capture-file route: see [`CaptureFileRoute`].
+fn capture_file_route() -> CaptureFileRoute {
+    if cfg!(windows) {
+        CaptureFileRoute::AdminRpc
+    } else {
+        CaptureFileRoute::CaptureSocket
+    }
+}
+
+/// The [`CaptureFileRoute::AdminRpc`] leg: send `setCaptureFile` and print
+/// ph's error (there is no success leg in this release — ph without
+/// capture support answers Unimplemented, plan D7).
+async fn set_capture_file_via_rpc(service: svc::Client) -> Result<(), CliError> {
+    let request = service.set_capture_file_request();
+    match request.send().promise.await {
+        Ok(_) => {
+            println!("Capture file set");
+            Ok(())
+        }
+        Err(e) => {
+            println!("{}", e.extra);
+            Err(CliError::RpcError(e.extra))
+        }
+    }
+}
+
 /// Opens a capture file, sends a message to the RPC worker to prepare to receive
 /// the file descriptor, upon receiving correct response, sends the fd as
 /// ancillary data, and awaits response again.
@@ -976,5 +1028,20 @@ mod tests {
         let agent = interactive_auth_agent(false);
         assert!(agent.open_browser, "no_browser: false → open_browser: true");
         assert!(agent.progress.is_none());
+    }
+
+    /// `capture set-file` / `capture sequence` reach ph over the capture
+    /// socket with SCM_RIGHTS fd-passing on unix, and over the admin RPC's
+    /// `setCaptureFile` on Windows — where ph answers `Unimplemented:
+    /// capture is not available on this platform` (plan D7, zipline#131
+    /// step 5 / the #129 carryover), so the user sees ph's authoritative
+    /// message instead of a client-side guess.
+    #[test]
+    fn capture_set_file_routes_per_platform() {
+        if cfg!(windows) {
+            assert_eq!(capture_file_route(), CaptureFileRoute::AdminRpc);
+        } else {
+            assert_eq!(capture_file_route(), CaptureFileRoute::CaptureSocket);
+        }
     }
 }

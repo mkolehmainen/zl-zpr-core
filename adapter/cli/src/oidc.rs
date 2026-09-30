@@ -767,14 +767,13 @@ async fn login_flow(
 /// hence this pre-flight check (zipline#46). macOS `open` talks to the
 /// window server directly, so the display-variable leg is Linux-only.
 fn browser_unavailable() -> Option<&'static str> {
-    // Root/elevation check: unix asks the euid. On Windows there is no
-    // root-owned-browser hazard of the same shape; the full elevation check
-    // via the process token is C4's scope (zipline#131), so no pre-flight
-    // block applies here yet.
-    #[cfg(unix)]
-    let is_root = nix::unistd::geteuid().is_root();
-    #[cfg(windows)]
-    let is_root = false;
+    // Elevation check (zipline#131 step 4): unix asks the euid, Windows
+    // the process token (`admin_api::is_elevated`). ph-cli is documented
+    // to run from an elevated console on Windows, so this prints the URL
+    // instead of opening a browser as the elevated principal. A failed
+    // probe reads as not-elevated: the browser path stays available, and
+    // its own failure mode (zipline#46) is the fallback.
+    let is_root = admin_api::is_elevated().unwrap_or(false);
     browser_unavailable_for(
         is_root,
         std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some(),
@@ -2419,8 +2418,12 @@ mod tests {
         );
     }
 
-    /// The pure browser-availability predicate: root and (on Linux) a
+    /// The pure browser-availability predicate: elevation and (on Linux) a
     /// missing display each block the launch; otherwise it may proceed.
+    /// `is_root` now comes from `admin_api::is_elevated()` — euid on unix,
+    /// the process token on Windows (zipline#131 step 4) — so the "elevated
+    /// blocks" legs cover every OS; the headless leg blocks only on Linux
+    /// (macOS `open` and Windows `cmd /c start` need no display variable).
     #[test]
     fn test_browser_unavailable_predicate() {
         assert_eq!(browser_unavailable_for(true, true), Some("running as root"));
@@ -2432,6 +2435,10 @@ mod tests {
         if cfg!(target_os = "linux") {
             let reason = browser_unavailable_for(false, false).expect("headless must block");
             assert!(reason.contains("DISPLAY"), "unhelpful reason: {reason}");
+        } else {
+            // Windows and macOS: no display variable to check, so an
+            // unelevated process may always launch.
+            assert_eq!(browser_unavailable_for(false, false), None);
         }
     }
 
