@@ -404,9 +404,9 @@ impl<'a> WaitSet<'a> {
 /// `WSAEventSelect(FD_READ)`: the event signals when data arrives.
 /// `FD_READ` re-arming is edge-like — after a wake, [`reset`](Self::reset)
 /// must be called (it runs `WSAEnumNetworkEvents`, which clears the event
-/// and re-enables `FD_READ` recording) once the ready data has been
-/// drained, or a subsequent arrival may not re-signal; the Windows batch_io
-/// engine (zipline#131) owns that call in its receive path.
+/// and re-enables `FD_READ` recording) before the ready data is drained,
+/// or a subsequent arrival may not re-signal. The fastpath's substrate
+/// receive path (`FastpathIo::process_substrate_socket_in`) owns that call.
 #[cfg(windows)]
 pub struct SocketWaitable {
     socket: windows_sys::Win32::Networking::WinSock::SOCKET,
@@ -449,8 +449,9 @@ impl SocketWaitable {
 
     /// Acknowledge a wake: `WSAEnumNetworkEvents` clears the event and
     /// re-enables `FD_READ` recording. Call after every wait that reported
-    /// this socket ready, once the ready data has been drained (zipline#131
-    /// wires this into the receive path).
+    /// this socket ready, before draining the ready data: cleared after
+    /// the drain, a datagram arriving between the last recv and the clear
+    /// would be left buffered with no wakeup.
     pub fn reset(&self) -> Result<()> {
         use windows_sys::Win32::Networking::WinSock::{WSAEnumNetworkEvents, WSANETWORKEVENTS};
         // SAFETY: plain output struct, fully written by the call on success.

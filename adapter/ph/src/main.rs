@@ -414,8 +414,9 @@ fn main() -> ExitCode {
         socket.set_nonblocking(true).unwrap();
         // pktinfo and SO_REUSEPORT are unix-only; the Windows datapath
         // (zipline#131, plan D5) is single-socket/single-homed and needs
-        // neither. Gated so the msvc cross-check compiles (zipline#130);
-        // the real Windows substrate setup lands with the engine in #131.
+        // neither, so both calls are unix-gated. The Windows-specific
+        // substrate setup is the socket recreate and wildcard-bind check
+        // below.
         #[cfg(unix)]
         batch_io::set_recv_packet_info(&socket, true).unwrap();
 

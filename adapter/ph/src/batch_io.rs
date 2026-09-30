@@ -54,9 +54,9 @@ impl SendFlags {
     /// Linux only (elsewhere the sockets are already non-blocking, or the
     /// platform has no such flag); a no-op off Linux.
     ///
-    /// Not yet called: the unix engines apply `MSG_DONTWAIT` internally
-    /// (zipline#117), so this constructor exists for the Windows engine
-    /// (zipline#131) and for callers that need it explicitly.
+    /// Not called: the unix engines apply `MSG_DONTWAIT` internally
+    /// (zipline#117) and the Windows engine has no flags argument, so this
+    /// constructor exists only for callers that need it explicitly.
     #[allow(dead_code)]
     #[cfg(target_os = "linux")]
     pub const fn dontwait() -> Self {

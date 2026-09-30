@@ -375,10 +375,10 @@ impl ZprTun {
     ///   loss / crash where no handle close ran, leaving a phantom
     ///   device).
     ///
-    /// Explicit in-process deletion becomes wireable once the Windows
-    /// datapath engine gives fastpath workers a stop signal (zipline#131);
-    /// until then this hook plus OS handle-close semantics implement
-    /// delete-on-exit.
+    /// Explicit in-process deletion would additionally need a fastpath
+    /// worker stop signal, which no platform has (the worker loop never
+    /// exits); OS handle-close semantics make it unnecessary, so this hook
+    /// plus handle close implement delete-on-exit.
     pub fn teardown(&self) -> std::io::Result<()> {
         self.session
             .shutdown()
