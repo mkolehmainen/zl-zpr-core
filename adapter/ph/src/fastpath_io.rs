@@ -292,14 +292,12 @@ impl FastpathIo {
 
         // (Try to) send packets.
         self.io_results.clear();
-        let n = self
-            .batch_io
-            .try_write_batch(
-                &self.actor_tun,
-                worker.actor_input_q.iter().map(|pkt| pkt.body()),
-                &mut self.io_results,
-            )
-            .expect("unrecoverable TUN error");
+        let n = tun_write_batch_sent(self.batch_io.try_write_batch(
+            &self.actor_tun,
+            worker.actor_input_q.iter().map(|pkt| pkt.body()),
+            &mut self.io_results,
+        ))
+        .expect("unrecoverable TUN error");
 
         // Tally results.
         let mut dropped = worker.actor_input_q.len() - n;
@@ -402,6 +400,22 @@ fn is_ip(pi: TunPi) -> bool {
     pi.proto == net_defs::ethertype::IP || pi.proto == net_defs::ethertype::IPV6
 }
 
+/// Classify a TUN write's batch-level result (zipline#131 PR #52 review
+/// round 1, thread 2): a first-item `WouldBlock` is ordinary backpressure
+/// — on Windows, `ZprTun::send` maps a full Wintun send ring
+/// (`ERROR_BUFFER_OVERFLOW`) to `WouldBlock`, and the batch loop returns a
+/// first-item error as the batch error (the sendmmsg(2) emulation all
+/// engines share). It must reach the drop tally as "zero packets sent",
+/// not kill the fastpath. Everything else stays fatal to the caller.
+/// Same shape as the substrate egress leg's `WouldBlock => 0` arm in
+/// `process_substrate_egress_queue`.
+fn tun_write_batch_sent(res: Result<usize>) -> Result<usize> {
+    match res {
+        Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(0),
+        res => res,
+    }
+}
+
 fn clear_flowinfo(addr: &mut SocketAddr) {
     match addr {
         SocketAddr::V4(_) => (),
@@ -434,5 +448,45 @@ fn batch_process_packet_queue(
                 panic!("unrecoverable I/O error {err:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tun_write_batch_sent;
+    use std::io::{Error, ErrorKind};
+
+    /// zipline#131 PR #52 review round 1 (thread 2): a batch-level
+    /// `WouldBlock` from the TUN write — the Wintun send ring full on the
+    /// FIRST packet of a batch — is ordinary backpressure and must come
+    /// back as "zero sent" (the whole batch then reaches the drop tally),
+    /// not as an error the caller's `expect` turns into a fastpath panic.
+    #[test]
+    fn tun_write_first_item_wouldblock_is_zero_sent() {
+        let res = tun_write_batch_sent(Err(Error::new(
+            ErrorKind::WouldBlock,
+            "Wintun send ring full",
+        )));
+        assert_eq!(
+            res.unwrap(),
+            0,
+            "a first-item WouldBlock must be nonfatal backpressure"
+        );
+    }
+
+    /// A successful batch result passes through unchanged.
+    #[test]
+    fn tun_write_success_passes_through() {
+        assert_eq!(tun_write_batch_sent(Ok(7)).unwrap(), 7);
+    }
+
+    /// Anything that is not `WouldBlock` stays a batch-level error, so the
+    /// caller's `expect("unrecoverable TUN error")` still fires on a real
+    /// TUN failure.
+    #[test]
+    fn tun_write_real_error_stays_fatal() {
+        let err =
+            tun_write_batch_sent(Err(Error::new(ErrorKind::BrokenPipe, "TUN gone"))).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
     }
 }

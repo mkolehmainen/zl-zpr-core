@@ -539,6 +539,21 @@ fn main() -> ExitCode {
             }
         }
 
+        // Windows (zipline#131 PR #52 review round 1): the datapath has no
+        // per-datagram destination info (no WSARecvMsg/IP_PKTINFO, plan
+        // D5), so a socket still wildcard-bound here — a node with a
+        // wildcard self_addr, which the adapter-only probe above never
+        // rebinds — would record 0.0.0.0/:: as every packet's interface
+        // address and trip the fastpath's unspecified-address assertion
+        // on the first response. Reject the configuration at startup with
+        // the fix in the message.
+        #[cfg(windows)]
+        {
+            let bound = socket.local_addr().unwrap().as_socket().unwrap();
+            batch_io::windows_substrate_bind_check(bound)
+                .expect("substrate socket configuration unusable on Windows");
+        }
+
         substrate_sockets.push(socket.into());
     }
 

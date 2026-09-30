@@ -1495,6 +1495,35 @@ mod posix_unbatched {
     }
 }
 
+/// Startup check behind the Windows substrate bind (zipline#131 PR #52
+/// review round 1): the Windows socket half has no per-datagram
+/// destination info (no `WSARecvMsg`/`IP_PKTINFO`, plan D5's single-homed
+/// ceiling), so a wildcard-bound socket would record the unspecified
+/// address as every received packet's interface address and trip the
+/// fastpath's `!src_intf.ip().is_unspecified()` assertion on the first
+/// response of a new link. Reject the configuration up front with an
+/// error that names the fix.
+///
+/// Portable (and unit tested) on every OS; only the Windows startup path
+/// calls it. Note the adapter case is unaffected: a wildcard `self_addr`
+/// with a `node_addr` is rebound to the OS-chosen concrete address before
+/// this check runs.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn windows_substrate_bind_check(bound: SocketAddr) -> Result<()> {
+    if bound.ip().is_unspecified() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "the Windows datapath cannot use a wildcard substrate bind \
+                 ({bound}): without per-datagram destination info every \
+                 received packet would carry the unspecified address as its \
+                 interface address; set self_addr to a concrete local address"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The socket half of the Windows engine (plan D5): unbatched non-blocking
 /// `send`/`recv`/`send_to`/`recv_from` on a `std::net::UdpSocket`.
 ///
@@ -1663,9 +1692,23 @@ mod std_udp {
     }
 
     /// The socket's bound address as the `ScopedIpAddr` the fastpath
-    /// expects for a packet's destination.
+    /// expects for a packet's destination. A wildcard-bound socket has no
+    /// usable destination to report (see `windows_substrate_bind_check`,
+    /// the startup rejection this backstops), so it is refused rather
+    /// than fabricating the unspecified address the fastpath asserts
+    /// against.
     fn local_scoped_addr(socket: &UdpSocket) -> Result<ScopedIpAddr> {
-        Ok(match socket.local_addr()? {
+        let local = socket.local_addr()?;
+        if local.ip().is_unspecified() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot report a destination for a wildcard-bound \
+                     socket ({local}); bind to a concrete local address"
+                ),
+            ));
+        }
+        Ok(match local {
             SocketAddr::V4(a) => ScopedIpAddr::V4(*a.ip()),
             SocketAddr::V6(a) => ScopedIpAddr::V6(ScopedIpv6Addr::new(*a.ip(), a.scope_id())),
         })
@@ -2604,6 +2647,83 @@ mod tests {
             assert_eq!(*res.as_ref().unwrap(), msgs[i].len());
             assert_eq!(bufs[i].as_slice(), msgs[i].as_bytes());
         }
+    }
+
+    /// zipline#131 PR #52 review round 1 (thread 1): the startup-time
+    /// wildcard rejection behind the Windows substrate bind, portable so
+    /// it is unit tested on every OS.
+    #[test]
+    fn test_windows_substrate_bind_check() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        // Concrete addresses pass.
+        for addr in [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 7000)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 7000)),
+        ] {
+            windows_substrate_bind_check(addr).unwrap();
+        }
+
+        // Wildcard addresses are rejected with a clear config error that
+        // names the offending address and the config key.
+        for addr in [
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 7000)),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 7000)),
+        ] {
+            let err = windows_substrate_bind_check(addr).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            let msg = err.to_string();
+            assert!(msg.contains("wildcard"), "unhelpful error: {msg}");
+            assert!(msg.contains("self_addr"), "unhelpful error: {msg}");
+            assert!(
+                msg.contains(&addr.to_string()),
+                "error must name the address: {msg}"
+            );
+        }
+    }
+
+    /// zipline#131 PR #52 review round 1 (thread 1): the socket half has
+    /// no per-datagram destination info (no pktinfo, plan D5), so a
+    /// wildcard-bound socket would record the unspecified address as
+    /// every received packet's destination — that value flows into
+    /// `PeerState::interface_addr` and trips the fastpath's
+    /// `!src_intf.ip().is_unspecified()` assertion on the first response.
+    /// The `with_dest` receive leg must refuse to fabricate an
+    /// unspecified destination, as a backstop behind the startup check.
+    #[test]
+    fn test_wildcard_bind_recv_with_dest_rejected() {
+        let receiver = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let sender = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        sender
+            .send_to(b"hello", (std::net::Ipv4Addr::LOCALHOST, port))
+            .unwrap();
+
+        let mut bufs = vec![Vec::with_capacity(64); 1];
+        let mut results: Vec<Result<ReceivedPacket>> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let err = loop {
+            assert!(std::time::Instant::now() < deadline, "datagram lost");
+            match std_udp::recv_from_batch(
+                &receiver,
+                &mut bufs.iter_mut().map(|b| b as &mut dyn BufMut),
+                &mut results,
+                true,
+            ) {
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                Err(err) => break err,
+                Ok(_) => {
+                    let dest = results[0].as_ref().unwrap().destination;
+                    panic!("wildcard-bound receive must fail, got destination {dest:?}");
+                }
+            }
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(msg.contains("wildcard"), "unhelpful error: {msg}");
     }
 
     /// Two localhost UDP sockets connected to each other: a portable
