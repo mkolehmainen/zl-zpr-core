@@ -20,6 +20,24 @@ pub fn current_user_id() -> io::Result<String> {
     windows_token::current_user_sid()
 }
 
+/// Whether this process runs with elevated privileges: euid 0 on unix, an
+/// elevated access token (UAC "run as administrator") on Windows.
+///
+/// ph-cli's browser pre-flight (zipline#46) consumes this: a browser
+/// spawned from an elevated context fails inside the child (unix) or opens
+/// as the wrong principal, so the login flow prints the URL instead
+/// (zipline#131 step 4).
+#[cfg(unix)]
+pub fn is_elevated() -> io::Result<bool> {
+    Ok(nix::unistd::geteuid().is_root())
+}
+
+/// Whether this process runs with elevated privileges: see the unix arm.
+#[cfg(windows)]
+pub fn is_elevated() -> io::Result<bool> {
+    windows_token::current_token_elevated()
+}
+
 /// Reading the user SID out of this process's access token.
 #[cfg(windows)]
 mod windows_token {
@@ -27,7 +45,9 @@ mod windows_token {
     use std::ptr;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// The SID of the user this process runs as, in `S-1-...` form.
@@ -42,6 +62,38 @@ mod windows_token {
         // SAFETY: `token` was opened above and is closed exactly once.
         unsafe { CloseHandle(token) };
         sid
+    }
+
+    /// Whether this process's access token is elevated (UAC "run as
+    /// administrator"): the `TokenElevation` information class, which is a
+    /// single `TOKEN_ELEVATION { TokenIsElevated: u32 }`.
+    pub fn current_token_elevated() -> io::Result<bool> {
+        let mut token: HANDLE = ptr::null_mut();
+        // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no
+        // closing; `token` is a valid out-pointer.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0u32;
+        // SAFETY: `elevation` is a valid out-buffer of exactly the size
+        // this information class writes.
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            )
+        };
+        let err = io::Error::last_os_error();
+        // SAFETY: `token` was opened above and is closed exactly once.
+        unsafe { CloseHandle(token) };
+        if ok == 0 {
+            return Err(err);
+        }
+        Ok(elevation.TokenIsElevated != 0)
     }
 
     /// The user SID recorded in the access token `token`.
@@ -99,6 +151,25 @@ mod test {
             current_user_id().unwrap(),
             nix::unistd::geteuid().as_raw().to_string()
         );
+    }
+
+    /// On unix "elevated" means euid 0, exactly the old
+    /// `geteuid().is_root()` check this helper replaces in ph-cli
+    /// (zipline#131 step 4). Test runs unprivileged, so both sides are
+    /// false; run as root both are true.
+    #[cfg(unix)]
+    #[test]
+    fn unix_is_elevated_is_root_euid() {
+        assert_eq!(is_elevated().unwrap(), nix::unistd::geteuid().is_root());
+    }
+
+    /// On Windows the elevation state comes from the process token; all
+    /// this portable test can pin is that the call succeeds (CI runs both
+    /// elevated and not).
+    #[cfg(windows)]
+    #[test]
+    fn windows_is_elevated_reads_the_token() {
+        let _ = is_elevated().unwrap();
     }
 
     /// On Windows the id is a SID string.

@@ -35,7 +35,10 @@ use tokio_util::compat::*;
 #[cfg(unix)]
 use zpr_ext::std::os::unix::net::{SocketAncillary, UnixStreamExt};
 
-#[cfg(feature = "pcap")]
+// The pcap-consuming code is additionally gated off Windows (plan D13):
+// filter-string compilation would need the Npcap SDK, so a Windows build
+// uses `--no-default-features` and the paths below answer Unsupported.
+#[cfg(all(feature = "pcap", not(windows)))]
 use {
     cbpf_rs,
     pcap::{Capture, Linktype},
@@ -69,7 +72,7 @@ enum CliError {
     #[error("Feature Not Enabled: {0}")]
     FeatureNotEnabled(String),
 
-    #[cfg(feature = "pcap")]
+    #[cfg(all(feature = "pcap", not(windows)))]
     #[error("Pcap error: {0}")]
     CaptureError(#[from] pcap::Error),
 }
@@ -555,7 +558,7 @@ async fn flush_capture_file_task(service: svc::Client) -> Result<(), CliError> {
 /// need to use the pcap library, and can just have knowledge of the serialized
 /// format and use exclusively cbpf-rs
 // TODO change parameters of set cap prog to take the actual bpf vals instead of string
-#[cfg(feature = "pcap")]
+#[cfg(all(feature = "pcap", not(windows)))]
 async fn set_capture_program_task(service: svc::Client, program: String) -> Result<(), CliError> {
     let capture = Capture::dead(Linktype::USER0)?;
     let program = capture.compile(&program, true)?;
@@ -591,7 +594,9 @@ async fn set_capture_program_task(service: svc::Client, program: String) -> Resu
     Ok(())
 }
 
-#[cfg(not(feature = "pcap"))]
+/// Filter-string compilation is unavailable without pcap, and on Windows
+/// regardless of features (plan D13: no Npcap in this release).
+#[cfg(not(all(feature = "pcap", not(windows))))]
 async fn set_capture_program_task(_service: svc::Client, _program: String) -> Result<(), CliError> {
     Err(CliError::FeatureNotEnabled(
         "packet capture (pcap)".to_string(),
