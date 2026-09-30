@@ -2392,6 +2392,11 @@ mod tests {
         }
     }
 
+    /// Unix only: the stall this guards against is an op left in flight by
+    /// a batching engine.  `windows_unbatched` is a loop of non-blocking
+    /// `recv_from` calls with nothing in flight, so on Windows the test only
+    /// measures scheduler preemption, which on a loaded VM exceeds STALL.
+    #[cfg(unix)]
     #[test]
     fn test_recv_stress_no_stall() {
         // zipline#117: a batch receive on an empty or partly-filled socket
@@ -2528,6 +2533,8 @@ mod tests {
         }
     }
 
+    /// Minimal PRNG for `test_recv_stress_no_stall`'s send jitter.
+    #[cfg(unix)]
     fn xorshift(state: &mut u64) -> u64 {
         *state ^= *state << 13;
         *state ^= *state >> 7;
