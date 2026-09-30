@@ -121,14 +121,12 @@ impl FastpathIo {
         let _nbufs = worker.get_fresh_packets(worker.config.batch_size, &mut self.packets);
 
         self.io_results.clear();
-        let n = self
-            .batch_io
-            .try_recv_buf_from_to_batch(
-                &self.substrate_socket,
-                self.packets.iter_mut(),
-                &mut self.recv_results,
-            )
-            .unwrap();
+        let n = wouldblock_as_empty_batch(self.batch_io.try_recv_buf_from_to_batch(
+            &self.substrate_socket,
+            self.packets.iter_mut(),
+            &mut self.recv_results,
+        ))
+        .expect("unrecoverable substrate socket error");
 
         // return empty buffers to pool
         worker
@@ -188,14 +186,12 @@ impl FastpathIo {
         let _nbufs = worker.get_fresh_packets(worker.config.batch_size, &mut self.packets);
 
         self.io_results.clear();
-        let n = self
-            .batch_io
-            .try_read_buf_batch(
-                &self.actor_tun,
-                self.packets.iter_mut(),
-                &mut self.io_results,
-            )
-            .unwrap();
+        let n = wouldblock_as_empty_batch(self.batch_io.try_read_buf_batch(
+            &self.actor_tun,
+            self.packets.iter_mut(),
+            &mut self.io_results,
+        ))
+        .expect("unrecoverable TUN error");
 
         // return empty buffers to pool
         worker
@@ -292,7 +288,7 @@ impl FastpathIo {
 
         // (Try to) send packets.
         self.io_results.clear();
-        let n = tun_write_batch_sent(self.batch_io.try_write_batch(
+        let n = wouldblock_as_empty_batch(self.batch_io.try_write_batch(
             &self.actor_tun,
             worker.actor_input_q.iter().map(|pkt| pkt.body()),
             &mut self.io_results,
@@ -323,7 +319,7 @@ impl FastpathIo {
         // (Try to) send packets.
         self.io_results.clear();
 
-        let n = match self.batch_io.try_send_to_from_batch(
+        let n = wouldblock_as_empty_batch(self.batch_io.try_send_to_from_batch(
             &self.substrate_socket,
             worker.substrate_egress_q.iter().map(|pkt| {
                 (
@@ -334,11 +330,8 @@ impl FastpathIo {
                 )
             }),
             &mut self.io_results,
-        ) {
-            Ok(n) => n,
-            Err(err) if err.kind() == ErrorKind::WouldBlock => 0,
-            Err(err) => panic!("unrecoverable I/O error: {err}"),
-        };
+        ))
+        .unwrap_or_else(|err| panic!("unrecoverable I/O error: {err}"));
 
         // Tally results.
         let mut dropped = 0;
@@ -400,16 +393,22 @@ fn is_ip(pi: TunPi) -> bool {
     pi.proto == net_defs::ethertype::IP || pi.proto == net_defs::ethertype::IPV6
 }
 
-/// Classify a TUN write's batch-level result (zipline#131 PR #52 review
-/// round 1, thread 2): a first-item `WouldBlock` is ordinary backpressure
-/// — on Windows, `ZprTun::send` maps a full Wintun send ring
-/// (`ERROR_BUFFER_OVERFLOW`) to `WouldBlock`, and the batch loop returns a
-/// first-item error as the batch error (the sendmmsg(2) emulation all
-/// engines share). It must reach the drop tally as "zero packets sent",
-/// not kill the fastpath. Everything else stays fatal to the caller.
-/// Same shape as the substrate egress leg's `WouldBlock => 0` arm in
-/// `process_substrate_egress_queue`.
-fn tun_write_batch_sent(res: Result<usize>) -> Result<usize> {
+/// Classify a batch I/O call's batch-level result: a first-item
+/// `WouldBlock` means "nothing to do right now", so it comes back as an
+/// empty batch (`Ok(0)`). Every engine returns a first-item error as the
+/// batch error (the sendmmsg(2) emulation they share), and on Windows that
+/// case is routine, not exceptional:
+///
+/// * TUN write: `ZprTun::send` maps a full Wintun send ring
+///   (`ERROR_BUFFER_OVERFLOW`) to `WouldBlock` (zipline#131 PR #52 review
+///   round 1, thread 2).
+/// * Substrate receive and TUN read: the wait Event is reset before the
+///   drain (see `process_substrate_socket_in`), so a wake can find nothing
+///   to read (zipline#133 Windows smoke test).
+/// * Substrate send: a full socket send buffer.
+///
+/// Everything else stays an error for the caller to treat as fatal.
+fn wouldblock_as_empty_batch(res: Result<usize>) -> Result<usize> {
     match res {
         Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(0),
         res => res,
@@ -453,8 +452,10 @@ fn batch_process_packet_queue(
 
 #[cfg(test)]
 mod tests {
-    use super::tun_write_batch_sent;
+    use super::wouldblock_as_empty_batch;
+    use crate::batch_io;
     use std::io::{Error, ErrorKind};
+    use std::net::UdpSocket;
 
     /// zipline#131 PR #52 review round 1 (thread 2): a batch-level
     /// `WouldBlock` from the TUN write — the Wintun send ring full on the
@@ -463,7 +464,7 @@ mod tests {
     /// not as an error the caller's `expect` turns into a fastpath panic.
     #[test]
     fn tun_write_first_item_wouldblock_is_zero_sent() {
-        let res = tun_write_batch_sent(Err(Error::new(
+        let res = wouldblock_as_empty_batch(Err(Error::new(
             ErrorKind::WouldBlock,
             "Wintun send ring full",
         )));
@@ -477,7 +478,7 @@ mod tests {
     /// A successful batch result passes through unchanged.
     #[test]
     fn tun_write_success_passes_through() {
-        assert_eq!(tun_write_batch_sent(Ok(7)).unwrap(), 7);
+        assert_eq!(wouldblock_as_empty_batch(Ok(7)).unwrap(), 7);
     }
 
     /// Anything that is not `WouldBlock` stays a batch-level error, so the
@@ -485,8 +486,47 @@ mod tests {
     /// TUN failure.
     #[test]
     fn tun_write_real_error_stays_fatal() {
-        let err =
-            tun_write_batch_sent(Err(Error::new(ErrorKind::BrokenPipe, "TUN gone"))).unwrap_err();
+        let err = wouldblock_as_empty_batch(Err(Error::new(ErrorKind::BrokenPipe, "TUN gone")))
+            .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+    }
+
+    /// zipline#133 Windows smoke test: a substrate-socket wake that finds
+    /// no datagram (on Windows the wait Event is reset before the drain, so
+    /// such wakes are expected) makes every engine's batch receive fail
+    /// its FIRST item with `WouldBlock`, which the batch loop returns as
+    /// the batch error. That must classify as an empty batch — the smoke
+    /// test's `ph.exe adapter` panicked here (`fastpath_io.rs`
+    /// `.unwrap()`, os error 10035) right after docking.
+    #[test]
+    fn substrate_recv_on_empty_socket_is_empty_batch() {
+        for name in batch_io::engine_names() {
+            let mut bio = batch_io::select_engine_by_name(name)
+                .unwrap()
+                .instantiate(4)
+                .unwrap();
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+
+            let mut bufs: Vec<Vec<u8>> = (0..4).map(|_| Vec::with_capacity(64)).collect();
+            let mut results = Vec::new();
+            let n = wouldblock_as_empty_batch(bio.try_recv_buf_from_to_batch(
+                &socket,
+                bufs.iter_mut(),
+                &mut results,
+            ))
+            .unwrap_or_else(|err| {
+                panic!("engine {name}: empty socket must be an empty batch, got {err}")
+            });
+            // Engines differ in shape (io_uring completes every item with
+            // a per-item `WouldBlock`; the unbatched engines fail the first
+            // item), but none may yield a packet.
+            assert!(
+                results[..n]
+                    .iter()
+                    .all(|r| matches!(r, Err(e) if e.kind() == ErrorKind::WouldBlock)),
+                "engine {name}: nothing to receive"
+            );
+        }
     }
 }
