@@ -94,7 +94,7 @@ from an elevated (Administrator) console, with the signed `wintun.dll` from
 [wintun.net](https://www.wintun.net) next to `ph.exe`. `ph-cli.exe` talks to
 it over a named pipe instead of the unix socket. Nodes stay on Linux, and
 packet capture is not available on Windows. See
-[`integration-test/windows-smoke.md`](integration-test/windows-smoke.md) for
+[`integration-test/windows-adapter-test.md`](integration-test/windows-adapter-test.md) for
 an end-to-end walkthrough against a Linux node.
 
 ### Integration tests

@@ -425,7 +425,7 @@ next `ph.exe` startup deletes it (`WinTun: Removed orphaned adapter "zpr 1"`).
 Defender SmartScreen at defaults.
 
 For an end-to-end walkthrough against a Linux node and visa service, see
-[`integration-test/windows-smoke.md`](../integration-test/windows-smoke.md).
+[`integration-test/windows-adapter-test.md`](../integration-test/windows-adapter-test.md).
 
 
 ## Certificate and peer verification reference
