@@ -73,7 +73,7 @@ mod zprtun;
 #[cfg(test)]
 mod km_testdata;
 
-use assembly::{Assembly, PhMode};
+use assembly::{Assembly, PhMode, SelfAddressError};
 use capture_worker::CaptureWorker;
 use fastpath::FastpathWorkerConfig;
 use flow_control::FlowControl;
@@ -748,7 +748,12 @@ fn main() -> ExitCode {
             // ignores the prefix and the address alone makes nothing
             // on-link. Failure means the node cannot reach the visa service
             // and every symptom would appear somewhere other than here, so
-            // refuse to start, naming the manual command.
+            // refuse to start — naming the manual command that matches what
+            // actually failed (PR #61 review): an address failure gets the
+            // add-address command, a route failure the add-route command,
+            // and a route owned by another live interface means a second
+            // ZPR instance on this host already carries visa-service
+            // traffic, which is a conflict to resolve, not a command to run.
             if let Err(e) = asm.ensure_local_zpr_addrs_on_tun() {
                 let ifname = asm
                     .config
@@ -756,28 +761,44 @@ fn main() -> ExitCode {
                     .tun_if
                     .clone()
                     .unwrap_or_else(|| "<TUN device>".to_string());
-                for addr in &asm.config.get().zpr_addr {
-                    #[cfg(target_os = "linux")]
-                    error!(
-                        target: STARTUP,
-                        "could not apply node ZPR address {addr} to {ifname}: {e}; \
-                         configure it manually with: \
-                         ip -6 addr add {addr}/{ZPRNET_PREFIX_LEN} dev {ifname}"
-                    );
-                    #[cfg(target_os = "macos")]
-                    error!(
-                        target: STARTUP,
-                        "could not apply node ZPR address {addr} to {ifname}: {e}; \
-                         configure it manually with: \
-                         ifconfig {ifname} inet6 {addr}/{ZPRNET_PREFIX_LEN} alias"
-                    );
-                    #[cfg(windows)]
-                    error!(
-                        target: STARTUP,
-                        "could not apply node ZPR address {addr} to {ifname}: {e}; \
-                         configure it manually with: \
-                         netsh interface ipv6 add address {ifname} {addr}"
-                    );
+                match &e {
+                    SelfAddressError::Address { addr, .. } => {
+                        #[cfg(target_os = "linux")]
+                        error!(
+                            target: STARTUP,
+                            "{e}; configure it manually with: \
+                             ip -6 addr add {addr}/{ZPRNET_PREFIX_LEN} dev {ifname}"
+                        );
+                        #[cfg(target_os = "macos")]
+                        error!(
+                            target: STARTUP,
+                            "{e}; configure it manually with: \
+                             ifconfig {ifname} inet6 {addr}/{ZPRNET_PREFIX_LEN} alias"
+                        );
+                        #[cfg(windows)]
+                        error!(
+                            target: STARTUP,
+                            "{e}; configure it manually with: \
+                             netsh interface ipv6 add address {ifname} {addr}"
+                        );
+                    }
+                    SelfAddressError::VsRoute { .. } => {
+                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        error!(target: STARTUP, "{e}");
+                        #[cfg(windows)]
+                        error!(
+                            target: STARTUP,
+                            "{e}; configure it manually with: \
+                             netsh interface ipv6 add route {VISA_SERVICE_ADDR}/128 \"{ifname}\""
+                        );
+                    }
+                    SelfAddressError::VsRouteConflict { .. } => {
+                        error!(
+                            target: STARTUP,
+                            "{e}; stop the other instance, or remove its route, before \
+                             starting this node on {ifname}"
+                        );
+                    }
                 }
                 return ExitCode::FAILURE;
             }
