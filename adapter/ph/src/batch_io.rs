@@ -1695,6 +1695,31 @@ mod std_udp {
         err
     }
 
+    /// Consecutive-reset bound for [`recv_retrying_connreset`]: enough
+    /// that a burst of departed-peer resets cannot end a batch while real
+    /// datagrams sit queued behind them, small enough that a pathological
+    /// reset storm cannot pin the dispatch thread in the retry loop —
+    /// past the cap the receive falls back to the "no datagram" mapping,
+    /// the batch ends, and the dispatcher re-polls as before.
+    pub(super) const CONNRESET_RETRY_CAP: u32 = 64;
+
+    /// Retry a receive whose failure was a peer connection reset
+    /// (zl-zpr-core#62 review on zipline#160). A swallowed
+    /// `WSAECONNRESET` consumed no datagram — the socket is fine and
+    /// valid packets may already be queued behind the reset — so ending
+    /// the batch per reset (one wake/dispatch each) can starve
+    /// legitimate substrate traffic when `SIO_UDP_CONNRESET` could not
+    /// be disabled. Instead the receive is retried with the same buffer,
+    /// bounded by [`CONNRESET_RETRY_CAP`]; every swallowed reset is
+    /// counted and traced via [`connreset_as_wouldblock`], which also
+    /// supplies the capped fallback. Every other outcome — a datagram, a
+    /// genuine `WouldBlock`, any other error — returns immediately.
+    pub(super) fn recv_retrying_connreset<T>(
+        mut recv: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        recv().map_err(connreset_as_wouldblock)
+    }
+
     /// Receive with peer addresses. With `with_dest`, the destination is
     /// the socket's own bound address (no pktinfo — single-homed ceiling
     /// above), resolved once per batch.
@@ -2848,6 +2873,80 @@ mod tests {
         ] {
             let passed = std_udp::connreset_as_wouldblock(Error::new(kind, "other"));
             assert_eq!(passed.kind(), kind, "{kind:?} must pass through");
+        }
+    }
+
+    /// zl-zpr-core#62 review (zipline#160): a swallowed reset consumed no
+    /// datagram, so the receive must be retried with the same buffer —
+    /// datagrams queued behind a departed peer's reset are delivered in
+    /// the same batch instead of costing one wake/dispatch per reset.
+    #[test]
+    fn test_recv_retried_after_connreset() {
+        use std::io::{Error, ErrorKind};
+
+        // Two resets queued ahead of a real datagram: the receive seam
+        // must swallow both and return the datagram.
+        let mut calls = 0u32;
+        let res = std_udp::recv_retrying_connreset(|| {
+            calls += 1;
+            if calls <= 2 {
+                Err(Error::new(ErrorKind::ConnectionReset, "peer departed"))
+            } else {
+                Ok(7usize)
+            }
+        });
+        assert_eq!(
+            res.expect("datagram behind resets must be delivered"),
+            7,
+            "retry must return the datagram received after the resets"
+        );
+        assert_eq!(calls, 3, "one retry per swallowed reset, then the datagram");
+    }
+
+    /// zl-zpr-core#62 review (zipline#160): the retry is bounded — a
+    /// pathological storm of consecutive resets ends the batch as "no
+    /// datagram" after `CONNRESET_RETRY_CAP` retries instead of pinning
+    /// the dispatch thread in the retry loop.
+    #[test]
+    fn test_recv_retry_bounded_on_reset_storm() {
+        use std::io::{Error, ErrorKind};
+
+        let mut calls = 0u32;
+        let res = std_udp::recv_retrying_connreset(|| -> std::io::Result<usize> {
+            calls += 1;
+            Err(Error::new(ErrorKind::ConnectionReset, "reset storm"))
+        });
+        assert_eq!(
+            res.expect_err("an unbroken reset storm must end the batch").kind(),
+            ErrorKind::WouldBlock,
+            "capped storm must surface as WouldBlock (no datagram)"
+        );
+        assert_eq!(
+            calls,
+            std_udp::CONNRESET_RETRY_CAP + 1,
+            "the receive must stop after the retry cap"
+        );
+    }
+
+    /// zl-zpr-core#62 review (zipline#160): only `ConnectionReset` is
+    /// retried — a genuine `WouldBlock` (empty socket) and real faults
+    /// return on the first call, unchanged.
+    #[test]
+    fn test_recv_retry_other_errors_return_immediately() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::BrokenPipe,
+            ErrorKind::InvalidInput,
+        ] {
+            let mut calls = 0u32;
+            let res = std_udp::recv_retrying_connreset(|| -> std::io::Result<usize> {
+                calls += 1;
+                Err(Error::new(kind, "not a reset"))
+            });
+            assert_eq!(res.expect_err("error must surface").kind(), kind);
+            assert_eq!(calls, 1, "{kind:?} must not be retried");
         }
     }
 
