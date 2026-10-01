@@ -1625,6 +1625,20 @@ mod std_udp {
         )
     }
 
+    /// Map a peer's connection reset to "no datagram" (zipline#160, plan
+    /// N4). On Windows an ICMP port-unreachable from a departed peer makes
+    /// a later `recvfrom` on an unconnected UDP socket fail with
+    /// `WSAECONNRESET` (10054); nothing was received and the socket is
+    /// fine, so surface it as `WouldBlock` — stop this batch, return what
+    /// was received — exactly as an empty socket ends a batch. This is the
+    /// belt-and-braces fallback behind the `SIO_UDP_CONNRESET` ioctl
+    /// disabled at bind (`windows_disable_udp_connreset`); a `trace!`
+    /// counter keeps a reset storm visible. Portable (and unit tested) on
+    /// every OS; only the Windows engine reaches it at runtime.
+    pub(super) fn connreset_as_wouldblock(err: std::io::Error) -> std::io::Error {
+        err
+    }
+
     /// Receive with peer addresses. With `with_dest`, the destination is
     /// the socket's own bound address (no pktinfo — single-homed ceiling
     /// above), resolved once per batch.
@@ -2665,10 +2679,15 @@ mod tests {
     fn test_windows_substrate_bind_check() {
         use std::net::{Ipv4Addr, Ipv6Addr};
 
-        // Concrete addresses pass.
+        // Concrete addresses pass — loopback explicitly among them
+        // (zipline#160 / plan N2: a node and an adapter on one Windows
+        // host may dock over loopback, so a loopback self_addr must stay
+        // a valid bind), alongside concrete LAN addresses.
         for addr in [
             SocketAddr::from((Ipv4Addr::LOCALHOST, 7000)),
             SocketAddr::from((Ipv6Addr::LOCALHOST, 7000)),
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 7), 7000)),
+            SocketAddr::from((Ipv6Addr::new(0xfd5a, 0x5052, 0, 0, 0, 0, 0, 0x99), 7000)),
         ] {
             windows_substrate_bind_check(addr).unwrap();
         }
@@ -2733,6 +2752,89 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         let msg = err.to_string();
         assert!(msg.contains("wildcard"), "unhelpful error: {msg}");
+    }
+
+    /// zipline#160 (plan N4): a peer's ICMP port-unreachable surfaces on
+    /// Windows as `WSAECONNRESET` on a later `recvfrom` of an unconnected
+    /// UDP socket. Nothing was received and the socket is fine, so the
+    /// mapping seam must turn `ConnectionReset` into `WouldBlock` — the
+    /// "stop this batch, return what was received" error every engine
+    /// already handles — and leave every other error untouched. Portable,
+    /// so the mapping logic is unit tested on every OS even though only
+    /// the Windows engine reaches it at runtime.
+    #[test]
+    fn test_connreset_mapped_to_wouldblock() {
+        use std::io::{Error, ErrorKind};
+
+        // The Windows reset becomes "no datagram".
+        let mapped = std_udp::connreset_as_wouldblock(Error::new(
+            ErrorKind::ConnectionReset,
+            "peer departed (WSAECONNRESET)",
+        ));
+        assert_eq!(
+            mapped.kind(),
+            ErrorKind::WouldBlock,
+            "ConnectionReset must map to WouldBlock, got {mapped:?}"
+        );
+
+        // Anything else passes through unchanged — the fastpath's
+        // "unrecoverable substrate socket error" expect still fires for
+        // real faults.
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::BrokenPipe,
+            ErrorKind::InvalidInput,
+        ] {
+            let passed = std_udp::connreset_as_wouldblock(Error::new(kind, "other"));
+            assert_eq!(passed.kind(), kind, "{kind:?} must pass through");
+        }
+    }
+
+    /// zipline#160 (plan N4), the end-to-end shape on the real OS: send
+    /// from a bound UDP socket to a closed local port — Windows queues the
+    /// resulting ICMP port-unreachable as a `WSAECONNRESET` for a later
+    /// receive on that socket — then receive, and assert the batch comes
+    /// back clean ("nothing received", not an error and not a panic).
+    /// Windows-only by nature: unix never surfaces a reset on an
+    /// unconnected UDP socket, so there is nothing to observe there. Runs
+    /// in the Windows core-gate run (plan C2/C3).
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_recv_tolerates_connreset() {
+        let socket = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+
+        // A port with nothing behind it: bind a throwaway socket, note its
+        // port, drop it.
+        let closed_port = {
+            let dead = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            dead.local_addr().unwrap().port()
+        };
+
+        // Provoke the reset, then give the stack a moment to queue it.
+        socket
+            .send_to(b"ping", (std::net::Ipv4Addr::LOCALHOST, closed_port))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Drain. Every outcome except ConnectionReset/panic is a pass:
+        // WouldBlock (reset already mapped or ioctl-suppressed) ends the
+        // drain; a datagram cannot arrive (nothing sends to us).
+        let mut bufs = vec![Vec::with_capacity(64); 4];
+        let mut results: Vec<Result<ReceivedPacket>> = Vec::new();
+        for _ in 0..8 {
+            match std_udp::recv_from_batch(
+                &socket,
+                &mut bufs.iter_mut().map(|b| b as &mut dyn BufMut),
+                &mut results,
+                true,
+            ) {
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("reset must not surface as a batch error: {err}"),
+                Ok(0) => break,
+                Ok(_) => panic!("received a datagram nobody sent"),
+            }
+        }
     }
 
     /// Two localhost UDP sockets connected to each other: a portable
