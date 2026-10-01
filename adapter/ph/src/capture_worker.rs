@@ -21,8 +21,10 @@ impl CaptureWorker {
         }
     }
 
-    /// Unix-only: the sole caller is `set_capture_file_worker`, the
-    /// `capture.sock` SCM_RIGHTS path, which is `#[cfg(unix)]` (plan D7).
+    /// Unix-only: the sole caller is the admin RPC's `setCaptureFile`
+    /// handler, which receives the file's fd over the capnp-ancillary
+    /// FD-passing transport (zipline#142); capture is Unsupported
+    /// elsewhere (plan D7).
     #[cfg(unix)]
     pub async fn open_capture_file(&self, file: File) -> Result<(), io::Error> {
         let mut inner = self.inner.lock().await;

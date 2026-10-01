@@ -5,7 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{self, Path, PathBuf};
 use zpr::packet_info::{KM_ID_NOISE, KM_ID_NULL, KmId};
 
-use admin_api::{SocketOwner, capture_socket_path, control_socket_path};
+use admin_api::{SocketOwner, control_socket_path};
 use base64::prelude::*;
 use serde::Deserialize;
 
@@ -80,11 +80,6 @@ pub const OIDC_USER_INTERACTION_TIMEOUT: std::time::Duration = std::time::Durati
 /// How long to wait when we expect the VS to have to talk to external auth services.
 pub const VS_AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// SCM_RIGHTS ancillary buffer for `capture.sock` (`set_capture_file_worker`),
-/// which is unix-only (plan D7).
-#[cfg(unix)]
-pub const ANCILLARY_BUFFER_SIZE: usize = 128;
-
 const DEFAULT_BUFFER_COUNT: usize = 512; // should be at least 5x batch size; see fastpath_worker.rs for explanation
 const DEFAULT_BATCH_SIZE: usize = 64;
 const DEFAULT_DATAPATH_QUEUE_SIZE: usize = 256;
@@ -148,8 +143,6 @@ pub struct Config {
     /// Path to the unix domain socket for the control interface.
     pub control_path: PathBuf,
 
-    pub capture_path: PathBuf,
-
     /// Source address for our UDP substrate socket. For an adapter this should (always?) be `0.0.0.0:0`.
     /// For a node this is the nodes dock listening address.
     pub self_addr: SocketAddr,
@@ -211,7 +204,7 @@ pub struct Config {
     /// automatic restart (zipline#28).
     pub auto_connect: bool,
 
-    /// The user the control/capture sockets should belong to, resolved from
+    /// The user the control socket should belong to, resolved from
     /// `SUDO_UID`/`SUDO_GID`/`PKEXEC_UID` by [Config::apply_socket_owner].
     /// `None` when ph was started with no recoverable invoking user (e.g.
     /// under systemd), in which case main falls back to the `zpr` group
@@ -224,9 +217,6 @@ pub struct Config {
     /// parent directory is auto-created; an explicit path keeps today's
     /// "parent must already exist" contract (zipline#39).
     pub(crate) control_path_derived: bool,
-
-    /// Same as `control_path_derived`, for `capture_path`.
-    pub(crate) capture_path_derived: bool,
 
     /// Node only — how far ahead of an actor's `auth_expires` the node
     /// starts attempting silent authentication renewal (zipline#45).
@@ -365,9 +355,6 @@ impl Config {
             if self.control_path_derived {
                 self.control_path = control_socket_path(Some(&owner_id));
             }
-            if self.capture_path_derived {
-                self.capture_path = capture_socket_path(Some(&owner_id));
-            }
         }
         self.socket_owner = owner;
     }
@@ -381,10 +368,7 @@ impl Config {
     #[cfg(unix)]
     pub fn prepare_socket_dirs(&self) -> Result<(), ArgsError> {
         use std::os::unix::fs::PermissionsExt;
-        for (path, derived) in [
-            (&self.control_path, self.control_path_derived),
-            (&self.capture_path, self.capture_path_derived),
-        ] {
+        for (path, derived) in [(&self.control_path, self.control_path_derived)] {
             // Explicit paths keep the parent-must-exist contract; only the
             // derived per-owner directory is created here. socket_owner
             // presence gates it too: without an owner the derived path is
@@ -435,16 +419,6 @@ impl Config {
         // For control path, the parent dir must exist or there will be an error later.
         if let Some(parent) = self.control_path.parent() {
             match check_file_exists("control socket parent directory", parent) {
-                Ok(_) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        if self.capture_path.as_os_str().is_empty() {
-            return Err("capture_path".arg_missing());
-        }
-        // For capture path, the parent dir must exist or there will be an error later.
-        if let Some(parent) = self.capture_path.parent() {
-            match check_file_exists("capture socket parent directory", parent) {
                 Ok(_) => {}
                 Err(e) => return Err(e),
             }
@@ -511,14 +485,6 @@ impl Config {
                 self.control_path = control_path.clone();
             }
             self.control_path_derived = false;
-        }
-        if let Some(capture_path) = &config.capture_path {
-            if capture_path.is_relative() {
-                self.capture_path = base_dir.join(capture_path);
-            } else {
-                self.capture_path = capture_path.clone();
-            }
-            self.capture_path_derived = false;
         }
         if let Some(self_addr) = &config.self_addr {
             self.self_addr = *self_addr;
@@ -637,16 +603,6 @@ impl Config {
             })?;
             self.control_path_derived = false;
         }
-        if let Some(capture_path) = &common.capture_path {
-            let cp = PathBuf::from(capture_path);
-            self.capture_path = path::absolute(cp).or_else(|e| {
-                Err(ArgsError::PathError(format!(
-                    "path error for capture_path: {:?}",
-                    e
-                )))
-            })?;
-            self.capture_path_derived = false;
-        }
         if let Some(self_addr) = &common.self_addr {
             self.self_addr = *self_addr;
         }
@@ -725,7 +681,6 @@ impl Default for Config {
         Self {
             name: String::new(),
             control_path: control_socket_path(None),
-            capture_path: capture_socket_path(None),
             self_addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0),
             ca_file: None,
             certificate_file: None,
@@ -744,7 +699,6 @@ impl Default for Config {
             auto_connect: true,
             socket_owner: None,
             control_path_derived: true,
-            capture_path_derived: true,
             auth_renewal_lead: DEFAULT_AUTH_RENEWAL_LEAD,
             #[cfg(feature = "enable-security-testing")]
             security_testing_mangle_forwarded_pings: false,
@@ -794,7 +748,6 @@ pub struct NodeConfigSection {
 #[derive(Deserialize, Debug, Clone)]
 pub struct GlobalConfigSection {
     pub control_path: Option<PathBuf>,
-    pub capture_path: Option<PathBuf>,
     pub self_addr: Option<SocketAddr>,
     pub ca_file: Option<PathBuf>,
     pub certificate_file: Option<PathBuf>,
@@ -1091,9 +1044,10 @@ mod test {
         assert!(resolve_advertised_addr("203.0.113.7").is_err());
     }
 
-    /// With a resolved owner and derived (default) socket paths, both paths
-    /// move into the owner's per-uid directory and match what admin-api
-    /// derives — the ph / ph-cli agreement this issue exists for (zipline#39).
+    /// With a resolved owner and a derived (default) socket path, the
+    /// control path moves into the owner's per-uid directory and matches
+    /// what admin-api derives — the ph / ph-cli agreement this issue exists
+    /// for (zipline#39).
     #[test]
     fn test_apply_socket_owner_moves_derived_paths() {
         let mut config = Config::default();
@@ -1102,7 +1056,6 @@ mod test {
             gid: Some(1234),
         }));
         assert_eq!(config.control_path, control_socket_path(Some("1234")));
-        assert_eq!(config.capture_path, capture_socket_path(Some("1234")));
         assert_eq!(
             config.socket_owner,
             Some(SocketOwner {
@@ -1112,13 +1065,12 @@ mod test {
         );
     }
 
-    /// No owner: the derived paths stay at today's shared location.
+    /// No owner: the derived path stays at today's shared location.
     #[test]
     fn test_apply_socket_owner_none_keeps_shared_paths() {
         let mut config = Config::default();
         config.apply_socket_owner(None);
         assert_eq!(config.control_path, control_socket_path(None));
-        assert_eq!(config.capture_path, capture_socket_path(None));
         assert_eq!(config.socket_owner, None);
     }
 
@@ -1130,7 +1082,6 @@ mod test {
         let section: GlobalConfigSection = toml::from_str(
             r#"
             control_path = "/explicit/control.sock"
-            capture_path = "/explicit/capture.sock"
             "#,
         )
         .unwrap();
@@ -1143,7 +1094,6 @@ mod test {
             gid: Some(1234),
         }));
         assert_eq!(config.control_path, PathBuf::from("/explicit/control.sock"));
-        assert_eq!(config.capture_path, PathBuf::from("/explicit/capture.sock"));
         // The owner is still recorded for the post-bind chown.
         assert_eq!(
             config.socket_owner,
@@ -1169,7 +1119,7 @@ mod test {
 
         let mut config = Config::default();
         // Simulate the derived per-uid layout under a temp data home; keep
-        // the derived flags true so prepare_socket_dirs owns the parents.
+        // the derived flag true so prepare_socket_dirs owns the parent.
         let uid = nix::unistd::geteuid().as_raw();
         let gid = nix::unistd::getegid().as_raw();
         config.socket_owner = Some(SocketOwner {
@@ -1177,7 +1127,6 @@ mod test {
             gid: Some(gid),
         });
         config.control_path = base.join(uid.to_string()).join("control.sock");
-        config.capture_path = base.join(uid.to_string()).join("capture.sock");
 
         let parent = config.control_path.parent().unwrap().to_path_buf();
         assert!(!parent.exists(), "parent must not pre-exist for this test");
@@ -1215,7 +1164,6 @@ mod test {
         let section: GlobalConfigSection = toml::from_str(&format!(
             r#"
             control_path = "{base}/nosuchdir/control.sock"
-            capture_path = "{base}/nosuchdir/capture.sock"
             "#,
             base = base.display()
         ))

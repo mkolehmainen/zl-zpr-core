@@ -114,7 +114,8 @@ impl<W: AsyncWrite + Unpin> PcapWriter<W> {
     /// "Open" a new PCAP writer, using the specified async writer as the destination.
     ///
     /// Unix-only: the sole caller is `CaptureWorker::open_capture_file`,
-    /// reached via the `capture.sock` fd-passing path (plan D7).
+    /// reached via the admin RPC's FD-passing `setCaptureFile` path
+    /// (zipline#142); capture is Unsupported elsewhere (plan D7).
     #[cfg(unix)]
     pub async fn open(writer: W, linktype: u32) -> io::Result<Self> {
         let mut writer = BufWriter::new(writer);

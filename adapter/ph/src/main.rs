@@ -50,9 +50,6 @@ mod pki;
 mod prelude;
 mod queues;
 mod sample_ring;
-// Capture hands fds over SCM_RIGHTS; unix only (plan D7).
-#[cfg(unix)]
-mod set_capture_file_worker;
 mod signal_worker;
 #[cfg(unix)]
 mod socket_access;
@@ -263,8 +260,8 @@ fn main() -> ExitCode {
     if socket_plan == socket_access::SocketAccess::Unchanged && config.socket_owner.is_none() {
         warn!(
             target: STARTUP,
-            "no invoking user resolved and no '{}' group on this host; control/capture sockets \
-             stay root-only (ph-cli will need sudo or an explicit -p)",
+            "no invoking user resolved and no '{}' group on this host; the control socket \
+             stays root-only (ph-cli will need sudo or an explicit -p)",
             socket_access::FALLBACK_GROUP
         );
     }
@@ -279,21 +276,6 @@ fn main() -> ExitCode {
             error!(target: STARTUP, "{e}");
             return ExitCode::FAILURE;
         }
-    };
-
-    // The capture socket exists only where capture is supported (plan D7);
-    // elsewhere setCaptureFile answers Unsupported and no worker runs.
-    #[cfg(unix)]
-    let capture_socket = if sys::capture_supported() {
-        match socket_access::bind_owned_listener("capture", &config.capture_path, &socket_plan) {
-            Ok(socket) => Some(Arc::new(socket)),
-            Err(e) => {
-                error!(target: STARTUP, "{e}");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        None
     };
 
     //
@@ -813,10 +795,6 @@ fn main() -> ExitCode {
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(mgmt_dispatch_worker::launch(asm.clone(), md_outq, mhd_outq));
     js.spawn_local(adapter_manager_worker::launch(asm.clone(), am_outq));
-    #[cfg(unix)]
-    if let Some(capture_socket) = capture_socket {
-        js.spawn_local(set_capture_file_worker::launch(asm.clone(), capture_socket));
-    }
     js.spawn_local(admin_worker::launch(asm.clone(), control_listener));
     js.spawn_local(km_multiplexor::launch_signal_worker(
         asm.clone(),

@@ -266,7 +266,7 @@ ip netns exec zpr-vs "$VS" -c vs-config.toml --clear-state windows-smoke.bin2 >v
 sleep 2
 
 "$PH" node -l all=INFO \
-  --control-path "$WORK/node.sock" --capture-path "$WORK/node-cap.sock" \
+  --control-path "$WORK/node.sock" \
   --self-addr 0.0.0.0:5000 \
   --advertised-substrate-addr "$HOST_LAN_IP:5000" \
   --ca-file ca.crt --certificate-file node.crt --private-key-file node.key \
@@ -275,7 +275,7 @@ sleep 2
 sleep 2
 
 ip netns exec zpr-vs "$PH" adapter -l all=INFO \
-  --control-path "$WORK/vs-adapter.sock" --capture-path "$WORK/vs-adapter-cap.sock" \
+  --control-path "$WORK/vs-adapter.sock" \
   --ca-file ca.crt --certificate-file vs.zpr.crt --private-key-file vs.zpr.key \
   --bootstrap-key actorvs-rsa.key \
   --tun-if tun0 --node-addr 10.0.0.1:5000 --zpr-addr fd5a:5052::1 \
@@ -283,7 +283,7 @@ ip netns exec zpr-vs "$PH" adapter -l all=INFO \
 sleep 5
 
 ip netns exec zpr-a "$PH" adapter -l all=INFO \
-  --control-path "$WORK/adapter1.sock" --capture-path "$WORK/adapter1-cap.sock" \
+  --control-path "$WORK/adapter1.sock" \
   --ca-file ca.crt --bootstrap-key adapter1-rsa.key --name adapter1 \
   --tun-if tun0 --node-addr 10.0.1.1:5000 --zpr-addr fd5a:5052:8888::1:1 \
   >adapter1.log 2>&1 &
