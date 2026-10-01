@@ -660,7 +660,12 @@ wait_for 30 check_node_has_auth_services || {
 # where ZPR_USER=root. Unlike `sudo -u`, setpriv does not scrub the
 # environment, so the outer `sudo -E` env (ZPR_* overrides, HOME) still
 # reaches the binary; SSL_CERT_FILE is set explicitly as before.
-sudo -E ip netns exec zpr-a setpriv --reuid "$ZPR_USER" --regid "$ZPR_USER" --init-groups \
+# --regid takes a gid or group name, not a username: derive the user's
+# primary GID so accounts whose primary group is shared (e.g.
+# `developers`) work; --init-groups restores the supplementary groups,
+# matching `sudo -u` semantics.
+ZPR_GID=$(id -g "$ZPR_USER")
+sudo -E ip netns exec zpr-a setpriv --reuid "$ZPR_USER" --regid "$ZPR_GID" --init-groups \
   --inh-caps +net_admin --ambient-caps +net_admin -- \
   env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
   adapter \
