@@ -1,8 +1,10 @@
-# Windows adapter smoke test
+# Windows adapter test
 
 Hand-run, end-to-end verification that `ph adapter` on Windows carries real
-traffic against a Linux node and visa service (umbrella zipline#126, plan Z1).
-It exercises: Wintun interface creation, docking over the substrate, `ph-cli`
+traffic against a Linux node and visa service. There is no automated Windows
+CI that carries real traffic, so run this whenever a change touches the Windows
+datapath (Wintun, the named-pipe control channel, the `windows_unbatched`
+engine, shutdown). It exercises: Wintun interface creation, docking over the substrate, `ph-cli`
 over the named pipe, ICMPv6 and TCP through ZPR, and graceful Ctrl-C shutdown
 that leaves no Wintun adapter behind.
 
@@ -89,7 +91,7 @@ integration-test/lib/zpr-pki gensignedcert "$WORK/ca.crt" "$WORK/ca.key" \
 # The policy: one node, adapter1 (Linux) serves ping + HTTP :8080 to the
 # Windows adapter; the Windows adapter serves ping back.
 cat > "$WORK/windows-smoke.zpl" <<'EOF'
-# Windows smoke-test policy (integration-test/windows-smoke.md).
+# Windows adapter test policy (integration-test/windows-adapter-test.md).
 
 define adapter as a device with zpr.adapter.cn.
 
@@ -411,5 +413,5 @@ rm -rf "$WORK"
 ## Recording the result
 
 Paste the transcript of sections 2–4 (adapter startup lines, `ph-cli`
-output, ping/HTTP output, shutdown, `Get-NetAdapter` after exit) on the
-Windows umbrella issue (zipline#126).
+output, ping/HTTP output, shutdown, `Get-NetAdapter` after exit) on the PR
+or issue the run verifies.
