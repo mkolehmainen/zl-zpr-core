@@ -20,13 +20,19 @@
 //! adapter when the last Arc drops; an unclean exit leaves the adapter for
 //! the next startup's stale-delete to reap).
 
+use crate::sys::dad;
 use crate::sys::linux_route;
 use crate::sys::wait::{WaitHandle, Waitable};
 use crate::zprtun::ZprTunError;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::process::Command;
 use std::sync::Arc;
 use tracing::*;
+use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, NO_ERROR};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GetUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
+};
+use windows_sys::Win32::Networking::WinSock::AF_INET6;
 
 use crate::logging::targets::NET_OS;
 
@@ -44,11 +50,11 @@ pub struct ZprTun {
     /// Keeps the driver loaded for the life of the device.
     _wintun: wintun::Wintun,
     /// Explicit hold on the adapter device. The `session` also holds an
-    /// `Arc` to it internally, so nothing reads this field since the
-    /// unwireable `delete(self)` was dropped (PR #51 review) — it stays to
-    /// document that the device outlives every session-independent user
-    /// (netsh helpers address it by name while the ring may be shut down).
-    _adapter: Arc<wintun::Adapter>,
+    /// `Arc` to it internally; this one documents that the device outlives
+    /// every session-independent user (netsh helpers address it by name
+    /// while the ring may be shut down) and supplies the interface LUID for
+    /// the IP Helper DAD-state query in [`ZprTun::dad_state`].
+    adapter: Arc<wintun::Adapter>,
     session: Arc<wintun::Session>,
     /// The adapter name (config `tun_if` or [`DEFAULT_ADAPTER_NAME`]), as
     /// netsh commands address it.
@@ -115,7 +121,7 @@ impl ZprTun {
 
         Ok(vec![ZprTun {
             _wintun: wintun,
-            _adapter: adapter,
+            adapter,
             session,
             name,
             mtx: std::sync::Mutex::new(()),
@@ -184,7 +190,48 @@ impl ZprTun {
                 netsh_output_text(&output)
             )));
         }
-        Ok(())
+        // netsh returns while the address is still tentative (DAD, ~1 s on
+        // Wintun), and binding to it in that window fails with
+        // WSAEADDRNOTAVAIL — the node's VSS listener lost that race on
+        // every start (zipline#162). Wait, bounded, until it is usable.
+        dad::wait_until_usable(
+            || self.dad_state(addr),
+            dad::DAD_WAIT_TIMEOUT,
+            dad::DAD_POLL_INTERVAL,
+        )
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("address {addr} on {} did not become usable: {e}", self.name),
+            )
+        })
+    }
+
+    /// Read the duplicate-address-detection state of `addr` on this adapter
+    /// through IP Helper (`GetUnicastIpAddressEntry`). IP Helper reports the
+    /// state as an enum; `netsh show address` prints it as localized text,
+    /// which would not parse on a non-English Windows. An address that is
+    /// not (yet) on the adapter is a `NotFound` error.
+    fn dad_state(&self, addr: Ipv6Addr) -> std::io::Result<dad::DadState> {
+        let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+        // The lookup key is (interface LUID, address).
+        // SAFETY: NET_LUID_LH is a union whose every variant is a view of
+        // the same 64 bits; reading `Value` reads them as a plain u64.
+        row.InterfaceLuid.Value = unsafe { self.adapter.get_luid().Value };
+        row.Address.Ipv6.sin6_family = AF_INET6;
+        row.Address.Ipv6.sin6_addr.u.Byte = addr.octets();
+        // SAFETY: `row` is a valid, initialized MIB_UNICASTIPADDRESS_ROW
+        // that outlives the call; the function only reads the key fields
+        // and writes the rest of the row in place.
+        let rc = unsafe { GetUnicastIpAddressEntry(&mut row) };
+        match rc {
+            NO_ERROR => Ok(dad::DadState::from_nl_dad_state(row.DadState)),
+            ERROR_NOT_FOUND => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("address {addr} is not on {}", self.name),
+            )),
+            rc => Err(std::io::Error::from_raw_os_error(rc as i32)),
+        }
     }
 
     pub fn clear_address(&self, addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {

@@ -32,6 +32,12 @@ pub(crate) mod macos_route;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod linux_route;
 
+// Bounded wait for a freshly added address to leave the DAD tentative
+// state (zipline#162). Compiled on every OS, same pattern and reason as
+// `macos_route` above; only the Windows `add_address` calls it at runtime.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod dad;
+
 // POSIX arms of the control channel and the Notify wakeup object
 // (zipline#130: Windows provides the same two modules from sys/windows).
 #[cfg(unix)]

@@ -85,6 +85,10 @@ windows-sys = { version = "0.61", features = [
     # behind Win32_System_IO (its OVERLAPPED parameter); declared here
     # rather than inherited through feature unification.
     "Win32_System_IO",
+    # GetUnicastIpAddressEntry: add_address waits out the DAD tentative
+    # state of a fresh address (zipline#162); the row type needs Ndis.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
 ] }
 
 [dev-dependencies]
