@@ -739,12 +739,52 @@ fn main() -> ExitCode {
             }
 
             // Those are the only source addresses the node will accept from
-            // itself, and the addresses it binds its own services to -- but on
-            // Linux the TUN device is addressed out of band (see the TUN setup
-            // above), so nothing has confirmed the device actually has them.
-            // If it does not, the node cannot reach the visa service and every
-            // symptom of that appears somewhere other than here, so refuse to
-            // start rather than fail quietly for the lifetime of the process.
+            // itself, and the addresses it binds its own services to. Apply
+            // them to the TUN device ourselves (zipline#159, N3): on Linux a
+            // hand-configured or script-configured device already carries
+            // them and nothing is called; on macOS and Windows nobody else
+            // addresses a node's TUN at all. On Windows this also installs
+            // the /128 visa-service host route, because `netsh add address`
+            // ignores the prefix and the address alone makes nothing
+            // on-link. Failure means the node cannot reach the visa service
+            // and every symptom would appear somewhere other than here, so
+            // refuse to start, naming the manual command.
+            if let Err(e) = asm.ensure_local_zpr_addrs_on_tun() {
+                let ifname = asm
+                    .config
+                    .get()
+                    .tun_if
+                    .clone()
+                    .unwrap_or_else(|| "<TUN device>".to_string());
+                for addr in &asm.config.get().zpr_addr {
+                    #[cfg(target_os = "linux")]
+                    error!(
+                        target: STARTUP,
+                        "could not apply node ZPR address {addr} to {ifname}: {e}; \
+                         configure it manually with: \
+                         ip -6 addr add {addr}/{ZPRNET_PREFIX_LEN} dev {ifname}"
+                    );
+                    #[cfg(target_os = "macos")]
+                    error!(
+                        target: STARTUP,
+                        "could not apply node ZPR address {addr} to {ifname}: {e}; \
+                         configure it manually with: \
+                         ifconfig {ifname} inet6 {addr}/{ZPRNET_PREFIX_LEN} alias"
+                    );
+                    #[cfg(windows)]
+                    error!(
+                        target: STARTUP,
+                        "could not apply node ZPR address {addr} to {ifname}: {e}; \
+                         configure it manually with: \
+                         netsh interface ipv6 add address {ifname} {addr}"
+                    );
+                }
+                return ExitCode::FAILURE;
+            }
+
+            // The self-addressing above is best-effort only for addresses
+            // the platform cannot inspect -- so confirm the device actually
+            // has them; this check stays the hard stop.
             let missing = asm.local_zpr_addrs_missing_from_tun();
             if !missing.is_empty() {
                 let ifname = asm
