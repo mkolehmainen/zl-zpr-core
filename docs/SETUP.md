@@ -361,10 +361,12 @@ accepts docking adapters, and forwards their traffic, exactly like
 
 **Windows node constraints** (deliberate, in this release):
 
-* **A concrete `self_addr` is required** (or an explicit
-  `advertised_substrate_addr`): the Windows substrate engine rejects a
-  wildcard bind by design, and startup fails cleanly with a message naming
-  the fix. With a concrete `self_addr`, no separate
+* **A concrete `self_addr` is required**, unconditionally: the Windows
+  substrate engine rejects a wildcard bind by design, and startup fails
+  cleanly with a message naming the fix. An explicit
+  `advertised_substrate_addr` is no substitute — the bind check runs before
+  the advertised address is selected, so a wildcard `self_addr` fails at
+  startup regardless. With a concrete `self_addr`, no separate
   `advertised_substrate_addr` is needed.
 * **Single-homed only** — one substrate address, configured once at startup;
   multi-homed hosts and address changes while running are
@@ -389,9 +391,13 @@ The hand-run, end-to-end verification of the Windows node (a Windows VM
 forwarding real traffic between Linux adapters and hosting the visa
 service's support service) is
 [`integration-test/windows-node-test.md`](../integration-test/windows-node-test.md);
-run it whenever a change touches the Windows node path. There is no
-automated Windows CI tier
-([zipline#152](https://github.com/mkolehmainen/zipline/issues/152)).
+run it whenever a change touches the Windows node path. CI covers Windows
+builds and unit tests (`.github/workflows/adapter.yml` builds and tests `ph`
+and `ph-cli` on `windows-latest`), but there is no automated end-to-end
+Windows tier that carries real traffic
+([zipline#152](https://github.com/mkolehmainen/zipline/issues/152)); note
+that Actions is currently disabled on this fork, so no CI runs here either
+way.
 
 **Not supported on Windows** (deliberately, in this release):
 
