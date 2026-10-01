@@ -1,4 +1,4 @@
-//! Ownership and mode applied to the control/capture sockets after bind
+//! Ownership and mode applied to the control socket after bind
 //! (zipline#39).
 //!
 //! `ph` usually runs as root, which used to leave both unix sockets root-only
@@ -29,7 +29,7 @@ use nix::unistd::{Gid, Uid, chown};
 /// without the group degrades to today's root-only behaviour.
 pub const FALLBACK_GROUP: &str = "zpr";
 
-/// What to do to a control/capture socket after binding it.
+/// What to do to a control socket after binding it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SocketAccess {
     /// Chown to the resolved invoking user, mode `0600`. `gid: None` when

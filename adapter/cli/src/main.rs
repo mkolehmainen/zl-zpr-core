@@ -8,32 +8,24 @@ mod oidc;
 mod rusty_helper;
 
 use crate::main_args::{CaptureCommands, CliCommand, CmdlineArgs, Commands, LinkCommands};
-#[cfg(unix)]
-use admin_api::rpc_commands::RpcCommands;
 use admin_api::v1 as cli;
 use clap::Parser;
 use cli::cmd_line_inter as svc;
 use rustyline::{CompletionType, Config, Editor, error::ReadlineError, history::FileHistory};
-#[cfg(unix)]
-use std::fs::OpenOptions;
 use std::io::Error;
-#[cfg(unix)]
-use std::io::prelude::*;
-#[cfg(unix)]
-use std::io::{BufReader, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-// The capture path passes the opened file's fd over SCM_RIGHTS; unix only
-// (capture is Unsupported on Windows, plan D7 / zipline#130).
-#[cfg(unix)]
-use std::os::fd::AsFd;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
+// The FD-passing capture path (capnp-ancillary) opens the file here and
+// hands its fd to ph over the admin RPC; unix only (capture is Unsupported
+// on Windows, plan D7 / zipline#130).
+#[cfg(all(unix, feature = "capnp-ancillary"))]
+use std::fs::OpenOptions;
+#[cfg(all(unix, feature = "capnp-ancillary"))]
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use thiserror::Error;
 use tokio::time::{Duration, sleep};
+#[cfg(not(all(unix, feature = "capnp-ancillary")))]
 use tokio_util::compat::*;
-#[cfg(unix)]
-use zpr_ext::std::os::unix::net::{SocketAncillary, UnixStreamExt};
 
 // The pcap-consuming code is additionally gated off Windows (plan D13):
 // filter-string compilation would need the Npcap SDK, so a Windows build
@@ -49,9 +41,6 @@ use {
 use ctrlc;
 #[allow(unused_imports)]
 use std::sync::{Arc, Condvar, Mutex};
-
-#[allow(dead_code)]
-const ANCILLARY_BUFFER_SIZE: usize = 128;
 
 #[derive(Error, Debug)]
 enum CliError {
@@ -95,34 +84,31 @@ impl From<std::str::Utf8Error> for CliError {
 async fn main() -> Result<(), CliError> {
     let args = CmdlineArgs::parse();
     // zipline#39: default socket search — per-uid path for our euid, then the
-    // shared path; explicit -p/-c short-circuit. Commands that never touch
+    // shared path; explicit -p short-circuits. Commands that never touch
     // the packet handler socket must not fail when no socket exists.
-    let (socket, cap_socket) =
-        match main_args::resolve_sockets(args.socket.clone(), args.cap_socket.clone()) {
-            Ok(pair) => pair,
-            Err(msg) => {
-                if matches!(
-                    args.command,
-                    Some(Commands::Quit) | Some(Commands::OidcLogin { .. })
-                ) {
-                    (PathBuf::new(), PathBuf::new())
-                } else {
-                    eprintln!("{msg}");
-                    return Err(CliError::ParseError(msg));
-                }
+    let socket = match main_args::resolve_sockets(args.socket.clone()) {
+        Ok(path) => path,
+        Err(msg) => {
+            if matches!(
+                args.command,
+                Some(Commands::Quit) | Some(Commands::OidcLogin { .. })
+            ) {
+                PathBuf::new()
+            } else {
+                eprintln!("{msg}");
+                return Err(CliError::ParseError(msg));
             }
-        };
+        }
+    };
 
     if let Some(command) = args.command {
-        process_command(command, &socket, &cap_socket)
-            .await
-            .map(|_| {})
+        process_command(command, &socket).await.map(|_| {})
     } else {
-        run_cli(socket, cap_socket).await
+        run_cli(socket).await
     }
 }
 
-async fn run_cli(socket: PathBuf, cap_socket: PathBuf) -> Result<(), CliError> {
+async fn run_cli(socket: PathBuf) -> Result<(), CliError> {
     let config = Config::builder()
         .completion_type(CompletionType::List)
         .completion_show_all_if_ambiguous(true)
@@ -147,7 +133,7 @@ async fn run_cli(socket: PathBuf, cap_socket: PathBuf) -> Result<(), CliError> {
 
                 rl.add_history_entry(line)?;
 
-                match parse_and_exec(line, &socket, &cap_socket).await {
+                match parse_and_exec(line, &socket).await {
                     Ok(quit) => {
                         if quit {
                             break;
@@ -183,22 +169,14 @@ async fn run_cli(socket: PathBuf, cap_socket: PathBuf) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn parse_and_exec(
-    line: &str,
-    socket: &PathBuf,
-    cap_socket: &PathBuf,
-) -> Result<bool, CliError> {
+async fn parse_and_exec(line: &str, socket: &PathBuf) -> Result<bool, CliError> {
     let args = shlex::split(line).ok_or(Error::other("Invalid quoting"))?;
     let cli = CliCommand::try_parse_from(args).map_err(|e| Error::other(e.to_string()))?;
 
-    process_command(cli.command, &socket, cap_socket).await
+    process_command(cli.command, &socket).await
 }
 
-async fn process_command(
-    command: Commands,
-    socket: &PathBuf,
-    cap_socket: &PathBuf,
-) -> Result<bool, CliError> {
+async fn process_command(command: Commands, socket: &PathBuf) -> Result<bool, CliError> {
     // Must quit immediately otherwise you get an error if the port is no longer open
     if matches!(command, Commands::Quit) {
         return Ok(true);
@@ -227,14 +205,32 @@ async fn process_command(
 
     let sock = control::connect(socket).await?;
 
-    let (reader, writer) = tokio::io::split(sock);
+    #[cfg(not(all(unix, feature = "capnp-ancillary")))]
+    let network = {
+        let (reader, writer) = tokio::io::split(sock);
+        capnp_rpc::twoparty::VatNetwork::new(
+            tokio::io::BufReader::new(reader).compat(),
+            tokio::io::BufWriter::new(writer).compat_write(),
+            capnp_rpc::rpc_twoparty_capnp::Side::Client,
+            capnp::message::ReaderOptions::new(),
+        )
+    };
 
-    let network = capnp_rpc::twoparty::VatNetwork::new(
-        tokio::io::BufReader::new(reader).compat(),
-        tokio::io::BufWriter::new(writer).compat_write(),
-        capnp_rpc::rpc_twoparty_capnp::Side::Client,
-        capnp::message::ReaderOptions::new(),
-    );
+    // FD-passing transport (zipline#142): `capture set-file` sends the opened
+    // capture file's descriptor to ph as SCM_RIGHTS ancillary data. Needs the
+    // capnproto-rust fork — see [patch.crates-io] in the workspace root
+    // Cargo.toml.
+    #[cfg(all(unix, feature = "capnp-ancillary"))]
+    let network = {
+        let (reader, writer) = sock.into_split();
+        capnp_rpc::twoparty::io::VatNetwork::new_with_fds(
+            capnp_futures::io::tokio::UnixFdStream::new(reader),
+            capnp_futures::io::tokio::UnixFdStream::new(writer),
+            1,
+            capnp_rpc::rpc_twoparty_capnp::Side::Client,
+            capnp::message::ReaderOptions::new(),
+        )
+    };
 
     let mut rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), None);
 
@@ -255,14 +251,9 @@ async fn process_command(
                     }
                 }
                 Commands::Capture(capture) => match capture.command {
-                    CaptureCommands::SetFile { file_path } => match capture_file_route() {
-                        CaptureFileRoute::CaptureSocket => {
-                            handle_set_capture_file(file_path, cap_socket)?;
-                        }
-                        CaptureFileRoute::AdminRpc => {
-                            set_capture_file_via_rpc(service).await?;
-                        }
-                    },
+                    CaptureCommands::SetFile { file_path } => {
+                        set_capture_file_task(service, file_path).await?;
+                    }
                     CaptureCommands::CloseFile => close_capture_file_task(service).await?,
                     CaptureCommands::FlushFile => flush_capture_file_task(service).await?,
                     CaptureCommands::SetProgram { program } => {
@@ -273,10 +264,7 @@ async fn process_command(
                         file_path,
                         duration,
                         program,
-                    } => {
-                        capture_sequence_task(service, file_path, duration, program, cap_socket)
-                            .await?
-                    }
+                    } => capture_sequence_task(service, file_path, duration, program).await?,
                 },
                 Commands::Watch { interval } => watch_task(service, interval).await?,
                 Commands::PerfSample {
@@ -622,13 +610,9 @@ async fn capture_sequence_task(
     file_path: String,
     time: u64,
     program: String,
-    cap_socket: &PathBuf,
 ) -> Result<(), CliError> {
     let sleep_time = Duration::new(time, 0);
-    match capture_file_route() {
-        CaptureFileRoute::CaptureSocket => handle_set_capture_file(file_path, cap_socket)?,
-        CaptureFileRoute::AdminRpc => set_capture_file_via_rpc(service.clone()).await?,
-    }
+    set_capture_file_task(service.clone(), file_path).await?;
     set_capture_program_task(service.clone(), program).await?;
 
     let handler = Arc::new(CtrlcHandle::new());
@@ -854,32 +838,58 @@ async fn get_node_addr_task(service: svc::Client) -> Result<(), CliError> {
     }
 }
 
-/// How `capture set-file` / `capture sequence` deliver the capture file to
-/// ph on this platform (zipline#131 step 5 / the #129 carryover).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CaptureFileRoute {
-    /// unix: open the file here and pass the fd over `capture.sock` with
-    /// SCM_RIGHTS, so root-running ph never opens a user-chosen path.
-    CaptureSocket,
-    /// Windows: no capture socket exists (plan D7). Call the admin RPC's
-    /// `setCaptureFile`, which answers `Unimplemented: capture is not
-    /// available on this platform` — ph's authoritative message.
-    AdminRpc,
+// This struct implements the CaptureFile capability for the admin RPC: ph
+// calls back `get_fd` and the transport sends the descriptor as SCM_RIGHTS
+// ancillary data. Only used with the capnp-ancillary FD-passing transport
+// (zipline#142).
+#[cfg(all(unix, feature = "capnp-ancillary"))]
+struct CaptureFileImpl {
+    fd: OwnedFd,
 }
 
-/// The platform's capture-file route: see [`CaptureFileRoute`].
-fn capture_file_route() -> CaptureFileRoute {
-    if cfg!(windows) {
-        CaptureFileRoute::AdminRpc
-    } else {
-        CaptureFileRoute::CaptureSocket
+#[cfg(all(unix, feature = "capnp-ancillary"))]
+impl cli::capture_file::Server for CaptureFileImpl {
+    fn get_fd(&self) -> Option<BorrowedFd<'_>> {
+        Some(self.fd.as_fd())
     }
 }
 
-/// The [`CaptureFileRoute::AdminRpc`] leg: send `setCaptureFile` and print
-/// ph's error (there is no success leg in this release — ph without
-/// capture support answers Unimplemented, plan D7).
-async fn set_capture_file_via_rpc(service: svc::Client) -> Result<(), CliError> {
+/// Opens the named capture file and passes its FD to ph as a CaptureFile
+/// capability on `setCaptureFile`, so root-running ph never opens a
+/// user-chosen path (zipline#142). Needs the capnp-ancillary FD-passing
+/// transport.
+#[cfg(all(unix, feature = "capnp-ancillary"))]
+async fn set_capture_file_task(service: svc::Client, file_path: String) -> Result<(), CliError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(file_path)?;
+
+    let mut request = service.set_capture_file_request();
+    request
+        .get()
+        .set_capture_file(capnp_rpc::new_client(CaptureFileImpl { fd: file.into() }));
+    let response = request.send().promise.await?;
+
+    match response.get()?.get_result()?.which()? {
+        cli::success_or_error::Which::Success(_) => {
+            println!("Capture file opened");
+            Ok(())
+        }
+        cli::success_or_error::Which::Error(e) => {
+            let result = e?.get_txt()?.to_string()?;
+            println!("{result}");
+            Err(CliError::RpcError(result))
+        }
+    }
+}
+
+/// Without the FD-passing transport there is no way to hand ph a capture
+/// file: send `setCaptureFile` anyway and print ph's authoritative error
+/// (`Unimplemented: capture is not available on this platform`, plan D7).
+#[cfg(not(all(unix, feature = "capnp-ancillary")))]
+async fn set_capture_file_task(service: svc::Client, _file_path: String) -> Result<(), CliError> {
     let request = service.set_capture_file_request();
     match request.send().promise.await {
         Ok(_) => {
@@ -892,89 +902,6 @@ async fn set_capture_file_via_rpc(service: svc::Client) -> Result<(), CliError> 
         }
     }
 }
-
-/// Opens a capture file, sends a message to the RPC worker to prepare to receive
-/// the file descriptor, upon receiving correct response, sends the fd as
-/// ancillary data, and awaits response again.
-#[cfg(unix)]
-#[allow(dead_code)]
-fn handle_set_capture_file(file_path: String, cap_socket: &PathBuf) -> Result<(), CliError> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(file_path)
-        .unwrap();
-
-    let mut ancillary_buffer = [0; ANCILLARY_BUFFER_SIZE];
-    let mut ancillary = SocketAncillary::new(&mut ancillary_buffer);
-    ancillary.add_fds(&[file.as_fd()]);
-
-    let buf = [1; 1]; // Must send some data with the ancillary data
-    let bufs = &mut [IoSlice::new(&buf)];
-
-    // Establish connection with RPC worker, send command
-    let stream = &mut UnixStream::connect(cap_socket).unwrap();
-    stream.write_all(format!("{}\n", RpcCommands::SetCaptureFile).as_bytes())?;
-    stream.flush()?;
-
-    // Receive response from RPC worker, ensure that it sent the correct response and
-    // is expecting the file descriptor
-    let mut confirmation = String::new();
-    let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
-    buf_reader.read_line(&mut confirmation)?;
-    buf_reader.read_line(&mut confirmation)?;
-    if confirmation != "Message Received\nSEND ANCILLARY\n" {
-        return Err(CliError::RpcError("Incorrect Message Received".to_string()));
-    }
-    confirmation.pop(); // Removes \n at end of message, simply makes output look nicer
-    println!("{confirmation}");
-
-    // Create fd, ancillary buffer, data buffer, and send ancillary data
-    #[allow(unstable_name_collisions)]
-    stream.send_vectored_with_ancillary(bufs, &mut ancillary)?;
-
-    // Read response from
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?; // Read rest of response
-    println!("{response}");
-
-    Ok(())
-}
-
-/// Capture is not available on Windows (plan D7): the fd-passing design
-/// has no cheap equivalent there, so the whole path answers Unsupported.
-/// The server side (`setCaptureFile` RPC) answers the same.
-#[cfg(windows)]
-fn handle_set_capture_file(_file_path: String, _cap_socket: &PathBuf) -> Result<(), CliError> {
-    Err(CliError::OsError(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "capture is not available on this platform",
-    )))
-}
-
-/// Opens capture file, sets appropriate capture program, waits a designated
-/// amount of time, then closes the capture file (which also deletes the program)
-// fn handle_capture_sequence(
-//     file_path: String,
-//     time: u64,
-//     program: Option<String>,
-//     socket: &str,
-// ) -> std::io::Result<()> {
-//     let sleep_time = Duration::new(time, 0);
-//     handle_set_capture_file(file_path, socket)?;
-//     handle_set_capture_program(program, socket)?;
-
-//     let handler = Arc::new(CtrlcHandle::new());
-//     let ctrlc_handler = handler.clone();
-//     // Will set wait to false in CtrlcHandler if ctrl+c is pressed
-//     ctrlc::set_handler(move || ctrlc_handler.set_false()).unwrap();
-//     handler.timed_wait(sleep_time);
-
-//     basic_command!(RpcCommands::CloseCaptureFile, socket)?;
-
-//     Ok(())
-// }
 
 #[allow(dead_code)]
 struct CtrlcHandle {
@@ -1028,20 +955,5 @@ mod tests {
         let agent = interactive_auth_agent(false);
         assert!(agent.open_browser, "no_browser: false → open_browser: true");
         assert!(agent.progress.is_none());
-    }
-
-    /// `capture set-file` / `capture sequence` reach ph over the capture
-    /// socket with SCM_RIGHTS fd-passing on unix, and over the admin RPC's
-    /// `setCaptureFile` on Windows — where ph answers `Unimplemented:
-    /// capture is not available on this platform` (plan D7, zipline#131
-    /// step 5 / the #129 carryover), so the user sees ph's authoritative
-    /// message instead of a client-side guess.
-    #[test]
-    fn capture_set_file_routes_per_platform() {
-        if cfg!(windows) {
-            assert_eq!(capture_file_route(), CaptureFileRoute::AdminRpc);
-        } else {
-            assert_eq!(capture_file_route(), CaptureFileRoute::CaptureSocket);
-        }
     }
 }

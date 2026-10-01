@@ -1,15 +1,15 @@
-//! Control/capture socket ownership and default path derivation (zipline#39).
+//! Control socket ownership and default path derivation (zipline#39).
 //!
 //! `ph` usually runs as root (it creates a TUN device) while `ph-cli` runs as
-//! the invoking user. Both sides must agree on who "owns" the control and
-//! capture sockets and, from that, where the sockets live:
+//! the invoking user. Both sides must agree on who "owns" the control
+//! socket and, from that, where the socket lives:
 //!
-//! * Owner known (`ph` started via `sudo` or `pkexec`): the sockets live in a
-//!   per-uid directory `/var/run/zpr/<uid>/` and are chowned to that user.
+//! * Owner known (`ph` started via `sudo` or `pkexec`): the socket lives in a
+//!   per-uid directory `/var/run/zpr/<uid>/` and is chowned to that user.
 //!   `ph-cli`, running as that user, derives the identical path from its own
 //!   effective uid. The base is fixed, never environment-derived — see
 //!   [PER_UID_SOCKET_BASE].
-//! * Owner unknown (systemd, direct root login): the sockets live at the
+//! * Owner unknown (systemd, direct root login): the socket lives at the
 //!   shared `<data_home>/` path as before; `ph` falls back to the `zpr` group
 //!   for access control.
 //!
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use crate::data_home::get_data_home;
 
-/// The user a control/capture socket should belong to.
+/// The user a control socket should belong to.
 ///
 /// `gid` is `Some` when the environment supplied it directly (`SUDO_GID`);
 /// `None` when only the uid is known (`PKEXEC_UID`) and the consumer must
@@ -97,12 +97,6 @@ pub fn control_socket_path(owner_id: Option<&str>) -> PathBuf {
     socket_path(owner_id, "control")
 }
 
-/// Default capture socket path; same derivation as [control_socket_path].
-/// (Windows has no capture channel yet (plan D7); the name is reserved.)
-pub fn capture_socket_path(owner_id: Option<&str>) -> PathBuf {
-    socket_path(owner_id, "capture")
-}
-
 // Shared derivation for both sockets, unix arm: `<name>.sock` in the
 // owner's directory or the data home.
 #[cfg(unix)]
@@ -151,7 +145,7 @@ pub fn socket_is_live(path: &std::path::Path) -> bool {
 }
 
 /// Which socket path a client (`ph-cli`) should use, given an optional
-/// explicit path (`-p` / `-c`) and an injected usability predicate
+/// explicit path (`-p`) and an injected usability predicate
 /// (see [socket_is_live]).
 ///
 /// * An explicit path short-circuits everything — it is used whether or not
@@ -178,7 +172,7 @@ where
         return Ok(shared);
     }
     Err(format!(
-        "no live packet handler socket (tried {} and {}); is ph running? Use -p/-c to point at an explicit socket path",
+        "no live packet handler socket (tried {} and {}); is ph running? Use -p to point at an explicit socket path",
         per_uid.display(),
         shared.display()
     ))
@@ -303,11 +297,6 @@ mod test {
             Path::new("/var/run/zpr/1000/control.sock")
         );
         assert_eq!(control_socket_path(None), dh.join("control.sock"));
-        assert_eq!(
-            capture_socket_path(Some("1000")),
-            Path::new("/var/run/zpr/1000/capture.sock")
-        );
-        assert_eq!(capture_socket_path(None), dh.join("capture.sock"));
     }
 
     /// Windows: owner known is a per-SID named pipe, owner unknown the
@@ -323,10 +312,6 @@ mod test {
         assert_eq!(
             control_socket_path(None),
             Path::new(r"\\.\pipe\zpr-control")
-        );
-        assert_eq!(
-            capture_socket_path(Some(sid)),
-            Path::new(r"\\.\pipe\zpr-capture-S-1-5-21-1-2-3-1001")
         );
     }
 
@@ -361,10 +346,6 @@ mod test {
         let ph_side = control_socket_path(Some(&4321u32.to_string()));
         let cli_side = owner_socket_dir("4321").join("control.sock");
         assert_eq!(ph_side, cli_side);
-        assert_eq!(
-            capture_socket_path(Some(&4321u32.to_string())),
-            owner_socket_dir("4321").join("capture.sock")
-        );
     }
 
     /// An explicit `-p` path short-circuits the search, even when it does
@@ -417,6 +398,28 @@ mod test {
         .expect_err("no socket exists, the search must fail");
         assert!(err.contains("/per-uid/control.sock"), "err was: {err}");
         assert!(err.contains("/shared/control.sock"), "err was: {err}");
+    }
+
+    /// The failure diagnostic points at `-p` and ONLY `-p`: `ph-cli`
+    /// retired its `-c` option (zipline#142 / zl-zpr-core#59 review), so a
+    /// message telling the user to pass `-c` now leads straight into a
+    /// clap unknown-option error. `ph`'s remaining `-c` is
+    /// `--config-file`, unrelated to socket discovery, and `ph` never
+    /// calls [choose_socket_path].
+    #[test]
+    fn error_recommends_only_dash_p() {
+        let err = choose_socket_path(
+            None,
+            PathBuf::from("/per-uid/control.sock"),
+            PathBuf::from("/shared/control.sock"),
+            |_: &Path| false,
+        )
+        .expect_err("no socket exists, the search must fail");
+        assert!(err.contains("-p"), "err must recommend -p: {err}");
+        assert!(
+            !err.contains("-c"),
+            "err must not mention the retired -c option: {err}"
+        );
     }
 
     /// A socket path with a live listener probes as live (zipline#39

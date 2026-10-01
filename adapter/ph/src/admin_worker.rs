@@ -15,7 +15,6 @@ use crate::sys;
 use crate::sys::control::ControlListener;
 use crate::test_packet::TestPacketMetrics;
 use crate::zdp::TerminateReason;
-use admin_api::rpc_commands::RpcCommands;
 use admin_api::v1 as cli;
 use cbpf_rs;
 use cli::cmd_line_inter as svc;
@@ -44,7 +43,24 @@ pub async fn launch_capnp(
     loop {
         let stream = listener.accept().await?;
 
+        #[cfg(not(all(unix, feature = "capnp-ancillary")))]
         let network = byte_stream_network(stream, capnp_rpc::rpc_twoparty_capnp::Side::Server);
+
+        // FD-passing transport (zipline#142): `setCaptureFile` receives the
+        // capture file's descriptor as SCM_RIGHTS ancillary data, so ph never
+        // opens a user-chosen path as root. Needs the capnproto-rust fork —
+        // see [patch.crates-io] in the workspace root Cargo.toml.
+        #[cfg(all(unix, feature = "capnp-ancillary"))]
+        let network = {
+            let (reader, writer) = stream.into_split();
+            Box::new(capnp_rpc::twoparty::io::VatNetwork::new_with_fds(
+                capnp_futures::io::tokio::UnixFdStream::new(reader),
+                capnp_futures::io::tokio::UnixFdStream::new(writer),
+                1,
+                capnp_rpc::rpc_twoparty_capnp::Side::Server,
+                capnp::message::ReaderOptions::new(),
+            ))
+        };
 
         serve_connection(asm.clone(), network, sys::capture_supported());
     }
@@ -212,23 +228,69 @@ impl svc::Server for AdminServiceImpl {
         Ok(())
     }
 
-    /// `setCaptureFile` is never served over the admin RPC (zipline#134):
-    /// the fd-passing `capnp-ancillary` transport is gone. Where capture is
-    /// unsupported the answer is Unimplemented (plan D7); where it is
-    /// supported, unix capture goes through the capture socket instead.
+    /// Opens the capture file from an FD received as ancillary data over the
+    /// FD-passing transport (zipline#142). `capture_supported` is false only
+    /// off-unix, which this cfg already excludes, but the flag is still
+    /// checked so tests can exercise the unsupported path.
+    #[cfg(all(unix, feature = "capnp-ancillary"))]
+    async fn set_capture_file(
+        self: Rc<Self>,
+        params: svc::SetCaptureFileParams,
+        mut results: svc::SetCaptureFileResults,
+    ) -> Result<(), capnp::Error> {
+        info!(target: RPC, "Set capture file procedure initiated");
+        if !self.capture_supported {
+            return Err(capture_unsupported());
+        }
+        let capture_file = params.get()?.get_capture_file()?;
+        let fd = capture_file.client.get_fd().await?;
+        let results_builder = results.get().init_result();
+
+        match fd {
+            Some(fd) => {
+                let owned_fd = fd.try_clone_to_owned().map_err(|e| {
+                    capnp::Error::failed(format!("failed to clone capture file fd: {e}"))
+                })?;
+                let file = File::from(std::fs::File::from(owned_fd));
+                match self.asm.capture_worker.open_capture_file(file).await {
+                    Ok(()) => {
+                        debug!(target: RPC, "Capture file opened");
+                        results_builder.init_success().set_none(());
+                    }
+                    Err(err) => {
+                        debug!(target: RPC, "Error opening capture file: {err}");
+                        results_builder
+                            .init_error()
+                            .set_txt(format!("Error opening capture file: {err}").as_str());
+                    }
+                }
+            }
+            None => {
+                // No descriptor arrived: the caller is not on the FD-passing
+                // transport (byte-stream client, e.g. Windows ph-cli), so
+                // capture is unsupported over this connection (zipline#142).
+                debug!(target: RPC, "setCaptureFile: no file descriptor received");
+                return Err(capnp::Error::unimplemented(
+                    "no file descriptor received: setCaptureFile needs the \
+                     fd-passing (capnp-ancillary) transport"
+                        .to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Without the FD-passing transport there is no way to hand ph a capture
+    /// file — `capture.sock` is gone (zipline#142, org-zpr#1399) — so every
+    /// other configuration answers Unsupported (plan D7).
+    #[cfg(not(all(unix, feature = "capnp-ancillary")))]
     async fn set_capture_file(
         self: Rc<Self>,
         _: svc::SetCaptureFileParams,
         _: svc::SetCaptureFileResults,
     ) -> Result<(), capnp::Error> {
-        if !self.capture_supported {
-            return Err(capture_unsupported());
-        }
-        Err(capnp::Error::failed(
-            "setCaptureFile is not served over the admin RPC; \
-             open the capture file via the capture socket (capture.sock)"
-                .to_string(),
-        ))
+        Err(capture_unsupported())
     }
 
     async fn close_capture_file(
@@ -1500,26 +1562,165 @@ mod test {
             .await
     }
 
-    /// With the fd-passing `capnp-ancillary` transport gone (zipline#134),
-    /// `setCaptureFile` is never served over the admin RPC. Both error
-    /// paths of the new contract: where capture is unsupported it answers
-    /// Unimplemented/"not available on this platform" (plan D7, as
-    /// before); where capture IS supported it fails pointing the caller
-    /// at the capture socket (`capture.sock`), through which unix capture
-    /// keeps working.
+    /// The FD-passing path end to end (zipline#142): a capture file's
+    /// descriptor sent over a `UnixFdStream` VatNetwork arrives in ph as a
+    /// usable file — `setCaptureFile` succeeds and ph writes the pcap
+    /// header through the received descriptor, which we read back.
+    #[cfg(all(unix, feature = "capnp-ancillary"))]
     #[tokio::test]
-    async fn test_set_capture_file_never_served_over_admin_rpc() {
+    async fn test_set_capture_file_fd_arrives_usable_over_unix_fd_stream() {
+        use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+        struct TestCaptureFile {
+            fd: OwnedFd,
+        }
+        impl cli::capture_file::Server for TestCaptureFile {
+            fn get_fd(&self) -> Option<BorrowedFd<'_>> {
+                Some(self.fd.as_fd())
+            }
+        }
+
         LocalSet::new()
             .run_until(async {
-                // Path 1: capture unsupported -> capture_unsupported().
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+
+                // A real socketpair: FD passing needs SCM_RIGHTS, which an
+                // in-memory duplex cannot carry.
+                let (client_sock, server_sock) = tokio::net::UnixStream::pair().unwrap();
+                let fd_network = |sock: tokio::net::UnixStream, side| {
+                    let (reader, writer) = sock.into_split();
+                    Box::new(capnp_rpc::twoparty::io::VatNetwork::new_with_fds(
+                        capnp_futures::io::tokio::UnixFdStream::new(reader),
+                        capnp_futures::io::tokio::UnixFdStream::new(writer),
+                        1,
+                        side,
+                        capnp::message::ReaderOptions::new(),
+                    ))
+                };
+                serve_connection(
+                    asm,
+                    fd_network(server_sock, capnp_rpc::rpc_twoparty_capnp::Side::Server),
+                    true,
+                );
+
+                let mut client_rpc = capnp_rpc::RpcSystem::new(
+                    fd_network(client_sock, capnp_rpc::rpc_twoparty_capnp::Side::Client),
+                    None,
+                );
+                let service: svc::Client =
+                    client_rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+                tokio::task::spawn_local(client_rpc);
+
+                // The capture file whose fd crosses the socket.
+                let tstamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let path = std::env::temp_dir().join(format!("zpr_test_capture_{tstamp}.pcap"));
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                    .unwrap();
+
+                let mut request = service.set_capture_file_request();
+                request
+                    .get()
+                    .set_capture_file(capnp_rpc::new_client(TestCaptureFile { fd: file.into() }));
+                let response = request
+                    .send()
+                    .promise
+                    .await
+                    .expect("setCaptureFile over the FD-passing transport must not error");
+                match response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                {
+                    cli::success_or_error::Which::Success(_) => (),
+                    cli::success_or_error::Which::Error(e) => panic!(
+                        "setCaptureFile must succeed: {}",
+                        e.unwrap().get_txt().unwrap().to_string().unwrap()
+                    ),
+                }
+
+                // ph wrote the pcap global header through the received fd:
+                // read the file back and check it.
+                let written = std::fs::read(&path).unwrap();
+                std::fs::remove_file(&path).unwrap();
+                assert!(
+                    written.len() >= 24,
+                    "pcap header missing: ph did not receive a usable file ({} bytes)",
+                    written.len()
+                );
+                let magic = u32::from_ne_bytes(written[0..4].try_into().unwrap());
+                assert_eq!(magic, 0xa1b2_c3d4, "not a pcap global header");
+            })
+            .await
+    }
+
+    /// `setCaptureFile` whose CaptureFile capability yields no descriptor —
+    /// the caller is not on the FD-passing transport — answers
+    /// Unimplemented rather than opening anything (zipline#142).
+    #[cfg(all(unix, feature = "capnp-ancillary"))]
+    #[tokio::test]
+    async fn test_set_capture_file_without_fd_is_unsupported() {
+        use std::os::fd::BorrowedFd;
+
+        struct NoFdCaptureFile;
+        impl cli::capture_file::Server for NoFdCaptureFile {
+            fn get_fd(&self) -> Option<BorrowedFd<'_>> {
+                None
+            }
+        }
+
+        LocalSet::new()
+            .run_until(async {
                 let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
                 let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
-                    asm: asm.clone(),
+                    asm,
                     agent_registrations: Rc::new(RefCell::new(Vec::new())),
-                    capture_supported: false,
+                    capture_supported: true,
+                });
+
+                let mut request = service.set_capture_file_request();
+                request
+                    .get()
+                    .set_capture_file(capnp_rpc::new_client(NoFdCaptureFile));
+                let err = match request.send().promise.await {
+                    Ok(_) => panic!("setCaptureFile without an fd must fail"),
+                    Err(err) => err,
+                };
+                assert_eq!(err.kind, capnp::ErrorKind::Unimplemented);
+                assert!(
+                    err.extra.contains("no file descriptor received"),
+                    "unexpected error: {err}"
+                );
+            })
+            .await
+    }
+
+    /// On a non-ancillary build `setCaptureFile` is Unsupported outright
+    /// (zipline#142, plan D4): there is no transport to receive an fd on
+    /// and `capture.sock` no longer exists.
+    #[cfg(not(all(unix, feature = "capnp-ancillary")))]
+    #[tokio::test]
+    async fn test_set_capture_file_unsupported_on_non_ancillary_build() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
+                    asm,
+                    agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    capture_supported: true,
                 });
                 let err = match service.set_capture_file_request().send().promise.await {
-                    Ok(_) => panic!("setCaptureFile must fail where capture is unsupported"),
+                    Ok(_) => panic!("setCaptureFile must fail on a non-ancillary build"),
                     Err(err) => err,
                 };
                 assert_eq!(err.kind, capnp::ErrorKind::Unimplemented);
@@ -1527,21 +1728,6 @@ mod test {
                     err.extra
                         .contains("capture is not available on this platform"),
                     "unexpected error: {err}"
-                );
-
-                // Path 2: capture supported -> redirect to the capture socket.
-                let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
-                    asm,
-                    agent_registrations: Rc::new(RefCell::new(Vec::new())),
-                    capture_supported: true,
-                });
-                let err = match service.set_capture_file_request().send().promise.await {
-                    Ok(_) => panic!("setCaptureFile must not be served over the admin RPC"),
-                    Err(err) => err,
-                };
-                assert!(
-                    err.extra.contains("capture.sock"),
-                    "the error must point at the capture socket: {err}"
                 );
             })
             .await

@@ -305,16 +305,15 @@ Now you can attach additional adapters and start up the "WebService".
 ## Control socket ownership and `ph-cli` access
 
 `ph` needs root (it creates a TUN interface), but `ph-cli` should not.
-`ph` decides who owns its control and capture sockets at startup, and the
+`ph` decides who owns its control socket at startup, and the
 socket path and permissions follow from that. There are two modes:
 
 **Sudo/pkexec-invoked (owner known).** When `ph` is started with
 `sudo ph ...` (or via `pkexec`), it recovers the invoking user from
-`SUDO_UID`/`SUDO_GID` (or `PKEXEC_UID`) and puts the sockets in a per-user
+`SUDO_UID`/`SUDO_GID` (or `PKEXEC_UID`) and puts the socket in a per-user
 directory, chowned to that user with mode `0600`:
 
     /var/run/zpr/<uid>/control.sock
-    /var/run/zpr/<uid>/capture.sock
 
 The per-user base is fixed at `/var/run/zpr` — deliberately not derived
 from `HOME`/`XDG_DATA_HOME`, since `ph` runs in root's environment and
@@ -326,11 +325,11 @@ invoking user gets their own directory, two adapters started by two different
 users on one host do not collide.
 
 **systemd-started (owner unknown).** When `ph` is started by systemd, `su -`,
-or a direct root login, there is no invoking user to recover. The sockets
-stay at the shared path (`/var/run/zpr/control.sock`), and if a group
-named `zpr` exists they are chgrp'd to it with mode `0660`, so members of the
+or a direct root login, there is no invoking user to recover. The socket
+stays at the shared path (`/var/run/zpr/control.sock`), and if a group
+named `zpr` exists it is chgrp'd to it with mode `0660`, so members of the
 `zpr` group can use `ph-cli` without sudo. If no `zpr` group exists, the
-sockets are left exactly as before (root-only) and `ph` logs one warning —
+socket is left exactly as before (root-only) and `ph` logs one warning —
 creating the group is a packaging/admin choice, never a hard runtime
 dependency.
 
@@ -339,10 +338,9 @@ the shared socket. A candidate is chosen by actually connecting to it, not
 by checking the pathname exists — a stale socket file left behind by a dead
 `ph` (nothing unlinks it on a crash) never shadows a live server at the
 other path. If neither answers, `ph-cli` fails with an error naming both
-paths tried. An explicit `-p` (control) or `-c`
-(capture) always wins, on both `ph` and `ph-cli`, as does an explicit
-`control_path`/`capture_path` in the config file — so multi-adapter and test
-setups keep full control.
+paths tried. An explicit `-p` (control) always wins, on both `ph` and
+`ph-cli`, as does an explicit `control_path` in the config file — so
+multi-adapter and test setups keep full control.
 
 **Security note.** Reaching the control socket means being able to start and
 stop links and register an `AuthAgent` — i.e. to supply and observe user

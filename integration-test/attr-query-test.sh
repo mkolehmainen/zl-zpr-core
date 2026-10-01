@@ -200,10 +200,6 @@ NODE_SOCK=node.sock
 VS_SOCK=vs.sock
 ADAPTER1_SOCK=adapter1.sock
 ADAPTER2_SOCK=adapter2.sock
-NODE_CAP_SOCK=node_cap.sock
-VS_CAP_SOCK=vs_cap.sock
-ADAPTER1_CAP_SOCK=adapter1_cap.sock
-ADAPTER2_CAP_SOCK=adapter2_cap.sock
 
 # Launch a fake IdP inside a netns (see one-node-oidc-test.sh for the
 # per-netns-loopback reasoning). Only zpr-vs (JWKS refresh) and zpr-a (the
@@ -604,7 +600,6 @@ sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
   node \
   --logging "$DEBUG_TARGETS vss_rpc=DEBUG" \
   --control-path "$NODE_SOCK" \
-  --capture-path "$NODE_CAP_SOCK" \
   --advertised-substrate-addr "$NODE_SUBSTRATE_ADDR_VS":5000 \
   --ca-file ca.crt \
   --certificate-file node.crt \
@@ -622,7 +617,6 @@ sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$VS_SOCK" \
-  --capture-path "$VS_CAP_SOCK" \
   --self-addr "$VS_SUBSTRATE_ADDR" \
   --ca-file ca.crt \
   --certificate-file vs.zpr.crt \
@@ -671,7 +665,6 @@ sudo -E ip netns exec zpr-a setpriv --reuid "$ZPR_USER" --regid "$ZPR_GID" --ini
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER1_SOCK" \
-  --capture-path "$ADAPTER1_CAP_SOCK" \
   --self-addr "$A_SUBSTRATE_ADDR" \
   --ca-file ca.crt \
   --name adapter1 \
@@ -685,7 +678,6 @@ sudo -E ip netns exec zpr-b sudo -E -u "$ZPR_USER" "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER2_SOCK" \
-  --capture-path "$ADAPTER2_CAP_SOCK" \
   --self-addr "$B_SUBSTRATE_ADDR" \
   --ca-file ca.crt \
   --bootstrap-key actor2-rsa.key \

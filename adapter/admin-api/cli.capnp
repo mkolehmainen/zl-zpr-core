@@ -21,10 +21,9 @@ interface CmdLineInter {
 }
 
 interface CaptureFile {
-    # Retained so the setCaptureFile method keeps a parameter type (zipline#134).
-    # The fd-passing (capnp-ancillary) transport is gone: ph never calls back
-    # into this capability. On unix, capture files are opened via the capture
-    # socket (capture.sock) instead.
+    # Passed to setCaptureFile by the controller (ph-cli). ph calls get_fd
+    # and receives the capture file's descriptor as SCM_RIGHTS ancillary
+    # data over the fd-passing (capnp-ancillary) transport (zipline#142).
 }
 
 # Provided by ph-cli (or another controller); called by ph when a credential
