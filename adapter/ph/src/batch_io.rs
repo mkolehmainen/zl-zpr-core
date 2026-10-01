@@ -1670,12 +1670,14 @@ mod std_udp {
     /// N4). On Windows an ICMP port-unreachable from a departed peer makes
     /// a later `recvfrom` on an unconnected UDP socket fail with
     /// `WSAECONNRESET` (10054); nothing was received and the socket is
-    /// fine, so surface it as `WouldBlock` — stop this batch, return what
-    /// was received — exactly as an empty socket ends a batch. This is the
-    /// belt-and-braces fallback behind the `SIO_UDP_CONNRESET` ioctl
-    /// disabled at bind (`windows_disable_udp_connreset`); a `trace!`
-    /// counter keeps a reset storm visible. Portable (and unit tested) on
-    /// every OS; only the Windows engine reaches it at runtime.
+    /// fine, so surface it as `WouldBlock` — exactly as an empty socket
+    /// ends a batch. The receive path retries past swallowed resets first
+    /// (see [`recv_retrying_connreset`]); this mapping is its capped
+    /// fallback. This is the belt-and-braces fallback behind the
+    /// `SIO_UDP_CONNRESET` ioctl disabled at bind
+    /// (`windows_disable_udp_connreset`); a `trace!` counter keeps a
+    /// reset storm visible. Portable (and unit tested) on every OS; only
+    /// the Windows engine reaches it at runtime.
     pub(super) fn connreset_as_wouldblock(err: std::io::Error) -> std::io::Error {
         if err.kind() == std::io::ErrorKind::ConnectionReset {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -1717,7 +1719,21 @@ mod std_udp {
     pub(super) fn recv_retrying_connreset<T>(
         mut recv: impl FnMut() -> std::io::Result<T>,
     ) -> std::io::Result<T> {
-        recv().map_err(connreset_as_wouldblock)
+        let mut resets = 0u32;
+        loop {
+            match recv() {
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                    // Count and trace the swallowed reset; the mapped
+                    // WouldBlock doubles as the capped fallback.
+                    let mapped = connreset_as_wouldblock(err);
+                    if resets >= CONNRESET_RETRY_CAP {
+                        return Err(mapped);
+                    }
+                    resets += 1;
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Receive with peer addresses. With `with_dest`, the destination is
@@ -1738,43 +1754,37 @@ mod std_udp {
             |socket, buf| {
                 // SAFETY: We will only be writing to the chunk.
                 let chunk = unsafe { slice_assume_init_mut(buf.chunk_mut().as_uninit_slice_mut()) };
-                match socket.recv_from(chunk) {
-                    Ok((size, source)) => {
-                        // SAFETY: We know we've written the given number of bytes in the BufMut.
-                        unsafe { buf.advance_mut(size) };
-                        Ok(ReceivedPacket {
-                            size,
-                            truncated: false,
-                            source: Some(source),
-                            destination,
-                        })
+                // A swallowed peer reset consumed no datagram, so retry
+                // the receive with the same buffer (bounded) rather than
+                // ending the batch per reset — see
+                // `recv_retrying_connreset` (zl-zpr-core#62 review).
+                let (size, truncated, source) = recv_retrying_connreset(|| {
+                    match socket.recv_from(chunk) {
+                        Ok((size, source)) => Ok((size, false, Some(source))),
+                        // Windows reports an oversized datagram as
+                        // WSAEMSGSIZE (10040) — the buffer holds the
+                        // truncated head and the rest is discarded. Map it
+                        // to `truncated`, which the fastpath drops and
+                        // counts, the same as MSG_TRUNC on unix. (The peer
+                        // address is lost with the error; the truncated
+                        // path never reads it.)
+                        #[cfg(windows)]
+                        Err(err) if err.raw_os_error() == Some(10040) => {
+                            // WSAEMSGSIZE fills the whole buffer before
+                            // failing; it is all initialized.
+                            Ok((chunk.len(), true, None))
+                        }
+                        Err(err) => Err(err),
                     }
-                    // Windows reports an oversized datagram as WSAEMSGSIZE
-                    // (10040) — the buffer holds the truncated head and the
-                    // rest is discarded. Map it to `truncated`, which the
-                    // fastpath drops and counts, the same as MSG_TRUNC on
-                    // unix. (The peer address is lost with the error; the
-                    // truncated path never reads it.)
-                    #[cfg(windows)]
-                    Err(err) if err.raw_os_error() == Some(10040) => {
-                        let size = chunk.len();
-                        // SAFETY: WSAEMSGSIZE fills the whole buffer before
-                        // failing; it is all initialized.
-                        unsafe { buf.advance_mut(size) };
-                        Ok(ReceivedPacket {
-                            size,
-                            truncated: true,
-                            source: None,
-                            destination,
-                        })
-                    }
-                    // WSAECONNRESET from a departed peer's ICMP
-                    // port-unreachable is "no datagram", not a socket
-                    // fault (zipline#160, plan N4) — mapped to WouldBlock
-                    // so the batch ends like an empty socket. See
-                    // `connreset_as_wouldblock`.
-                    Err(err) => Err(connreset_as_wouldblock(err)),
-                }
+                })?;
+                // SAFETY: We know we've written the given number of bytes in the BufMut.
+                unsafe { buf.advance_mut(size) };
+                Ok(ReceivedPacket {
+                    size,
+                    truncated,
+                    source,
+                    destination,
+                })
             },
             socket,
             bufs,
@@ -2917,7 +2927,8 @@ mod tests {
             Err(Error::new(ErrorKind::ConnectionReset, "reset storm"))
         });
         assert_eq!(
-            res.expect_err("an unbroken reset storm must end the batch").kind(),
+            res.expect_err("an unbroken reset storm must end the batch")
+                .kind(),
             ErrorKind::WouldBlock,
             "capped storm must surface as WouldBlock (no datagram)"
         );
