@@ -7115,6 +7115,111 @@ mod tests {
             .await
     }
 
+    /// zipline#157 review round 1 (Codex P1): a restart timer scheduled by
+    /// an EARLIER, non-fatal close must not override a later fatal stop.
+    ///
+    /// Sequence: an auto-connect close completes and schedules the holddown
+    /// restart; during the holddown the operator manually starts a new
+    /// attempt (startLink), which reaches a fatal `ActivationFailed` and
+    /// closes. The hard-stop branch in `complete_close` correctly declines
+    /// to schedule a NEW timer — but the OLD timer is still pending, and an
+    /// unconditional `setup_restart` task would fire it, send `Start`,
+    /// clear the recorded failure, and resume the reconnect loop the fatal
+    /// stop was meant to end. The pending task must re-check the recorded
+    /// fatal failure before starting.
+    #[tokio::test(start_paused = true)]
+    async fn test_stale_restart_timer_does_not_override_fatal_stop() {
+        LocalSet::new()
+            .run_until(async {
+                let mut builder = TestAssemblyBuilder::new();
+                // Keying material so that, if the stale timer DID re-fire
+                // Start, process_start would key the link (observed as
+                // Keying) instead of panicking on a missing keypair.
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+
+                // 1. A non-fatal close completes: `complete_close` leaves
+                //    the link Inactive and schedules the holddown restart.
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine.test_set_state(LinkState::Closing);
+                }
+                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive,
+                    "test precondition: the first close parks the link Inactive"
+                );
+
+                // 2. During the holddown, the operator manually starts a
+                //    new attempt (ph-cli connect -> startLink -> Start).
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                asm.process_link_state_event(link_id, LinkEvent::Start)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Keying,
+                    "test precondition: the manual Start begins a new attempt"
+                );
+
+                // 3. The new attempt hits a fatal local activation failure
+                //    and its close completes BEFORE the old timer expires.
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine.record_auth_failure(
+                        AuthFailureReason::ActivationFailed(
+                            "failed to set ZPR address: EPERM".to_owned(),
+                        ),
+                    );
+                    peer.link_state_machine.test_set_state(LinkState::Closing);
+                }
+                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive
+                );
+
+                // 4. The FIRST close's restart timer expires. It must not
+                //    send Start: the link stays Inactive and the recorded
+                //    fatal failure survives for showLink / ph-cli connect.
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
+                    .await;
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_state(),
+                    LinkState::Inactive,
+                    "a restart timer scheduled before a fatal activation \
+                     failure must not resume the reconnect loop \
+                     (zipline#157 review round 1)"
+                );
+                assert!(
+                    matches!(
+                        peer.link_state_machine.get_last_auth_failure(),
+                        Some(AuthFailureReason::ActivationFailed(_))
+                    ),
+                    "the stale restart fired Start and wiped the recorded \
+                     fatal failure"
+                );
+            })
+            .await
+    }
+
     /// zipline#157 RED (problem 1, site 2: dynamic-grant route install):
     /// same classification as a failed add_address — the failure is
     /// recorded as `ActivationFailed` naming the route install, so the
