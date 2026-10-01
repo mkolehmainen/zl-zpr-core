@@ -176,6 +176,15 @@ pub enum AuthFailureReason {
         requested: Vec<IpAddr>,
         granted: Vec<IpAddr>,
     },
+    /// A local activation step failed after authentication succeeded —
+    /// setting the granted ZPR address on the TUN, installing the
+    /// internal-network route on a dynamic grant, or a route-owner
+    /// conflict (zipline#157). Local and non-transient (e.g. EPERM will
+    /// not clear on reconnect), so it is fatal for this connect request:
+    /// the link hard-stops instead of reconnecting, and the operator
+    /// re-runs `ph-cli connect` after fixing the host. Carries the
+    /// failure text, which names the failed step.
+    ActivationFailed(String),
 }
 
 /// A single credential request forwarded to the out-of-band AuthAgent
@@ -1602,7 +1611,17 @@ impl LinkStateWrapper {
                         // TODO: deal with the potential i/o blocking here ( https://github.com/org-zpr/zpr-core/issues/938 )
                         if let Err(e) = asm.tun_ctl.add_address(addrs[0].into(), ZPRNET_PREFIX_LEN)
                         {
+                            // zipline#157: a local, non-transient failure
+                            // (e.g. EPERM) that reconnecting cannot clear.
+                            // Record it so showLink / ph-cli connect report
+                            // the real error, and so complete_close hard-
+                            // stops the reconnect loop instead of retrying
+                            // into a fresh interactive OIDC prompt.
                             warn!(target: LINK_STATE, "{} failed to set ZPR address: {e}", asm.formatted_link_id(link_id));
+                            self.record_auth_failure(AuthFailureReason::ActivationFailed(format!(
+                                "failed to set ZPR address {}: {e}",
+                                addrs[0]
+                            )));
                             locked_fsm.set_state(LinkState::Error);
                             drop(locked_fsm);
                             return self.initiate_close(asm, TerminateReason::Other);
@@ -1626,6 +1645,16 @@ impl LinkStateWrapper {
                             Ok(Some(owner_if)) => {
                                 if configured.is_empty() {
                                     warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} already routes to interface {owner_if} — another ZPR adapter or tool already owns ZPR traffic on this host; failing activation", asm.formatted_link_id(link_id));
+                                    // zipline#157: local and non-transient —
+                                    // record and hard-stop (see add_address).
+                                    self.record_auth_failure(AuthFailureReason::ActivationFailed(
+                                        format!(
+                                            "{ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} already \
+                                             routes to interface {owner_if} — another ZPR \
+                                             adapter or tool already owns ZPR traffic on this \
+                                             host"
+                                        ),
+                                    ));
                                     locked_fsm.set_state(LinkState::Error);
                                     drop(locked_fsm);
                                     return self.initiate_close(asm, TerminateReason::Other);
@@ -1662,6 +1691,14 @@ impl LinkStateWrapper {
                         {
                             if configured.is_empty() {
                                 warn!(target: LINK_STATE, "{} failed to install ZPR internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}; a dynamically addressed adapter cannot function without it", asm.formatted_link_id(link_id));
+                                // zipline#157: local and non-transient —
+                                // record and hard-stop (see add_address).
+                                self.record_auth_failure(AuthFailureReason::ActivationFailed(
+                                    format!(
+                                        "failed to install ZPR internal-network route \
+                                         {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}"
+                                    ),
+                                ));
                                 locked_fsm.set_state(LinkState::Error);
                                 drop(locked_fsm);
                                 return self.initiate_close(asm, TerminateReason::Other);
@@ -1701,6 +1738,16 @@ impl LinkStateWrapper {
                                 if configured.is_empty() {
                                     warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} routes to interface {owner_if} after carrier-up — a concurrently starting ZPR adapter owns ZPR traffic on this host; backing off and failing activation", asm.formatted_link_id(link_id));
                                     asm.tun_ctl.set_carrier(false).unwrap();
+                                    // zipline#157: local and non-transient —
+                                    // record and hard-stop (see add_address).
+                                    self.record_auth_failure(AuthFailureReason::ActivationFailed(
+                                        format!(
+                                            "{ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} routes \
+                                             to interface {owner_if} after carrier-up — a \
+                                             concurrently starting ZPR adapter owns ZPR \
+                                             traffic on this host"
+                                        ),
+                                    ));
                                     locked_fsm.set_state(LinkState::Error);
                                     drop(locked_fsm);
                                     return self.initiate_close(asm, TerminateReason::Other);
@@ -2645,6 +2692,24 @@ impl LinkStateWrapper {
                     // start). Every connect is operator-initiated.
                     if self.link_type == LinkType::AdapterToNode && !asm.config.get().auto_connect {
                         info!(target: LINK_STATE, "{} idle (auto-connect off); waiting for startLink", asm.formatted_link_id(link_id));
+                    } else if self.link_type == LinkType::AdapterToNode
+                        && matches!(
+                            self.get_last_auth_failure(),
+                            Some(AuthFailureReason::ActivationFailed(_))
+                        )
+                    {
+                        // zipline#157 (Q1 ruling): a local activation
+                        // failure (address set, dynamic-grant route
+                        // install, route-owner conflict) is non-transient —
+                        // an EPERM will not clear on reconnect, and each
+                        // retry costs a full keying, a VS round trip, and a
+                        // fresh interactive OIDC prompt that masks the real
+                        // error as InteractionTimeout. Hard stop: stay
+                        // Inactive with the recorded ActivationFailed
+                        // reason (which ph-cli connect reports as this
+                        // attempt's terminal outcome); the operator re-runs
+                        // `ph-cli connect` after fixing the host.
+                        warn!(target: LINK_STATE, "{} not reconnecting after a fatal local activation failure; fix the host and re-run `ph-cli connect`", asm.formatted_link_id(link_id));
                     } else {
                         self.setup_restart(asm);
                     }
@@ -2671,6 +2736,22 @@ impl LinkStateWrapper {
         let task_asm = asm.clone();
         tokio::task::spawn_local(async move {
             tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN).await;
+            // zipline#157 review round 1 (Codex P1): this timer may have
+            // been scheduled by an earlier, non-fatal close, and a newer
+            // attempt (operator startLink during the holddown) may have
+            // reached a fatal local activation failure while it was
+            // pending. Re-check the recorded failure before starting: a
+            // stale Start would clear it and resume the reconnect loop
+            // the hard stop in complete_close was meant to end.
+            if let Some(peer) = task_asm.peer_table.get(link_id) {
+                if matches!(
+                    peer.link_state_machine.get_last_auth_failure(),
+                    Some(AuthFailureReason::ActivationFailed(_))
+                ) {
+                    info!(target: LINK_STATE, "{} skipping stale holddown restart after a fatal local activation failure", task_asm.formatted_link_id(link_id));
+                    return;
+                }
+            }
             info!(target: LINK_STATE, "Attempting to restart {}", task_asm.formatted_link_id(link_id));
             let _ = task_asm.process_link_state_event(link_id, LinkEvent::Start);
         });
@@ -6954,6 +7035,408 @@ mod tests {
                     "the static path must leave the carrier up"
                 );
                 assert_eq!(asm.get_fatal_error(), None);
+            })
+            .await
+    }
+
+    /// zipline#157 RED (problem 1, site 1: address set): a failed
+    /// `add_address` on a dynamic grant is a LOCAL, non-transient failure
+    /// (e.g. EPERM — it will not clear on reconnect), so it must be fatal
+    /// for this connect request:
+    /// (a) the recorded failure is `ActivationFailed` naming the
+    ///     address-set failure — the durable trace showLink prints and
+    ///     ph-cli's `connect` poll reports as this attempt's terminal
+    ///     outcome, instead of a 5-minute `InteractionTimeout` from the
+    ///     next attempt's unanswered OIDC prompt;
+    /// (b) the reconnect loop hard-stops — after the close completes, the
+    ///     holddown restart must NOT re-fire `Start` even with
+    ///     `auto_connect` on (Q1 ruling: the operator re-runs
+    ///     `ph-cli connect` after fixing the host).
+    #[tokio::test(start_paused = true)]
+    async fn test_add_address_failure_is_fatal_and_suppresses_reconnect() {
+        LocalSet::new()
+            .run_until(async {
+                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+
+                let (tun_ctl, _routes) =
+                    crate::assembly::test::RecordingTunCtl::with_failing_addresses();
+                let mut builder = TestAssemblyBuilder::new();
+                // Keying material so that, if the holddown restart DID
+                // fire, process_start would key the link (observed as
+                // Keying) instead of panicking on a missing keypair.
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let state = peer.link_state_machine.get_state();
+                assert!(
+                    matches!(state, LinkState::Error | LinkState::Closing),
+                    "a failed add_address must fail the activation; got {state:?}"
+                );
+                // (a) the failure is recorded, and names the address set.
+                match peer.link_state_machine.get_last_auth_failure() {
+                    Some(AuthFailureReason::ActivationFailed(msg)) => assert!(
+                        msg.contains("failed to set ZPR address"),
+                        "the recorded failure must name the address-set step; got: {msg}"
+                    ),
+                    other => panic!(
+                        "a failed add_address must record ActivationFailed so \
+                         ph-cli connect reports the real error, got {other:?}"
+                    ),
+                }
+
+                // (b) the close completes, and the holddown restart must
+                // NOT re-fire Start: a reconnect re-keys, re-prompts OIDC
+                // interactively, and the EPERM will not have cleared.
+                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive
+                );
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
+                    .await;
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive,
+                    "a fatal local activation failure must hard-stop the \
+                     reconnect loop (zipline#157 Q1); the holddown restart \
+                     re-fired Start"
+                );
+            })
+            .await
+    }
+
+    /// zipline#157 review round 1 (Codex P1): a restart timer scheduled by
+    /// an EARLIER, non-fatal close must not override a later fatal stop.
+    ///
+    /// Sequence: an auto-connect close completes and schedules the holddown
+    /// restart; during the holddown the operator manually starts a new
+    /// attempt (startLink), which reaches a fatal `ActivationFailed` and
+    /// closes. The hard-stop branch in `complete_close` correctly declines
+    /// to schedule a NEW timer — but the OLD timer is still pending, and an
+    /// unconditional `setup_restart` task would fire it, send `Start`,
+    /// clear the recorded failure, and resume the reconnect loop the fatal
+    /// stop was meant to end. The pending task must re-check the recorded
+    /// fatal failure before starting.
+    #[tokio::test(start_paused = true)]
+    async fn test_stale_restart_timer_does_not_override_fatal_stop() {
+        LocalSet::new()
+            .run_until(async {
+                let mut builder = TestAssemblyBuilder::new();
+                // Keying material so that, if the stale timer DID re-fire
+                // Start, process_start would key the link (observed as
+                // Keying) instead of panicking on a missing keypair.
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+
+                // 1. A non-fatal close completes: `complete_close` leaves
+                //    the link Inactive and schedules the holddown restart.
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine.test_set_state(LinkState::Closing);
+                }
+                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive,
+                    "test precondition: the first close parks the link Inactive"
+                );
+
+                // 2. During the holddown, the operator manually starts a
+                //    new attempt (ph-cli connect -> startLink -> Start).
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                asm.process_link_state_event(link_id, LinkEvent::Start)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Keying,
+                    "test precondition: the manual Start begins a new attempt"
+                );
+
+                // 3. The new attempt hits a fatal local activation failure
+                //    and its close completes BEFORE the old timer expires.
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine.record_auth_failure(
+                        AuthFailureReason::ActivationFailed(
+                            "failed to set ZPR address: EPERM".to_owned(),
+                        ),
+                    );
+                    peer.link_state_machine.test_set_state(LinkState::Closing);
+                }
+                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Inactive
+                );
+
+                // 4. The FIRST close's restart timer expires. It must not
+                //    send Start: the link stays Inactive and the recorded
+                //    fatal failure survives for showLink / ph-cli connect.
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
+                    .await;
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.link_state_machine.get_state(),
+                    LinkState::Inactive,
+                    "a restart timer scheduled before a fatal activation \
+                     failure must not resume the reconnect loop \
+                     (zipline#157 review round 1)"
+                );
+                assert!(
+                    matches!(
+                        peer.link_state_machine.get_last_auth_failure(),
+                        Some(AuthFailureReason::ActivationFailed(_))
+                    ),
+                    "the stale restart fired Start and wiped the recorded \
+                     fatal failure"
+                );
+            })
+            .await
+    }
+
+    /// zipline#157 RED (problem 1, site 2: dynamic-grant route install):
+    /// same classification as a failed add_address — the failure is
+    /// recorded as `ActivationFailed` naming the route install, so the
+    /// control-channel caller sees the real error. (Reconnect suppression
+    /// keys on the recorded reason and is covered by the add_address test.)
+    #[tokio::test(start_paused = true)]
+    async fn test_dynamic_route_install_failure_records_activation_failed() {
+        LocalSet::new()
+            .run_until(async {
+                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+
+                let (tun_ctl, _routes) = crate::assembly::test::RecordingTunCtl::new(true);
+                let mut builder = TestAssemblyBuilder::new();
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                match peer.link_state_machine.get_last_auth_failure() {
+                    Some(AuthFailureReason::ActivationFailed(msg)) => assert!(
+                        msg.contains("internal-network route"),
+                        "the recorded failure must name the route install; got: {msg}"
+                    ),
+                    other => panic!(
+                        "a failed dynamic-grant route install must record \
+                         ActivationFailed, got {other:?}"
+                    ),
+                }
+            })
+            .await
+    }
+
+    /// zipline#157 RED (problem 1, site 3: route-owner conflict on the
+    /// pre-install probe): recorded as `ActivationFailed` naming the
+    /// conflicting interface.
+    #[tokio::test(start_paused = true)]
+    async fn test_dynamic_route_owner_conflict_records_activation_failed() {
+        LocalSet::new()
+            .run_until(async {
+                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+
+                let (tun_ctl, _routes) =
+                    crate::assembly::test::RecordingTunCtl::with_conflict("tunA");
+                let mut builder = TestAssemblyBuilder::new();
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                match peer.link_state_machine.get_last_auth_failure() {
+                    Some(AuthFailureReason::ActivationFailed(msg)) => assert!(
+                        msg.contains("tunA"),
+                        "the recorded failure must name the conflicting owner; got: {msg}"
+                    ),
+                    other => panic!(
+                        "a route-owner conflict on a dynamic grant must record \
+                         ActivationFailed, got {other:?}"
+                    ),
+                }
+            })
+            .await
+    }
+
+    /// zipline#157 RED (problem 1, site 3 variant: conflict surfacing on
+    /// the post-carrier-up re-probe): same recording as the pre-install
+    /// probe — the zipline#101 concurrent-activation back-off is a
+    /// route-owner conflict and gets the same classification.
+    #[tokio::test(start_paused = true)]
+    async fn test_dynamic_late_route_owner_conflict_records_activation_failed() {
+        LocalSet::new()
+            .run_until(async {
+                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+
+                let (tun_ctl, _routes) =
+                    crate::assembly::test::RecordingTunCtl::with_late_conflict("tunA");
+                let mut builder = TestAssemblyBuilder::new();
+                builder.tun_ctl = Some(Box::new(tun_ctl));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_adapter_peer(&asm);
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::RegisterAA);
+                }
+
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
+                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
+                    ])),
+                )
+                .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                match peer.link_state_machine.get_last_auth_failure() {
+                    Some(AuthFailureReason::ActivationFailed(msg)) => assert!(
+                        msg.contains("tunA") && msg.contains("carrier-up"),
+                        "the recorded failure must name the late conflict; got: {msg}"
+                    ),
+                    other => panic!(
+                        "a late route-owner conflict on a dynamic grant must \
+                         record ActivationFailed, got {other:?}"
+                    ),
+                }
+            })
+            .await
+    }
+
+    /// zipline#157 (problem 2, investigation lock-in): a dock-link
+    /// reconnect within the token's lifetime DOES re-request interaction
+    /// from the AuthAgent — `interactive: true` on every connect attempt.
+    /// This is structural, not a dropped token: the connect path requires
+    /// the id_token's nonce to equal the hash of the node's fresh link
+    /// challenge (docs/OIDC.md, "the connect path's nonce check is
+    /// untouched"), and a refresh-grant id_token SHOULD NOT carry a nonce
+    /// (OIDC Core §12.2) — so a cached or silently-refreshed token can
+    /// never satisfy a new connect. Reusing a token across reconnects
+    /// therefore needs a protocol/VS design change, split out per the Q3
+    /// ruling; this test documents the current, intended behavior.
+    #[tokio::test(start_paused = true)]
+    async fn test_reconnect_within_token_lifetime_rerequests_interaction() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress_rx) = assembly_with_observable_egress();
+                let link_id = add_adapter_peer(&asm);
+                let (agent_tx, mut agent_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<super::OidcCredentialRequest>();
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
+                    peer.link_state_machine.set_auth_agent(agent_tx);
+                }
+
+                // Attempt 1: the user completes the interactive login.
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((false, Some(test_challenge_payload()))),
+                )
+                .unwrap();
+                let req1 = agent_rx.recv().await.expect("attempt 1 reaches the agent");
+                assert!(req1.interactive, "a first connect is interactive");
+                let _ = req1.reply.send(Ok("STILL.VALID.TOKEN".to_string()));
+                tokio::task::yield_now().await;
+
+                // Reconnect moments later (well within the token lifetime):
+                // the link restarts and the node sends a FRESH challenge.
+                // The restart path preserves LinkData (agent, IdPs); model
+                // it by rewinding the FSM, as the admin_worker tests do.
+                {
+                    let peer = asm.peer_table.get(link_id).unwrap();
+                    peer.link_state_machine
+                        .test_set_state(LinkState::WaitForInitAuth);
+                }
+                asm.process_link_state_event(
+                    link_id,
+                    LinkEvent::ReceivedInitAuth((
+                        false,
+                        Some(auth::ZdpInitAuthenticationPayload {
+                            nonce: [8u8; 8],
+                            ctime: 434343u64.into(),
+                            hmac: [3u8; 32],
+                        }),
+                    )),
+                )
+                .unwrap();
+                let req2 = agent_rx.recv().await.expect("attempt 2 reaches the agent");
+                assert!(
+                    req2.interactive,
+                    "a reconnect is a new connect bound to a new challenge, \
+                     so it re-requests interaction (see zipline#157 problem 2 \
+                     and the follow-up issue); a cached token cannot carry \
+                     the fresh challenge-bound nonce the connect path requires"
+                );
             })
             .await
     }

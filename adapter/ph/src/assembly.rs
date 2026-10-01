@@ -666,6 +666,10 @@ pub mod test {
     pub struct RecordingTunCtl {
         pub routes: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
         pub fail_routes: bool,
+        /// With this set, `add_address` fails — modelling a host where the
+        /// granted ZPR address cannot be set on the TUN (e.g. EPERM,
+        /// zipline#157).
+        pub fail_addresses: bool,
         pub conflict: Option<String>,
         pub late_conflict: Option<String>,
         pub probes: Arc<std::sync::atomic::AtomicUsize>,
@@ -682,6 +686,7 @@ pub mod test {
                 Self {
                     routes: routes.clone(),
                     fail_routes,
+                    fail_addresses: false,
                     conflict: None,
                     late_conflict: None,
                     probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -690,6 +695,15 @@ pub mod test {
                 },
                 routes,
             )
+        }
+
+        /// A recording instance whose `add_address` fails — the zipline#157
+        /// scenario: the granted ZPR address cannot be set on the TUN
+        /// (e.g. EPERM), a local failure that will not clear on reconnect.
+        pub fn with_failing_addresses() -> (Self, Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) {
+            let (mut tun_ctl, routes) = Self::new(false);
+            tun_ctl.fail_addresses = true;
+            (tun_ctl, routes)
         }
 
         /// A recording instance whose `route_owner_conflict` names
@@ -721,6 +735,12 @@ pub mod test {
             Ok(())
         }
         fn add_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            if self.fail_addresses {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "RecordingTunCtl: add_address deliberately failing (EPERM)",
+                ));
+            }
             Ok(())
         }
         fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
