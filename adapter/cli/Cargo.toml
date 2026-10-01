@@ -56,3 +56,9 @@ path = "src/main.rs"
 name = "generate_completions"
 path = "src/generate_completions.rs"
 required-features = ["complete"]
+
+[lints.rust]
+# Keeps a mainline-capnp build (capnp-ancillary feature deleted per the D4
+# recipe in the root Cargo.toml) warning-free: check-cfg keeps the cfg a
+# known value after the feature is gone.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"capnp-ancillary\"))"] }
