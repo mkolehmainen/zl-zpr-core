@@ -145,7 +145,7 @@ pub fn socket_is_live(path: &std::path::Path) -> bool {
 }
 
 /// Which socket path a client (`ph-cli`) should use, given an optional
-/// explicit path (`-p` / `-c`) and an injected usability predicate
+/// explicit path (`-p`) and an injected usability predicate
 /// (see [socket_is_live]).
 ///
 /// * An explicit path short-circuits everything — it is used whether or not
@@ -172,7 +172,7 @@ where
         return Ok(shared);
     }
     Err(format!(
-        "no live packet handler socket (tried {} and {}); is ph running? Use -p/-c to point at an explicit socket path",
+        "no live packet handler socket (tried {} and {}); is ph running? Use -p to point at an explicit socket path",
         per_uid.display(),
         shared.display()
     ))
@@ -398,6 +398,28 @@ mod test {
         .expect_err("no socket exists, the search must fail");
         assert!(err.contains("/per-uid/control.sock"), "err was: {err}");
         assert!(err.contains("/shared/control.sock"), "err was: {err}");
+    }
+
+    /// The failure diagnostic points at `-p` and ONLY `-p`: `ph-cli`
+    /// retired its `-c` option (zipline#142 / zl-zpr-core#59 review), so a
+    /// message telling the user to pass `-c` now leads straight into a
+    /// clap unknown-option error. `ph`'s remaining `-c` is
+    /// `--config-file`, unrelated to socket discovery, and `ph` never
+    /// calls [choose_socket_path].
+    #[test]
+    fn error_recommends_only_dash_p() {
+        let err = choose_socket_path(
+            None,
+            PathBuf::from("/per-uid/control.sock"),
+            PathBuf::from("/shared/control.sock"),
+            |_: &Path| false,
+        )
+        .expect_err("no socket exists, the search must fail");
+        assert!(err.contains("-p"), "err must recommend -p: {err}");
+        assert!(
+            !err.contains("-c"),
+            "err must not mention the retired -c option: {err}"
+        );
     }
 
     /// A socket path with a live listener probes as live (zipline#39
