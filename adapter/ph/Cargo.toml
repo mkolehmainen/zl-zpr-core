@@ -81,6 +81,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    # WSAIoctl (SIO_UDP_CONNRESET at substrate bind, zipline#160) is gated
+    # behind Win32_System_IO (its OVERLAPPED parameter); declared here
+    # rather than inherited through feature unification.
+    "Win32_System_IO",
 ] }
 
 [dev-dependencies]

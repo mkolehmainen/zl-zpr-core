@@ -1504,6 +1504,47 @@ pub fn windows_substrate_bind_check(bound: SocketAddr) -> Result<()> {
     Ok(())
 }
 
+/// Disable `SIO_UDP_CONNRESET` on a UDP socket (zipline#160, plan N4).
+///
+/// On Windows, a datagram sent to a peer that answers with ICMP
+/// port-unreachable (it exited, or nothing ever listened there) is recorded
+/// against the socket and surfaces as `WSAECONNRESET` (10054) on a LATER
+/// `recvfrom` — on an unconnected socket, where no reset semantics are
+/// wanted: a node's substrate socket talks to many adapters and any of them
+/// may leave at any time. This ioctl turns the behavior off so the reset is
+/// never reported; the `ConnectionReset` mapping in
+/// `std_udp::connreset_as_wouldblock` remains as the belt-and-braces
+/// fallback should the ioctl ever be absent.
+#[cfg(windows)]
+pub fn windows_disable_udp_connreset(socket: &socket2::Socket) -> Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SOCKET, WSAIoctl};
+
+    // FALSE as the BOOL input argument: new behavior = do not report resets.
+    let enable: u32 = 0;
+    let mut bytes_returned: u32 = 0;
+    // SAFETY: the socket is live (borrowed for this call); the input buffer
+    // is a readable u32 of the size passed; no output buffer is requested;
+    // no OVERLAPPED/completion routine (synchronous call).
+    let rc = unsafe {
+        WSAIoctl(
+            socket.as_raw_socket() as SOCKET,
+            SIO_UDP_CONNRESET,
+            &enable as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The socket half of the Windows engine (plan D5): unbatched non-blocking
 /// `send`/`recv`/`send_to`/`recv_from` on a `std::net::UdpSocket`.
 ///
@@ -1636,6 +1677,21 @@ mod std_udp {
     /// counter keeps a reset storm visible. Portable (and unit tested) on
     /// every OS; only the Windows engine reaches it at runtime.
     pub(super) fn connreset_as_wouldblock(err: std::io::Error) -> std::io::Error {
+        if err.kind() == std::io::ErrorKind::ConnectionReset {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            // Counter so a reset storm is visible at trace level without
+            // flooding higher levels (resets are normal when peers leave).
+            static RESETS: AtomicU64 = AtomicU64::new(0);
+            let total = RESETS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::trace!(
+                target: crate::logging::targets::DATAPATH,
+                "substrate recv ignored a peer connection reset ({total} total): {err}"
+            );
+            return std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "peer connection reset; no datagram",
+            );
+        }
         err
     }
 
@@ -1687,7 +1743,12 @@ mod std_udp {
                             destination,
                         })
                     }
-                    Err(err) => Err(err),
+                    // WSAECONNRESET from a departed peer's ICMP
+                    // port-unreachable is "no datagram", not a socket
+                    // fault (zipline#160, plan N4) — mapped to WouldBlock
+                    // so the batch ends like an empty socket. See
+                    // `connreset_as_wouldblock`.
+                    Err(err) => Err(connreset_as_wouldblock(err)),
                 }
             },
             socket,
