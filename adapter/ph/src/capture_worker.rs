@@ -25,7 +25,7 @@ impl CaptureWorker {
     /// handler, which receives the file's fd over the capnp-ancillary
     /// FD-passing transport (zipline#142); capture is Unsupported
     /// elsewhere (plan D7).
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "capnp-ancillary"))]
     pub async fn open_capture_file(&self, file: File) -> Result<(), io::Error> {
         let mut inner = self.inner.lock().await;
         let mut savefile = PcapWriter::open(file, linktype::USER0).await?;
