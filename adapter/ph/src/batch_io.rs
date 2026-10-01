@@ -1504,6 +1504,47 @@ pub fn windows_substrate_bind_check(bound: SocketAddr) -> Result<()> {
     Ok(())
 }
 
+/// Disable `SIO_UDP_CONNRESET` on a UDP socket (zipline#160, plan N4).
+///
+/// On Windows, a datagram sent to a peer that answers with ICMP
+/// port-unreachable (it exited, or nothing ever listened there) is recorded
+/// against the socket and surfaces as `WSAECONNRESET` (10054) on a LATER
+/// `recvfrom` — on an unconnected socket, where no reset semantics are
+/// wanted: a node's substrate socket talks to many adapters and any of them
+/// may leave at any time. This ioctl turns the behavior off so the reset is
+/// never reported; the `ConnectionReset` mapping in
+/// `std_udp::connreset_as_wouldblock` remains as the belt-and-braces
+/// fallback should the ioctl ever be absent.
+#[cfg(windows)]
+pub fn windows_disable_udp_connreset(socket: &socket2::Socket) -> Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SOCKET, WSAIoctl};
+
+    // FALSE as the BOOL input argument: new behavior = do not report resets.
+    let enable: u32 = 0;
+    let mut bytes_returned: u32 = 0;
+    // SAFETY: the socket is live (borrowed for this call); the input buffer
+    // is a readable u32 of the size passed; no output buffer is requested;
+    // no OVERLAPPED/completion routine (synchronous call).
+    let rc = unsafe {
+        WSAIoctl(
+            socket.as_raw_socket() as SOCKET,
+            SIO_UDP_CONNRESET,
+            &enable as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The socket half of the Windows engine (plan D5): unbatched non-blocking
 /// `send`/`recv`/`send_to`/`recv_from` on a `std::net::UdpSocket`.
 ///
@@ -1625,6 +1666,76 @@ mod std_udp {
         )
     }
 
+    /// Map a peer's connection reset to "no datagram" (zipline#160, plan
+    /// N4). On Windows an ICMP port-unreachable from a departed peer makes
+    /// a later `recvfrom` on an unconnected UDP socket fail with
+    /// `WSAECONNRESET` (10054); nothing was received and the socket is
+    /// fine, so surface it as `WouldBlock` — exactly as an empty socket
+    /// ends a batch. The receive path retries past swallowed resets first
+    /// (see [`recv_retrying_connreset`]); this mapping is its capped
+    /// fallback. This is the belt-and-braces fallback behind the
+    /// `SIO_UDP_CONNRESET` ioctl disabled at bind
+    /// (`windows_disable_udp_connreset`); a `trace!` counter keeps a
+    /// reset storm visible. Portable (and unit tested) on every OS; only
+    /// the Windows engine reaches it at runtime.
+    pub(super) fn connreset_as_wouldblock(err: std::io::Error) -> std::io::Error {
+        if err.kind() == std::io::ErrorKind::ConnectionReset {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            // Counter so a reset storm is visible at trace level without
+            // flooding higher levels (resets are normal when peers leave).
+            static RESETS: AtomicU64 = AtomicU64::new(0);
+            let total = RESETS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::trace!(
+                target: crate::logging::targets::DATAPATH,
+                "substrate recv ignored a peer connection reset ({total} total): {err}"
+            );
+            return std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "peer connection reset; no datagram",
+            );
+        }
+        err
+    }
+
+    /// Consecutive-reset bound for [`recv_retrying_connreset`]: enough
+    /// that a burst of departed-peer resets cannot end a batch while real
+    /// datagrams sit queued behind them, small enough that a pathological
+    /// reset storm cannot pin the dispatch thread in the retry loop —
+    /// past the cap the receive falls back to the "no datagram" mapping,
+    /// the batch ends, and the dispatcher re-polls as before.
+    pub(super) const CONNRESET_RETRY_CAP: u32 = 64;
+
+    /// Retry a receive whose failure was a peer connection reset
+    /// (zl-zpr-core#62 review on zipline#160). A swallowed
+    /// `WSAECONNRESET` consumed no datagram — the socket is fine and
+    /// valid packets may already be queued behind the reset — so ending
+    /// the batch per reset (one wake/dispatch each) can starve
+    /// legitimate substrate traffic when `SIO_UDP_CONNRESET` could not
+    /// be disabled. Instead the receive is retried with the same buffer,
+    /// bounded by [`CONNRESET_RETRY_CAP`]; every swallowed reset is
+    /// counted and traced via [`connreset_as_wouldblock`], which also
+    /// supplies the capped fallback. Every other outcome — a datagram, a
+    /// genuine `WouldBlock`, any other error — returns immediately.
+    pub(super) fn recv_retrying_connreset<T>(
+        mut recv: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let mut resets = 0u32;
+        loop {
+            match recv() {
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                    // Count and trace the swallowed reset; the mapped
+                    // WouldBlock doubles as the capped fallback.
+                    let mapped = connreset_as_wouldblock(err);
+                    if resets >= CONNRESET_RETRY_CAP {
+                        return Err(mapped);
+                    }
+                    resets += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Receive with peer addresses. With `with_dest`, the destination is
     /// the socket's own bound address (no pktinfo — single-homed ceiling
     /// above), resolved once per batch.
@@ -1643,38 +1754,37 @@ mod std_udp {
             |socket, buf| {
                 // SAFETY: We will only be writing to the chunk.
                 let chunk = unsafe { slice_assume_init_mut(buf.chunk_mut().as_uninit_slice_mut()) };
-                match socket.recv_from(chunk) {
-                    Ok((size, source)) => {
-                        // SAFETY: We know we've written the given number of bytes in the BufMut.
-                        unsafe { buf.advance_mut(size) };
-                        Ok(ReceivedPacket {
-                            size,
-                            truncated: false,
-                            source: Some(source),
-                            destination,
-                        })
+                // A swallowed peer reset consumed no datagram, so retry
+                // the receive with the same buffer (bounded) rather than
+                // ending the batch per reset — see
+                // `recv_retrying_connreset` (zl-zpr-core#62 review).
+                let (size, truncated, source) = recv_retrying_connreset(|| {
+                    match socket.recv_from(chunk) {
+                        Ok((size, source)) => Ok((size, false, Some(source))),
+                        // Windows reports an oversized datagram as
+                        // WSAEMSGSIZE (10040) — the buffer holds the
+                        // truncated head and the rest is discarded. Map it
+                        // to `truncated`, which the fastpath drops and
+                        // counts, the same as MSG_TRUNC on unix. (The peer
+                        // address is lost with the error; the truncated
+                        // path never reads it.)
+                        #[cfg(windows)]
+                        Err(err) if err.raw_os_error() == Some(10040) => {
+                            // WSAEMSGSIZE fills the whole buffer before
+                            // failing; it is all initialized.
+                            Ok((chunk.len(), true, None))
+                        }
+                        Err(err) => Err(err),
                     }
-                    // Windows reports an oversized datagram as WSAEMSGSIZE
-                    // (10040) — the buffer holds the truncated head and the
-                    // rest is discarded. Map it to `truncated`, which the
-                    // fastpath drops and counts, the same as MSG_TRUNC on
-                    // unix. (The peer address is lost with the error; the
-                    // truncated path never reads it.)
-                    #[cfg(windows)]
-                    Err(err) if err.raw_os_error() == Some(10040) => {
-                        let size = chunk.len();
-                        // SAFETY: WSAEMSGSIZE fills the whole buffer before
-                        // failing; it is all initialized.
-                        unsafe { buf.advance_mut(size) };
-                        Ok(ReceivedPacket {
-                            size,
-                            truncated: true,
-                            source: None,
-                            destination,
-                        })
-                    }
-                    Err(err) => Err(err),
-                }
+                })?;
+                // SAFETY: We know we've written the given number of bytes in the BufMut.
+                unsafe { buf.advance_mut(size) };
+                Ok(ReceivedPacket {
+                    size,
+                    truncated,
+                    source,
+                    destination,
+                })
             },
             socket,
             bufs,
@@ -2665,10 +2775,15 @@ mod tests {
     fn test_windows_substrate_bind_check() {
         use std::net::{Ipv4Addr, Ipv6Addr};
 
-        // Concrete addresses pass.
+        // Concrete addresses pass — loopback explicitly among them
+        // (zipline#160 / plan N2: a node and an adapter on one Windows
+        // host may dock over loopback, so a loopback self_addr must stay
+        // a valid bind), alongside concrete LAN addresses.
         for addr in [
             SocketAddr::from((Ipv4Addr::LOCALHOST, 7000)),
             SocketAddr::from((Ipv6Addr::LOCALHOST, 7000)),
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 7), 7000)),
+            SocketAddr::from((Ipv6Addr::new(0xfd5a, 0x5052, 0, 0, 0, 0, 0, 0x99), 7000)),
         ] {
             windows_substrate_bind_check(addr).unwrap();
         }
@@ -2733,6 +2848,164 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         let msg = err.to_string();
         assert!(msg.contains("wildcard"), "unhelpful error: {msg}");
+    }
+
+    /// zipline#160 (plan N4): a peer's ICMP port-unreachable surfaces on
+    /// Windows as `WSAECONNRESET` on a later `recvfrom` of an unconnected
+    /// UDP socket. Nothing was received and the socket is fine, so the
+    /// mapping seam must turn `ConnectionReset` into `WouldBlock` — the
+    /// "stop this batch, return what was received" error every engine
+    /// already handles — and leave every other error untouched. Portable,
+    /// so the mapping logic is unit tested on every OS even though only
+    /// the Windows engine reaches it at runtime.
+    #[test]
+    fn test_connreset_mapped_to_wouldblock() {
+        use std::io::{Error, ErrorKind};
+
+        // The Windows reset becomes "no datagram".
+        let mapped = std_udp::connreset_as_wouldblock(Error::new(
+            ErrorKind::ConnectionReset,
+            "peer departed (WSAECONNRESET)",
+        ));
+        assert_eq!(
+            mapped.kind(),
+            ErrorKind::WouldBlock,
+            "ConnectionReset must map to WouldBlock, got {mapped:?}"
+        );
+
+        // Anything else passes through unchanged — the fastpath's
+        // "unrecoverable substrate socket error" expect still fires for
+        // real faults.
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::BrokenPipe,
+            ErrorKind::InvalidInput,
+        ] {
+            let passed = std_udp::connreset_as_wouldblock(Error::new(kind, "other"));
+            assert_eq!(passed.kind(), kind, "{kind:?} must pass through");
+        }
+    }
+
+    /// zl-zpr-core#62 review (zipline#160): a swallowed reset consumed no
+    /// datagram, so the receive must be retried with the same buffer —
+    /// datagrams queued behind a departed peer's reset are delivered in
+    /// the same batch instead of costing one wake/dispatch per reset.
+    #[test]
+    fn test_recv_retried_after_connreset() {
+        use std::io::{Error, ErrorKind};
+
+        // Two resets queued ahead of a real datagram: the receive seam
+        // must swallow both and return the datagram.
+        let mut calls = 0u32;
+        let res = std_udp::recv_retrying_connreset(|| {
+            calls += 1;
+            if calls <= 2 {
+                Err(Error::new(ErrorKind::ConnectionReset, "peer departed"))
+            } else {
+                Ok(7usize)
+            }
+        });
+        assert_eq!(
+            res.expect("datagram behind resets must be delivered"),
+            7,
+            "retry must return the datagram received after the resets"
+        );
+        assert_eq!(calls, 3, "one retry per swallowed reset, then the datagram");
+    }
+
+    /// zl-zpr-core#62 review (zipline#160): the retry is bounded — a
+    /// pathological storm of consecutive resets ends the batch as "no
+    /// datagram" after `CONNRESET_RETRY_CAP` retries instead of pinning
+    /// the dispatch thread in the retry loop.
+    #[test]
+    fn test_recv_retry_bounded_on_reset_storm() {
+        use std::io::{Error, ErrorKind};
+
+        let mut calls = 0u32;
+        let res = std_udp::recv_retrying_connreset(|| -> std::io::Result<usize> {
+            calls += 1;
+            Err(Error::new(ErrorKind::ConnectionReset, "reset storm"))
+        });
+        assert_eq!(
+            res.expect_err("an unbroken reset storm must end the batch")
+                .kind(),
+            ErrorKind::WouldBlock,
+            "capped storm must surface as WouldBlock (no datagram)"
+        );
+        assert_eq!(
+            calls,
+            std_udp::CONNRESET_RETRY_CAP + 1,
+            "the receive must stop after the retry cap"
+        );
+    }
+
+    /// zl-zpr-core#62 review (zipline#160): only `ConnectionReset` is
+    /// retried — a genuine `WouldBlock` (empty socket) and real faults
+    /// return on the first call, unchanged.
+    #[test]
+    fn test_recv_retry_other_errors_return_immediately() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::BrokenPipe,
+            ErrorKind::InvalidInput,
+        ] {
+            let mut calls = 0u32;
+            let res = std_udp::recv_retrying_connreset(|| -> std::io::Result<usize> {
+                calls += 1;
+                Err(Error::new(kind, "not a reset"))
+            });
+            assert_eq!(res.expect_err("error must surface").kind(), kind);
+            assert_eq!(calls, 1, "{kind:?} must not be retried");
+        }
+    }
+
+    /// zipline#160 (plan N4), the end-to-end shape on the real OS: send
+    /// from a bound UDP socket to a closed local port — Windows queues the
+    /// resulting ICMP port-unreachable as a `WSAECONNRESET` for a later
+    /// receive on that socket — then receive, and assert the batch comes
+    /// back clean ("nothing received", not an error and not a panic).
+    /// Windows-only by nature: unix never surfaces a reset on an
+    /// unconnected UDP socket, so there is nothing to observe there. Runs
+    /// in the Windows core-gate run (plan C2/C3).
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_recv_tolerates_connreset() {
+        let socket = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+
+        // A port with nothing behind it: bind a throwaway socket, note its
+        // port, drop it.
+        let closed_port = {
+            let dead = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            dead.local_addr().unwrap().port()
+        };
+
+        // Provoke the reset, then give the stack a moment to queue it.
+        socket
+            .send_to(b"ping", (std::net::Ipv4Addr::LOCALHOST, closed_port))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Drain. Every outcome except ConnectionReset/panic is a pass:
+        // WouldBlock (reset already mapped or ioctl-suppressed) ends the
+        // drain; a datagram cannot arrive (nothing sends to us).
+        let mut bufs = vec![Vec::with_capacity(64); 4];
+        let mut results: Vec<Result<ReceivedPacket>> = Vec::new();
+        for _ in 0..8 {
+            match std_udp::recv_from_batch(
+                &socket,
+                &mut bufs.iter_mut().map(|b| b as &mut dyn BufMut),
+                &mut results,
+                true,
+            ) {
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("reset must not surface as a batch error: {err}"),
+                Ok(0) => break,
+                Ok(_) => panic!("received a datagram nobody sent"),
+            }
+        }
     }
 
     /// Two localhost UDP sockets connected to each other: a portable

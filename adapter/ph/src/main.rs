@@ -529,12 +529,37 @@ fn main() -> ExitCode {
         // rebinds — would record 0.0.0.0/:: as every packet's interface
         // address and trip the fastpath's unspecified-address assertion
         // on the first response. Reject the configuration at startup with
-        // the fix in the message.
+        // the fix in the message — a logged error and a clean exit, not a
+        // panic (zipline#160): a misconfigured node must fail with the
+        // message that names the fix, like the ZPR-address check below.
         #[cfg(windows)]
         {
             let bound = socket.local_addr().unwrap().as_socket().unwrap();
-            batch_io::windows_substrate_bind_check(bound)
-                .expect("substrate socket configuration unusable on Windows");
+            if let Err(err) = batch_io::windows_substrate_bind_check(bound) {
+                error!(
+                    target: STARTUP,
+                    "substrate socket configuration unusable on Windows: {err}"
+                );
+                return ExitCode::FAILURE;
+            }
+
+            // Disable SIO_UDP_CONNRESET (zipline#160, plan N4): without
+            // this, a peer that departs — its host answering our sends
+            // with ICMP port-unreachable — makes a later recvfrom on this
+            // unconnected UDP socket fail with WSAECONNRESET, and the
+            // substrate socket talks to many peers that may leave at any
+            // time. Failure here is non-fatal: the ConnectionReset
+            // mapping in the receive path (connreset_as_wouldblock) is
+            // the fallback, so the socket still works, just with a
+            // trace-level note per swallowed reset.
+            if let Err(err) = batch_io::windows_disable_udp_connreset(&socket) {
+                warn!(
+                    target: STARTUP,
+                    "unable to disable SIO_UDP_CONNRESET on the substrate \
+                     socket (continuing; resets are tolerated in the \
+                     receive path): {err}"
+                );
+            }
         }
 
         substrate_sockets.push(socket.into());
