@@ -352,20 +352,54 @@ convenience group.
 
 ## Windows
 
-`ph adapter` runs on Windows 10/11 x64. The adapter role only: it creates a
-Wintun interface, docks to a Linux node, and carries this machine's own
-traffic, exactly like `sudo ph adapter -c x.toml` on Linux.
+`ph` runs on Windows 10/11 x64 in both roles. `ph adapter` creates a Wintun
+interface, docks to a node, and carries this machine's own traffic, exactly
+like `sudo ph adapter -c x.toml` on Linux. `ph node` creates a Wintun
+interface, applies its own ZPR address and the visa-service route to it,
+accepts docking adapters, and forwards their traffic, exactly like
+`sudo ph node -c x.toml` on Linux — within the constraints below.
+
+**Windows node constraints** (deliberate, in this release):
+
+* **A concrete `self_addr` is required** (or an explicit
+  `advertised_substrate_addr`): the Windows substrate engine rejects a
+  wildcard bind by design, and startup fails cleanly with a message naming
+  the fix. With a concrete `self_addr`, no separate
+  `advertised_substrate_addr` is needed.
+* **Single-homed only** — one substrate address, configured once at startup;
+  multi-homed hosts and address changes while running are
+  [zipline#150](https://github.com/mkolehmainen/zipline/issues/150).
+* **Elevated console** — Wintun device creation requires Run as
+  administrator, same as the adapter role.
+* **A single, unbatched datapath worker** — Wintun enforces one queue and
+  the `windows_unbatched` engine drives one substrate socket; functional
+  parity with Linux is the bar, throughput is not (measured numbers are in
+  the test document below).
+* **Inbound firewall rules are required**: UDP on the dock port (5000 by
+  default) on the LAN interface, and TCP 8183 (the VSS listener) on the
+  Wintun interface, which Windows places on the Public profile where
+  unsolicited inbound is dropped. The exact rules and when each can be added
+  are in the test document below.
+* **One `ph` instance per user without `--control-path`**: the default
+  control path is derived from the owner alone, so a node and an adapter for
+  the same user on one host need explicit `--control-path`s to coexist
+  ([zipline#169](https://github.com/mkolehmainen/zipline/issues/169)).
+
+The hand-run, end-to-end verification of the Windows node (a Windows VM
+forwarding real traffic between Linux adapters and hosting the visa
+service's support service) is
+[`integration-test/windows-node-test.md`](../integration-test/windows-node-test.md);
+run it whenever a change touches the Windows node path. There is no
+automated Windows CI tier
+([zipline#152](https://github.com/mkolehmainen/zipline/issues/152)).
 
 **Not supported on Windows** (deliberately, in this release):
 
-* the **node role** — `ph node` compiles but is unsupported and untested;
-  nodes stay on Linux,
 * **packet capture to a file** — `ph-cli capture set-file` returns
   `Unsupported`,
 * a **Windows service or installer** — `ph.exe` is started by hand from an
-  elevated console,
-* **multi-homed hosts and address changes while running** — the substrate
-  address is configured or discovered once at startup,
+  elevated console
+  ([zipline#147](https://github.com/mkolehmainen/zipline/issues/147)),
 * **`ph-cli` filter compilation** — the `pcap` feature is off on Windows, so
   capture filter strings cannot be compiled there.
 
