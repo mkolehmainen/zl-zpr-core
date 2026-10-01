@@ -2736,6 +2736,22 @@ impl LinkStateWrapper {
         let task_asm = asm.clone();
         tokio::task::spawn_local(async move {
             tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN).await;
+            // zipline#157 review round 1 (Codex P1): this timer may have
+            // been scheduled by an earlier, non-fatal close, and a newer
+            // attempt (operator startLink during the holddown) may have
+            // reached a fatal local activation failure while it was
+            // pending. Re-check the recorded failure before starting: a
+            // stale Start would clear it and resume the reconnect loop
+            // the hard stop in complete_close was meant to end.
+            if let Some(peer) = task_asm.peer_table.get(link_id) {
+                if matches!(
+                    peer.link_state_machine.get_last_auth_failure(),
+                    Some(AuthFailureReason::ActivationFailed(_))
+                ) {
+                    info!(target: LINK_STATE, "{} skipping stale holddown restart after a fatal local activation failure", task_asm.formatted_link_id(link_id));
+                    return;
+                }
+            }
             info!(target: LINK_STATE, "Attempting to restart {}", task_asm.formatted_link_id(link_id));
             let _ = task_asm.process_link_state_event(link_id, LinkEvent::Start);
         });
