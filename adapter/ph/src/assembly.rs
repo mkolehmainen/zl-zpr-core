@@ -30,6 +30,7 @@ use tracing_subscriber::filter::targets::Targets;
 #[allow(unused_imports)]
 use tracing_subscriber::{Layer, Registry, filter, fmt, reload};
 use x25519_dalek::ReusableSecret;
+use zpr::addrs::{VISA_SERVICE_ADDR, ZPRNET_PREFIX_LEN};
 use zpr::vsapi_types::{AuthServicesList, ConnectRequest};
 use zpr_utils::net_defs::{IpAddress, ScopedIpAddr};
 
@@ -333,6 +334,64 @@ impl Assembly {
                 }
             })
             .collect()
+    }
+
+    /// Node self-addressing (zipline#159, decision N3 of the Windows node
+    /// plan): apply each local ZPR address this node believes it owns to the
+    /// TUN device, and make the visa service's well-known address reachable
+    /// through it where the address alone does not.
+    ///
+    /// Idempotent: an address the device already carries is left untouched,
+    /// so hand-configured setups and the integration scripts' out-of-band
+    /// `ip addr add` see no change — for them `has_address` is true and
+    /// nothing is called. An address the platform cannot inspect
+    /// (`ErrorKind::Unsupported`) is skipped, exactly as
+    /// [`Self::local_zpr_addrs_missing_from_tun`] treats it: a helper that
+    /// cannot see the truth must not act on it. Any other error — from the
+    /// inspection or from `add_address` itself — is propagated; the node
+    /// branch of `main.rs` exits on it rather than run misaddressed.
+    ///
+    /// Reads the *current* address set via [`Self::get_local_zpr_addrs_std`],
+    /// the same source as the missing-address check that runs after it.
+    /// Node use only: adapter addressing belongs to link activation
+    /// (`link_state.rs`), which this deliberately does not touch (N2).
+    pub fn ensure_local_zpr_addrs_on_tun(&self) -> std::io::Result<()> {
+        // On Windows the visa-service host route is required: `netsh
+        // interface ipv6 add address` takes no prefix length (see
+        // `sys/windows/zprtun.rs::add_address`), so the address is installed
+        // as a /128 and never makes the ZPR internal network on-link. On
+        // Linux and macOS `add_address` applies `ZPRNET_PREFIX_LEN`, which
+        // puts the whole internal network — the visa service included —
+        // on-link, so no route is needed and none is installed.
+        self.ensure_local_zpr_addrs_on_tun_impl(cfg!(windows))
+    }
+
+    /// The platform-independent body of [`Self::ensure_local_zpr_addrs_on_tun`],
+    /// with the one platform fact — whether on-link reachability of the visa
+    /// service needs an explicit host route — passed in so both arms are
+    /// unit-testable everywhere.
+    fn ensure_local_zpr_addrs_on_tun_impl(&self, vs_route_needed: bool) -> std::io::Result<()> {
+        for addr in self.get_local_zpr_addrs_std() {
+            match self.tun_ctl.has_address(addr) {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!(target: NET_OS, "applying node ZPR address {addr}/{ZPRNET_PREFIX_LEN} to the TUN device");
+                    self.tun_ctl.add_address(addr, ZPRNET_PREFIX_LEN)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                    debug!(target: NET_OS, "cannot inspect {addr} on this platform; leaving it alone: {e}");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if vs_route_needed {
+            // A /128 host route: the narrowest statement of what the node
+            // needs — "the visa service is on-link via the TUN" — without
+            // claiming the whole internal network, which is the adapter
+            // activation path's decision to make, not ours (N2).
+            self.tun_ctl.add_route(VISA_SERVICE_ADDR, 128)?;
+        }
+        Ok(())
     }
 
     pub fn process_link_state_event(
@@ -844,6 +903,211 @@ pub mod test {
     fn no_local_zpr_addrs_is_not_a_mismatch() {
         let asm = assembly_with_addrs(&[], &["fd5a:5052:90de::2"]);
         assert!(asm.local_zpr_addrs_missing_from_tun().is_empty());
+    }
+
+    /// A `TunCtl` for the node self-addressing helper (zipline#159): reports
+    /// exactly the addresses it was constructed with, records every
+    /// `add_address` and `add_route` call, and can be made to fail
+    /// `add_address` or report addresses as uninspectable, so tests can
+    /// assert exactly what `ensure_local_zpr_addrs_on_tun` did.
+    #[cfg(test)]
+    struct SelfAddressTunCtl {
+        on_tun: Vec<IpAddr>,
+        added: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
+        routes: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
+        fail_add_address: bool,
+        inspect_unsupported: bool,
+    }
+
+    #[cfg(test)]
+    impl SelfAddressTunCtl {
+        /// An instance whose device already carries `on_tun`, plus the
+        /// shared logs of `add_address` and `add_route` calls the test
+        /// asserts on.
+        #[allow(clippy::type_complexity)]
+        fn new(
+            on_tun: &[&str],
+        ) -> (
+            Self,
+            Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
+            Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
+        ) {
+            let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let routes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    on_tun: on_tun.iter().map(|a| a.parse().unwrap()).collect(),
+                    added: added.clone(),
+                    routes: routes.clone(),
+                    fail_add_address: false,
+                    inspect_unsupported: false,
+                },
+                added,
+                routes,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    impl TunCtl for SelfAddressTunCtl {
+        fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn add_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+            if self.fail_add_address {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "SelfAddressTunCtl: add_address deliberately failing (EPERM)",
+                ));
+            }
+            self.added.lock().unwrap().push((addr, prefix_len));
+            Ok(())
+        }
+        fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn has_address(&self, addr: IpAddr) -> std::io::Result<bool> {
+            if self.inspect_unsupported {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "SelfAddressTunCtl: has_address deliberately unsupported",
+                ));
+            }
+            Ok(self.on_tun.contains(&addr))
+        }
+        fn add_route(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+            self.routes.lock().unwrap().push((dest, prefix_len));
+            Ok(())
+        }
+        fn route_owner_conflict(
+            &self,
+            _dest: IpAddr,
+            _prefix_len: u8,
+        ) -> std::io::Result<Option<String>> {
+            Ok(None)
+        }
+    }
+
+    /// Builds a node-mode test assembly around the given `TunCtl`, with
+    /// `zpr_addr` as its configured local ZPR addresses (zipline#159).
+    #[cfg(test)]
+    fn assembly_with_tun_ctl(zpr_addr: &[&str], tun_ctl: Box<dyn TunCtl + Send>) -> Assembly {
+        let config = config::Config {
+            zpr_addr: zpr_addr.iter().map(|a| a.parse().unwrap()).collect(),
+            ..Default::default()
+        };
+        create_assembly(TestAssemblyBuilder {
+            ph_mode: Some(PhMode::Node),
+            config: Some(rcu::RcuBox::new(config)),
+            tun_ctl: Some(tun_ctl),
+            ..Default::default()
+        })
+    }
+
+    /// zipline#159: an address the TUN does not carry is applied by the
+    /// node itself, exactly once, with the ZPR network prefix length.
+    #[test]
+    fn node_self_addressing_applies_missing_address() {
+        let (tun_ctl, added, _routes) = SelfAddressTunCtl::new(&[]);
+        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
+        asm.ensure_local_zpr_addrs_on_tun().unwrap();
+        assert_eq!(
+            *added.lock().unwrap(),
+            vec![(
+                "fd5a:5052:90de::1".parse::<IpAddr>().unwrap(),
+                zpr::addrs::ZPRNET_PREFIX_LEN
+            )]
+        );
+    }
+
+    /// zipline#159: an address already on the TUN — a hand-configured
+    /// device, or the integration scripts' out-of-band `ip addr add` — is
+    /// left untouched: the helper is idempotent.
+    #[test]
+    fn node_self_addressing_skips_present_address() {
+        let (tun_ctl, added, _routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
+        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
+        asm.ensure_local_zpr_addrs_on_tun().unwrap();
+        assert!(added.lock().unwrap().is_empty());
+    }
+
+    /// zipline#159: only the missing addresses of a partially configured
+    /// set are applied.
+    #[test]
+    fn node_self_addressing_applies_only_missing_addresses() {
+        let (tun_ctl, added, _routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
+        let asm = assembly_with_tun_ctl(
+            &["fd5a:5052:90de::1", "fd5a:5052:90de::7"],
+            Box::new(tun_ctl),
+        );
+        asm.ensure_local_zpr_addrs_on_tun().unwrap();
+        assert_eq!(
+            *added.lock().unwrap(),
+            vec![(
+                "fd5a:5052:90de::7".parse::<IpAddr>().unwrap(),
+                zpr::addrs::ZPRNET_PREFIX_LEN
+            )]
+        );
+    }
+
+    /// zipline#159: an `add_address` failure (e.g. EPERM) is propagated to
+    /// the caller, which exits rather than run misaddressed.
+    #[test]
+    fn node_self_addressing_propagates_add_address_error() {
+        let (mut tun_ctl, added, _routes) = SelfAddressTunCtl::new(&[]);
+        tun_ctl.fail_add_address = true;
+        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
+        let err = asm.ensure_local_zpr_addrs_on_tun().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(added.lock().unwrap().is_empty());
+    }
+
+    /// zipline#159: an address the platform cannot inspect is skipped, not
+    /// applied and not an error — the same treatment
+    /// `local_zpr_addrs_missing_from_tun` gives it.
+    #[test]
+    fn node_self_addressing_skips_uninspectable_address() {
+        let (mut tun_ctl, added, _routes) = SelfAddressTunCtl::new(&[]);
+        tun_ctl.inspect_unsupported = true;
+        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
+        asm.ensure_local_zpr_addrs_on_tun().unwrap();
+        assert!(added.lock().unwrap().is_empty());
+    }
+
+    /// zipline#159: where the platform needs it (Windows, whose
+    /// `netsh add address` ignores the prefix length), a /128 host route to
+    /// the visa service's well-known address is installed via the TUN.
+    #[test]
+    fn node_self_addressing_installs_vs_host_route_where_needed() {
+        let (tun_ctl, _added, routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
+        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
+        asm.ensure_local_zpr_addrs_on_tun_impl(true).unwrap();
+        assert_eq!(
+            *routes.lock().unwrap(),
+            vec![(zpr::addrs::VISA_SERVICE_ADDR, 128)]
+        );
+    }
+
+    /// zipline#159: where the address itself makes the ZPR internal network
+    /// on-link (Linux, macOS), no route is installed — hand-configured
+    /// routing is untouched.
+    #[test]
+    fn node_self_addressing_adds_no_route_where_address_is_onlink() {
+        let (tun_ctl, _added, routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
+        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
+        asm.ensure_local_zpr_addrs_on_tun_impl(false).unwrap();
+        assert!(routes.lock().unwrap().is_empty());
+    }
+
+    /// zipline#159: the public entry point resolves the route decision from
+    /// the platform — the visa-service host route exists exactly on Windows.
+    #[test]
+    fn node_self_addressing_route_matches_platform() {
+        let (tun_ctl, _added, routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
+        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
+        asm.ensure_local_zpr_addrs_on_tun().unwrap();
+        let expected = if cfg!(windows) { 1 } else { 0 };
+        assert_eq!(routes.lock().unwrap().len(), expected);
     }
 
     impl TestAssemblyBuilder {
