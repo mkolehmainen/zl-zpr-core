@@ -649,7 +649,25 @@ wait_for 30 check_node_has_auth_services || {
 # fabric assigns (zipline#88); a static demand would be scrubbed by the
 # visa service (no join policy) and the adapter would exit on the
 # mismatch (zipline#83).
-sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
+#
+# Launched via setpriv with ambient CAP_NET_ADMIN (zipline#156): on the
+# dynamic grant the adapter must `ip addr add` the granted address onto
+# tun0 itself, which needs CAP_NET_ADMIN. `sudo -u "$ZPR_USER"` strips
+# it, so on the netns host route (ZPR_USER = the unprivileged operator)
+# activation failed with "RTNETLINK answers: Operation not permitted".
+# setpriv keeps the launch unprivileged but carries net_admin through —
+# matching a real deployment — and is a no-op privilege-wise in Docker,
+# where ZPR_USER=root. Unlike `sudo -u`, setpriv does not scrub the
+# environment, so the outer `sudo -E` env (ZPR_* overrides, HOME) still
+# reaches the binary; SSL_CERT_FILE is set explicitly as before.
+# --regid takes a gid or group name, not a username: derive the user's
+# primary GID so accounts whose primary group is shared (e.g.
+# `developers`) work; --init-groups restores the supplementary groups,
+# matching `sudo -u` semantics.
+ZPR_GID=$(id -g "$ZPR_USER")
+sudo -E ip netns exec zpr-a setpriv --reuid "$ZPR_USER" --regid "$ZPR_GID" --init-groups \
+  --inh-caps +net_admin --ambient-caps +net_admin -- \
+  env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER1_SOCK" \
