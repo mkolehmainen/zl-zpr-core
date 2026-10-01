@@ -1611,7 +1611,17 @@ impl LinkStateWrapper {
                         // TODO: deal with the potential i/o blocking here ( https://github.com/org-zpr/zpr-core/issues/938 )
                         if let Err(e) = asm.tun_ctl.add_address(addrs[0].into(), ZPRNET_PREFIX_LEN)
                         {
+                            // zipline#157: a local, non-transient failure
+                            // (e.g. EPERM) that reconnecting cannot clear.
+                            // Record it so showLink / ph-cli connect report
+                            // the real error, and so complete_close hard-
+                            // stops the reconnect loop instead of retrying
+                            // into a fresh interactive OIDC prompt.
                             warn!(target: LINK_STATE, "{} failed to set ZPR address: {e}", asm.formatted_link_id(link_id));
+                            self.record_auth_failure(AuthFailureReason::ActivationFailed(format!(
+                                "failed to set ZPR address {}: {e}",
+                                addrs[0]
+                            )));
                             locked_fsm.set_state(LinkState::Error);
                             drop(locked_fsm);
                             return self.initiate_close(asm, TerminateReason::Other);
@@ -1635,6 +1645,16 @@ impl LinkStateWrapper {
                             Ok(Some(owner_if)) => {
                                 if configured.is_empty() {
                                     warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} already routes to interface {owner_if} — another ZPR adapter or tool already owns ZPR traffic on this host; failing activation", asm.formatted_link_id(link_id));
+                                    // zipline#157: local and non-transient —
+                                    // record and hard-stop (see add_address).
+                                    self.record_auth_failure(AuthFailureReason::ActivationFailed(
+                                        format!(
+                                            "{ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} already \
+                                             routes to interface {owner_if} — another ZPR \
+                                             adapter or tool already owns ZPR traffic on this \
+                                             host"
+                                        ),
+                                    ));
                                     locked_fsm.set_state(LinkState::Error);
                                     drop(locked_fsm);
                                     return self.initiate_close(asm, TerminateReason::Other);
@@ -1671,6 +1691,14 @@ impl LinkStateWrapper {
                         {
                             if configured.is_empty() {
                                 warn!(target: LINK_STATE, "{} failed to install ZPR internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}; a dynamically addressed adapter cannot function without it", asm.formatted_link_id(link_id));
+                                // zipline#157: local and non-transient —
+                                // record and hard-stop (see add_address).
+                                self.record_auth_failure(AuthFailureReason::ActivationFailed(
+                                    format!(
+                                        "failed to install ZPR internal-network route \
+                                         {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}"
+                                    ),
+                                ));
                                 locked_fsm.set_state(LinkState::Error);
                                 drop(locked_fsm);
                                 return self.initiate_close(asm, TerminateReason::Other);
@@ -1710,6 +1738,16 @@ impl LinkStateWrapper {
                                 if configured.is_empty() {
                                     warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} routes to interface {owner_if} after carrier-up — a concurrently starting ZPR adapter owns ZPR traffic on this host; backing off and failing activation", asm.formatted_link_id(link_id));
                                     asm.tun_ctl.set_carrier(false).unwrap();
+                                    // zipline#157: local and non-transient —
+                                    // record and hard-stop (see add_address).
+                                    self.record_auth_failure(AuthFailureReason::ActivationFailed(
+                                        format!(
+                                            "{ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} routes \
+                                             to interface {owner_if} after carrier-up — a \
+                                             concurrently starting ZPR adapter owns ZPR \
+                                             traffic on this host"
+                                        ),
+                                    ));
                                     locked_fsm.set_state(LinkState::Error);
                                     drop(locked_fsm);
                                     return self.initiate_close(asm, TerminateReason::Other);
@@ -2654,6 +2692,24 @@ impl LinkStateWrapper {
                     // start). Every connect is operator-initiated.
                     if self.link_type == LinkType::AdapterToNode && !asm.config.get().auto_connect {
                         info!(target: LINK_STATE, "{} idle (auto-connect off); waiting for startLink", asm.formatted_link_id(link_id));
+                    } else if self.link_type == LinkType::AdapterToNode
+                        && matches!(
+                            self.get_last_auth_failure(),
+                            Some(AuthFailureReason::ActivationFailed(_))
+                        )
+                    {
+                        // zipline#157 (Q1 ruling): a local activation
+                        // failure (address set, dynamic-grant route
+                        // install, route-owner conflict) is non-transient —
+                        // an EPERM will not clear on reconnect, and each
+                        // retry costs a full keying, a VS round trip, and a
+                        // fresh interactive OIDC prompt that masks the real
+                        // error as InteractionTimeout. Hard stop: stay
+                        // Inactive with the recorded ActivationFailed
+                        // reason (which ph-cli connect reports as this
+                        // attempt's terminal outcome); the operator re-runs
+                        // `ph-cli connect` after fixing the host.
+                        warn!(target: LINK_STATE, "{} not reconnecting after a fatal local activation failure; fix the host and re-run `ph-cli connect`", asm.formatted_link_id(link_id));
                     } else {
                         self.setup_restart(asm);
                     }

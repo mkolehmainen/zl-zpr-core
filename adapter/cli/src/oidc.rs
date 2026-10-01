@@ -1424,6 +1424,16 @@ mod tests {
         assert_eq!(exit_code_for_auth_failure("NoAgent"), 1);
         assert_eq!(exit_code_for_auth_failure("AgentError(\"x\")"), 1);
         assert_eq!(exit_code_for_auth_failure("AuthUnavailable"), 1);
+        // zipline#157: a fatal local activation failure is reported with
+        // its full text ("connect failed: ActivationFailed(...)" names the
+        // failed step) and the generic exit code — it is a host problem,
+        // not one of the authentication outcomes the 2-7 contract covers.
+        assert_eq!(
+            exit_code_for_auth_failure(
+                "ActivationFailed(\"failed to set ZPR address fd5a::1: EPERM\")"
+            ),
+            1
+        );
         assert_eq!(exit_code_for_auth_failure("something else"), 1);
 
         assert_eq!(
