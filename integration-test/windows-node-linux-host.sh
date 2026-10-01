@@ -20,7 +20,7 @@
 #   ... docker run (see windows-node-test.md) ...
 #   integration-test/windows-node-linux-host.sh up          # container
 #   integration-test/windows-node-linux-host.sh down        # container
-#   sudo -E integration-test/windows-node-linux-host.sh nat-down  # host, root
+#   sudo integration-test/windows-node-linux-host.sh nat-down     # host, root, no env needed
 #
 # nat-up/nat-down run on the HOST, not in the container: the container joins
 # the host network namespace (--network host) so the rules land in the same
@@ -41,14 +41,33 @@ ZPLC_BIN="${ZPLC_BIN:-$ROOT/../zl-zpr-compiler/target/debug/zplc}"
 
 die() { echo "windows-node-linux-host.sh: $*" >&2; exit 1; }
 
-[ -n "${WORK:-}" ] || die "WORK is not set (export WORK=\$(mktemp -d /tmp/win-node.XXXX))"
-[ -n "${VM_LAN_IP:-}" ] || die "VM_LAN_IP is not set (the Windows VM's IP as seen from this host)"
+# The three namespace /24s (10.0.[0-2].0/24) live inside this supernet; the
+# masquerade rule and the no-NAT alternative in the doc both use it.
+NS_SUPERNET=10.0.0.0/22
+
+# A VM inside one of the namespace /24s is unreachable by construction: the
+# host and the namespaces would treat it as on-link on an isolated veth and
+# neighbor-discover into nothing. Refuse loudly rather than fail obscurely
+# (review finding on zl-zpr-core#63).
+check_vm_ip() {
+    case "$VM_LAN_IP" in
+        10.0.0.*|10.0.1.*|10.0.2.*)
+            die "VM_LAN_IP=$VM_LAN_IP is inside a namespace subnet (10.0.[0-2].0/24): the host would treat the VM as on-link on an isolated veth. Move the VM to another subnet, or change the 10.0.x /24s in this script." ;;
+    esac
+}
+
+# Environment is validated per subcommand, not globally: a global check made
+# the documented plain-sudo `nat-down` exit before deleting anything, because
+# sudo resets WORK and VM_LAN_IP (review finding on zl-zpr-core#63).
+need_work()  { [ -n "${WORK:-}" ]      || die "WORK is not set (export WORK=\$(mktemp -d /tmp/win-node.XXXX))"; }
+need_vm_ip() { [ -n "${VM_LAN_IP:-}" ] || die "VM_LAN_IP is not set (the Windows VM's IP as seen from this host)"; }
 
 # ---------------------------------------------------------------------------
 # prepare: key material, policy, configs, compiled policy, VM staging dir.
 # Run on the host (needs zplc and zpr-pki, nothing privileged).
 # ---------------------------------------------------------------------------
 prepare() {
+    check_vm_ip
     [ -x "$ZPLC_BIN" ] || die "zplc not found at $ZPLC_BIN (build zl-zpr-compiler, or set ZPLC_BIN)"
     mkdir -p "$WORK"
 
@@ -198,6 +217,7 @@ EOF
 # network). Everything it starts records its PID in $WORK/pids.
 # ---------------------------------------------------------------------------
 up() {
+    check_vm_ip
     [ -x "$PH_BIN" ] || die "ph not found at $PH_BIN (make at the zl-zpr-core root, or set PH_BIN)"
     [ -x "$VS_BIN" ] || die "vs not found at $VS_BIN (make in zl-zpr-visaservice, or set VS_BIN)"
     [ -f "$WORK/windows-node.bin2" ] || die "no compiled policy in $WORK — run '$0 prepare' first"
@@ -290,21 +310,54 @@ up() {
 }
 
 # ---------------------------------------------------------------------------
-# nat-up / nat-down: forwarding + MASQUERADE for the namespace subnets, so
-# the adapters (10.0.x.0/24, behind veths) can reach the node on the VM. Run
-# on the HOST as root: the integration-test image has no iptables and its
-# /proc/sys is read-only, and with --network host the container shares this
-# network namespace anyway, so host rules cover it.
+# nat-up / nat-down: forwarding + filter accepts + MASQUERADE so the adapters
+# (10.0.x.0/24, behind veths) can reach the node on the VM. Run on the HOST
+# as root: the integration-test image has no iptables and its /proc/sys is
+# read-only, and with --network host the container shares this network
+# namespace anyway, so host rules cover it.
+#
+# Three pieces (Codex review findings on zl-zpr-core#63):
+#  - ip_forward, as before.
+#  - FORWARD accepts for the veth-zpr-* interfaces: on Docker hosts the
+#    filter-table FORWARD policy is DROP, so without these the namespace
+#    traffic is discarded in the filter table before NAT matters. Inserted
+#    at the top of the chain so Docker's own chains cannot shadow them.
+#  - MASQUERADE scoped to namespace->VM traffic only ($NS_SUPERNET ->
+#    $VM_LAN_IP/32) instead of "from 10.0.0.0/16 to anywhere but
+#    10.0.0.0/16": the old exclusion stopped masquerading exactly when the
+#    VM itself sat inside 10.0.0.0/16, leaving the VM with no route back.
+#    (A VM inside the namespace /24s themselves cannot work at all;
+#    check_vm_ip rejects that with guidance.)
 # ---------------------------------------------------------------------------
 nat_up() {
+    check_vm_ip
     sysctl -qw net.ipv4.ip_forward=1
-    iptables -t nat -A POSTROUTING -s 10.0.0.0/16 ! -d 10.0.0.0/16 -j MASQUERADE
-    echo "forwarding on, MASQUERADE for 10.0.0.0/16 installed."
+    iptables -I FORWARD 1 -i veth-zpr-+ -j ACCEPT
+    iptables -I FORWARD 2 -o veth-zpr-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    iptables -t nat -A POSTROUTING -s "$NS_SUPERNET" -d "$VM_LAN_IP/32" -j MASQUERADE
+    echo "forwarding on; FORWARD accepts for veth-zpr-*; MASQUERADE $NS_SUPERNET -> $VM_LAN_IP installed."
 }
 
+# nat-down deletes by scanning the live tables for what nat-up adds (plus the
+# broader 10.0.0.0/16 masquerade older revisions installed), so it needs no
+# environment: the documented plain `sudo ... nat-down` works even though
+# sudo resets WORK and VM_LAN_IP.
 nat_down() {
-    iptables -t nat -D POSTROUTING -s 10.0.0.0/16 ! -d 10.0.0.0/16 -j MASQUERADE 2>/dev/null || true
-    echo "MASQUERADE for 10.0.0.0/16 removed (ip_forward left as-is)."
+    local spec specs
+    specs=$(iptables -t nat -S POSTROUTING | grep -F -- '-j MASQUERADE' \
+                | grep -E -- '-s 10\.0\.0\.0/(16|22) ' || true)
+    while read -r spec; do
+        [ -n "$spec" ] || continue
+        # shellcheck disable=SC2086  # the rule spec must word-split
+        iptables -t nat ${spec/#-A /-D } || true
+    done <<< "$specs"
+    specs=$(iptables -S FORWARD | grep -F -- 'veth-zpr-+' || true)
+    while read -r spec; do
+        [ -n "$spec" ] || continue
+        # shellcheck disable=SC2086
+        iptables ${spec/#-A /-D } || true
+    done <<< "$specs"
+    echo "FORWARD accepts and MASQUERADE rules removed (ip_forward left as-is)."
 }
 
 # ---------------------------------------------------------------------------
@@ -321,14 +374,14 @@ down() {
     ip netns del zpr-a1 2>/dev/null || true
     ip netns del zpr-a2 2>/dev/null || true
     echo "Linux side down. \$WORK ($WORK) is left for inspection; remove it yourself."
-    echo "(run 'nat-down' on the host to remove the MASQUERADE rule)"
+    echo "(run 'nat-down' on the host to remove the FORWARD and MASQUERADE rules)"
 }
 
 case "${1:-}" in
-    prepare)  prepare ;;
-    nat-up)   nat_up ;;
-    up)       up ;;
-    down)     down ;;
+    prepare)  need_work; need_vm_ip; prepare ;;
+    nat-up)   need_vm_ip; nat_up ;;
+    up)       need_work; need_vm_ip; up ;;
+    down)     need_work; down ;;
     nat-down) nat_down ;;
     *) die "usage: $0 {prepare|nat-up|up|down|nat-down} (see integration-test/windows-node-test.md)" ;;
 esac

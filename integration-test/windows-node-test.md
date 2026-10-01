@@ -84,9 +84,11 @@ export WORK=$(mktemp -d /tmp/win-node.XXXX)
 # Generate keys, configs, policy; compiles the policy with zplc.
 integration-test/windows-node-linux-host.sh prepare
 
-# Forwarding + NAT so the namespaced adapters can reach the VM — on the
-# HOST, as root (the integration-test image has no iptables and a read-only
-# /proc/sys; with --network host the rules cover the container anyway).
+# Forwarding + FORWARD accepts + NAT so the namespaced adapters can reach
+# the VM — on the HOST, as root (the integration-test image has no iptables
+# and a read-only /proc/sys; with --network host the rules cover the
+# container anyway). The VM must NOT be inside 10.0.[0-2].0/24 — those are
+# the namespace subnets, and the script refuses such a VM_LAN_IP loudly.
 sudo -E integration-test/windows-node-linux-host.sh nat-up
 
 # Enter the integration-test container (host network; the capabilities and
@@ -121,12 +123,17 @@ For auditing; the script is the executable form of this list.
   host side, the same shape as `windows-adapter-test.md` 1b.
 * Unlike the adapter test, the node the adapters dock to is **not** on this
   host, so the namespaces need a route to the VM: `nat-up` (run on the host,
-  as root) enables `net.ipv4.ip_forward` and adds one `MASQUERADE` rule for
-  `10.0.0.0/16` (`nat-down` removes it). The VM therefore sees all three
-  adapters as the Linux host's LAN IP on distinct UDP source ports, which the
-  dock does not care about. (Alternative, if you prefer no NAT: add a route
-  on the VM for `10.0.0.0/16` via the Linux host's LAN IP and skip the
-  MASQUERADE.)
+  as root) enables `net.ipv4.ip_forward`, inserts `FORWARD` accept rules for
+  the `veth-zpr-*` interfaces (Docker hosts set the filter-table `FORWARD`
+  policy to DROP, which would discard the namespace traffic before NAT), and
+  adds one `MASQUERADE` rule scoped to namespace→VM traffic
+  (`10.0.0.0/22 -> $VM_LAN_IP/32`); `nat-down` removes all of them. The VM
+  therefore sees all three adapters as the Linux host's LAN IP on distinct
+  UDP source ports, which the dock does not care about. `VM_LAN_IP` must not
+  be inside the namespace subnets `10.0.[0-2].0/24` — the host would treat
+  the VM as on-link on an isolated veth; the script rejects that with
+  guidance. (Alternative, if you prefer no NAT: add a route on the VM for
+  `10.0.0.0/22` via the Linux host's LAN IP and skip the MASQUERADE.)
 * TUN devices are pre-created with their address already set, working around
   the Linux TUN bug described in `docs/SETUP.md` (required whenever
   `zpr_addr` is given): `fd5a:5052::1` for the vs adapter,
@@ -296,7 +303,9 @@ Remove-NetFirewallRule -DisplayName zpr-node-vss
 Linux (container shell): `integration-test/windows-node-linux-host.sh down`
 kills the started processes and deletes the namespaces. Back on the host:
 `sudo integration-test/windows-node-linux-host.sh nat-down` removes the
-MASQUERADE rule. Then `rm -rf "$WORK"`.
+FORWARD accepts and the MASQUERADE rule — it finds them by scanning the live
+tables, so it needs no environment and plain `sudo` (no `-E`) is correct
+here. Then `rm -rf "$WORK"`.
 
 ## Recording the result
 
