@@ -70,6 +70,13 @@ Windows VM:
   `ph.exe` — exactly as in `windows-adapter-test.md` "Prerequisites, Windows
   VM" (build commands, DLL source and signing notes are there; they are
   identical for the node role).
+* The VM must expose **more than one logical CPU** to Windows — check with
+  `(Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors`.
+  libvirt presents vCPUs as sockets by default and Windows 11 *Home* uses
+  only one socket, leaving 1 usable CPU; the node then livelocks (a
+  tokio/mio re-register loop starves the fastpath — the management side
+  goes silent for 13–25 s right after the VSAPI TLS handshake). libvirt
+  fix: `<topology sockets='1' cores='4'/>` in the domain XML.
 
 ## 1. Linux side up
 
@@ -160,11 +167,19 @@ Copy to a directory on the VM (e.g. `C:\zpr-node`):
 Firewall first. Two rules are *expected* to be necessary — the dock listener
 (UDP 5000 on the LAN interface) and the VSS listener (TCP 8183, reached over
 the Wintun interface, which Windows places on the Public profile where
-unsolicited inbound is dropped):
+unsolicited inbound is dropped). The dock rule can be added now:
 
 ```powershell
 New-NetFirewallRule -DisplayName zpr-node-dock -Direction Inbound `
   -Protocol UDP -LocalPort 5000 -Action Allow
+```
+
+The VSS rule **cannot be added up front**: `-InterfaceAlias zpr-node` fails
+with "The specified interface was not found" until `ph.exe node` has created
+the adapter. Add it from the second PowerShell after the node is up; once
+created it persists across node restarts and VM reboots:
+
+```powershell
 New-NetFirewallRule -DisplayName zpr-node-vss -Direction Inbound `
   -Protocol TCP -LocalPort 8183 -InterfaceAlias zpr-node -Action Allow
 ```
@@ -172,7 +187,8 @@ New-NetFirewallRule -DisplayName zpr-node-vss -Direction Inbound `
 Checklist item 3 asks which rules are *actually* required: on the first run,
 add no rules, watch what fails (no dock → UDP rule; dock up but the visa
 service never registers → VSS rule), add them one at a time and record the
-result. On later runs just add both up front.
+result. On later runs add the dock rule up front and the VSS rule after
+startup, if an earlier run has not already left it in place.
 
 Start the node from an **elevated** PowerShell (Wintun device creation
 requires it). The concrete `--self-addr` is decision N1 of the win-node plan:
@@ -313,20 +329,31 @@ Paste the transcript (node startup lines, `ph-cli` output from both sides,
 ping/HTTP/rate output, shutdown and the post-exit `Get-NetAdapter`) on the PR
 or issue the run verifies, and fill in **Findings** below in the same PR.
 
+Packet captures: `pktmon` on the VM does **not** capture Wintun traffic —
+capture on the Linux side instead (e.g.
+`ip netns exec zpr-vs tcpdump -ni tun0`).
+
 ## Findings
 
 *(filled in by the first run; keep one dated subsection per run)*
 
-### <YYYY-MM-DD> — first end-to-end run
+### 2026-10-01 — first end-to-end run
 
-* Build commit (`zl-zpr-core`): `________`
-* Windows version / OS build (`winver`): `________`
+* Build commit (`zl-zpr-core`): `1da1f10` (same build on the VM and the
+  Linux host) · vs `0.21.0` (`zl-zpr-visaservice` `546386f`)
+* Windows version / OS build (`winver`): Windows 11 Home 25H2, build
+  26200.9457
 
 | # | Checklist item | Result | Evidence / issue |
 |---|---|---|---|
-| 1 | tentative-address VSS bind | | |
-| 2 | `fd5a:5052::1` on-link via /128 route | | |
-| 3 | firewall rules actually required | | |
-| 4 | ≥2 adapters, one socket (numbers) | | |
-| 5 | `set_carrier` NOP, no visible effect | | |
-| 6 | Ctrl-C teardown + clean second start | | |
+| 1 | tentative-address VSS bind | **FAIL → fixed in `1da1f10`** | VSS bind failed on every start with error 10049 (`AddrNotAvailable`) while the freshly added address was still `Tentative` (applied at 36.93, `Tentative` at 37.41, bind fail at 37.86, `Preferred` at 38.82, `DadTransmits=1`). Fix: Windows `add_address` now waits, bounded at 5 s, for the address to leave the tentative state, reading DAD state via IP Helper `GetUnicastIpAddressEntry` (not netsh, whose text output is localized); wait loop in `sys/dad.rs` with 6 unit tests that run on Linux. After the fix the listener comes up: `TCP [fd5a:5052::2]:8183 LISTENING`. |
+| 2 | `fd5a:5052::1` on-link via /128 route | PASS | `netsh interface ipv6 show route`: `fd5a:5052::1/128 Manual zpr-node`; the node reached the VSAPI, visas were issued, all three links `Active`. |
+| 3 | firewall rules actually required | UDP 5000 **required**; TCP 8183 kept | With no rules all docks hit `handshake timeout`; adding `zpr-node-dock` (UDP 5000) let them dock. The `zpr-node-vss` (TCP 8183) rule was kept per the doc — the VS reaches the node's VSS through the Wintun interface on the Public profile. Removing it alone was not tested. |
+| 4 | ≥2 adapters, one socket (numbers) | recorded | flood ping loss **0 %** (500 packets, `-i 0.02`); `blob` download **6,751,114 bytes/s** (64 MiB in 9.94 s). |
+| 5 | `set_carrier` NOP, no visible effect | PASS | No carrier-related error; `Get-NetAdapter zpr-node`: Status `Up`, MediaConnectionState `Connected`. |
+| 6 | Ctrl-C teardown + clean second start | PASS (teardown) / second start: **zipline#167** | `Got Ctrl-C; attempting graceful shutdown` → `Removed peer link 13/12/10`, `VS API notify_disconnect succeeded`; `Get-NetAdapter zpr-node` → none; the process exits by itself. Second starts came up without held or orphan errors (one logged `Removed orphaned adapter "zpr-node 1"`). One of three restarts then failed to re-register with the VS — a VS/node restart ordering race, not Windows-specific, filed as [zipline#167](https://github.com/mkolehmainen/zipline/issues/167). |
+
+Minor observation, not filed: on Ctrl-C, `adapter1` received
+`Terminate ... reason Reset`, while `adapter2` dropped the node's terminate
+as `unexpected ZPI value 0 (expected ZPIPair { encr: 133, hmac: 6 })` and
+noticed the node had gone only through missed keep-alives.
