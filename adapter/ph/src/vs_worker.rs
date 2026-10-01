@@ -122,14 +122,31 @@ pub async fn launch(
                     Err(e) => {
                         error!(target: STARTUP, "failed to register VSS: {e:?}");
 
+                        // Tell the VS we are gone (best-effort), then recycle
+                        // the run loop so the retry starts from a clean dial
+                        // (zipline#167). Without the restart the run loop's
+                        // vs_handle stays set and every retry dies locally
+                        // with CommandFailed("connect called but already
+                        // connected to VS-API") — the node never re-registers.
                         let dreq = DisconnectNotice {
                             zpr_addr: None,
                             reason: DisconnectReason::LinkError,
                         };
                         if let Err(e) = vs_handle.notify_disconnect(dreq).await {
+                            // A dead VS link is not a reason to kill the node:
+                            // the VS has typically already dropped us (it
+                            // answers AuthRequired), so there is nothing to
+                            // deregister. Log and fall through to the restart.
                             error!(target: STARTUP, "error disconnecting from VS after failed registration: {e:?}");
-                            panic!("failed to establish connection to VS");
                         }
+                        if let Err(e) = vs_handle.restart().await {
+                            // Discarded mid-dial or during a reconnect delay
+                            // means a restart is already in progress — the
+                            // desired outcome either way.
+                            info!(target: STARTUP, "VSConn restart request not delivered (restart already in progress?): {e:?}");
+                        }
+                        // Re-gate on the fresh RunLoopStarts the re-dial emits.
+                        break;
                     }
                 }
             }
