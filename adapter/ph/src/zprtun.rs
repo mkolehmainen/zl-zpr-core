@@ -21,3 +21,22 @@ pub enum ZprTunError {
 
 /// TRUE if the platform TUN implementation supports per-packet packet info.
 pub const TUN_HAS_PI: bool = TunPi::PI_SIZE > 0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PR #66 review (P2): the TUN MTU must not depend on an address being
+    /// supplied at creation — an unspecified MTU gets `DEFAULT_TUN_MTU`,
+    /// not the kernel default (2000 for a macOS utun, above the overlay's
+    /// 1400).
+    #[test]
+    fn unspecified_mtu_defaults_to_overlay_mtu() {
+        assert_eq!(effective_tun_mtu(None), DEFAULT_TUN_MTU);
+    }
+
+    #[test]
+    fn explicit_mtu_wins() {
+        assert_eq!(effective_tun_mtu(Some(1500)), 1500);
+    }
+}
