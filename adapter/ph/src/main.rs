@@ -788,23 +788,14 @@ fn main() -> ExitCode {
                     .unwrap_or_else(|| "<TUN device>".to_string());
                 match &e {
                     SelfAddressError::Address { addr, .. } => {
-                        #[cfg(target_os = "linux")]
                         error!(
                             target: STARTUP,
-                            "{e}; configure it manually with: \
-                             ip -6 addr add {addr}/{ZPRNET_PREFIX_LEN} dev {ifname}"
-                        );
-                        #[cfg(target_os = "macos")]
-                        error!(
-                            target: STARTUP,
-                            "{e}; configure it manually with: \
-                             ifconfig {ifname} inet6 {addr}/{ZPRNET_PREFIX_LEN} alias"
-                        );
-                        #[cfg(windows)]
-                        error!(
-                            target: STARTUP,
-                            "{e}; configure it manually with: \
-                             netsh interface ipv6 add address {ifname} {addr}"
+                            "{e}; configure it manually with: {}",
+                            sys::addr_hint::manual_add_address_hint(
+                                addr,
+                                ZPRNET_PREFIX_LEN as usize,
+                                &ifname
+                            )
                         );
                     }
                     SelfAddressError::VsRoute { .. } => {
@@ -843,8 +834,12 @@ fn main() -> ExitCode {
                     error!(
                         target: STARTUP,
                         "node ZPR address {addr} is not configured on {ifname}; \
-                         configure it with: \
-                         ip -6 addr add {addr}/{ZPRNET_PREFIX_LEN} dev {ifname}"
+                         configure it with: {}",
+                        sys::addr_hint::manual_add_address_hint(
+                            addr,
+                            ZPRNET_PREFIX_LEN as usize,
+                            &ifname
+                        )
                     );
                 }
                 return ExitCode::FAILURE;
