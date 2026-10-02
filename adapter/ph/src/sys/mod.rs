@@ -32,6 +32,20 @@ pub(crate) mod macos_route;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod linux_route;
 
+// Pure parsing of macOS `ifconfig <if>` output for `has_address` (PR #66
+// review P1: unscoped ULA addresses were not recognized). Compiled on every
+// OS, same pattern and reason as `macos_route` above.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod macos_ifconfig;
+
+// The manual add-address hint printed when a node ZPR address cannot be
+// applied to, or is missing from, the TUN device (zipline#161). Compiled on
+// every OS, same pattern and reason as `macos_route`: the per-platform
+// command strings stay unit-testable from Linux builds. Only `main.rs`
+// calls it, so the library's copy of the module is dead code by design.
+#[allow(dead_code)]
+pub(crate) mod addr_hint;
+
 // Bounded wait for a freshly added address to leave the DAD tentative
 // state (zipline#162). Compiled on every OS, same pattern and reason as
 // `macos_route` above; only the Windows `add_address` calls it at runtime.

@@ -7,6 +7,7 @@ use tracing::*;
 use crate::logging::targets::NET_OS;
 use crate::sys::linux_route;
 use crate::sys::macos::tun;
+use crate::sys::macos_ifconfig;
 use crate::sys::macos_route::{self, ExistingRouteAction, RouteCmdResult};
 use crate::zprtun::ZprTunError;
 use std::process::Command;
@@ -36,6 +37,17 @@ impl ZprTun {
     /// Create a new TUN device.
     /// If `ifname` is `None`, the kernel will automatically assign a name.
     /// On macOS if the name is specificed, it must be of the form `utun[0-9]+`.
+    ///
+    /// The utun is created unaddressed — `address` is only used to pick the
+    /// address family of the control socket (IPv6 when `None`) — and is
+    /// addressed later via [`ZprTun::add_address`], the same lifecycle as
+    /// Linux and Windows (zipline#161).
+    ///
+    /// IPv4 ZPR addresses are not supported on macOS: `add_address` (like
+    /// `has_address`, `clear_address`, `add_route`) returns `Unsupported`
+    /// for IPv4, and no create-time path ever installed one — the old
+    /// builder `with_address` was never called (PR #66 review). The ZPR
+    /// internal network is IPv6 (`fd5a:5052::/32`).
     pub fn new_mq(
         ifname: Option<String>,
         concurrency: usize,
@@ -46,11 +58,8 @@ impl ZprTun {
                 "on macos concurrency (queues) must be 1",
             )));
         }
-        let addr = address.ok_or_else(|| {
-            ZprTunError::PlatformError(String::from("address is required on macos"))
-            // TODO: Temporary
-        })?;
-        let mut bldr = tun::Tun::builder(addr.into());
+        let ipv = address.map(tun::IPV::from).unwrap_or(tun::IPV::V6);
+        let mut bldr = tun::Tun::builder(ipv);
         if let Some(name) = ifname {
             bldr.with_tun_name(&name);
         }
@@ -413,7 +422,11 @@ impl ZprTun {
         //
         // utun2: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 2000
         //         inet6 fe80::e9b0:1972:d221:2196%utun2 prefixlen 64 scopeid 0x11
+        //         inet6 fd5a:5052::abcd prefixlen 64
         //         nd6 options=201<PERFORMNUD,DAD>
+        //
+        // Note the %utun2 scope suffix on the link-local address and its
+        // absence on the ZPR ULA — the parser handles both (PR #66 review).
         if !output.status.success() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -424,14 +437,36 @@ impl ZprTun {
                 ),
             ));
         }
-        // Just look for the pattern "inet6 <addr>" + "%" in the output.
         let out_str = String::from_utf8_lossy(&output.stdout);
-        Ok(out_str.contains(&format!("inet6 {}%", addr)))
+        match addr {
+            IpAddr::V4(_) => unreachable!("rejected above"),
+            IpAddr::V6(v6) => Ok(macos_ifconfig::reports_inet6_address(&out_str, v6)),
+        }
     }
 }
 
 impl AsFd for ZprTun {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.inner.as_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// zipline#161: `new_mq` must create a utun with no address supplied —
+    /// the device comes up unaddressed (IPv6 control socket) and is
+    /// addressed later via `add_address`, as on Linux and Windows.
+    ///
+    /// Creating a utun needs root, so this is part of the operator's
+    /// macOS gate: `sudo cargo test -p ph -- --ignored`.
+    #[test]
+    #[ignore = "requires root; run with sudo cargo test -- --ignored"]
+    fn new_mq_without_address_creates_ipv6_utun() {
+        let devs = ZprTun::new_mq(Some("utun9".into()), 1, None)
+            .expect("new_mq with no address must create the utun");
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].inner.get_name(), "utun9");
     }
 }

@@ -282,12 +282,13 @@ fn main() -> ExitCode {
     // open TUN devices and actor requeue sockets
     //
 
-    // If a zpr_addr is supplied we use it on the TUN.  Otherwise we hand the TUN create code a
-    // local address which we never use.
-    // TODO: Can we create a TUN with no address on it?
-
-    // TODO: Currently on linux we cannot configure a TUN interface with an IPv6 address.
-    // So if you set tun_if in the config we assume TUN is there and has a static ZPR address.
+    // The TUN device is never addressed at creation on any platform
+    // (zipline#161): it is created bare and addressed later via
+    // `add_address` once the node's ZPR address is known. The value
+    // computed here only picks the address family of the control socket
+    // on macOS (IPv6 when None) and is ignored on Linux and Windows,
+    // which is why a placeholder is fine — it is never put on the wire
+    // or on the device.
     let tun_addr = if !config.zpr_addr.is_empty() {
         if config.tun_if.is_none() {
             Some(config.zpr_addr[0].clone())
@@ -788,23 +789,14 @@ fn main() -> ExitCode {
                     .unwrap_or_else(|| "<TUN device>".to_string());
                 match &e {
                     SelfAddressError::Address { addr, .. } => {
-                        #[cfg(target_os = "linux")]
                         error!(
                             target: STARTUP,
-                            "{e}; configure it manually with: \
-                             ip -6 addr add {addr}/{ZPRNET_PREFIX_LEN} dev {ifname}"
-                        );
-                        #[cfg(target_os = "macos")]
-                        error!(
-                            target: STARTUP,
-                            "{e}; configure it manually with: \
-                             ifconfig {ifname} inet6 {addr}/{ZPRNET_PREFIX_LEN} alias"
-                        );
-                        #[cfg(windows)]
-                        error!(
-                            target: STARTUP,
-                            "{e}; configure it manually with: \
-                             netsh interface ipv6 add address {ifname} {addr}"
+                            "{e}; configure it manually with: {}",
+                            sys::addr_hint::manual_add_address_hint(
+                                addr,
+                                ZPRNET_PREFIX_LEN as usize,
+                                &ifname
+                            )
                         );
                     }
                     SelfAddressError::VsRoute { .. } => {
@@ -843,8 +835,12 @@ fn main() -> ExitCode {
                     error!(
                         target: STARTUP,
                         "node ZPR address {addr} is not configured on {ifname}; \
-                         configure it with: \
-                         ip -6 addr add {addr}/{ZPRNET_PREFIX_LEN} dev {ifname}"
+                         configure it with: {}",
+                        sys::addr_hint::manual_add_address_hint(
+                            addr,
+                            ZPRNET_PREFIX_LEN as usize,
+                            &ifname
+                        )
                     );
                 }
                 return ExitCode::FAILURE;
