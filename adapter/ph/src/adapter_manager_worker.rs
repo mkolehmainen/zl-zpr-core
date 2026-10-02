@@ -97,8 +97,14 @@ fn do_request_tether_id(asm: &Arc<Assembly>, pkt: Packet) {
             Ok(PacketStatus::Acked) => (),
 
             Ok(PacketStatus::Canceled) => {
-                mgmt::adapter::deny_tether(&task_asm, &txn, "Network error issuing bind request")
-                    .unwrap();
+                // NoSuchTransaction means the entry is already gone: the
+                // dock link went down and its teardown flushed the ELT
+                // (zipline#170). Nothing is left to deny.
+                let _ = mgmt::adapter::deny_tether(
+                    &task_asm,
+                    &txn,
+                    "Network error issuing bind request",
+                );
             }
 
             Err(MgmtSendError::LinkClosed) => (),

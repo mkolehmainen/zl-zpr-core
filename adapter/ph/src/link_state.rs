@@ -2641,7 +2641,16 @@ impl LinkStateWrapper {
                 asm.peer_table.clear_peer_state(link_id);
 
                 match self.link_type {
-                    LinkType::AdapterToNode => asm.tun_ctl.set_carrier(false).unwrap(),
+                    LinkType::AdapterToNode => {
+                        asm.tun_ctl.set_carrier(false).unwrap();
+                        // Every tether in the flow tables was set up with the
+                        // node on this docking session; none survives it, and
+                        // a restarted node knows none of their stream ids.
+                        // Flush them so the next session binds afresh
+                        // (zipline#170).
+                        asm.elt.clear();
+                        asm.dlt.clear();
+                    }
                     LinkType::NodeToAdapter => join_set = self.deregister_actor_addresses(asm),
                     _ => {}
                 }
@@ -7841,6 +7850,77 @@ mod tests {
                     "restart must recycle the run loop, not stop run_with_reconnect"
                 );
                 vsconn_task.abort();
+            })
+            .await
+    }
+
+    /// zipline#170: tearing down an adapter's dock link must flush the
+    /// adapter's flow tables. Every ELT stream id and DLT entry was issued
+    /// by the node on the old docking session; a restarted node knows none
+    /// of them, so a surviving ELT entry sends on a stream id the node drops
+    /// (`Unknown Stream ID`) and never triggers a fresh bind. A Pending entry
+    /// orphaned by the closed link would block re-binding its flow forever.
+    #[tokio::test]
+    async fn test_adapter_dock_link_cleanup_flushes_elt_and_dlt() {
+        use crate::adapter_tables::{DltPep, EltPep};
+        use crate::defs::FiveTuple;
+        use crate::mgmt::core::new_heap_packet;
+        use crate::mgmt::txn_mgr::TxnMgr;
+        use zpr::packet_info::CompressionMode;
+
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let txn_mgr = Arc::new(TxnMgr::new());
+
+                // One Active ELT entry, as left behind by a completed bind.
+                let active_ft = FiveTuple {
+                    src_port: 1000,
+                    ..FiveTuple::default()
+                };
+                let txn = txn_mgr.try_open().unwrap();
+                asm.elt
+                    .insert_pending(active_ft, new_heap_packet(), &txn)
+                    .unwrap();
+                asm.elt
+                    .set_active(&active_ft, EltPep::new(CompressionMode::default(), 7, None))
+                    .unwrap();
+
+                // One Pending ELT entry, as left by a bind in flight at close.
+                let pending_ft = FiveTuple {
+                    src_port: 2000,
+                    ..FiveTuple::default()
+                };
+                let pending_txn = txn_mgr.try_open().unwrap();
+                asm.elt
+                    .insert_pending(pending_ft, new_heap_packet(), &pending_txn)
+                    .unwrap();
+
+                // One DLT entry, as installed by a node's bind_egress_stream.
+                let dlt_id = asm
+                    .dlt
+                    .insert(DltPep::new(crate::tc::Ip5TupleTc::new(active_ft), None))
+                    .unwrap();
+
+                let peer = asm.peer_table.get(link_id).unwrap();
+                peer.link_state_machine.test_set_state(LinkState::Closing);
+                let _ = peer.link_state_machine.clean_up_link_state(&asm);
+                drop(peer);
+
+                assert!(
+                    asm.elt.get(&active_ft).is_none(),
+                    "Active ELT entry must be flushed"
+                );
+                assert!(
+                    asm.elt.get(&pending_ft).is_none(),
+                    "Pending ELT entry must be flushed"
+                );
+                assert!(
+                    asm.elt.lookup_pending(&pending_txn).is_err(),
+                    "the flushed Pending entry's transaction must be forgotten too"
+                );
+                assert!(asm.dlt.get(dlt_id).is_none(), "DLT entry must be flushed");
             })
             .await
     }
