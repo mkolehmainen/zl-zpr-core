@@ -244,6 +244,18 @@ function wait_all_carriers() {
   return 0
 }
 
+# One quick end-to-end probe: node->VS and a->c. Carrier alone is not a
+# readiness signal after a node restart — the surviving namespaces' tun
+# carriers never drop, so wait_all_carriers returns long before the
+# restarted node has re-authenticated and the adapters' visas are rebuilt
+# (~25s of auth + re-dock). Used with wait_for so the strict ping_test
+# below only runs once the data path is actually back.
+function zpr_data_path_up() {
+  sudo ip netns exec zpr-node ping -q -c 1 -W 2 "$VS_ZPR_ADDR" > /dev/null 2>&1 || return 1
+  sudo ip netns exec zpr-a ping -q -c 1 -W 2 "$C_ZPR_ADDR" > /dev/null 2>&1 || return 1
+  return 0
+}
+
 # Succeed once node.log has grown past line $1 with a VSS registration
 # attempt — either outcome. "registered VSS" is the success line;
 # "failed to register VSS" is the losing side of the race.
@@ -341,6 +353,16 @@ if [[ "$PASS" == 0 ]]; then
     # re-docked adapters need a little time for auth + visas.
     if ! wait_all_carriers 90; then
       echo "ROUND $round FAILED: carrier did not return after node restart"
+      PASS=1
+      break
+    fi
+
+    # Carrier is necessary but not sufficient: the VS only notices the dead
+    # dock link after ~3 missed keep-alives and the adapters re-dock a few
+    # seconds later, so give the data path time to actually come back before
+    # the strict all-pairs ping check.
+    if ! wait_for 90 zpr_data_path_up; then
+      echo "ROUND $round FAILED: data path did not return after node restart"
       PASS=1
       break
     fi
