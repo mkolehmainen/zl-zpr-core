@@ -6,6 +6,43 @@
 //! Linux builds, same pattern and reason as `macos_route`: the decision of
 //! *which* command to print is pure, only the caller is platform-specific.
 
+use std::net::IpAddr;
+
+/// The platform whose command syntax the hint uses. Separated from the
+/// `cfg` so every arm is testable on every build host.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Platform {
+    Linux,
+    MacOs,
+    Windows,
+}
+
+/// The current platform's arm.
+const CURRENT: Platform = if cfg!(target_os = "linux") {
+    Platform::Linux
+} else if cfg!(target_os = "macos") {
+    Platform::MacOs
+} else {
+    Platform::Windows
+};
+
+/// The hint in `platform`'s command syntax.
+fn hint_for(platform: Platform, addr: &IpAddr, prefix_len: usize, ifname: &str) -> String {
+    match platform {
+        Platform::Linux => format!("ip -6 addr add {addr}/{prefix_len} dev {ifname}"),
+        Platform::MacOs => format!("ifconfig {ifname} inet6 {addr}/{prefix_len} alias"),
+        // netsh's add-address form takes no prefix length, and the
+        // interface comes before the address.
+        Platform::Windows => format!("netsh interface ipv6 add address {ifname} {addr}"),
+    }
+}
+
+/// The command an operator runs to put `addr/prefix_len` on `ifname` by
+/// hand, in the current platform's syntax.
+pub fn manual_add_address_hint(addr: &IpAddr, prefix_len: usize, ifname: &str) -> String {
+    hint_for(CURRENT, addr, prefix_len, ifname)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
