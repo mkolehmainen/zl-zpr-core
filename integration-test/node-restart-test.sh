@@ -10,25 +10,36 @@
 # ("connect called but already connected to VS-API") and never recovered.
 #
 # The test brings up the one-node-test.sh topology to all-Active, then
-# restarts the node several times with the VS kept running. On the forced
-# round ($FORCE_RACE_ROUND) the VS's own adapter is SIGSTOPped across the
-# restart, so the node's registration PROVABLY wins the race against the
-# adapter re-dock; the adapter is resumed only after the node has logged a
-# registration attempt. Pass = carrier and pings return on every round.
+# restarts the node several times with the VS kept running. There is no race
+# to force on the node side: a restarted node always calls register_vss
+# BEFORE it forwards the VS adapter's re-dock to the VS (deferred_vs_connect,
+# sent only once the VSS is registered). What decides whether the VS still
+# holds its own adapter's actor at that point is how the old node left:
+#
+#   - kill (SIGKILL, crash semantics): the node says nothing; its replacement
+#     connects with ctype=Reset, whose teardown always spared the VS adapter.
+#   - graceful (SIGINT): the node sends a NodeShutdown self-disconnect, and
+#     the VS's disconnect cascade ran over every adapter docked to it — the
+#     path that dropped the VS's own adapter before the zipline#167 fix.
+#
+# The graceful round ($GRACEFUL_ROUND) waits for the VS to log that
+# NodeShutdown disconnect before relaunching, so the cascade provably ran
+# before the new node registers. The other rounds SIGKILL the node.
+# Pass = carrier and pings return on every round.
+#
+# No process is ever SIGSTOPped: an earlier forced round froze the VS adapter,
+# which cut the node's only path to the VS and left the sudo wrappers stopped
+# so cleanup hung (https://github.com/mkolehmainen/zipline/issues/171).
 set -euo pipefail
 
 export RUST_BACKTRACE=1
 DEBUG_TARGETS=${DEBUG_TARGETS:-all=INFO}
 KM_IMPL=${KM_IMPL:-noise}
 
-# How many node restarts, and on which round to force the bad ordering.
-# FORCE_RACE_ROUND=0 (the default) runs plain restarts only: the forced
-# round cannot currently force the race — SIGSTOPping the VS adapter also
-# cuts the node's only path to the VS — and a failed forced round hangs
-# cleanup on the stopped sudo wrapper
-# (https://github.com/mkolehmainen/zipline/issues/171).
+# How many node restarts, and which one is graceful (SIGINT) rather than a
+# SIGKILL. GRACEFUL_ROUND=0 runs SIGKILL restarts only.
 RESTART_ROUNDS=${RESTART_ROUNDS:-3}
-FORCE_RACE_ROUND=${FORCE_RACE_ROUND:-0}
+GRACEFUL_ROUND=${GRACEFUL_ROUND:-2}
 
 PH_BIN="${PH_BIN:-$(realpath "$(dirname "$0")/../target/debug/ph")}"
 PH_DEBUG_BIN="${PH_DEBUG_BIN:-$(realpath "$(dirname "$0")/../target/debug/ph-cli")}"
@@ -269,20 +280,17 @@ function zpr_data_path_up() {
   return 0
 }
 
-# Succeed once node.log has grown past line $1 with a VSS registration
-# attempt — either outcome. "registered VSS" is the success line;
-# "failed to register VSS" is the losing side of the race.
-function node_attempted_register() {
-  tail -n +"$(( $1 + 1 ))" node.log | grep -qE "registered VSS|failed to register VSS"
+# Succeed once vs.log has grown past line $1 with the VS processing the
+# node's graceful-shutdown self-disconnect — the cascade over its adapters.
+function vs_saw_node_shutdown() {
+  tail -n +"$(( $1 + 1 ))" vs.log | grep -q "disconnect actor at $NODE_ZPR_ADDR for reason NodeShutdown"
 }
 
-# Kill the node (crash semantics: SIGKILL, no goodbye to anyone) and
-# relaunch it. With $1 == "force", SIGSTOP the VS's own adapter first and
-# resume it only after the restarted node has logged a registration
-# attempt — the node's register_vss provably wins the race against the
-# VS-adapter re-dock.
+# Stop the node and relaunch it. $1 == "graceful" sends SIGINT and, before
+# relaunching, waits for the VS to have processed the node's NodeShutdown
+# disconnect; anything else SIGKILLs it (crash semantics, no goodbye).
 function restart_node() {
-  local force=$1 node_pid vs_adapter_pid log_mark
+  local mode=$1 node_pid vs_log_mark
 
   node_pid=$(ph_pid_for_socket "$NODE_SOCK")
   if [ -z "$node_pid" ]; then
@@ -290,38 +298,28 @@ function restart_node() {
     return 1
   fi
 
-  if [ "$force" == "force" ]; then
-    vs_adapter_pid=$(ph_pid_for_socket "$VS_SOCK")
-    if [ -z "$vs_adapter_pid" ]; then
-      echo "could not find the VS adapter's pid"
+  vs_log_mark=$(wc -l < vs.log)
+
+  if [ "$mode" == "graceful" ]; then
+    echo "Stopping node gracefully ($node_pid)"
+    sudo kill -SIGINT "$node_pid"
+  else
+    echo "Killing node ($node_pid)"
+    sudo kill -SIGKILL "$node_pid"
+  fi
+  wait_for 15 process_exited "$node_pid" || { echo "node did not exit"; return 1; }
+
+  if [ "$mode" == "graceful" ]; then
+    if ! wait_for 10 vs_saw_node_shutdown "$vs_log_mark"; then
+      echo "VS never processed the node's NodeShutdown disconnect"
       return 1
     fi
-    echo "Forcing the race: SIGSTOP VS adapter ($vs_adapter_pid)"
-    sudo kill -SIGSTOP "$vs_adapter_pid"
+    echo "VS processed the node's NodeShutdown disconnect"
   fi
-
-  log_mark=$(wc -l < node.log)
-
-  echo "Killing node ($node_pid)"
-  sudo kill -SIGKILL "$node_pid"
-  wait_for 15 process_exited "$node_pid" || { echo "node did not exit"; return 1; }
 
   sleep 1
   echo "Relaunching node"
   launch_node
-
-  if [ "$force" == "force" ]; then
-    # Only resume the VS adapter after the node has demonstrably tried to
-    # register — i.e. after its registration won the race.
-    if ! wait_for 60 node_attempted_register "$log_mark"; then
-      echo "restarted node never attempted VSS registration"
-      sudo kill -SIGCONT "$vs_adapter_pid" || true
-      return 1
-    fi
-    echo "Node attempted registration; SIGCONT VS adapter ($vs_adapter_pid)"
-    sudo kill -SIGCONT "$vs_adapter_pid"
-  fi
-
   return 0
 }
 
@@ -351,12 +349,12 @@ fi
 
 if [[ "$PASS" == 0 ]]; then
   for (( round=1; round<=RESTART_ROUNDS; round++ )); do
-    FORCE=no
-    if [[ "$round" == "$FORCE_RACE_ROUND" ]]; then FORCE=force; fi
+    MODE=kill
+    if [[ "$round" == "$GRACEFUL_ROUND" ]]; then MODE=graceful; fi
     echo
-    echo "==== Node restart round $round/$RESTART_ROUNDS (force race: $FORCE) ===="
+    echo "==== Node restart round $round/$RESTART_ROUNDS ($MODE) ===="
 
-    if ! restart_node "$FORCE"; then
+    if ! restart_node "$MODE"; then
       echo "ROUND $round FAILED: restart"
       PASS=1
       break
