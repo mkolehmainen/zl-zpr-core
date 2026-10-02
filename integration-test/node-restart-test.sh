@@ -216,43 +216,51 @@ sudo -E ip netns exec zpr-b sudo -E -u "$ZPR_USER" "$PH_BIN" \
   --node-addr "$NODE_SUBSTRATE_ADDR_B" \
   --zpr-addr "$B_ZPR_ADDR" 2>&1 | tee adapter2.log | prefix_log zpr-b &
 
-sudo -E ip netns exec zpr-c sudo -E -u "$ZPR_USER" "$PH_BIN" \
-  adapter \
-  --logging "$DEBUG_TARGETS" \
-  --control-path "$ADAPTER3_SOCK" \
-  --self-addr "$C_SUBSTRATE_ADDR" \
-  --ca-file ca.crt \
-  --bootstrap-key actor3-rsa.key \
-  --name adapter3 \
-  --km-impl "$KM_IMPL" \
-  --tun-if tun0 \
-  --node-addr "$NODE_SUBSTRATE_ADDR_C" \
-  --zpr-addr "$C_ZPR_ADDR" 2>&1 | tee adapter3.log | prefix_log zpr-c &
+if [[ "$NUM_ACTORS" -ge 3 ]]; then
+  sudo -E ip netns exec zpr-c sudo -E -u "$ZPR_USER" "$PH_BIN" \
+    adapter \
+    --logging "$DEBUG_TARGETS" \
+    --control-path "$ADAPTER3_SOCK" \
+    --self-addr "$C_SUBSTRATE_ADDR" \
+    --ca-file ca.crt \
+    --bootstrap-key actor3-rsa.key \
+    --name adapter3 \
+    --km-impl "$KM_IMPL" \
+    --tun-if tun0 \
+    --node-addr "$NODE_SUBSTRATE_ADDR_C" \
+    --zpr-addr "$C_ZPR_ADDR" 2>&1 | tee adapter3.log | prefix_log zpr-c &
+fi
 
 #
 # Helpers for the restart loop
 #
 
-# All five TUN carriers up, allowing $1 seconds.
+# All TUN carriers up (five in three-actor mode, four with --num_actors 2),
+# allowing $1 seconds.
 function wait_all_carriers() {
   local timeout=$1
   wait_for "$timeout" check_carrier zpr-node tun0 || return 1
   wait_for "$timeout" check_carrier zpr-vs tun0 || return 1
   wait_for "$timeout" check_carrier zpr-a tun0 || return 1
   wait_for "$timeout" check_carrier zpr-b tun0 || return 1
-  wait_for "$timeout" check_carrier zpr-c tun0 || return 1
+  if [[ "$NUM_ACTORS" -ge 3 ]]; then
+    wait_for "$timeout" check_carrier zpr-c tun0 || return 1
+  fi
   return 0
 }
 
-# One quick end-to-end probe: node->VS and a->c. Carrier alone is not a
+# One quick end-to-end probe: node->VS plus one actor-to-actor pair (a->c in
+# three-actor mode, a->b with --num_actors 2). Carrier alone is not a
 # readiness signal after a node restart — the surviving namespaces' tun
 # carriers never drop, so wait_all_carriers returns long before the
 # restarted node has re-authenticated and the adapters' visas are rebuilt
 # (~25s of auth + re-dock). Used with wait_for so the strict ping_test
 # below only runs once the data path is actually back.
 function zpr_data_path_up() {
+  local peer_addr=$B_ZPR_ADDR
+  if [[ "$NUM_ACTORS" -ge 3 ]]; then peer_addr=$C_ZPR_ADDR; fi
   sudo ip netns exec zpr-node ping -q -c 1 -W 2 "$VS_ZPR_ADDR" > /dev/null 2>&1 || return 1
-  sudo ip netns exec zpr-a ping -q -c 1 -W 2 "$C_ZPR_ADDR" > /dev/null 2>&1 || return 1
+  sudo ip netns exec zpr-a ping -q -c 1 -W 2 "$peer_addr" > /dev/null 2>&1 || return 1
   return 0
 }
 
