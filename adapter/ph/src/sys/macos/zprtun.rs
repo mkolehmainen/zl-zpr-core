@@ -36,6 +36,11 @@ impl ZprTun {
     /// Create a new TUN device.
     /// If `ifname` is `None`, the kernel will automatically assign a name.
     /// On macOS if the name is specificed, it must be of the form `utun[0-9]+`.
+    ///
+    /// The utun is created unaddressed — `address` is only used to pick the
+    /// address family of the control socket (IPv6 when `None`) — and is
+    /// addressed later via [`ZprTun::add_address`], the same lifecycle as
+    /// Linux and Windows (zipline#161).
     pub fn new_mq(
         ifname: Option<String>,
         concurrency: usize,
@@ -46,11 +51,8 @@ impl ZprTun {
                 "on macos concurrency (queues) must be 1",
             )));
         }
-        let addr = address.ok_or_else(|| {
-            ZprTunError::PlatformError(String::from("address is required on macos"))
-            // TODO: Temporary
-        })?;
-        let mut bldr = tun::Tun::builder(addr.into());
+        let ipv = address.map(tun::IPV::from).unwrap_or(tun::IPV::V6);
+        let mut bldr = tun::Tun::builder(ipv);
         if let Some(name) = ifname {
             bldr.with_tun_name(&name);
         }
@@ -433,5 +435,25 @@ impl ZprTun {
 impl AsFd for ZprTun {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.inner.as_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// zipline#161: `new_mq` must create a utun with no address supplied —
+    /// the device comes up unaddressed (IPv6 control socket) and is
+    /// addressed later via `add_address`, as on Linux and Windows.
+    ///
+    /// Creating a utun needs root, so this is part of the operator's
+    /// macOS gate: `sudo cargo test -p ph -- --ignored`.
+    #[test]
+    #[ignore = "requires root; run with sudo cargo test -- --ignored"]
+    fn new_mq_without_address_creates_ipv6_utun() {
+        let devs = ZprTun::new_mq(Some("utun9".into()), 1, None)
+            .expect("new_mq with no address must create the utun");
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].inner.get_name(), "utun9");
     }
 }
