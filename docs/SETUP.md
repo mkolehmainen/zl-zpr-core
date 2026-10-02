@@ -466,6 +466,57 @@ For an end-to-end walkthrough against a Linux node and visa service, see
 [`integration-test/windows-adapter-test.md`](../integration-test/windows-adapter-test.md).
 
 
+## macOS
+
+`ph node` runs on a Mac — Apple Silicon or Intel — started by hand with
+`sudo ph node -c x.toml` exactly as on Linux. It creates a utun interface,
+applies its own ZPR address to it, accepts docking adapters, forwards their
+traffic, and reaches the visa service through its own TUN. This section
+covers the **node role only**; see the last paragraph for the adapter role.
+
+**macOS node constraints** (deliberate, in this release):
+
+* **A dev/demo node** — the adapters and the visa service stay on Linux;
+  functional parity with Linux is the bar, not throughput. No launchd
+  service; `ph` is started by hand from a terminal.
+* **`sudo` is required** — creating a utun needs root, same as the TUN on
+  Linux.
+* **A single, unbatched datapath worker** — the macOS `posix_unbatched`
+  engine forces one worker (`new_mq` rejects more). Wildcard and
+  multi-homed binds are allowed (unix pktinfo), unlike the Windows node.
+  Measured single-worker numbers are in the test document below.
+* **One `ph` instance per user without `--control-path`**: the default
+  control path is derived from the owner alone, so a node and an adapter
+  for the same user on one host need explicit `--control-path`s to coexist
+  ([zipline#169](https://github.com/mkolehmainen/zipline/issues/169)).
+
+**Addressing.** The node creates the utun through `TunCtl` and applies its
+ZPR address with `ifconfig <utun> inet6 <addr>/32 alias`. The alias alone
+installs the on-link `fd5a:5052::/32` route via the utun — no explicit
+route is needed; the kernel does it as part of the alias (verified in the
+first end-to-end run, 2026-10-02). No manual `ifconfig` or `route` step is
+required before starting the node.
+
+**Firewall.** The application firewall was **not exercised** in the first
+end-to-end run — it was disabled on the test Mac
+(`socketfilterfw --getglobalstate`: State = 0) and left off by choice.
+`/usr/libexec/ApplicationFirewall/socketfilterfw` is the knob to check if
+inbound UDP on the dock port or TCP 8183 (the VSS listener) is blocked on
+a Mac where the firewall is on; no tested command set exists yet.
+
+The hand-run, end-to-end verification of the macOS node (a Mac forwarding
+real traffic between Linux adapters and hosting the visa service's support
+service) is
+[`integration-test/macos-node-test.md`](../integration-test/macos-node-test.md);
+run it whenever a change touches the macOS node path. There is no automated
+macOS end-to-end tier.
+
+**The adapter role on macOS is undocumented.** The code exists (the
+original macOS adapter port) but has no hand-run test document and no
+section here; documenting and hand-testing it is
+[zipline#174](https://github.com/mkolehmainen/zipline/issues/174).
+
+
 ## Certificate and peer verification reference
 
 ### Local certificate (`certificate_file` / `name`)
