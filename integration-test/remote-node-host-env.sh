@@ -1,26 +1,29 @@
 #!/bin/bash
-# Linux-host side of integration-test/windows-node-test.md (zipline#162).
+# Linux-host side of the remote-node test documents:
+# integration-test/windows-node-test.md (zipline#162) and
+# integration-test/macos-node-test.md (zipline#164).
 #
-# The Windows VM runs `ph node`; this script builds everything else: keys,
-# policy and configs (`prepare`, run on the host), then valkey, the visa
-# service, the visa service's adapter and two client adapters in network
-# namespaces (`up`, run inside the zpr-integration-test container with
-# --network host), and tears it down again (`down`). The document is the
-# authority on what this builds and why; keep the two in sync.
+# A remote machine — a Windows VM or a Mac — runs `ph node`; this script
+# builds everything else: keys, policy and configs (`prepare`, run on the
+# host), then valkey, the visa service, the visa service's adapter and two
+# client adapters in network namespaces (`up`, run inside the
+# zpr-integration-test container with --network host), and tears it down
+# again (`down`). The documents are the authority on what this builds and
+# why; keep them in sync.
 #
 # Deliberately NOT named *-test.sh: the Makefile's docker-test target sweeps
-# that glob, and this script needs a Windows VM on the network, which the
+# that glob, and this script needs a remote node on the network, which the
 # automated tier does not have.
 #
 # Usage:
-#   export VM_LAN_IP=<Windows VM IP as seen from this host>
-#   export WORK=$(mktemp -d /tmp/win-node.XXXX)
-#   integration-test/windows-node-linux-host.sh prepare     # host, unprivileged
-#   sudo -E integration-test/windows-node-linux-host.sh nat-up    # host, root
-#   ... docker run (see windows-node-test.md) ...
-#   integration-test/windows-node-linux-host.sh up          # container
-#   integration-test/windows-node-linux-host.sh down        # container
-#   sudo integration-test/windows-node-linux-host.sh nat-down     # host, root, no env needed
+#   export NODE_LAN_IP=<remote node's IP as seen from this host>
+#   export WORK=$(mktemp -d /tmp/zpr-node.XXXX)
+#   integration-test/remote-node-host-env.sh prepare     # host, unprivileged
+#   sudo -E integration-test/remote-node-host-env.sh nat-up    # host, root
+#   ... docker run (see the test document) ...
+#   integration-test/remote-node-host-env.sh up          # container
+#   integration-test/remote-node-host-env.sh down        # container
+#   sudo integration-test/remote-node-host-env.sh nat-down     # host, root, no env needed
 #
 # nat-up/nat-down run on the HOST, not in the container: the container joins
 # the host network namespace (--network host) so the rules land in the same
@@ -39,41 +42,41 @@ PHCLI_BIN="${PHCLI_BIN:-$ROOT/target/debug/ph-cli}"
 VS_BIN="${VS_BIN:-$ROOT/../zl-zpr-visaservice/target/debug/vs}"
 ZPLC_BIN="${ZPLC_BIN:-$ROOT/../zl-zpr-compiler/target/debug/zplc}"
 
-die() { echo "windows-node-linux-host.sh: $*" >&2; exit 1; }
+die() { echo "remote-node-host-env.sh: $*" >&2; exit 1; }
 
 # The three namespace /24s (10.0.[0-2].0/24) live inside this supernet; the
 # masquerade rule and the no-NAT alternative in the doc both use it.
 NS_SUPERNET=10.0.0.0/22
 
-# A VM inside one of the namespace /24s is unreachable by construction: the
-# host and the namespaces would treat it as on-link on an isolated veth and
-# neighbor-discover into nothing. Refuse loudly rather than fail obscurely
-# (review finding on zl-zpr-core#63).
-check_vm_ip() {
-    case "$VM_LAN_IP" in
+# A remote node inside one of the namespace /24s is unreachable by
+# construction: the host and the namespaces would treat it as on-link on an
+# isolated veth and neighbor-discover into nothing. Refuse loudly rather
+# than fail obscurely (review finding on zl-zpr-core#63).
+check_node_ip() {
+    case "$NODE_LAN_IP" in
         10.0.0.*|10.0.1.*|10.0.2.*)
-            die "VM_LAN_IP=$VM_LAN_IP is inside a namespace subnet (10.0.[0-2].0/24): the host would treat the VM as on-link on an isolated veth. Move the VM to another subnet, or change the 10.0.x /24s in this script." ;;
+            die "NODE_LAN_IP=$NODE_LAN_IP is inside a namespace subnet (10.0.[0-2].0/24): the host would treat the remote node as on-link on an isolated veth. Move the node machine to another subnet, or change the 10.0.x /24s in this script." ;;
     esac
 }
 
 # Environment is validated per subcommand, not globally: a global check made
 # the documented plain-sudo `nat-down` exit before deleting anything, because
-# sudo resets WORK and VM_LAN_IP (review finding on zl-zpr-core#63).
-need_work()  { [ -n "${WORK:-}" ]      || die "WORK is not set (export WORK=\$(mktemp -d /tmp/win-node.XXXX))"; }
-need_vm_ip() { [ -n "${VM_LAN_IP:-}" ] || die "VM_LAN_IP is not set (the Windows VM's IP as seen from this host)"; }
+# sudo resets WORK and NODE_LAN_IP (review finding on zl-zpr-core#63).
+need_work()    { [ -n "${WORK:-}" ]        || die "WORK is not set (export WORK=\$(mktemp -d /tmp/zpr-node.XXXX))"; }
+need_node_ip() { [ -n "${NODE_LAN_IP:-}" ] || die "NODE_LAN_IP is not set (the remote node's IP as seen from this host)"; }
 
 # ---------------------------------------------------------------------------
-# prepare: key material, policy, configs, compiled policy, VM staging dir.
+# prepare: key material, policy, configs, compiled policy, node staging dir.
 # Run on the host (needs zplc and zpr-pki, nothing privileged).
 # ---------------------------------------------------------------------------
 prepare() {
-    check_vm_ip
+    check_node_ip
     [ -x "$ZPLC_BIN" ] || die "zplc not found at $ZPLC_BIN (build zl-zpr-compiler, or set ZPLC_BIN)"
     mkdir -p "$WORK"
 
     # Key material. actor1 -> adapter1, actor2 -> adapter2, actorvs + a
     # generated vs.zpr noise cert for the visa service's adapter. The node's
-    # material goes to the staging dir for the VM.
+    # material goes to the staging dir for the remote machine.
     cp "$PREGEN/ca-cert.pem"         "$WORK/ca.crt"
     cp "$PREGEN/ca-key.pem"          "$WORK/ca.key"
     cp "$PREGEN/actor1-rsa.key"      "$WORK/adapter1-rsa.key"
@@ -90,18 +93,19 @@ prepare() {
     "$ZPR_PKI" gensignedcert "$WORK/ca.crt" "$WORK/ca.key" \
         /CN=vs.zpr 1 < "$WORK/vs.zpr.pubkey" > "$WORK/vs.zpr.crt"
 
-    # Staging dir: everything the Windows VM needs, in one place.
-    mkdir -p "$WORK/vm"
-    cp "$PREGEN/ca-cert.pem"       "$WORK/vm/ca.crt"
-    cp "$PREGEN/node-cert.pem"     "$WORK/vm/node.crt"
-    cp "$PREGEN/node.key"          "$WORK/vm/node.key"
-    cp "$PREGEN/node-rsa-key.pem"  "$WORK/vm/node-rsa-key.pem"
+    # Staging dir: everything the remote node machine needs, in one place.
+    mkdir -p "$WORK/node"
+    cp "$PREGEN/ca-cert.pem"       "$WORK/node/ca.crt"
+    cp "$PREGEN/node-cert.pem"     "$WORK/node/node.crt"
+    cp "$PREGEN/node.key"          "$WORK/node/node.key"
+    cp "$PREGEN/node-rsa-key.pem"  "$WORK/node/node-rsa-key.pem"
 
-    # The policy: the Windows VM is the node; adapter2 serves ping + HTTP
+    # The policy: the remote machine is the node; adapter2 serves ping + HTTP
     # :8080 to adapter1, adapter1 serves ping back. Every packet between
-    # them is forwarded by the VM.
-    cat > "$WORK/windows-node.zpl" <<'EOF'
-# Windows node test policy (integration-test/windows-node-test.md).
+    # them is forwarded by the remote node.
+    cat > "$WORK/remote-node.zpl" <<'EOF'
+# Remote-node test policy (integration-test/windows-node-test.md,
+# integration-test/macos-node-test.md).
 
 define adapter as a device with zpr.adapter.cn.
 
@@ -121,7 +125,7 @@ define VsAdmin as a device with zpr.adapter.cn:'client.zpr.org'.
 allow VsAdmin to access VisaService.
 EOF
 
-    cat > "$WORK/windows-node.zplc" <<EOF
+    cat > "$WORK/remote-node.zplc" <<EOF
 # -*- mode: toml -*-
 
 [resolver]
@@ -129,7 +133,7 @@ order = ["hosts", "dns"]
 
 [resolver.hosts]
 "n0.zpr" = "fd5a:5052::2"
-"n0.overlay" = "$VM_LAN_IP"
+"n0.overlay" = "$NODE_LAN_IP"
 
 [nodes."node"]
 provider = [ [ "device.zpr.adapter.cn", "node" ] ]
@@ -202,33 +206,33 @@ EOF
     mkdir -p "$WORK/www"
     [ -f "$WORK/www/blob" ] || dd if=/dev/urandom of="$WORK/www/blob" bs=1M count=64 status=none
 
-    # Compile the policy; zplc prints the output name (windows-node.bin2).
-    "$ZPLC_BIN" -c "$WORK/windows-node.zplc" -d "$WORK" "$WORK/windows-node.zpl"
+    # Compile the policy; zplc prints the output name (remote-node.bin2).
+    "$ZPLC_BIN" -c "$WORK/remote-node.zplc" -d "$WORK" "$WORK/remote-node.zpl"
 
     echo
     echo "prepare done."
-    echo "  copy to the VM : $WORK/vm/{ca.crt,node.crt,node.key,node-rsa-key.pem}"
-    echo "  next           : enter the container and run '$0 up' (see windows-node-test.md)"
+    echo "  copy to the node machine : $WORK/node/{ca.crt,node.crt,node.key,node-rsa-key.pem}"
+    echo "  next                     : enter the container and run '$0 up' (see the test document)"
 }
 
 # ---------------------------------------------------------------------------
-# up: namespaces, NAT to the VM, valkey, vs, vs-adapter, adapter1, adapter2,
-# HTTP server. Run inside the zpr-integration-test container (root, host
-# network). Everything it starts records its PID in $WORK/pids.
+# up: namespaces, NAT to the remote node, valkey, vs, vs-adapter, adapter1,
+# adapter2, HTTP server. Run inside the zpr-integration-test container (root,
+# host network). Everything it starts records its PID in $WORK/pids.
 # ---------------------------------------------------------------------------
 up() {
-    check_vm_ip
+    check_node_ip
     [ -x "$PH_BIN" ] || die "ph not found at $PH_BIN (make at the zl-zpr-core root, or set PH_BIN)"
     [ -x "$VS_BIN" ] || die "vs not found at $VS_BIN (make in zl-zpr-visaservice, or set VS_BIN)"
-    [ -f "$WORK/windows-node.bin2" ] || die "no compiled policy in $WORK — run '$0 prepare' first"
+    [ -f "$WORK/remote-node.bin2" ] || die "no compiled policy in $WORK — run '$0 prepare' first"
     cd "$WORK"
     : > "$WORK/pids"
 
     # Namespaces: zpr-vs (valkey + vs + vs adapter), zpr-a1, zpr-a2. Each on
     # a veth /24 to the host namespace with a default route back, the same
     # layout as windows-adapter-test.md 1b — but here the node the adapters
-    # dock to is on the VM, not this host, so the host forwards and
-    # masquerades their traffic out to the LAN (removed by `down`).
+    # dock to is on the remote machine, not this host, so the host forwards
+    # and masquerades their traffic out to the LAN (removed by `down`).
     ip netns add zpr-vs; ip netns add zpr-a1; ip netns add zpr-a2
     ip -n zpr-vs link set lo up; ip -n zpr-a1 link set lo up; ip -n zpr-a2 link set lo up
     ip link add veth-zpr-vs type veth peer veth0 netns zpr-vs
@@ -264,18 +268,18 @@ up() {
     echo $! >> "$WORK/pids"
     sleep 1
 
-    ip netns exec zpr-vs "$VS_BIN" -c vs-config.toml --clear-state windows-node.bin2 >vs.log 2>&1 &
+    ip netns exec zpr-vs "$VS_BIN" -c vs-config.toml --clear-state remote-node.bin2 >vs.log 2>&1 &
     echo $! >> "$WORK/pids"
     sleep 2
 
-    # The visa service's adapter, docking to the node ON THE VM. The dock
-    # retries in the background, so this works whether or not ph.exe is up
-    # yet; the link goes Active on its own once it is.
+    # The visa service's adapter, docking to the node ON THE REMOTE MACHINE.
+    # The dock retries in the background, so this works whether or not the
+    # remote `ph node` is up yet; the link goes Active on its own once it is.
     ip netns exec zpr-vs "$PH_BIN" adapter -l all=INFO \
         --control-path "$WORK/vs-adapter.sock" \
         --ca-file ca.crt --certificate-file vs.zpr.crt --private-key-file vs.zpr.key \
         --bootstrap-key actorvs-rsa.key \
-        --tun-if tun0 --node-addr "$VM_LAN_IP:5000" --zpr-addr fd5a:5052::1 \
+        --tun-if tun0 --node-addr "$NODE_LAN_IP:5000" --zpr-addr fd5a:5052::1 \
         >vs-adapter.log 2>&1 &
     echo $! >> "$WORK/pids"
     sleep 2
@@ -283,14 +287,14 @@ up() {
     ip netns exec zpr-a1 "$PH_BIN" adapter -l all=INFO \
         --control-path "$WORK/adapter1.sock" \
         --ca-file ca.crt --bootstrap-key adapter1-rsa.key --name adapter1 \
-        --tun-if tun0 --node-addr "$VM_LAN_IP:5000" --zpr-addr fd5a:5052:8888::1:1 \
+        --tun-if tun0 --node-addr "$NODE_LAN_IP:5000" --zpr-addr fd5a:5052:8888::1:1 \
         >adapter1.log 2>&1 &
     echo $! >> "$WORK/pids"
 
     ip netns exec zpr-a2 "$PH_BIN" adapter -l all=INFO \
         --control-path "$WORK/adapter2.sock" \
         --ca-file ca.crt --bootstrap-key adapter2-rsa.key --name adapter2 \
-        --tun-if tun0 --node-addr "$VM_LAN_IP:5000" --zpr-addr fd5a:5052:8888::2:1 \
+        --tun-if tun0 --node-addr "$NODE_LAN_IP:5000" --zpr-addr fd5a:5052:8888::2:1 \
         >adapter2.log 2>&1 &
     echo $! >> "$WORK/pids"
     sleep 2
@@ -301,20 +305,20 @@ up() {
     echo $! >> "$WORK/pids"
 
     echo
-    echo "Linux side up. Link state (NOT Active until ph.exe node runs on the VM):"
+    echo "Linux side up. Link state (NOT Active until ph node runs on the remote machine):"
     "$PHCLI_BIN" -p "$WORK/vs-adapter.sock" link show || true
     "$PHCLI_BIN" -p "$WORK/adapter1.sock" link show || true
     "$PHCLI_BIN" -p "$WORK/adapter2.sock" link show || true
     echo
-    echo "next: start ph.exe node on the VM (windows-node-test.md section 2)."
+    echo "next: start ph node on the remote machine (see the test document, section 2)."
 }
 
 # ---------------------------------------------------------------------------
 # nat-up / nat-down: forwarding + filter accepts + MASQUERADE so the adapters
-# (10.0.x.0/24, behind veths) can reach the node on the VM. Run on the HOST
-# as root: the integration-test image has no iptables and its /proc/sys is
-# read-only, and with --network host the container shares this network
-# namespace anyway, so host rules cover it.
+# (10.0.x.0/24, behind veths) can reach the node on the remote machine. Run
+# on the HOST as root: the integration-test image has no iptables and its
+# /proc/sys is read-only, and with --network host the container shares this
+# network namespace anyway, so host rules cover it.
 #
 # Three pieces (Codex review findings on zl-zpr-core#63):
 #  - ip_forward, as before.
@@ -322,26 +326,26 @@ up() {
 #    filter-table FORWARD policy is DROP, so without these the namespace
 #    traffic is discarded in the filter table before NAT matters. Inserted
 #    at the top of the chain so Docker's own chains cannot shadow them.
-#  - MASQUERADE scoped to namespace->VM traffic only ($NS_SUPERNET ->
-#    $VM_LAN_IP/32) instead of "from 10.0.0.0/16 to anywhere but
+#  - MASQUERADE scoped to namespace->node traffic only ($NS_SUPERNET ->
+#    $NODE_LAN_IP/32) instead of "from 10.0.0.0/16 to anywhere but
 #    10.0.0.0/16": the old exclusion stopped masquerading exactly when the
-#    VM itself sat inside 10.0.0.0/16, leaving the VM with no route back.
-#    (A VM inside the namespace /24s themselves cannot work at all;
-#    check_vm_ip rejects that with guidance.)
+#    node machine itself sat inside 10.0.0.0/16, leaving it with no route
+#    back. (A node machine inside the namespace /24s themselves cannot work
+#    at all; check_node_ip rejects that with guidance.)
 # ---------------------------------------------------------------------------
 nat_up() {
-    check_vm_ip
+    check_node_ip
     sysctl -qw net.ipv4.ip_forward=1
     iptables -I FORWARD 1 -i veth-zpr-+ -j ACCEPT
     iptables -I FORWARD 2 -o veth-zpr-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-    iptables -t nat -A POSTROUTING -s "$NS_SUPERNET" -d "$VM_LAN_IP/32" -j MASQUERADE
-    echo "forwarding on; FORWARD accepts for veth-zpr-*; MASQUERADE $NS_SUPERNET -> $VM_LAN_IP installed."
+    iptables -t nat -A POSTROUTING -s "$NS_SUPERNET" -d "$NODE_LAN_IP/32" -j MASQUERADE
+    echo "forwarding on; FORWARD accepts for veth-zpr-*; MASQUERADE $NS_SUPERNET -> $NODE_LAN_IP installed."
 }
 
 # nat-down deletes by scanning the live tables for what nat-up adds (plus the
 # broader 10.0.0.0/16 masquerade older revisions installed), so it needs no
 # environment: the documented plain `sudo ... nat-down` works even though
-# sudo resets WORK and VM_LAN_IP.
+# sudo resets WORK and NODE_LAN_IP.
 nat_down() {
     local spec specs
     specs=$(iptables -t nat -S POSTROUTING | grep -F -- '-j MASQUERADE' \
@@ -378,10 +382,10 @@ down() {
 }
 
 case "${1:-}" in
-    prepare)  need_work; need_vm_ip; prepare ;;
-    nat-up)   need_vm_ip; nat_up ;;
-    up)       need_work; need_vm_ip; up ;;
+    prepare)  need_work; need_node_ip; prepare ;;
+    nat-up)   need_node_ip; nat_up ;;
+    up)       need_work; need_node_ip; up ;;
     down)     need_work; down ;;
     nat-down) nat_down ;;
-    *) die "usage: $0 {prepare|nat-up|up|down|nat-down} (see integration-test/windows-node-test.md)" ;;
+    *) die "usage: $0 {prepare|nat-up|up|down|nat-down} (see integration-test/windows-node-test.md or macos-node-test.md)" ;;
 esac

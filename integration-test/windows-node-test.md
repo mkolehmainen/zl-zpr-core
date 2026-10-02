@@ -28,7 +28,9 @@ Two machines:
   integration-test Docker image with `--network host`. Each `ph adapter` gets
   its own network namespace because running two adapters in one namespace is
   unsupported (the second refuses activation: "already routes to interface").
-  `integration-test/windows-node-linux-host.sh` scripts this whole side; the
+  `integration-test/remote-node-host-env.sh` scripts this whole side (it is
+  shared with `macos-node-test.md` — the remote node can be a Windows VM or
+  a Mac); the
   layout it builds is described in "Linux-side layout" below.
 
 The keys and certificates come from `integration-test/pregen` and are
@@ -85,18 +87,18 @@ driven by two variables: the VM's LAN IP as seen from the Linux host, and a
 scratch directory.
 
 ```sh
-export VM_LAN_IP=192.168.122.188     # the Windows VM's IP as seen FROM THE LINUX HOST
-export WORK=$(mktemp -d /tmp/win-node.XXXX)
+export NODE_LAN_IP=192.168.122.188   # the Windows VM's IP as seen FROM THE LINUX HOST
+export WORK=$(mktemp -d /tmp/zpr-node.XXXX)
 
 # Generate keys, configs, policy; compiles the policy with zplc.
-integration-test/windows-node-linux-host.sh prepare
+integration-test/remote-node-host-env.sh prepare
 
 # Forwarding + FORWARD accepts + NAT so the namespaced adapters can reach
 # the VM — on the HOST, as root (the integration-test image has no iptables
 # and a read-only /proc/sys; with --network host the rules cover the
 # container anyway). The VM must NOT be inside 10.0.[0-2].0/24 — those are
-# the namespace subnets, and the script refuses such a VM_LAN_IP loudly.
-sudo -E integration-test/windows-node-linux-host.sh nat-up
+# the namespace subnets, and the script refuses such a NODE_LAN_IP loudly.
+sudo -E integration-test/remote-node-host-env.sh nat-up
 
 # Enter the integration-test container (host network; the capabilities and
 # the apparmor opt-out are what `ip netns` and TUN creation need — narrower
@@ -104,12 +106,12 @@ sudo -E integration-test/windows-node-linux-host.sh nat-up
 docker run --rm -it --network host \
   --cap-add=NET_ADMIN --cap-add=SYS_ADMIN --cap-add=NET_RAW \
   --security-opt apparmor=unconfined --device /dev/net/tun \
-  -e VM_LAN_IP -v "$(realpath ..)":"$(realpath ..)" -v "$WORK":"$WORK" -e WORK \
+  -e NODE_LAN_IP -v "$(realpath ..)":"$(realpath ..)" -v "$WORK":"$WORK" -e WORK \
   -w "$PWD" zpr-integration-test bash
 
 # Inside the container: namespaces, valkey, vs, vs-adapter, adapter1,
 # adapter2, and the HTTP server behind adapter2.
-integration-test/windows-node-linux-host.sh up
+integration-test/remote-node-host-env.sh up
 ```
 
 `up` ends by printing `ph-cli link show` for each adapter. **No link is
@@ -134,18 +136,18 @@ For auditing; the script is the executable form of this list.
   the `veth-zpr-*` interfaces (Docker hosts set the filter-table `FORWARD`
   policy to DROP, which would discard the namespace traffic before NAT), and
   adds one `MASQUERADE` rule scoped to namespace→VM traffic
-  (`10.0.0.0/22 -> $VM_LAN_IP/32`); `nat-down` removes all of them. The VM
+  (`10.0.0.0/22 -> $NODE_LAN_IP/32`); `nat-down` removes all of them. The VM
   therefore sees all three adapters as the Linux host's LAN IP on distinct
-  UDP source ports, which the dock does not care about. `VM_LAN_IP` must not
-  be inside the namespace subnets `10.0.[0-2].0/24` — the host would treat
-  the VM as on-link on an isolated veth; the script rejects that with
+  UDP source ports, which the dock does not care about. `NODE_LAN_IP` must
+  not be inside the namespace subnets `10.0.[0-2].0/24` — the host would
+  treat the VM as on-link on an isolated veth; the script rejects that with
   guidance. (Alternative, if you prefer no NAT: add a route on the VM for
   `10.0.0.0/22` via the Linux host's LAN IP and skip the MASQUERADE.)
 * TUN devices are pre-created with their address already set, working around
   the Linux TUN bug described in `docs/SETUP.md` (required whenever
   `zpr_addr` is given): `fd5a:5052::1` for the vs adapter,
   `fd5a:5052:8888::1:1` / `::2:1` for `adapter1` / `adapter2`.
-* Policy (`$WORK/windows-node.zpl` + `.zplc`): the node is the VM
+* Policy (`$WORK/remote-node.zpl` + `.zplc`): the node is the VM
   (`substrate_addrs.in1 = "<VM LAN IP>:5000"`, ZPR address `fd5a:5052::2`);
   services `A2Web` (TCP 8080) and `A2Ping` behind `adapter2`, `A1Ping`
   behind `adapter1`; `allow A1 to access A2Web / A2Ping`, `allow A2 to
@@ -154,15 +156,15 @@ For auditing; the script is the executable form of this list.
 * Identities: `actor1` → `adapter1`, `actor2` → `adapter2`, `actorvs` + a
   generated `vs.zpr` noise certificate for the vs adapter; the node's key
   material (`node.key`, `node.crt`, `node-rsa-key.pem`) is staged in
-  `$WORK/vm/` for copying to the VM.
+  `$WORK/node/` for copying to the VM.
 
 ## 2. Windows side
 
 Copy to a directory on the VM (e.g. `C:\zpr-node`):
 
 * `ph.exe`, `ph-cli.exe`, `wintun.dll` (all three in the same directory),
-* from the Linux host, the staged node material: `$WORK/vm/ca.crt`,
-  `$WORK/vm/node.crt`, `$WORK/vm/node.key`, `$WORK/vm/node-rsa-key.pem`.
+* from the Linux host, the staged node material: `$WORK/node/ca.crt`,
+  `$WORK/node/node.crt`, `$WORK/node/node.key`, `$WORK/node/node-rsa-key.pem`.
 
 Firewall first. Two rules are *expected* to be necessary — the dock listener
 (UDP 5000 on the LAN interface) and the VSS listener (TCP 8183, reached over
@@ -316,9 +318,9 @@ Remove-NetFirewallRule -DisplayName zpr-node-dock
 Remove-NetFirewallRule -DisplayName zpr-node-vss
 ```
 
-Linux (container shell): `integration-test/windows-node-linux-host.sh down`
+Linux (container shell): `integration-test/remote-node-host-env.sh down`
 kills the started processes and deletes the namespaces. Back on the host:
-`sudo integration-test/windows-node-linux-host.sh nat-down` removes the
+`sudo integration-test/remote-node-host-env.sh nat-down` removes the
 FORWARD accepts and the MASQUERADE rule — it finds them by scanning the live
 tables, so it needs no environment and plain `sudo` (no `-E`) is correct
 here. Then `rm -rf "$WORK"`.
