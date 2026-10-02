@@ -382,13 +382,25 @@ fn main() -> ExitCode {
     // address: ask the OS which local address routes to the node, and use
     // it as our self address so that every substrate socket binds the same
     // concrete address. Done once, with a throwaway probe socket, before
-    // any substrate socket exists (zipline#175).
+    // any substrate socket exists (zipline#175). The probe binds our
+    // configured port, so the route is chosen for the 5-tuple the
+    // substrate sockets will actually use; if no port was configured, we
+    // adopt the one the OS gave the probe, for the same reason.
     if let Some(node_addr) = config.node_addr {
         if config.self_addr.ip().is_unspecified() {
             let local = sys::substrate::resolve_local_addr(config.self_addr, node_addr)
                 .unwrap_or_else(|e| panic!("unable to connect to node_addr ({node_addr}): {e}"));
             config.self_addr.set_scoped_ip(local.scoped_ip());
             info!(target: STARTUP, "assigned substrate address {}", local.scoped_ip());
+            if config.self_addr.port() == 0 {
+                // ponytail: the port is free between the probe's drop and
+                // the first bind below; another process grabbing that exact
+                // ephemeral port in that window fails the bind (a startup
+                // panic, not misrouting). Hold the probe open across the
+                // bind with SO_REUSEPORT if that is ever seen.
+                config.self_addr.set_port(local.port());
+                info!(target: STARTUP, "assigned substrate UDP port {}", local.port());
+            }
         }
     }
 
