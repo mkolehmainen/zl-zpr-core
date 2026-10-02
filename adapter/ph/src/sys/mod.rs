@@ -32,6 +32,12 @@ pub(crate) mod macos_route;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod linux_route;
 
+// The manual add-address hint printed when a node ZPR address cannot be
+// applied to, or is missing from, the TUN device (zipline#161). Compiled on
+// every OS, same pattern and reason as `macos_route`: the per-platform
+// command strings stay unit-testable from Linux builds.
+pub(crate) mod addr_hint;
+
 // Bounded wait for a freshly added address to leave the DAD tentative
 // state (zipline#162). Compiled on every OS, same pattern and reason as
 // `macos_route` above; only the Windows `add_address` calls it at runtime.
