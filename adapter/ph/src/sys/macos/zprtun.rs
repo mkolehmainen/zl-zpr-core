@@ -7,6 +7,7 @@ use tracing::*;
 use crate::logging::targets::NET_OS;
 use crate::sys::linux_route;
 use crate::sys::macos::tun;
+use crate::sys::macos_ifconfig;
 use crate::sys::macos_route::{self, ExistingRouteAction, RouteCmdResult};
 use crate::zprtun::ZprTunError;
 use std::process::Command;
@@ -415,7 +416,11 @@ impl ZprTun {
         //
         // utun2: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 2000
         //         inet6 fe80::e9b0:1972:d221:2196%utun2 prefixlen 64 scopeid 0x11
+        //         inet6 fd5a:5052::abcd prefixlen 64
         //         nd6 options=201<PERFORMNUD,DAD>
+        //
+        // Note the %utun2 scope suffix on the link-local address and its
+        // absence on the ZPR ULA — the parser handles both (PR #66 review).
         if !output.status.success() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -426,9 +431,11 @@ impl ZprTun {
                 ),
             ));
         }
-        // Just look for the pattern "inet6 <addr>" + "%" in the output.
         let out_str = String::from_utf8_lossy(&output.stdout);
-        Ok(out_str.contains(&format!("inet6 {}%", addr)))
+        match addr {
+            IpAddr::V4(_) => unreachable!("rejected above"),
+            IpAddr::V6(v6) => Ok(macos_ifconfig::reports_inet6_address(&out_str, v6)),
+        }
     }
 }
 

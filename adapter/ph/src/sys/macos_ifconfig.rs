@@ -23,6 +23,28 @@
 //! `sys::macos::zprtun` calls it at runtime, but compiling it on every OS
 //! keeps it unit-testable from a Linux build.
 
+use std::net::Ipv6Addr;
+
+/// Report whether `ifconfig <if>` output shows `addr` configured.
+///
+/// An address line is `inet6 <addr>[%scope] prefixlen …`; the `%<ifname>`
+/// scope suffix appears only on link-local addresses. The token is parsed
+/// back to an [`Ipv6Addr`] and compared by value, so textual variants
+/// match and a shorter address cannot substring-match a longer one.
+pub fn reports_inet6_address(ifconfig_stdout: &str, addr: Ipv6Addr) -> bool {
+    ifconfig_stdout.lines().any(|line| {
+        let Some(rest) = line.trim_start().strip_prefix("inet6 ") else {
+            return false;
+        };
+        let Some(token) = rest.split_whitespace().next() else {
+            return false;
+        };
+        // Strip the %scope suffix link-local addresses carry.
+        let token = token.split('%').next().unwrap_or(token);
+        token.parse::<Ipv6Addr>() == Ok(addr)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
