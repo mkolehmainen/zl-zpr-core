@@ -102,6 +102,12 @@ WORK=$(mktemp -d /tmp/zpr-node.XXXX)`, then
 Windows-specific. As there, **no link is `Active`** until the node is up in
 section 2 — the adapters retry their dock in the background.
 
+**Run `nat-up` before `up`.** If the adapters start first, their UDP flows
+get conntrack entries without NAT; the node then sees the namespace
+addresses (`10.0.x.2`) as sources, its replies go nowhere, and every
+handshake times out until those entries expire (about a minute, during
+which the node accumulates `Keying` links that never complete).
+
 ## 2. Mac side
 
 Copy from the Linux host to a working directory on the Mac (e.g.
@@ -155,8 +161,10 @@ On the Mac (second terminal):
 
 ```sh
 cd ~/zpr-node
-sudo ./ph-cli link show        # expect THREE links (vs adapter, adapter1, adapter2), all (Active)
-sudo ./ph-cli counters
+# NOT under sudo: `sudo ph node` binds /var/run/zpr/<SUDO_UID>/control.sock
+# owned by you, and `sudo ph-cli` (uid 0) would look in /var/run/zpr/0/.
+./ph-cli link show             # expect THREE links (vs adapter, adapter1, adapter2), all (Active)
+./ph-cli counters
 ifconfig utun9                 # the utun exists and carries fd5a:5052::2 prefixlen 32
 netstat -rn -f inet6 | grep -i 'fd5a:5052\|utun9'   # route shape — evidence for checklist item 1
 ```
@@ -262,17 +270,40 @@ Packet captures, if needed: `tcpdump -ni utun9` works on the Mac;
 
 *(filled in by the first run; keep one dated subsection per run)*
 
-### YYYY-MM-DD — first end-to-end run
+### 2026-10-02 — first end-to-end run
 
-* Build commit (`zl-zpr-core`): `______` (same build on the Mac and the
-  Linux host) · vs `______` (`zl-zpr-visaservice` `______`)
-* macOS version / chip: macOS 26.5.2, Apple M2
+* Build commit (`zl-zpr-core`): `4a0e815` (same build on the Mac and the
+  Linux host) · vs `d741bdc` (`zl-zpr-visaservice`)
+* macOS version / chip: macOS 26.5.2, Apple M2 (arm64), Mac on Wi-Fi
+  (192.168.0.65); Linux host NATs the adapters as 192.168.0.212
 
 | # | Checklist item | Result | Evidence / issue |
 |---|---|---|---|
-| 1 | route shape after `/32 alias` (on-link vs explicit; /32 vs /128) | | |
-| 2 | `tun_if` set (`utun9`) and unset (kernel-chosen) both start | | |
-| 3 | wildcard `self_addr` + pktinfo reply steering | | |
-| 4 | application firewall: UDP 5000 / TCP 8183, `socketfilterfw` fix | | |
-| 5 | ≥2 adapters, one socket (numbers) | | loss: ___ % · rate: ___ bytes/s |
-| 6 | Ctrl-C teardown + clean second start | | |
+| 1 | route shape after `/32 alias` (on-link vs explicit; /32 vs /128) | PASS | Before: no `fd5a` routes. After: kernel installs `fd5a:5052::/32 … Uc utun9` on-link plus `fd5a:5052::2 link#21 UHL lo0`. VS registered (`registered VSS`), VSS TLS connection from `[fd5a:5052::1]`, adapters Active — the alias alone suffices; no explicit `add_route` needed. The /32 is harmless for a node: everything else in the ZPR network is forwarded by the node itself, so no change to the zipline#159 helper. |
+| 2 | `tun_if` set (`utun9`) and unset (kernel-chosen) both start | PASS | `--tun-if utun9`: `utun9` created and addressed. Unset: kernel chose `utun6` (system had `utun0`–`utun5`), same address + `/32` route, 3 links Active, ping 4/4, HTTP OK. |
+| 3 | wildcard `self_addr` + pktinfo reply steering | PASS | `--self-addr 0.0.0.0:5000` (`udp4 *.5000`), all three docks complete and stay Active through the flood ping and 64 MiB fetch. Single Mac address only (scope note; zipline#172). |
+| 4 | application firewall: UDP 5000 / TCP 8183, `socketfilterfw` fix | N-A | Firewall disabled (`socketfilterfw --getglobalstate`: State = 0); left off by choice. No rules needed or added. |
+| 5 | ≥2 adapters, one socket (numbers) | PASS | loss: 0 % (500/500, `-i 0.02`, rtt avg 15.5 ms over Wi-Fi) · rate: 8432600 bytes/s (64 MiB `blob`) |
+| 6 | Ctrl-C teardown + clean second start | PASS | `Got SIGINT; attempting graceful shutdown`, links reset, visas revoked, `notify_disconnect succeeded`, process exits on its own. `ifconfig utun9`: does not exist; no `fd5a` routes. All three adapters log `Received terminate for dock link … fully shut down`. Second start with the same command line: clean (re-binds the leftover `control.sock` path), adapters Active again in ~10 s, ping 4/4, HTTP OK. |
+
+Other observations from this run:
+
+* **Doc fix:** section 3 used `sudo ./ph-cli`; that fails (`no live packet
+  handler socket (tried /var/run/zpr/0/control.sock …)`) because the
+  sudo-started node binds `/var/run/zpr/<SUDO_UID>/control.sock`. Fixed to
+  plain `./ph-cli`.
+* **Doc fix:** `nat-up` must precede `up` (see section 1 note). This run
+  started the adapters first; the first docks arrived un-NATed from
+  `10.0.x.2` and timed out until conntrack expired (~1 min), then docked
+  normally from `192.168.0.212`.
+* **Stale `Keying` links:** those three un-NATed links (3–5) stayed in
+  `Keying` on the node for the whole run, re-timing-out the handshake, and
+  were only removed at shutdown. Not macOS-specific — a node keeps
+  never-completing links from a vanished peer indefinitely.
+* **Log noise on normal shutdown:** `ERROR startup: visa service connection
+  manager terminated: Ok(())` and two `ERROR startup: VSConn lifecycle
+  channel closed unexpectedly` are logged on a graceful Ctrl-C.
+* **Leftover socket:** `/var/run/zpr/501/control.sock` stays on disk after
+  exit; harmless (the next start re-binds it).
+* `WARN startup: Unable to enable ingress packet steering: packet steering
+  not supported on this OS` at every start — expected on macOS.
