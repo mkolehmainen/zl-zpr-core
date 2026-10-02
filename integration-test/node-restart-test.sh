@@ -22,8 +22,13 @@ DEBUG_TARGETS=${DEBUG_TARGETS:-all=INFO}
 KM_IMPL=${KM_IMPL:-noise}
 
 # How many node restarts, and on which round to force the bad ordering.
+# FORCE_RACE_ROUND=0 (the default) runs plain restarts only: the forced
+# round cannot currently force the race — SIGSTOPping the VS adapter also
+# cuts the node's only path to the VS — and a failed forced round hangs
+# cleanup on the stopped sudo wrapper
+# (https://github.com/mkolehmainen/zipline/issues/171).
 RESTART_ROUNDS=${RESTART_ROUNDS:-3}
-FORCE_RACE_ROUND=${FORCE_RACE_ROUND:-2}
+FORCE_RACE_ROUND=${FORCE_RACE_ROUND:-0}
 
 PH_BIN="${PH_BIN:-$(realpath "$(dirname "$0")/../target/debug/ph")}"
 PH_DEBUG_BIN="${PH_DEBUG_BIN:-$(realpath "$(dirname "$0")/../target/debug/ph-cli")}"
