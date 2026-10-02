@@ -189,17 +189,18 @@ impl Tun {
         }
 
         // The device is created unaddressed (zipline#161) — addressing
-        // happens later through `ZprTun::add_address` — so only an
-        // explicitly requested MTU is set here.
-        if let Some(mtu) = config.mtu {
-            if config.is_ipv6() && mtu < IPV6_MMTU {
-                return Err(TunError::InvalidIpv6Mtu);
-            }
-            if !config.is_ipv6() && mtu < IPV4_MMTU {
-                return Err(TunError::InvalidIpv4Mtu);
-            }
-            self.set_mtu(mtu)?;
+        // happens later through `ZprTun::add_address` — but the MTU is
+        // always applied: an unrequested MTU gets `DEFAULT_TUN_MTU`, never
+        // the kernel default (2000 for a utun, above the 1400 overlay MTU).
+        // PR #66 review (P2).
+        let mtu = crate::zprtun::effective_tun_mtu(config.mtu);
+        if config.is_ipv6() && mtu < IPV6_MMTU {
+            return Err(TunError::InvalidIpv6Mtu);
         }
+        if !config.is_ipv6() && mtu < IPV4_MMTU {
+            return Err(TunError::InvalidIpv4Mtu);
+        }
+        self.set_mtu(mtu)?;
         Ok(())
     }
 
