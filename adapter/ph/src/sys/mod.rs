@@ -52,6 +52,10 @@ pub(crate) mod addr_hint;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod dad;
 
+// Portable substrate socket helpers (zipline#175). Compiled on every OS:
+// the substrate setup in `main.rs` uses it on all three platforms.
+pub mod substrate;
+
 // POSIX arms of the control channel and the Notify wakeup object
 // (zipline#130: Windows provides the same two modules from sys/windows).
 #[cfg(unix)]

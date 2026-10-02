@@ -84,9 +84,6 @@ use pki::load_cert;
 use queues::*;
 use sys::ZprTun;
 use tun_ctl::TunCtl;
-// `new_unspec` (the AF_UNSPEC disconnect) is unix-gated in zpr-ext 0.6.0.
-#[cfg(unix)]
-use zpr_ext::socket2::SockAddrExt;
 use zpr_utils::net_defs::SocketAddrExt;
 
 use zpr::addrs::{
@@ -381,13 +378,36 @@ fn main() -> ExitCode {
         }
     }
 
+    // An adapter (it has a remote node address) without a specified self
+    // address: ask the OS which local address routes to the node, and use
+    // it as our self address so that every substrate socket binds the same
+    // concrete address. Done once, with a throwaway probe socket, before
+    // any substrate socket exists (zipline#175). The probe binds our
+    // configured port, so the route is chosen for the 5-tuple the
+    // substrate sockets will actually use; if no port was configured, we
+    // adopt the one the OS gave the probe, for the same reason.
+    if let Some(node_addr) = config.node_addr {
+        if config.self_addr.ip().is_unspecified() {
+            let local = sys::substrate::resolve_local_addr(config.self_addr, node_addr)
+                .unwrap_or_else(|e| panic!("unable to connect to node_addr ({node_addr}): {e}"));
+            config.self_addr.set_scoped_ip(local.scoped_ip());
+            info!(target: STARTUP, "assigned substrate address {}", local.scoped_ip());
+            if config.self_addr.port() == 0 {
+                // ponytail: the port is free between the probe's drop and
+                // the first bind below; another process grabbing that exact
+                // ephemeral port in that window fails the bind (a startup
+                // panic, not misrouting). Hold the probe open across the
+                // bind with SO_REUSEPORT if that is ever seen.
+                config.self_addr.set_port(local.port());
+                info!(target: STARTUP, "assigned substrate UDP port {}", local.port());
+            }
+        }
+    }
+
     let mut substrate_sockets: Vec<std::net::UdpSocket> = Vec::new();
 
     for _i in 0..topology_config.fastpath_concurrency {
-        // `mut` is consumed by the Windows disconnect-by-recreation arm
-        // below; the unix arms never reassign it.
-        #[cfg_attr(unix, allow(unused_mut))]
-        let mut socket = socket2::Socket::new(
+        let socket = socket2::Socket::new(
             socket2::Domain::for_address(config.self_addr),
             socket2::Type::DGRAM,
             None,
@@ -398,8 +418,7 @@ fn main() -> ExitCode {
         // pktinfo and SO_REUSEPORT are unix-only; the Windows datapath
         // (zipline#131, plan D5) is single-socket/single-homed and needs
         // neither, so both calls are unix-gated. The Windows-specific
-        // substrate setup is the socket recreate and wildcard-bind check
-        // below.
+        // substrate setup is the wildcard-bind check below.
         #[cfg(unix)]
         batch_io::set_recv_packet_info(&socket, true).unwrap();
 
@@ -407,9 +426,11 @@ fn main() -> ExitCode {
         #[cfg(unix)]
         socket.set_reuse_port(true).unwrap();
 
-        // First bind to our self address.
+        // Bind to our self address.
         // If the port is unspecified, one will be selected by the OS.
-        // (The IP address may also be unspecified, but the OS will not select one here.)
+        // (The IP address may also be unspecified -- a node with a
+        // wildcard self_addr -- in which case the socket receives on every
+        // local address.)
         socket
             .bind(&socket2::SockAddr::from(config.self_addr))
             .expect(&format!(
@@ -424,103 +445,6 @@ fn main() -> ExitCode {
             let port = socket.local_addr().unwrap().as_socket().unwrap().port();
             config.self_addr.set_port(port);
             info!(target: STARTUP, "assigned substrate UDP port {port}");
-        }
-
-        if let Some(node_addr) = config.node_addr {
-            if config.self_addr.ip().is_unspecified() {
-                // If we are an adapter (and thus have a remote node address),
-                // but we don't have a specified self address (and thus did not
-                // specify one in the bind call above), temporarily connect to
-                // the remote node address to forcee the OS to choose a local
-                // address.
-                socket
-                    .connect(&socket2::SockAddr::from(node_addr))
-                    .expect(&format!("unable to connect to node_addr ({})", node_addr));
-
-                // Update the address of our configured self address to match
-                // what the OS chose.  This ensures that all sockets we open share
-                // the same port.
-                let addr = socket
-                    .local_addr()
-                    .unwrap()
-                    .as_socket()
-                    .unwrap()
-                    .scoped_ip();
-                config.self_addr.set_scoped_ip(addr);
-                info!(target: STARTUP, "assigned substrate address {addr}");
-
-                // On Linux, dropping the connection (below) also drops the bind,
-                // so open a temp socket here to hold ownership of the local port.
-                #[cfg(target_os = "linux")]
-                let temp_socket;
-                #[cfg(target_os = "linux")]
-                {
-                    temp_socket = socket2::Socket::new(
-                        socket2::Domain::for_address(config.self_addr),
-                        socket2::Type::DGRAM,
-                        None,
-                    )
-                    .unwrap();
-
-                    temp_socket.set_reuse_port(true).unwrap();
-
-                    temp_socket
-                        .bind(&socket2::SockAddr::from(config.self_addr))
-                        .unwrap();
-                }
-
-                // Now drop the connection.  We will still specify it manually
-                // for each packet sent (and it's an error to do both).
-                // Unix only: `new_unspec` is unix-gated in zpr-ext 0.6.0,
-                // and the Windows datapath (zipline#131) recreates the
-                // socket instead of the AF_UNSPEC disconnect dance.
-                #[cfg(unix)]
-                match socket.connect(&socket2::SockAddr::new_unspec()) {
-                    Ok(()) => (),
-                    Err(err) if err.raw_os_error() == Some(libc::EAFNOSUPPORT) => (),
-                    res => res.expect("unable to disconnect socket"),
-                }
-
-                // Windows (zipline#131, plan D5/C4): UDP dissociation via an
-                // AF_UNSPEC connect is not reliably supported, so recreate
-                // the socket instead — deterministic, and cheap at startup.
-                // `config.self_addr` now carries the OS-chosen address and
-                // port from the probe above, so the fresh socket binds to
-                // exactly what the temp one discovered (no SO_REUSEPORT on
-                // Windows, but the old socket is dropped before the bind).
-                #[cfg(windows)]
-                {
-                    drop(socket);
-                    socket = socket2::Socket::new(
-                        socket2::Domain::for_address(config.self_addr),
-                        socket2::Type::DGRAM,
-                        None,
-                    )
-                    .unwrap();
-                    socket.set_nonblocking(true).unwrap();
-                    socket
-                        .bind(&socket2::SockAddr::from(config.self_addr))
-                        .expect(&format!(
-                            "unable to re-bind to self_addr ({})",
-                            config.self_addr
-                        ));
-                }
-
-                // Disconnecting above weirdly also drops the local-address binding!
-                // (Possible Linux bug?)  So now we need to re-bind.
-                // Enable on Linux only, because this does not seem to be needed
-                // and also does not work on macOS.
-                #[cfg(target_os = "linux")]
-                socket
-                    .bind(&socket2::SockAddr::from(config.self_addr))
-                    .expect(&format!(
-                        "unable to re-bind to self_addr ({})",
-                        config.self_addr
-                    ));
-
-                // Now the temp socket will go out of scope and close;
-                // we've re-bound no longer need it.
-            }
         }
 
         // Windows (zipline#131 PR #52 review round 1): the datapath has no
