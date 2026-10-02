@@ -42,6 +42,12 @@ impl ZprTun {
     /// address family of the control socket (IPv6 when `None`) — and is
     /// addressed later via [`ZprTun::add_address`], the same lifecycle as
     /// Linux and Windows (zipline#161).
+    ///
+    /// IPv4 ZPR addresses are not supported on macOS: `add_address` (like
+    /// `has_address`, `clear_address`, `add_route`) returns `Unsupported`
+    /// for IPv4, and no create-time path ever installed one — the old
+    /// builder `with_address` was never called (PR #66 review). The ZPR
+    /// internal network is IPv6 (`fd5a:5052::/32`).
     pub fn new_mq(
         ifname: Option<String>,
         concurrency: usize,
