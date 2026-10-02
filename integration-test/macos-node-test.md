@@ -70,11 +70,14 @@ Mac:
   (TCP 8183) listeners — settling what actually happens is checklist
   item 4. The command-line tool is
   `/usr/libexec/ApplicationFirewall/socketfilterfw`; the expected fix, if
-  one is needed, is to allow the freshly built binary:
+  one is needed, is to allow the binary **the test actually runs** — the
+  copy in `~/zpr-node` that section 2 starts, not the build-tree
+  `target/debug/ph` (the firewall keys rules on the executable's path, so a
+  rule for the build-tree copy does nothing for the copy the node runs as):
 
   ```sh
-  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add $(pwd)/target/debug/ph
-  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp $(pwd)/target/debug/ph
+  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add ~/zpr-node/ph
+  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp ~/zpr-node/ph
   ```
 
   On the first run add nothing up front: watch what fails (no dock → UDP
@@ -200,9 +203,14 @@ issue whose number goes in Findings.
 3. **Wildcard `self_addr` with pktinfo.** With `--self-addr 0.0.0.0:5000`,
    replies leave from the address the adapter docked to (the
    `posix_unbatched` pktinfo path). Evidence: docks complete and stay up
-   (an asymmetric reply source would break the handshake). If the Mac has a
-   second LAN interface (Wi-Fi + Ethernet), dock at least one adapter via
-   each address and record that both work.
+   (an asymmetric reply source would break the handshake). **Scope note:**
+   this run exercises the pktinfo path through a single Mac address only —
+   `remote-node-host-env.sh` points every adapter at the one `NODE_LAN_IP`
+   and installs NAT only toward it, and the compiled policy advertises a
+   single node substrate address, so docking adapters through a second Mac
+   interface (Wi-Fi + Ethernet) is not verifiable with this environment as
+   it stands. Multi-address support in the test env is deferred to
+   zipline#172; do not try to improvise it in this run.
    `[ ] PASS / [ ] FAIL: ______________________________________________`
 4. **Application firewall.** With the firewall enabled, does inbound UDP
    5000 / TCP 8183 prompt, silently drop, or pass? Evidence: the
@@ -232,7 +240,7 @@ Mac: Ctrl-C already stopped the node (section 4, item 6); if a
 `socketfilterfw` rule was added in item 4 and you want it gone:
 
 ```sh
-sudo /usr/libexec/ApplicationFirewall/socketfilterfw --remove $(pwd)/target/debug/ph
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --remove ~/zpr-node/ph
 ```
 
 Linux: identical to `windows-node-test.md` section 5 —
