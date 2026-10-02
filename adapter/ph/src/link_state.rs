@@ -931,7 +931,7 @@ impl LinkStateWrapper {
     /// Start an inactive link/tether
     /// Transitions from Inactive -> Keying
     /// Will trigger key management messages to be sent if this is an adapter
-    fn process_start(&self, asm: &Assembly) -> Result<(), LinkStateError> {
+    fn process_start(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
         assert!(self.id != LINK_ID_UNKNOWN);
         let link_id = self.id;
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
@@ -991,6 +991,11 @@ impl LinkStateWrapper {
                     asm.certx.clone().unwrap(),
                 )
                 .unwrap();
+                // The node is the noise responder and never re-initiates,
+                // so bound how long it waits for keying to finish
+                // (zipline#173). `KeyingDone` moves the FSM to Helloing,
+                // and that state change cancels this timer.
+                self.set_timeout(asm, &mut locked_fsm, config::NODE_KEYING_TIMEOUT);
                 Ok(())
             }
             LinkType::Internal => {
@@ -2372,6 +2377,18 @@ impl LinkStateWrapper {
             | (LinkType::AdapterToNode, LinkState::Helloing) => {
                 // Timeout here means we give up on the link.
                 error!(target: LINK_STATE, "{}: timed out in state {:?}", asm.formatted_link_id(self.id), locked_fsm.state);
+                locked_fsm.set_state(LinkState::Error);
+                drop(locked_fsm);
+                return self.initiate_close(asm, TerminateReason::RequestTimedOut);
+            }
+
+            (LinkType::NodeToAdapter, LinkState::Keying) => {
+                // The adapter never completed the noise handshake within
+                // NODE_KEYING_TIMEOUT (zipline#173). Drop the link: the
+                // close path removes the peer entry and stops the KM, and
+                // an adapter that is still alive will dock afresh.
+                warn!(target: LINK_STATE, "{}: keying not completed within {:?}, closing link",
+                    asm.formatted_link_id(self.id), config::NODE_KEYING_TIMEOUT);
                 locked_fsm.set_state(LinkState::Error);
                 drop(locked_fsm);
                 return self.initiate_close(asm, TerminateReason::RequestTimedOut);
@@ -6361,6 +6378,92 @@ mod tests {
                     generation_before,
                     "the new session must be distinguishable from the old one"
                 );
+            })
+            .await
+    }
+
+    /// zipline#173 RED: a node-side link whose peer never completes the
+    /// noise handshake must not sit in Keying forever. Nothing here answers
+    /// the responder, so the link can only leave Keying by timing out; once
+    /// it does, the close path removes the peer entry altogether.
+    #[tokio::test(start_paused = true)]
+    async fn test_node_link_stuck_in_keying_is_torn_down() {
+        LocalSet::new()
+            .run_until(async {
+                let mut builder = TestAssemblyBuilder::new();
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_node_peer(&asm);
+
+                asm.process_link_state_event(link_id, LinkEvent::Start)
+                    .unwrap();
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Keying
+                );
+
+                // Just before the deadline the link is still waiting.
+                let one_sec = std::time::Duration::from_secs(1);
+                tokio::time::sleep(config::NODE_KEYING_TIMEOUT - one_sec).await;
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Keying,
+                    "node link torn down before NODE_KEYING_TIMEOUT"
+                );
+
+                // Past the deadline plus the terminate timeout the close has
+                // completed and the peer entry is gone.
+                tokio::time::sleep(2 * one_sec + config::DEFAULT_TERMINATE_TIMEOUT).await;
+
+                assert!(
+                    asm.peer_table.get(link_id).is_none(),
+                    "node link that never completed keying is still in the peer table \
+                     (state {:?})",
+                    asm.peer_table
+                        .get(link_id)
+                        .map(|p| p.link_state_machine.get_state())
+                );
+            })
+            .await
+    }
+
+    /// zipline#173: the keying deadline only applies while Keying. A node
+    /// link that finishes keying in time (the FSM leaves Keying, as it does
+    /// on `KeyingDone`) must survive past NODE_KEYING_TIMEOUT.
+    #[tokio::test(start_paused = true)]
+    async fn test_node_link_keying_done_cancels_keying_timeout() {
+        LocalSet::new()
+            .run_until(async {
+                let mut builder = TestAssemblyBuilder::new();
+                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
+                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
+                let asm = Arc::new(create_assembly(builder));
+                let link_id = add_node_peer(&asm);
+
+                asm.process_link_state_event(link_id, LinkEvent::Start)
+                    .unwrap();
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .link_state_machine
+                    .test_set_state(LinkState::Helloing);
+
+                tokio::time::sleep(config::NODE_KEYING_TIMEOUT * 2).await;
+
+                let peer = asm
+                    .peer_table
+                    .get(link_id)
+                    .expect("keyed node link was torn down by the keying deadline");
+                assert_eq!(peer.link_state_machine.get_state(), LinkState::Helloing);
             })
             .await
     }
