@@ -407,36 +407,30 @@ fn main() -> ExitCode {
     let mut substrate_sockets: Vec<std::net::UdpSocket> = Vec::new();
 
     for _i in 0..topology_config.fastpath_concurrency {
-        let socket = socket2::Socket::new(
-            socket2::Domain::for_address(config.self_addr),
-            socket2::Type::DGRAM,
-            None,
-        )
-        .unwrap();
-
-        socket.set_nonblocking(true).unwrap();
-        // pktinfo and SO_REUSEPORT are unix-only; the Windows datapath
-        // (zipline#131, plan D5) is single-socket/single-homed and needs
-        // neither, so both calls are unix-gated. The Windows-specific
-        // substrate setup is the wildcard-bind check below.
-        #[cfg(unix)]
-        batch_io::set_recv_packet_info(&socket, true).unwrap();
-
-        // SO_REUSEPORT allows us to open multiple sockets for the same 5-tuple
-        #[cfg(unix)]
-        socket.set_reuse_port(true).unwrap();
-
-        // Bind to our self address.
-        // If the port is unspecified, one will be selected by the OS.
-        // (The IP address may also be unspecified -- a node with a
-        // wildcard self_addr -- in which case the socket receives on every
-        // local address.)
-        socket
-            .bind(&socket2::SockAddr::from(config.self_addr))
-            .expect(&format!(
-                "unable to bind to self_addr ({})",
-                config.self_addr
-            ));
+        // Create, configure and bind one substrate socket; the platform
+        // differences (pktinfo and SO_REUSEPORT on unix, the wildcard
+        // bind check and SIO_UDP_CONNRESET on Windows) live behind
+        // `sys::substrate::open` (zipline#176). Any failure — including
+        // the bind, and Windows' wildcard-bind rejection — is a logged
+        // error and a clean exit, not a panic (zipline#160): a
+        // misconfigured node must fail with the message that names the
+        // fix, like the ZPR-address check below.
+        //
+        // The bind is to our self address. If the port is unspecified,
+        // one is selected by the OS. (The IP address may also be
+        // unspecified -- a node with a wildcard self_addr -- in which
+        // case the socket receives on every local address.)
+        let socket = match sys::substrate::open(config.self_addr) {
+            Ok(socket) => socket,
+            Err(err) => {
+                error!(
+                    target: STARTUP,
+                    "unable to open a substrate socket on self_addr ({}): {err}",
+                    config.self_addr
+                );
+                return ExitCode::FAILURE;
+            }
+        };
 
         if config.self_addr.port() == 0 {
             // Update the port of our configured self address to match
@@ -445,46 +439,6 @@ fn main() -> ExitCode {
             let port = socket.local_addr().unwrap().as_socket().unwrap().port();
             config.self_addr.set_port(port);
             info!(target: STARTUP, "assigned substrate UDP port {port}");
-        }
-
-        // Windows (zipline#131 PR #52 review round 1): the datapath has no
-        // per-datagram destination info (no WSARecvMsg/IP_PKTINFO, plan
-        // D5), so a socket still wildcard-bound here — a node with a
-        // wildcard self_addr, which the adapter-only probe above never
-        // rebinds — would record 0.0.0.0/:: as every packet's interface
-        // address and trip the fastpath's unspecified-address assertion
-        // on the first response. Reject the configuration at startup with
-        // the fix in the message — a logged error and a clean exit, not a
-        // panic (zipline#160): a misconfigured node must fail with the
-        // message that names the fix, like the ZPR-address check below.
-        #[cfg(windows)]
-        {
-            let bound = socket.local_addr().unwrap().as_socket().unwrap();
-            if let Err(err) = batch_io::windows_substrate_bind_check(bound) {
-                error!(
-                    target: STARTUP,
-                    "substrate socket configuration unusable on Windows: {err}"
-                );
-                return ExitCode::FAILURE;
-            }
-
-            // Disable SIO_UDP_CONNRESET (zipline#160, plan N4): without
-            // this, a peer that departs — its host answering our sends
-            // with ICMP port-unreachable — makes a later recvfrom on this
-            // unconnected UDP socket fail with WSAECONNRESET, and the
-            // substrate socket talks to many peers that may leave at any
-            // time. Failure here is non-fatal: the ConnectionReset
-            // mapping in the receive path (connreset_as_wouldblock) is
-            // the fallback, so the socket still works, just with a
-            // trace-level note per swallowed reset.
-            if let Err(err) = batch_io::windows_disable_udp_connreset(&socket) {
-                warn!(
-                    target: STARTUP,
-                    "unable to disable SIO_UDP_CONNRESET on the substrate \
-                     socket (continuing; resets are tolerated in the \
-                     receive path): {err}"
-                );
-            }
         }
 
         substrate_sockets.push(socket.into());

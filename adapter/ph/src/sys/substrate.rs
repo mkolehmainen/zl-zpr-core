@@ -3,6 +3,14 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 
+// The per-platform "create, set options, bind, check" arm of substrate
+// socket setup (zipline#176), re-exported here so `main.rs` calls one
+// portable `sys::substrate::open` — the same split as `control`/`notify`.
+#[cfg(unix)]
+pub use super::posix::substrate::open;
+#[cfg(windows)]
+pub use super::windows::substrate::open;
+
 /// Ask the OS which local address it would use to send to `peer`.
 ///
 /// Binds a throwaway UDP socket to `bind_addr` exactly as configured, then
@@ -31,6 +39,53 @@ pub fn resolve_local_addr(bind_addr: SocketAddr, peer: SocketAddr) -> io::Result
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    /// `open` returns a socket already bound to the requested address and
+    /// nonblocking: a `recv` on the empty socket must fail with
+    /// `WouldBlock` immediately instead of blocking the thread, which is
+    /// what the batch I/O engines rely on.
+    #[test]
+    fn test_open_binds_nonblocking() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let socket = open(addr).unwrap();
+        let local = socket.local_addr().unwrap().as_socket().unwrap();
+        assert_eq!(local.ip(), Ipv4Addr::LOCALHOST);
+        assert_ne!(local.port(), 0);
+        let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 16];
+        let err = socket.recv(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    /// The substrate loop opens `fastpath_concurrency` sockets on the SAME
+    /// concrete addr+port, which on unix relies on `open` setting
+    /// SO_REUSEPORT before the bind: a second `open` on the first one's
+    /// bound address must succeed, and the option must read back set.
+    #[cfg(unix)]
+    #[test]
+    fn test_open_same_addr_twice_reuse_port() {
+        let first = open(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        assert!(first.reuse_port().unwrap());
+        let bound = first.local_addr().unwrap().as_socket().unwrap();
+        let second = open(bound).unwrap();
+        assert_eq!(
+            second.local_addr().unwrap().as_socket().unwrap(),
+            bound,
+            "second socket must share the first one's 5-tuple"
+        );
+    }
+
+    /// The posix arm enables pktinfo reception (`IP_PKTINFO`), which
+    /// `try_recv_buf_from_to_batch` needs to report each datagram's
+    /// destination address.
+    #[cfg(unix)]
+    #[test]
+    fn test_open_enables_pktinfo() {
+        let socket = open(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let enabled =
+            nix::sys::socket::getsockopt(&socket, nix::sys::socket::sockopt::Ipv4PacketInfo)
+                .unwrap();
+        assert!(enabled);
+    }
 
     /// A loopback peer is reached from loopback, so the probe must report
     /// a loopback source address (and the OS-chosen ephemeral port, which
