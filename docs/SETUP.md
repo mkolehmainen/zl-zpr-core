@@ -468,11 +468,13 @@ For an end-to-end walkthrough against a Linux node and visa service, see
 
 ## macOS
 
-`ph node` runs on a Mac — Apple Silicon or Intel — started by hand with
-`sudo ph node -c x.toml` exactly as on Linux. It creates a utun interface,
-applies its own ZPR address to it, accepts docking adapters, forwards their
-traffic, and reaches the visa service through its own TUN. This section
-covers the **node role only**; see the last paragraph for the adapter role.
+`ph` runs on a Mac — Apple Silicon or Intel — in both roles, started by
+hand with `sudo ph node -c x.toml` / `sudo ph adapter -c x.toml` exactly as
+on Linux. The node creates a utun interface, applies its own ZPR address to
+it, accepts docking adapters, forwards their traffic, and reaches the visa
+service through its own TUN. The adapter creates a utun, docks to a node,
+and carries this machine's own traffic. The node role first; the adapter
+subsection follows.
 
 **macOS node constraints** (deliberate, in this release):
 
@@ -511,9 +513,68 @@ service) is
 run it whenever a change touches the macOS node path. There is no automated
 macOS end-to-end tier.
 
-**The adapter role on macOS is undocumented.** The code exists (the
-original macOS adapter port) but has no hand-run test document and no
-section here; documenting and hand-testing it is
+### macOS adapter
+
+`sudo ph adapter -c x.toml`, same TOML schema as Linux (see the adapter
+examples above). `tun_if`, when set, must be of the form `utunN`; left
+unset, the kernel picks the name. No TUN pre-creation is needed or
+possible — `ph` creates the utun itself through `TunCtl`, and the known
+Linux pre-creation workaround does not apply.
+
+**macOS adapter constraints** (deliberate, in this release — verified
+against the code, not copied from the node list):
+
+* **A dev/demo adapter** — functional parity with Linux is the bar, not
+  throughput. No launchd service; `ph` is started by hand from a terminal.
+* **`sudo` is required** — creating a utun needs root, same as the node
+  role (`TunCtl::new_mq` goes through the same `PF_SYSTEM` control
+  socket).
+* **A single, unbatched datapath worker** — the one-worker limit is in
+  `new_mq` itself (`concurrency` must be 1 on macOS) and in the platform
+  default, so it binds the adapter role exactly as it does the node;
+  the engine is the same `posix_unbatched`.
+* **IPv6 ZPR addresses only** — `TunCtl::add_address` (and `add_route`)
+  return `Unsupported` for IPv4 on macOS; the ZPR internal network is
+  IPv6 (`fd5a:5052::/32`).
+* **One adapter per host** — at startup, and again at every link
+  activation, the adapter refuses to run when `fd5a:5052::/32` already
+  routes to another live interface
+  ([zipline#101](https://github.com/mkolehmainen/zipline/issues/101)).
+  This also means a node and an adapter cannot share a Mac.
+* **One `ph` instance per user without `--control-path`**: the default
+  control path is derived from the owner alone
+  ([zipline#169](https://github.com/mkolehmainen/zipline/issues/169)).
+
+**Addressing.** Unlike the node, the adapter does not self-address at
+startup: the utun is created **unaddressed**
+([zipline#161](https://github.com/mkolehmainen/zipline/issues/161)), and
+when the dock link activates with a granted ZPR address, the activation
+sequence in `link_state.rs` applies it via `TunCtl::add_address`
+(`ifconfig <utun> inet6 <addr>/32 alias`) and then ensures the internal-
+network route via `TunCtl::add_route` (`/sbin/route -n add -inet6
+fd5a:5052::/32 -interface <utun>` — idempotent: a route already present
+is verified to run via this utun and replaced if not,
+[zipline#100](https://github.com/mkolehmainen/zipline/issues/100)). On
+macOS the `/32` alias alone already installs the on-link route (verified
+in the node's first end-to-end run, 2026-10-02), so the explicit
+`add_route` is normally a no-op safety net. No manual `ifconfig` or
+`route` step is required.
+
+**Firewall (provisional).** The adapter run has not yet exercised the
+application firewall — these notes are derived from the node-role
+findings and stay provisional until the adapter checklist's firewall item
+is executed (zipline#174). The adapter *originates* its dock (outbound
+UDP), so docking is expected to work with the firewall on; the exposed
+piece is inbound traffic through the established flow and ZPR-internal
+services the Mac answers. `/usr/libexec/ApplicationFirewall/socketfilterfw`
+is the knob if anything is blocked; rules key on the executable's path,
+so allow the copy of `ph` the run actually starts.
+
+The hand-run, end-to-end verification of the macOS adapter (a Mac docking
+to a Linux node and carrying real traffic both ways) is
+[`integration-test/macos-adapter-test.md`](../integration-test/macos-adapter-test.md);
+run it whenever a change touches the macOS adapter path. Its first
+execution — and the firewall findings above — is tracked as
 [zipline#174](https://github.com/mkolehmainen/zipline/issues/174).
 
 
