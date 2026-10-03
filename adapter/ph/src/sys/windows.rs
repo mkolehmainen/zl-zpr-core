@@ -8,6 +8,7 @@
 
 pub mod control;
 pub mod notify;
+pub mod substrate;
 pub mod tun_pi;
 pub mod zprtun;
 

@@ -3,6 +3,14 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 
+// The per-platform "create, set options, bind, check" arm of substrate
+// socket setup (zipline#176), re-exported here so `main.rs` calls one
+// portable `sys::substrate::open` — the same split as `control`/`notify`.
+#[cfg(unix)]
+pub use super::posix::substrate::open;
+#[cfg(windows)]
+pub use super::windows::substrate::open;
+
 /// Ask the OS which local address it would use to send to `peer`.
 ///
 /// Binds a throwaway UDP socket to `bind_addr` exactly as configured, then
