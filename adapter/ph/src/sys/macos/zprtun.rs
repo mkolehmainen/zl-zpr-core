@@ -469,4 +469,18 @@ mod tests {
         assert_eq!(devs.len(), 1);
         assert_eq!(devs[0].inner.get_name(), "utun9");
     }
+
+    /// zipline#177: the ZPR_TEMP_LOCAL_ADDRESS fallback moved here from
+    /// `main.rs`, which now passes `None` where it used to pass
+    /// `Some(ZPR_TEMP_LOCAL_ADDRESS)` — so `None` must pick the same
+    /// control-socket address family that address produced (IPv6). Pure
+    /// decision, no utun created, no root needed.
+    #[test]
+    fn no_address_fallback_keeps_temp_address_family() {
+        use zpr::addrs::ZPR_TEMP_LOCAL_ADDRESS;
+        assert_eq!(
+            control_socket_ipv(None),
+            tun::IPV::from(IpAddr::from(ZPR_TEMP_LOCAL_ADDRESS))
+        );
+    }
 }
