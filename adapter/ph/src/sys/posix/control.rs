@@ -4,10 +4,13 @@
 //! this module hands it, so the RPC code is transport-agnostic; the
 //! Windows arm (named pipe, zipline#130) provides the same two items.
 
-use crate::socket_access::{self, SocketAccess};
+use super::socket_access::{self, SocketAccess};
+use crate::logging::targets::STARTUP;
+use admin_api::SocketOwner;
 use std::io;
 use std::path::Path;
 use tokio::net::{UnixListener, UnixStream};
+use tracing::warn;
 
 /// One accepted control connection.
 pub type ControlStream = UnixStream;
@@ -17,12 +20,37 @@ pub struct ControlListener {
     listener: UnixListener,
 }
 
+/// The socket-access plan for `owner`, from the real system lookups —
+/// exactly the computation `main.rs` did before zipline#177 moved the
+/// posix-only planning here. Separated from [ControlListener::bind] so the
+/// decision stays unit-testable without binding anything.
+fn access_plan(owner: Option<&SocketOwner>) -> SocketAccess {
+    socket_access::plan_socket_access(
+        owner,
+        socket_access::system_user_primary_gid,
+        socket_access::system_group_gid,
+    )
+}
+
 impl ControlListener {
-    /// Bind the control socket at `path` and give it the ownership/mode in
-    /// `access` (zipline#39). See [socket_access::bind_owned_listener].
-    pub fn bind(path: &Path, access: &SocketAccess) -> io::Result<Self> {
+    /// Bind the control socket at `path` and hand it to whoever should
+    /// drive `ph-cli` (zipline#39): the resolved `socket_owner` when there
+    /// is one, else the `zpr` group, else leave it root-only and warn. The
+    /// planning is posix-specific, which is why it lives here and not in
+    /// `main.rs` (zipline#177); the Windows arm shares the signature and
+    /// ignores `socket_owner` (named-pipe DACL is its access control).
+    pub fn bind(path: &Path, socket_owner: Option<&SocketOwner>) -> io::Result<Self> {
+        let plan = access_plan(socket_owner);
+        if plan == SocketAccess::Unchanged && socket_owner.is_none() {
+            warn!(
+                target: STARTUP,
+                "no invoking user resolved and no '{}' group on this host; the control socket \
+                 stays root-only (ph-cli will need sudo or an explicit -p)",
+                socket_access::FALLBACK_GROUP
+            );
+        }
         Ok(Self {
-            listener: socket_access::bind_owned_listener("control", path, access)?,
+            listener: socket_access::bind_owned_listener("control", path, &plan)?,
         })
     }
 

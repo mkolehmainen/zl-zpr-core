@@ -51,8 +51,6 @@ mod prelude;
 mod queues;
 mod sample_ring;
 mod signal_worker;
-#[cfg(unix)]
-mod socket_access;
 mod special_peers;
 mod sys;
 mod tc;
@@ -242,32 +240,15 @@ fn main() -> ExitCode {
     // create control socket
     //
 
-    // zipline#39: hand the sockets to whoever should drive ph-cli. Owner known
-    // (sudo/pkexec): chown to that user, mode 0600. Owner unknown (systemd):
-    // group "zpr" with mode 0660 when the group exists; otherwise leave the
-    // sockets exactly as before and warn once. Unix only: on Windows access
-    // control is the named pipe's DACL (zipline#130, plan D6).
-    #[cfg(unix)]
-    let socket_plan = socket_access::plan_socket_access(
+    // zipline#39: hand the sockets to whoever should drive ph-cli. The
+    // access planning is posix-specific (chown/chmod; on Windows access
+    // control is the named pipe's DACL, zipline#130), so it lives inside
+    // the posix ControlListener::bind — both platforms share one cfg-free
+    // signature here (zipline#177).
+    let control_listener = match sys::control::ControlListener::bind(
+        &config.control_path,
         config.socket_owner.as_ref(),
-        socket_access::system_user_primary_gid,
-        socket_access::system_group_gid,
-    );
-    #[cfg(unix)]
-    if socket_plan == socket_access::SocketAccess::Unchanged && config.socket_owner.is_none() {
-        warn!(
-            target: STARTUP,
-            "no invoking user resolved and no '{}' group on this host; the control socket \
-             stays root-only (ph-cli will need sudo or an explicit -p)",
-            socket_access::FALLBACK_GROUP
-        );
-    }
-
-    #[cfg(unix)]
-    let control_bind = sys::control::ControlListener::bind(&config.control_path, &socket_plan);
-    #[cfg(windows)]
-    let control_bind = sys::control::ControlListener::bind(&config.control_path);
-    let control_listener = match control_bind {
+    ) {
         Ok(listener) => listener,
         Err(e) => {
             error!(target: STARTUP, "{e}");
