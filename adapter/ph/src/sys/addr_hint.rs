@@ -89,4 +89,42 @@ mod tests {
         };
         assert_eq!(manual_add_address_hint(&addr(), 32, "zpr0"), expected);
     }
+
+    // --- route hint (zipline#177): the manual add-route command printed
+    // when the visa-service host route could not be installed. Only
+    // Windows needs one — `netsh add address` ignores the prefix, so the
+    // /128 route is a separate step there; on Linux and macOS the route
+    // failure message carries no command today, and None keeps it that way.
+
+    #[test]
+    fn windows_route_hint_is_netsh_add_route() {
+        // Exact current main.rs string, including the quotes around the
+        // interface name (Wintun adapter names may contain spaces).
+        assert_eq!(
+            route_hint_for(Platform::Windows, &addr(), "zpr0").as_deref(),
+            Some("netsh interface ipv6 add route fd5a:5052::a:b:c/128 \"zpr0\"")
+        );
+    }
+
+    #[test]
+    fn linux_route_hint_is_none() {
+        assert_eq!(route_hint_for(Platform::Linux, &addr(), "zpr0"), None);
+    }
+
+    #[test]
+    fn macos_route_hint_is_none() {
+        assert_eq!(route_hint_for(Platform::MacOs, &addr(), "utun4"), None);
+    }
+
+    #[test]
+    fn public_route_fn_uses_the_current_platform_arm() {
+        let expected = if cfg!(target_os = "linux") {
+            route_hint_for(Platform::Linux, &addr(), "zpr0")
+        } else if cfg!(target_os = "macos") {
+            route_hint_for(Platform::MacOs, &addr(), "zpr0")
+        } else {
+            route_hint_for(Platform::Windows, &addr(), "zpr0")
+        };
+        assert_eq!(manual_add_route_hint(&addr(), "zpr0"), expected);
+    }
 }
