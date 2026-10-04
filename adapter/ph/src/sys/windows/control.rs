@@ -16,6 +16,7 @@
 //! listener always keeps a free instance: `accept` creates the *next*
 //! server instance before handing out the connected one.
 
+use admin_api::SocketOwner;
 use std::io;
 use std::path::{Path, PathBuf};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -99,11 +100,12 @@ pub struct ControlListener {
 
 impl ControlListener {
     /// Create the control pipe at `path`, restricted to Administrators and
-    /// the owning user (plan D6). Ownership/mode planning is unix-specific
-    /// (chown/chmod have no meaning in the pipe namespace); the DACL owner
-    /// SID is taken from the current process token via
-    /// [admin_api::current_user_id].
-    pub fn bind(path: &Path) -> io::Result<Self> {
+    /// the owning user (plan D6). `socket_owner` is accepted for signature
+    /// parity with the posix arm and ignored (zipline#177): ownership/mode
+    /// planning is unix-specific — chown/chmod have no meaning in the pipe
+    /// namespace — and the DACL owner SID is taken from the current process
+    /// token via [admin_api::current_user_id] instead.
+    pub fn bind(path: &Path, _socket_owner: Option<&SocketOwner>) -> io::Result<Self> {
         let owner_sid = admin_api::current_user_id()?;
         let first = create_instance(path, &owner_sid, true)?;
         Ok(Self {

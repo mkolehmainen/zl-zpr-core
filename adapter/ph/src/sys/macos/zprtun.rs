@@ -26,6 +26,15 @@ impl From<tun::TunError> for ZprTunError {
     }
 }
 
+/// The control socket's address family for the `address` [`ZprTun::new_mq`]
+/// was given: the address's own family, or IPv6 when there is none — the
+/// family of the old `ZPR_TEMP_LOCAL_ADDRESS` placeholder `main.rs` used to
+/// pass before zipline#177 moved the fallback here. Pure decision, split out
+/// so it is unit-testable without creating a utun.
+fn control_socket_ipv(address: Option<IpAddr>) -> tun::IPV {
+    address.map(tun::IPV::from).unwrap_or(tun::IPV::V6)
+}
+
 impl ZprTun {
     fn new(inner: tun::Tun) -> Self {
         ZprTun {
@@ -39,9 +48,10 @@ impl ZprTun {
     /// On macOS if the name is specificed, it must be of the form `utun[0-9]+`.
     ///
     /// The utun is created unaddressed — `address` is only used to pick the
-    /// address family of the control socket (IPv6 when `None`) — and is
-    /// addressed later via [`ZprTun::add_address`], the same lifecycle as
-    /// Linux and Windows (zipline#161).
+    /// address family of the control socket (IPv6 when `None`, which is the
+    /// ZPR case: the internal network is IPv6) — and is addressed later via
+    /// [`ZprTun::add_address`], the same lifecycle as Linux and Windows
+    /// (zipline#161).
     ///
     /// IPv4 ZPR addresses are not supported on macOS: `add_address` (like
     /// `has_address`, `clear_address`, `add_route`) returns `Unsupported`
@@ -58,7 +68,7 @@ impl ZprTun {
                 "on macos concurrency (queues) must be 1",
             )));
         }
-        let ipv = address.map(tun::IPV::from).unwrap_or(tun::IPV::V6);
+        let ipv = control_socket_ipv(address);
         let mut bldr = tun::Tun::builder(ipv);
         if let Some(name) = ifname {
             bldr.with_tun_name(&name);
@@ -468,5 +478,19 @@ mod tests {
             .expect("new_mq with no address must create the utun");
         assert_eq!(devs.len(), 1);
         assert_eq!(devs[0].inner.get_name(), "utun9");
+    }
+
+    /// zipline#177: the ZPR_TEMP_LOCAL_ADDRESS fallback moved here from
+    /// `main.rs`, which now passes `None` where it used to pass
+    /// `Some(ZPR_TEMP_LOCAL_ADDRESS)` — so `None` must pick the same
+    /// control-socket address family that address produced (IPv6). Pure
+    /// decision, no utun created, no root needed.
+    #[test]
+    fn no_address_fallback_keeps_temp_address_family() {
+        use zpr::addrs::ZPR_TEMP_LOCAL_ADDRESS;
+        assert_eq!(
+            control_socket_ipv(None),
+            tun::IPV::from(IpAddr::from(ZPR_TEMP_LOCAL_ADDRESS))
+        );
     }
 }

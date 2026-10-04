@@ -51,8 +51,6 @@ mod prelude;
 mod queues;
 mod sample_ring;
 mod signal_worker;
-#[cfg(unix)]
-mod socket_access;
 mod special_peers;
 mod sys;
 mod tc;
@@ -88,7 +86,7 @@ use zpr_utils::net_defs::SocketAddrExt;
 
 use zpr::addrs::{
     DEFAULT_TETHER_PORT, VISA_SERVICE_ADDR, VISA_SERVICE_PORT, ZPR_INTERNAL_NETWORK,
-    ZPR_TEMP_LOCAL_ADDRESS, ZPRNET_PREFIX_LEN,
+    ZPRNET_PREFIX_LEN,
 };
 use zpr::packet_info::{DOCK_LINK_ID, LOCAL_ACTOR_LINK_ID};
 use zpr::vsapi_types::AuthServicesList;
@@ -242,32 +240,15 @@ fn main() -> ExitCode {
     // create control socket
     //
 
-    // zipline#39: hand the sockets to whoever should drive ph-cli. Owner known
-    // (sudo/pkexec): chown to that user, mode 0600. Owner unknown (systemd):
-    // group "zpr" with mode 0660 when the group exists; otherwise leave the
-    // sockets exactly as before and warn once. Unix only: on Windows access
-    // control is the named pipe's DACL (zipline#130, plan D6).
-    #[cfg(unix)]
-    let socket_plan = socket_access::plan_socket_access(
+    // zipline#39: hand the sockets to whoever should drive ph-cli. The
+    // access planning is posix-specific (chown/chmod; on Windows access
+    // control is the named pipe's DACL, zipline#130), so it lives inside
+    // the posix ControlListener::bind — both platforms share one cfg-free
+    // signature here (zipline#177).
+    let control_listener = match sys::control::ControlListener::bind(
+        &config.control_path,
         config.socket_owner.as_ref(),
-        socket_access::system_user_primary_gid,
-        socket_access::system_group_gid,
-    );
-    #[cfg(unix)]
-    if socket_plan == socket_access::SocketAccess::Unchanged && config.socket_owner.is_none() {
-        warn!(
-            target: STARTUP,
-            "no invoking user resolved and no '{}' group on this host; the control socket \
-             stays root-only (ph-cli will need sudo or an explicit -p)",
-            socket_access::FALLBACK_GROUP
-        );
-    }
-
-    #[cfg(unix)]
-    let control_bind = sys::control::ControlListener::bind(&config.control_path, &socket_plan);
-    #[cfg(windows)]
-    let control_bind = sys::control::ControlListener::bind(&config.control_path);
-    let control_listener = match control_bind {
+    ) {
         Ok(listener) => listener,
         Err(e) => {
             error!(target: STARTUP, "{e}");
@@ -283,22 +264,13 @@ fn main() -> ExitCode {
     // (zipline#161): it is created bare and addressed later via
     // `add_address` once the node's ZPR address is known. The value
     // computed here only picks the address family of the control socket
-    // on macOS (IPv6 when None) and is ignored on Linux and Windows,
-    // which is why a placeholder is fine — it is never put on the wire
-    // or on the device.
-    let tun_addr = if !config.zpr_addr.is_empty() {
-        if config.tun_if.is_none() {
-            Some(config.zpr_addr[0].clone())
-        } else {
-            None
-        }
+    // on macOS (which derives IPv6 when None, zipline#177) and is ignored
+    // on Linux and Windows, which is why a placeholder is fine — it is
+    // never put on the wire or on the device.
+    let tun_addr = if !config.zpr_addr.is_empty() && config.tun_if.is_none() {
+        Some(config.zpr_addr[0])
     } else {
-        // TODO: If linux then do not bother setting the temp address since it will fail because ipv6.
-        if cfg!(target_os = "linux") {
-            None
-        } else {
-            Some(ZPR_TEMP_LOCAL_ADDRESS.into())
-        }
+        None
     };
 
     let tun_devs: Vec<_> = match ZprTun::new_mq(
@@ -678,14 +650,15 @@ fn main() -> ExitCode {
                         );
                     }
                     SelfAddressError::VsRoute { .. } => {
-                        #[cfg(any(target_os = "linux", target_os = "macos"))]
-                        error!(target: STARTUP, "{e}");
-                        #[cfg(windows)]
-                        error!(
-                            target: STARTUP,
-                            "{e}; configure it manually with: \
-                             netsh interface ipv6 add route {VISA_SERVICE_ADDR}/128 \"{ifname}\""
-                        );
+                        // Only Windows has a manual command for this
+                        // (zipline#177): manual_add_route_hint is None on
+                        // Linux and macOS, where the message stands alone.
+                        match sys::addr_hint::manual_add_route_hint(&VISA_SERVICE_ADDR, &ifname) {
+                            Some(hint) => {
+                                error!(target: STARTUP, "{e}; configure it manually with: {hint}")
+                            }
+                            None => error!(target: STARTUP, "{e}"),
+                        }
                     }
                     SelfAddressError::VsRouteConflict { .. } => {
                         error!(

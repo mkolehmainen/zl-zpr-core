@@ -41,8 +41,6 @@ pub mod pki;
 pub mod prelude;
 pub mod sample_ring;
 pub mod signal_worker;
-#[cfg(unix)]
-pub mod socket_access;
 pub mod special_peers;
 pub mod sys;
 pub mod tc;
