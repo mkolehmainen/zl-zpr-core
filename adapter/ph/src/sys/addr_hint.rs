@@ -43,6 +43,31 @@ pub fn manual_add_address_hint(addr: &IpAddr, prefix_len: usize, ifname: &str) -
     hint_for(CURRENT, addr, prefix_len, ifname)
 }
 
+/// The manual add-route hint in `platform`'s command syntax, or `None` when
+/// that platform's route-failure message carries no command (zipline#177).
+///
+/// Only Windows needs one: `netsh add address` ignores the prefix, so the
+/// /128 visa-service host route is a separate `netsh add route` step there.
+/// On Linux and macOS the route is installed through the same tooling as the
+/// address, and the failure message has never suggested a command.
+fn route_hint_for(platform: Platform, addr: &IpAddr, ifname: &str) -> Option<String> {
+    match platform {
+        Platform::Linux | Platform::MacOs => None,
+        // The interface name is quoted: Wintun adapter names may contain
+        // spaces.
+        Platform::Windows => Some(format!(
+            "netsh interface ipv6 add route {addr}/128 \"{ifname}\""
+        )),
+    }
+}
+
+/// The command an operator runs to install the /128 host route to `addr` on
+/// `ifname` by hand, in the current platform's syntax — `None` where no
+/// manual command applies.
+pub fn manual_add_route_hint(addr: &IpAddr, ifname: &str) -> Option<String> {
+    route_hint_for(CURRENT, addr, ifname)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

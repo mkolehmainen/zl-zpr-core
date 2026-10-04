@@ -678,14 +678,15 @@ fn main() -> ExitCode {
                         );
                     }
                     SelfAddressError::VsRoute { .. } => {
-                        #[cfg(any(target_os = "linux", target_os = "macos"))]
-                        error!(target: STARTUP, "{e}");
-                        #[cfg(windows)]
-                        error!(
-                            target: STARTUP,
-                            "{e}; configure it manually with: \
-                             netsh interface ipv6 add route {VISA_SERVICE_ADDR}/128 \"{ifname}\""
-                        );
+                        // Only Windows has a manual command for this
+                        // (zipline#177): manual_add_route_hint is None on
+                        // Linux and macOS, where the message stands alone.
+                        match sys::addr_hint::manual_add_route_hint(&VISA_SERVICE_ADDR, &ifname) {
+                            Some(hint) => {
+                                error!(target: STARTUP, "{e}; configure it manually with: {hint}")
+                            }
+                            None => error!(target: STARTUP, "{e}"),
+                        }
                     }
                     SelfAddressError::VsRouteConflict { .. } => {
                         error!(
