@@ -86,7 +86,7 @@ use zpr_utils::net_defs::SocketAddrExt;
 
 use zpr::addrs::{
     DEFAULT_TETHER_PORT, VISA_SERVICE_ADDR, VISA_SERVICE_PORT, ZPR_INTERNAL_NETWORK,
-    ZPR_TEMP_LOCAL_ADDRESS, ZPRNET_PREFIX_LEN,
+    ZPRNET_PREFIX_LEN,
 };
 use zpr::packet_info::{DOCK_LINK_ID, LOCAL_ACTOR_LINK_ID};
 use zpr::vsapi_types::AuthServicesList;
@@ -264,22 +264,13 @@ fn main() -> ExitCode {
     // (zipline#161): it is created bare and addressed later via
     // `add_address` once the node's ZPR address is known. The value
     // computed here only picks the address family of the control socket
-    // on macOS (IPv6 when None) and is ignored on Linux and Windows,
-    // which is why a placeholder is fine — it is never put on the wire
-    // or on the device.
-    let tun_addr = if !config.zpr_addr.is_empty() {
-        if config.tun_if.is_none() {
-            Some(config.zpr_addr[0].clone())
-        } else {
-            None
-        }
+    // on macOS (which derives IPv6 when None, zipline#177) and is ignored
+    // on Linux and Windows, which is why a placeholder is fine — it is
+    // never put on the wire or on the device.
+    let tun_addr = if !config.zpr_addr.is_empty() && config.tun_if.is_none() {
+        Some(config.zpr_addr[0])
     } else {
-        // TODO: If linux then do not bother setting the temp address since it will fail because ipv6.
-        if cfg!(target_os = "linux") {
-            None
-        } else {
-            Some(ZPR_TEMP_LOCAL_ADDRESS.into())
-        }
+        None
     };
 
     let tun_devs: Vec<_> = match ZprTun::new_mq(
