@@ -2122,13 +2122,11 @@ mod tests {
 
     #[test]
     fn test_send_backlog_over_slab_capacity() {
-        // zipline#117 review (PR #43): with MSG_DONTWAIT socket operations
-        // (needs_cancel == false) each operation occupies a single SQE, so
-        // the submission limit derived from the ring capacity (2 * entries)
-        // can exceed MAX_ENTRIES -- but the state slab, the per-op sockaddr
-        // slabs and `op_seen` all hold only MAX_ENTRIES.  A backlog larger
-        // than MAX_ENTRIES must come back as a partial batch (like the old
-        // `/ 2` limit produced), not panic on the (MAX_ENTRIES + 1)-th push.
+        // zipline#117 review (PR #43): the io_uring engine's per-operation
+        // slabs (batch state, sockaddrs, cmsgs) hold only MAX_ENTRIES, so
+        // the submission limit derived from the ring capacity must never
+        // exceed that.  A backlog larger than MAX_ENTRIES must come back as
+        // a partial batch, not panic on the (MAX_ENTRIES + 1)-th push.
         for engine in ENGINES {
             let inq = udp_socket().unwrap();
             let outq = udp_socket().unwrap();
