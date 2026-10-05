@@ -296,19 +296,21 @@ Packet captures, if needed: `tcpdump -ni utun9` works on the Mac;
 
 *(filled in by the first run; keep one dated subsection per run)*
 
-### First run — pending
+### 2026-10-05 — first run (zipline#174)
 
-First run pending (zipline#174). Template for the run:
-
-* Build commit (`zl-zpr-core`): `______` (Mac and Linux host) · vs
-  `______` (`zl-zpr-visaservice`)
-* macOS version / chip: ______
+* Build commit (`zl-zpr-core`): `c3ef5ba` (Mac and Linux host) · vs
+  `0fafaea` (`zl-zpr-visaservice`)
+* macOS version / chip: macOS 26.5.2 (25F84) / Apple M2
+* Substrate: Mac and Linux host on the same home LAN (Linux host on
+  Wi-Fi), `HOST_LAN_IP=192.168.0.212`.
+* Three adapter runs: run 1 `tun_if = "utun9"` (all checks), run 2 the same
+  command line again (item 6 second start), run 3 `tun_if` removed (item 2).
 
 | # | Checklist item | Result | Evidence / issue |
 |---|---|---|---|
-| 1 | dock-time addressing + route shape | | |
-| 2 | `tun_if` set (`utun9`) and unset (kernel-chosen) both start | | |
-| 3 | bidirectional traffic (ping + HTTP both ways) | | |
-| 4 | application firewall: dock / inbound ping, `socketfilterfw` fix | | |
-| 5 | single-worker throughput (numbers) | | |
-| 6 | Ctrl-C teardown + clean second start | | |
+| 1 | dock-time addressing + route shape | PASS | Before: no `fd5a:5052` route, no `utun9`. After ACTIVE: `utun9` carries `inet6 fd5a:5052:8888::4:1 prefixlen 32`; `netstat` shows `fd5a:5052::/32 fe80::…%utun9 Uc utun9` (on-link, no `S` flag — the alias installed it, `add_route` was the idempotent no-op) and `fd5a:5052:8888::4:1 link#21 UHL lo0`. No error, `File exists` or `replacing` line in the log; the only WARN is packet steering. |
+| 2 | `tun_if` set (`utun9`) and unset (kernel-chosen) both start | PASS | Both reach `becoming ACTIVE`. Unset: the kernel chose `utun6` (system had `utun0`–`utun5`); route on `utun6`, ping both ways and HTTP OK. Minor: the adapter log never names the utun it created — the name came from `ifconfig -l`. |
+| 3 | bidirectional traffic (ping + HTTP both ways) | PASS | Mac→`adapter1` `ping6 -c 4`: 0.0% loss; HTTP `/` returns the `http.server` listing; 64 MiB `blob` fetch completes. `zpr-a`→Mac `ping -6 -c 4`: 0% loss. |
+| 4 | application firewall: dock / inbound ping, `socketfilterfw` fix | N-A | Firewall disabled (`socketfilterfw --getglobalstate`: State = 0) and left off for this run; neither dock nor inbound ping exercised against it. Fix: none needed with the firewall off. |
+| 5 | single-worker throughput (numbers) | recorded | `ping6 -c 500 -i 0.02`: 0.0% loss, rtt 6.654/9.565/16.217 ms. `blob`: 67108864 bytes at 3854327 bytes/s (~31 Mbit/s), over the Wi-Fi substrate. |
+| 6 | Ctrl-C teardown + clean second start | PASS | `Got SIGINT; attempting graceful shutdown`, `Received terminate response for dock link`, process exits on its own; `ifconfig utun9`: does not exist; no `fd5a:5052` route left. Node: `Received terminate for link 5 with reason Shutdown` … `Removed peer link 5`. Run 2 with the same command line: control socket rebinds, ACTIVE, route back on `utun9`, ping 0% loss — no stale-route or zipline#101 owner-check trip. `/var/run/zpr/501/control.sock` is left on disk after exit but does not block the rebind. |
