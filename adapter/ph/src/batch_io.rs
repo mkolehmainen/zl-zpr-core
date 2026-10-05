@@ -578,9 +578,35 @@ mod io_uring {
     // RWF_NOWAIT, which io_uring rejects with -EOPNOTSUPP unless the file
     // has FMODE_NOWAIT; the tun driver only sets that from 6.4 on (not
     // backported to the 5.10/5.15/6.1 stable series).  `detect_support()`
-    // does not probe for this, so on older kernels set `io_engine` to
-    // "posix_unbatched" (zipline#168).  Otherwise, limit io_uring features
-    // used to those available in 5.10 or later.
+    // therefore rejects older kernels, so automatic engine selection falls
+    // back to another engine there (zipline#168).  Otherwise, limit io_uring
+    // features used to those available in 5.10 or later.
+
+    /// Oldest kernel whose tun driver accepts RWF_NOWAIT (see NOTE above).
+    const TUN_NOWAIT_MIN_KERNEL: (u32, u32) = (6, 4);
+
+    /// Whether a kernel release string (as in `/proc/sys/kernel/osrelease`,
+    /// e.g. "6.8.0-138-generic") is at least `(major, minor)`.  Anything
+    /// that does not start with `<major>.<minor>` is rejected, so an
+    /// unrecognized kernel falls back to a safer engine rather than risking
+    /// a fastpath panic.
+    fn kernel_release_at_least(release: &str, (major, minor): (u32, u32)) -> bool {
+        // Parse the leading decimal digits of one dot-separated component
+        // (the minor may carry a suffix, e.g. "4-rc1").
+        fn leading_number(part: Option<&str>) -> Option<u32> {
+            let part = part?;
+            let end = part
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(part.len());
+            part[..end].parse().ok()
+        }
+
+        let mut parts = release.split('.');
+        match (leading_number(parts.next()), leading_number(parts.next())) {
+            (Some(have_major), Some(have_minor)) => (have_major, have_minor) >= (major, minor),
+            _ => false,
+        }
+    }
 
     impl BatchIo {
         pub const ENGINE_NAME: &'static str = "io_uring";
@@ -595,6 +621,15 @@ mod io_uring {
         ];
 
         pub fn detect_support() -> bool {
+            // TUN I/O fails with EOPNOTSUPP on older kernels, which the
+            // fastpath treats as fatal (zipline#168).
+            let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
+                return false;
+            };
+            if !kernel_release_at_least(release.trim(), TUN_NOWAIT_MIN_KERNEL) {
+                return false;
+            }
+
             let Ok(io_uring) = IoUring::new(1) else {
                 return false;
             };
@@ -810,6 +845,41 @@ mod io_uring {
                 bufs,
                 results,
             )
+        }
+    }
+
+    #[cfg(test)]
+    mod kernel_release_tests {
+        use super::*;
+
+        #[test]
+        fn test_kernel_release_at_least_tun_nowait_floor() {
+            // zipline#168 review (PR #76): io_uring must only be selected
+            // on kernels whose tun driver accepts RWF_NOWAIT (6.4+).
+            let at_least = |release| kernel_release_at_least(release, TUN_NOWAIT_MIN_KERNEL);
+
+            for ok in [
+                "6.4.0",
+                "6.4",
+                "6.8.0-138-generic",
+                "6.10.1",
+                "7.0.0-34-generic",
+            ] {
+                assert!(at_least(ok), "{ok} must be accepted");
+            }
+            for too_old in [
+                "6.3.13",
+                "6.1.150",
+                "5.15.0-91-generic",
+                "5.10.240",
+                "4.19.0",
+            ] {
+                assert!(!at_least(too_old), "{too_old} must be rejected");
+            }
+            // Unparseable releases fail safe (fall back to another engine).
+            for junk in ["", "garbage", "6", "6.x.1", ".4"] {
+                assert!(!at_least(junk), "{junk:?} must be rejected");
+            }
         }
     }
 
