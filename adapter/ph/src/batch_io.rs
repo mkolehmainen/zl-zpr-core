@@ -574,8 +574,13 @@ mod io_uring {
         io_uring: IoUring<squeue::Entry, cqueue::Entry>,
     }
 
-    // NOTE: Limit io_uring features used to those available in 5.10 or later.
-    // (= oldest LTS release with EOL > end of 2025)
+    // NOTE: Requires Linux 6.4 or later.  The TUN operations carry
+    // RWF_NOWAIT, which io_uring rejects with -EOPNOTSUPP unless the file
+    // has FMODE_NOWAIT; the tun driver only sets that from 6.4 on (not
+    // backported to the 5.10/5.15/6.1 stable series).  `detect_support()`
+    // does not probe for this, so on older kernels set `io_engine` to
+    // "posix_unbatched" (zipline#168).  Otherwise, limit io_uring features
+    // used to those available in 5.10 or later.
 
     impl BatchIo {
         pub const ENGINE_NAME: &'static str = "io_uring";
