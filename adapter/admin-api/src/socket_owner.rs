@@ -10,8 +10,8 @@
 //!   effective uid. The base is fixed, never environment-derived — see
 //!   [PER_UID_SOCKET_BASE].
 //! * Owner unknown (systemd, direct root login): the socket lives at the
-//!   shared `<data_home>/` path as before; `ph` falls back to the `zpr` group
-//!   for access control.
+//!   shared `<data_home>/` path as before; `ph` gives it to the configured
+//!   `control_group`, if any, for access control (zipline#154).
 //!
 //! Owner resolution here is pure environment-string parsing over an injected
 //! lookup so it is unit-testable without mutating process environment; the

@@ -6,7 +6,10 @@ CI that carries real traffic, so run this whenever a change touches the Windows
 datapath (Wintun, the named-pipe control channel, the `windows_unbatched`
 engine, shutdown). It exercises: Wintun interface creation, docking over the substrate, `ph-cli`
 over the named pipe, ICMPv6 and TCP through ZPR, and graceful Ctrl-C shutdown
-that leaves no Wintun adapter behind.
+that leaves no Wintun adapter behind. Section 6 (operator-run) checks who
+may open the control pipe: a non-elevated `ph-cli` through the configured
+`control_group`, with `ph` under a service identity and from an elevated
+console (zipline#154).
 
 Two machines:
 
@@ -410,8 +413,121 @@ exit
 rm -rf "$WORK"
 ```
 
+## 6. Control pipe access for non-elevated `ph-cli` (zipline#154) — operator-run
+
+**Operator-run.** This section needs a Windows VM; nothing on the Linux
+build host runs it, and the unit gate only *compiles* the Windows-only
+tests (`cargo xwin check --tests`). It checks the control pipe's DACL from
+`docs/SETUP.md` ("Control pipe access and non-elevated `ph-cli`") in the
+two launch modes that matter: `ph` under a service identity (SYSTEM, via
+`psexec -s`), and `ph` from an elevated console. Run it before merging a
+change to `sys/windows/control.rs`, `sys/control_access.rs`, or
+`admin_api::local_group_sid`.
+
+The issue text says `ph-cli status`; `ph-cli` has no `status` subcommand,
+so the checks use `link show`, the same round-trip as 3a. A denied open
+surfaces as `ph-cli`'s "no live packet handler socket (tried … and …)"
+error, because both candidate pipes refuse it; `-p \\.\pipe\zpr-control`
+shows the raw `Access is denied` instead.
+
+### 6a. One-time setup (elevated PowerShell)
+
+Keep the Linux side from section 1 up (run this section before section 5's
+teardown), so `ph.exe` docks as in section 2.
+Then create the group and two local test users (the passwords are
+throwaway; this VM is a test box):
+
+```powershell
+net localgroup zipline /add
+net user zpr-member  'Smoke-154-a!' /add
+net user zpr-outside 'Smoke-154-b!' /add
+net localgroup zipline zpr-member /add
+# Windows unit tests that only compile on the build host — run them here:
+cargo test -p admin-api local_group
+```
+
+Expected: the three `local_group` tests pass (`Users` resolves to
+`S-1-5-32-545`, a random name is `None`, `SYSTEM` is `None`).
+
+Membership is read at logon. `runas` starts a fresh logon, so it always
+sees the current membership; an interactive session of a user added to the
+group must log off and on first (the re-logon caveat in `docs/SETUP.md`).
+
+### 6b. `ph` under a service identity (operator-run)
+
+Stop any `ph.exe` from section 2 first (Ctrl-C). From an elevated
+PowerShell, with [PsExec](https://learn.microsoft.com/sysinternals/downloads/psexec):
+
+```powershell
+cd C:\zpr-smoke
+psexec -s -w C:\zpr-smoke C:\zpr-smoke\ph.exe adapter -c adapter.toml --control-group zipline
+```
+
+Expected startup line, in addition to section 2's:
+`control pipe: granting local group 'zipline' (S-1-5-21-…) access`.
+
+Then, from the **non-elevated** desktop session (or `runas`):
+
+```powershell
+# Member: succeeds.
+runas /user:zpr-member  "cmd /k C:\zpr-smoke\ph-cli.exe link show"
+# Non-member: denied.
+runas /user:zpr-outside "cmd /k C:\zpr-smoke\ph-cli.exe link show"
+# Your own admin account, NOT elevated, not in the group: denied
+# (an unelevated admin token holds Administrators deny-only).
+C:\zpr-smoke\ph-cli.exe link show
+```
+
+Pass criteria (each one operator-run):
+
+* [ ] **6b-1** `zpr-member`, not elevated: `link show` reports the dock link.
+* [ ] **6b-2** `zpr-outside`: denied (the "no live packet handler socket"
+  error, or `Access is denied` with `-p \\.\pipe\zpr-control`).
+* [ ] **6b-3** Your admin account, not elevated, not a member: denied.
+* [ ] **6b-4** `net localgroup zipline <your account> /add`, log off and on,
+  repeat 6b-3: now succeeds.
+
+Ctrl-C does not reach a `psexec -s` process; stop it with
+`taskkill /im ph.exe /f` (the next start reaps the stale Wintun adapter,
+see section 4).
+
+### 6c. `ph` from an elevated console (operator-run)
+
+```powershell
+cd C:\zpr-smoke
+.\ph.exe adapter -c adapter.toml --control-group zipline
+```
+
+* [ ] **6c-1** Same user, **not elevated** (a normal PowerShell as the
+  account that started `ph`): `.\ph-cli.exe link show` succeeds through the
+  owner-SID ACE, without group membership. (Remove yourself from the group
+  first if 6b-4 added you, and log off and on.)
+* [ ] **6c-2** `runas /user:zpr-member "cmd /k C:\zpr-smoke\ph-cli.exe link show"`:
+  succeeds through the group ACE (the over-the-shoulder case).
+* [ ] **6c-3** `runas /user:zpr-outside "cmd /k C:\zpr-smoke\ph-cli.exe link show"`:
+  denied.
+
+### 6d. Group configured but missing (operator-run)
+
+```powershell
+.\ph.exe adapter -c adapter.toml --control-group zpr-no-such-group
+```
+
+* [ ] **6d-1** One warning at startup:
+  `control group 'zpr-no-such-group' not found on this host; the control channel keeps its default access`.
+  `ph` keeps running, and an elevated `ph-cli link show` still works.
+
+### 6e. Cleanup
+
+```powershell
+net user zpr-member /delete
+net user zpr-outside /delete
+net localgroup zipline /delete
+```
+
 ## Recording the result
 
 Paste the transcript of sections 2–4 (adapter startup lines, `ph-cli`
 output, ping/HTTP output, shutdown, `Get-NetAdapter` after exit) on the PR
-or issue the run verifies.
+or issue the run verifies. For section 6, paste the ticked checklist with
+each check's `ph-cli` output and the `ph` startup line for the group.

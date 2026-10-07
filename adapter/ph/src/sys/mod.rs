@@ -56,6 +56,13 @@ pub(crate) mod dad;
 // the substrate setup in `main.rs` uses it on all three platforms.
 pub mod substrate;
 
+// Platform-neutral control-channel access helpers (zipline#154): the
+// shared missing-group warning and the Windows pipe SDDL builder. Compiled
+// on every OS, same pattern and reason as `macos_route` above; each arm
+// uses only its half at runtime.
+#[allow(dead_code)]
+pub(crate) mod control_access;
+
 // POSIX arms of the control channel and the Notify wakeup object
 // (zipline#130: Windows provides the same two modules from sys/windows).
 #[cfg(unix)]

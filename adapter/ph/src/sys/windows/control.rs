@@ -7,15 +7,18 @@
 //! socket.
 //!
 //! The pipe is created with `ServerOptions::create_with_security_attributes_raw`
-//! and a DACL granting access **only** to `BUILTIN\Administrators` and the
-//! owning user's SID — the default named-pipe DACL (which lets Everyone
-//! read) is not acceptable for a control channel.
+//! and a DACL granting access **only** to `BUILTIN\Administrators`, the
+//! owning user's SID and — when `control_group` names an existing local
+//! group (zipline#154) — that group's SID. The default named-pipe DACL
+//! (which lets Everyone read) is not acceptable for a control channel.
 //!
 //! Liveness contract: `admin_api::socket_is_live` probes by opening a pipe
 //! client, which succeeds only while a server instance is waiting — so this
 //! listener always keeps a free instance: `accept` creates the *next*
 //! server instance before handing out the connected one.
 
+use crate::logging::targets::STARTUP;
+use crate::sys::control_access::{control_pipe_sddl, missing_group_warning};
 use admin_api::SocketOwner;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,25 +30,15 @@ use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 /// One accepted control connection.
 pub type ControlStream = NamedPipeServer;
 
-/// The SDDL string for the control pipe's security descriptor: DACL with
-/// exactly two ACEs — full access for `BUILTIN\Administrators` (`BA`) and
-/// full access for the owning user's SID — and no inherited ACEs. `D:P` is
-/// SE_DACL_PROTECTED: nothing is inherited into this DACL.
-///
-/// Pure string construction, unit-testable everywhere; the conversion to a
-/// binary security descriptor below is Windows-only.
-fn control_pipe_sddl(owner_sid: &str) -> String {
-    format!("D:P(A;;GA;;;BA)(A;;GA;;;{owner_sid})")
-}
-
 /// Build the binary security descriptor for [control_pipe_sddl] and run
 /// `f` with a `SECURITY_ATTRIBUTES` pointing at it, freeing the descriptor
 /// afterwards whatever `f` returns.
 fn with_control_pipe_security<T>(
     owner_sid: &str,
+    group_sid: Option<&str>,
     f: impl FnOnce(*mut SECURITY_ATTRIBUTES) -> io::Result<T>,
 ) -> io::Result<T> {
-    let sddl: Vec<u16> = control_pipe_sddl(owner_sid)
+    let sddl: Vec<u16> = control_pipe_sddl(owner_sid, group_sid)
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -75,12 +68,18 @@ fn with_control_pipe_security<T>(
     result
 }
 
-/// Create one pipe server instance at `path` with the D6 DACL.
+/// Create one pipe server instance at `path` with the D6 DACL (plus the
+/// control group's ACE when `group_sid` is set, zipline#154).
 ///
 /// `first` maps to FILE_FLAG_FIRST_PIPE_INSTANCE: the first instance claims
 /// the pipe name, so a second `ph` (or a squatter) cannot hijack it.
-fn create_instance(path: &Path, owner_sid: &str, first: bool) -> io::Result<NamedPipeServer> {
-    with_control_pipe_security(owner_sid, |attrs| {
+fn create_instance(
+    path: &Path,
+    owner_sid: &str,
+    group_sid: Option<&str>,
+    first: bool,
+) -> io::Result<NamedPipeServer> {
+    with_control_pipe_security(owner_sid, group_sid, |attrs| {
         let mut options = ServerOptions::new();
         options.first_pipe_instance(first);
         // SAFETY: attrs points at a live SECURITY_ATTRIBUTES whose
@@ -89,28 +88,66 @@ fn create_instance(path: &Path, owner_sid: &str, first: bool) -> io::Result<Name
     })
 }
 
+/// Resolve the configured control group to its SID once, at startup
+/// (zipline#154). A missing group — or a lookup that fails — logs one
+/// warning and yields `None`, which keeps today's two-ACE DACL.
+fn resolve_control_group(control_group: Option<&str>) -> Option<String> {
+    let name = control_group?;
+    match admin_api::local_group_sid(name) {
+        Ok(Some(sid)) => {
+            tracing::info!(
+                target: STARTUP,
+                "control pipe: granting local group '{name}' ({sid}) access"
+            );
+            Some(sid)
+        }
+        Ok(None) => {
+            tracing::warn!(target: STARTUP, "{}", missing_group_warning(name));
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: STARTUP,
+                "{} (lookup failed: {e})",
+                missing_group_warning(name)
+            );
+            None
+        }
+    }
+}
+
 /// Listens for `ph-cli` control connections on the named pipe.
 pub struct ControlListener {
     path: PathBuf,
     owner_sid: String,
+    /// The configured control group's SID, resolved once in `bind`, so
+    /// every pipe instance carries the same DACL (zipline#154).
+    group_sid: Option<String>,
     /// The next server instance, already created and waiting — this is what
     /// keeps `socket_is_live`'s probe-connect working between accepts.
     next: Option<NamedPipeServer>,
 }
 
 impl ControlListener {
-    /// Create the control pipe at `path`, restricted to Administrators and
-    /// the owning user (plan D6). `socket_owner` is accepted for signature
-    /// parity with the posix arm and ignored (zipline#177): ownership/mode
-    /// planning is unix-specific — chown/chmod have no meaning in the pipe
-    /// namespace — and the DACL owner SID is taken from the current process
-    /// token via [admin_api::current_user_id] instead.
-    pub fn bind(path: &Path, _socket_owner: Option<&SocketOwner>) -> io::Result<Self> {
+    /// Create the control pipe at `path`, restricted to Administrators,
+    /// the owning user (plan D6) and, if configured and present, the local
+    /// group `control_group` (zipline#154). `socket_owner` is accepted for
+    /// signature parity with the posix arm and ignored (zipline#177):
+    /// ownership/mode planning is unix-specific — chown/chmod have no
+    /// meaning in the pipe namespace — and the DACL owner SID is taken from
+    /// the current process token via [admin_api::current_user_id] instead.
+    pub fn bind(
+        path: &Path,
+        _socket_owner: Option<&SocketOwner>,
+        control_group: Option<&str>,
+    ) -> io::Result<Self> {
         let owner_sid = admin_api::current_user_id()?;
-        let first = create_instance(path, &owner_sid, true)?;
+        let group_sid = resolve_control_group(control_group);
+        let first = create_instance(path, &owner_sid, group_sid.as_deref(), true)?;
         Ok(Self {
             path: path.to_path_buf(),
             owner_sid,
+            group_sid,
             next: Some(first),
         })
     }
@@ -128,22 +165,28 @@ impl ControlListener {
         server.connect().await?;
         // Immediately stand up the next instance so the pipe name stays
         // alive (and probe-connectable) while this connection is served.
-        self.next = Some(create_instance(&self.path, &self.owner_sid, false)?);
+        self.next = Some(create_instance(
+            &self.path,
+            &self.owner_sid,
+            self.group_sid.as_deref(),
+            false,
+        )?);
         Ok(server)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::control_pipe_sddl;
+    use crate::sys::control_access::control_pipe_sddl;
 
     /// The DACL grants exactly Administrators and the owner, protected
-    /// from inheritance — plan D6. (DACL construction is compile-checked
-    /// by the msvc gate now and exercised on a real Windows host by C5's
-    /// CI; this test pins the SDDL string itself.)
+    /// from inheritance — plan D6 — when no control group is configured.
+    /// (The SDDL builder moved to the cfg-free `sys::control_access` in
+    /// zipline#154, where its group cases are tested on every OS; this
+    /// Windows-side test pins that the arm still uses it unchanged.)
     #[test]
     fn sddl_grants_only_administrators_and_owner() {
-        let sddl = control_pipe_sddl("S-1-5-21-1-2-3-1001");
+        let sddl = control_pipe_sddl("S-1-5-21-1-2-3-1001", None);
         assert_eq!(sddl, "D:P(A;;GA;;;BA)(A;;GA;;;S-1-5-21-1-2-3-1001)");
     }
 }

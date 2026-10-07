@@ -7,11 +7,13 @@
 //!
 //! * Owner known (`sudo`/`pkexec` invocation): chown to that user, mode
 //!   `0600`.
-//! * Owner unknown (systemd, direct root login): chown group `zpr` when that
-//!   group exists, mode `0660`, so `zpr` group members can drive the adapter.
-//! * No owner and no `zpr` group: leave the socket exactly as before (the
-//!   caller logs one warning) — packaging must not become a hard runtime
-//!   dependency.
+//! * Owner unknown (systemd, launchd, direct root login) and a
+//!   `control_group` configured: chown to that group when it exists, mode
+//!   `0660`, so its members can drive the adapter (zipline#154; before
+//!   that the group was a hard-coded `zpr`).
+//! * No owner and no usable group (none configured, or configured but
+//!   missing): leave the socket exactly as before (the caller logs one
+//!   warning) — packaging must not become a hard runtime dependency.
 //!
 //! [plan_socket_access] is the pure, unit-tested decision; [apply_socket_access]
 //! is the thin syscall wrapper around it.
@@ -24,11 +26,6 @@ use crate::logging::targets::STARTUP;
 use admin_api::SocketOwner;
 use nix::unistd::{Gid, Uid, chown};
 
-/// Group granted socket access when no owner is resolvable. Hardcoded by
-/// design: the fallback must work with zero configuration, and a host
-/// without the group degrades to today's root-only behaviour.
-pub const FALLBACK_GROUP: &str = "zpr";
-
 /// What to do to a control socket after binding it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SocketAccess {
@@ -36,18 +33,21 @@ pub enum SocketAccess {
     /// the user's primary group could not be resolved (uid-only chown).
     OwnerOnly { uid: u32, gid: Option<u32> },
 
-    /// No owner: chown to the fallback group, mode `0660`.
+    /// No owner: chown to the configured control group, mode `0660`.
     GroupShared { gid: u32 },
 
-    /// No owner and no fallback group: leave the socket untouched.
+    /// No owner and no usable control group: leave the socket untouched.
     Unchanged,
 }
 
-/// Decide the socket access plan from the resolved owner and injected group
-/// lookups (pass [system_user_primary_gid] / [system_group_gid] for the real
-/// system; tests inject tables).
+/// Decide the socket access plan from the resolved owner, the configured
+/// `control_group` (zipline#154) and injected lookups (pass
+/// [system_user_primary_gid] / [system_group_gid] for the real system;
+/// tests inject tables). The group is consulted only when there is no
+/// owner, and only the configured name is ever looked up.
 pub fn plan_socket_access<U, G>(
     owner: Option<&SocketOwner>,
+    control_group: Option<&str>,
     user_primary_gid: U,
     group_gid: G,
 ) -> SocketAccess
@@ -65,7 +65,7 @@ where
                 gid,
             }
         }
-        None => match group_gid(FALLBACK_GROUP) {
+        None => match control_group.and_then(group_gid) {
             Some(gid) => SocketAccess::GroupShared { gid },
             None => SocketAccess::Unchanged,
         },
@@ -219,7 +219,7 @@ mod test {
             uid: 1000,
             gid: Some(1001),
         };
-        let plan = plan_socket_access(Some(&owner), no_user_lookup, no_group_lookup);
+        let plan = plan_socket_access(Some(&owner), None, no_user_lookup, no_group_lookup);
         assert_eq!(
             plan,
             SocketAccess::OwnerOnly {
@@ -239,6 +239,7 @@ mod test {
         };
         let plan = plan_socket_access(
             Some(&owner),
+            None,
             |uid| if uid == 1000 { Some(2000) } else { None },
             no_group_lookup,
         );
@@ -259,7 +260,7 @@ mod test {
             uid: 1000,
             gid: None,
         };
-        let plan = plan_socket_access(Some(&owner), |_| None, no_group_lookup);
+        let plan = plan_socket_access(Some(&owner), None, |_| None, no_group_lookup);
         assert_eq!(
             plan,
             SocketAccess::OwnerOnly {
@@ -269,21 +270,56 @@ mod test {
         );
     }
 
-    /// No owner (systemd start): the zpr group grants shared access.
+    /// No owner (systemd start) and a configured group that exists: the
+    /// group grants shared access, and exactly the configured name is
+    /// looked up (zipline#154: no hard-coded fallback group).
     #[test]
-    fn no_owner_with_zpr_group_yields_group_shared() {
-        let plan = plan_socket_access(None, no_user_lookup, |name| {
-            assert_eq!(name, FALLBACK_GROUP);
+    fn no_owner_with_configured_group_yields_group_shared() {
+        let plan = plan_socket_access(None, Some("zipline"), no_user_lookup, |name| {
+            assert_eq!(name, "zipline");
             Some(990)
         });
         assert_eq!(plan, SocketAccess::GroupShared { gid: 990 });
     }
 
-    /// No owner and no zpr group: today's behaviour, untouched.
+    /// No owner and a configured group that does not exist: today's
+    /// behaviour, untouched.
     #[test]
-    fn no_owner_without_zpr_group_yields_unchanged() {
-        let plan = plan_socket_access(None, no_user_lookup, |_| None);
+    fn no_owner_with_missing_configured_group_yields_unchanged() {
+        let plan = plan_socket_access(None, Some("zipline"), no_user_lookup, |_| None);
         assert_eq!(plan, SocketAccess::Unchanged);
+    }
+
+    /// No owner and no group configured: `Unchanged`, and no group lookup
+    /// is made at all — in particular `zpr` is no longer consulted
+    /// (zipline#154 behaviour change).
+    #[test]
+    fn no_owner_without_configured_group_yields_unchanged_without_lookup() {
+        let plan = plan_socket_access(None, None, no_user_lookup, no_group_lookup);
+        assert_eq!(plan, SocketAccess::Unchanged);
+    }
+
+    /// A resolved owner wins over a configured group: the group is only the
+    /// ownerless fallback, and it is not even looked up.
+    #[test]
+    fn owner_wins_over_configured_group() {
+        let owner = SocketOwner {
+            uid: 1000,
+            gid: Some(1001),
+        };
+        let plan = plan_socket_access(
+            Some(&owner),
+            Some("zipline"),
+            no_user_lookup,
+            no_group_lookup,
+        );
+        assert_eq!(
+            plan,
+            SocketAccess::OwnerOnly {
+                uid: 1000,
+                gid: Some(1001)
+            }
+        );
     }
 
     /// Applying a plan really sets the mode (owner case, chown-to-self so

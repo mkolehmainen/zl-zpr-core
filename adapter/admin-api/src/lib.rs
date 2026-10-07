@@ -12,4 +12,6 @@ pub use socket_owner::owner_socket_dir;
 pub use socket_owner::{
     SocketOwner, choose_socket_path, control_socket_path, resolve_socket_owner, socket_is_live,
 };
+#[cfg(windows)]
+pub use user_id::local_group_sid;
 pub use user_id::{current_user_id, is_elevated};

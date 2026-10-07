@@ -1140,4 +1140,105 @@ mod test {
         let bootstrap = config.bootstrap.as_ref().expect("bootstrap should be set");
         assert_eq!(bootstrap.cn(), "cli-adapter-name");
     }
+
+    /// Parse a minimal valid adapter config whose `[global]` section carries
+    /// `global_extra` verbatim, with `extra_args` appended to the command
+    /// line (zipline#154 `control_group` tests).
+    fn argparse_adapter_with(
+        global_extra: &str,
+        extra_args: &[&str],
+    ) -> Result<(PhMode, Config), ArgsError> {
+        let pk_file = TempFile::touch();
+        let tomltxt = format!(
+            r#"
+        [global]
+        private_key_file = '{pk}'
+        control_path = "/tmp/control.sock"
+        {global_extra}
+
+        [adapter]
+        name = "my-adapter"
+        node_addr = "192.168.0.2:5000"
+        "#,
+            pk = pk_file.get_path().to_str().unwrap()
+        );
+        let tmpfile = TempFile::new_toml(&tomltxt);
+        let mut args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
+        args.extend_from_slice(extra_args);
+        argparse(Some(args))
+    }
+
+    /// zipline#154: `control_group` in `[global]` is parsed into the config.
+    #[test]
+    #[parallel(env)]
+    fn test_control_group_from_config_file() {
+        let (_, config) = argparse_adapter_with(r#"control_group = "zipline""#, &[]).unwrap();
+        assert_eq!(config.control_group.as_deref(), Some("zipline"));
+    }
+
+    /// zipline#154: `--control-group` overrides the config file, the same
+    /// precedence as `control_path`.
+    #[test]
+    #[parallel(env)]
+    fn test_control_group_flag_overrides_config_file() {
+        let (_, config) = argparse_adapter_with(
+            r#"control_group = "from-file""#,
+            &["--control-group", "from-flag"],
+        )
+        .unwrap();
+        assert_eq!(config.control_group.as_deref(), Some("from-flag"));
+    }
+
+    /// zipline#154: the flag alone sets it too.
+    #[test]
+    #[parallel(env)]
+    fn test_control_group_from_flag_only() {
+        let (_, config) = argparse_adapter_with("", &["--control-group", "zipline"]).unwrap();
+        assert_eq!(config.control_group.as_deref(), Some("zipline"));
+    }
+
+    /// zipline#154: no default — absent everywhere means `None`.
+    #[test]
+    #[parallel(env)]
+    fn test_control_group_absent_is_none() {
+        let (_, config) = argparse_adapter_with("", &[]).unwrap();
+        assert_eq!(config.control_group, None);
+    }
+
+    /// zipline#154: invalid group names are rejected, from the config file
+    /// and from the flag alike, with an error naming `control_group`.
+    #[test]
+    #[parallel(env)]
+    fn test_control_group_invalid_names_rejected() {
+        for bad in ["", "a\\b", "a,b", "a/b", "a:b", "a*b", "a@b", "a\tb"] {
+            let line = format!("control_group = {}", toml::Value::String(bad.to_string()));
+            let err = argparse_adapter_with(&line, &[]).expect_err(bad);
+            assert!(
+                err.to_string().contains("control_group"),
+                "config {bad:?}: error does not name control_group: {err}"
+            );
+            let err = argparse_adapter_with("", &["--control-group", bad]).expect_err(bad);
+            assert!(
+                err.to_string().contains("control_group"),
+                "flag {bad:?}: error does not name control_group: {err}"
+            );
+        }
+    }
+
+    /// zipline#154: ordinary names (spaces, dots, dashes, underscores) pass.
+    #[test]
+    #[parallel(env)]
+    fn test_control_group_ordinary_names_accepted() {
+        for good in [
+            "zipline",
+            "zpr",
+            "zpr-users",
+            "zpr_users",
+            "ZPR Users",
+            "a.b",
+        ] {
+            let (_, config) = argparse_adapter_with("", &["--control-group", good]).unwrap();
+            assert_eq!(config.control_group.as_deref(), Some(good));
+        }
+    }
 }

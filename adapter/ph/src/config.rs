@@ -156,6 +156,13 @@ pub struct Config {
     /// Path to the unix domain socket for the control interface.
     pub control_path: PathBuf,
 
+    /// Local group granted control-channel access (zipline#154): on
+    /// Windows an extra ACE on the control pipe's DACL; on Linux/macOS the
+    /// socket's group when no invoking user is resolved. `None` (the
+    /// default) keeps each platform's owner-only access. Validated by
+    /// [validate_control_group]; only a name, never interpolated into SDDL.
+    pub control_group: Option<String>,
+
     /// Source address for our UDP substrate socket. For an adapter this should (always?) be `0.0.0.0:0`.
     /// For a node this is the nodes dock listening address.
     pub self_addr: SocketAddr,
@@ -220,8 +227,8 @@ pub struct Config {
     /// The user the control socket should belong to, resolved from
     /// `SUDO_UID`/`SUDO_GID`/`PKEXEC_UID` by [Config::apply_socket_owner].
     /// `None` when ph was started with no recoverable invoking user (e.g.
-    /// under systemd), in which case main falls back to the `zpr` group
-    /// (zipline#39).
+    /// under systemd), in which case the control socket goes to the
+    /// configured [Config::control_group], if any (zipline#39, zipline#154).
     pub socket_owner: Option<SocketOwner>,
 
     /// True while `control_path` is still the derived default — no config
@@ -499,6 +506,13 @@ impl Config {
             }
             self.control_path_derived = false;
         }
+        // The command line wins: set_from_common ran first, so only fill
+        // the value in when no flag supplied it.
+        if self.control_group.is_none() {
+            if let Some(group) = &config.control_group {
+                self.control_group = Some(validate_control_group(group)?);
+            }
+        }
         if let Some(self_addr) = &config.self_addr {
             self.self_addr = *self_addr;
         }
@@ -616,6 +630,9 @@ impl Config {
             })?;
             self.control_path_derived = false;
         }
+        if let Some(group) = &common.control_group {
+            self.control_group = Some(validate_control_group(group)?);
+        }
         if let Some(self_addr) = &common.self_addr {
             self.self_addr = *self_addr;
         }
@@ -694,6 +711,7 @@ impl Default for Config {
         Self {
             name: String::new(),
             control_path: control_socket_path(None),
+            control_group: None,
             self_addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0),
             ca_file: None,
             certificate_file: None,
@@ -761,6 +779,7 @@ pub struct NodeConfigSection {
 #[derive(Deserialize, Debug, Clone)]
 pub struct GlobalConfigSection {
     pub control_path: Option<PathBuf>,
+    pub control_group: Option<String>,
     pub self_addr: Option<SocketAddr>,
     pub ca_file: Option<PathBuf>,
     pub certificate_file: Option<PathBuf>,
@@ -830,6 +849,37 @@ impl Default for TopologyConfig {
             vss_queue_size: DEFAULT_SERVICE_QUEUE_SIZE,
         }
     }
+}
+
+/// Characters a `control_group` name must not contain (zipline#154): the
+/// Windows local-group-name restriction set, which is also safe for unix
+/// group names. Control characters are rejected separately.
+const CONTROL_GROUP_FORBIDDEN: &[char] = &[
+    '\\', '/', '"', '[', ']', ':', '|', '<', '>', '+', '=', ';', ',', '?', '*', '@',
+];
+
+/// Validate a `control_group` name from the config file or command line
+/// (zipline#154). The value is only ever a name handed to the platform's
+/// group lookup — the SID that goes into the pipe's SDDL is produced by the
+/// OS from that lookup, never from this text — but rejecting the Windows
+/// restricted set keeps the name unambiguous on every platform (and keeps a
+/// `DOMAIN\name` spelling from reaching a lookup that must stay local).
+pub fn validate_control_group(name: &str) -> Result<String, ArgsError> {
+    if name.is_empty() {
+        return Err(ArgsError::ParseError(
+            "control_group must not be empty".to_string(),
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| c.is_control() || CONTROL_GROUP_FORBIDDEN.contains(c))
+    {
+        return Err(ArgsError::ParseError(format!(
+            "control_group {name:?} contains the invalid character {bad:?} \
+             (not allowed: control characters and \\ / \" [ ] : | < > + = ; , ? * @)"
+        )));
+    }
+    Ok(name.to_string())
 }
 
 fn check_file_exists(desc: &str, path: &Path) -> Result<(), ArgsError> {
