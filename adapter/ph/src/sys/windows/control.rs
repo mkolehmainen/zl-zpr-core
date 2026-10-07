@@ -105,7 +105,11 @@ impl ControlListener {
     /// planning is unix-specific — chown/chmod have no meaning in the pipe
     /// namespace — and the DACL owner SID is taken from the current process
     /// token via [admin_api::current_user_id] instead.
-    pub fn bind(path: &Path, _socket_owner: Option<&SocketOwner>) -> io::Result<Self> {
+    pub fn bind(
+        path: &Path,
+        _socket_owner: Option<&SocketOwner>,
+        _control_group: Option<&str>,
+    ) -> io::Result<Self> {
         let owner_sid = admin_api::current_user_id()?;
         let first = create_instance(path, &owner_sid, true)?;
         Ok(Self {

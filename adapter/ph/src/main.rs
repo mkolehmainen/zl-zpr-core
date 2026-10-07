@@ -248,6 +248,7 @@ fn main() -> ExitCode {
     let control_listener = match sys::control::ControlListener::bind(
         &config.control_path,
         config.socket_owner.as_ref(),
+        config.control_group.as_deref(),
     ) {
         Ok(listener) => listener,
         Err(e) => {
