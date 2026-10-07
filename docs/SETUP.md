@@ -324,14 +324,28 @@ per-user directory for its own uid first and connects directly. Because each
 invoking user gets their own directory, two adapters started by two different
 users on one host do not collide.
 
-**systemd-started (owner unknown).** When `ph` is started by systemd, `su -`,
-or a direct root login, there is no invoking user to recover. The socket
-stays at the shared path (`/var/run/zpr/control.sock`), and if a group
-named `zpr` exists it is chgrp'd to it with mode `0660`, so members of the
-`zpr` group can use `ph-cli` without sudo. If no `zpr` group exists, the
-socket is left exactly as before (root-only) and `ph` logs one warning —
-creating the group is a packaging/admin choice, never a hard runtime
-dependency.
+**systemd-started (owner unknown).** When `ph` is started by systemd,
+launchd, `su -`, or a direct root login, there is no invoking user to
+recover. The socket stays at the shared path (`/var/run/zpr/control.sock`).
+If a control group is configured — `control_group = "<name>"` in the
+config file's `[global]` section, or `--control-group <name>` on the
+command line (the flag wins) — and that group exists, the socket is
+chgrp'd to it with mode `0660`, so the group's members can use `ph-cli`
+without sudo. The packager that installs `ph` as a service owns the group:
+it creates it at install, deletes it at uninstall, and passes its name to
+`ph` (Zipline uses `zipline`;
+[org-zpr/zipline#29](https://github.com/org-zpr/zipline/issues/29)). With
+no group configured, or a configured group that does not exist, the socket
+is left exactly as before (root-only) and `ph` logs one warning — the group
+is a packaging/admin choice, never a hard runtime dependency. The setting
+has no default, and it is ignored when an owner was resolved (the
+sudo/pkexec mode above always wins).
+
+**Behaviour change (zipline#154).** Before this setting existed, an
+ownerless `ph` looked for a hard-coded group named `zpr`. It no longer
+does: a host that relied on a `zpr` group must now say so explicitly, with
+`control_group = "zpr"` (or `--control-group zpr`). Without that, the
+socket stays root-only and `ph` logs the warning.
 
 `ph-cli`'s default search order is: the per-user socket for your uid, then
 the shared socket. A candidate is chosen by actually connecting to it, not
@@ -345,9 +359,9 @@ multi-adapter and test setups keep full control.
 **Security note.** Reaching the control socket means being able to start and
 stop links and register an `AuthAgent` — i.e. to supply and observe user
 credentials for this adapter, and to receive the IdP `client_secret` in a
-HelloResponse. Socket access is adapter control. Membership in the `zpr`
-group grants exactly that, so treat it accordingly: it is not a low-privilege
-convenience group.
+HelloResponse. Socket access is adapter control. Membership in the
+configured control group grants exactly that, on every platform, so treat
+it accordingly: it is not a low-privilege convenience group.
 
 
 ## Windows
@@ -403,9 +417,12 @@ way.
 
 * **packet capture to a file** — `ph-cli capture set-file` returns
   `Unsupported`,
-* a **Windows service or installer** — `ph.exe` is started by hand from an
-  elevated console
-  ([zipline#147](https://github.com/mkolehmainen/zipline/issues/147)),
+* a **Windows service or installer** — this repository ships none;
+  `ph.exe` is started by hand from an elevated console, and packaging
+  (including the service) belongs to Zipline
+  ([zipline#147](https://github.com/mkolehmainen/zipline/issues/147)). The
+  contract a service package relies on is under "Control pipe access and
+  non-elevated `ph-cli`" below,
 * **`ph-cli` filter compilation** — the `pcap` feature is off on Windows, so
   capture filter strings cannot be compiled there.
 
@@ -448,10 +465,11 @@ Cross-checking from Linux without a Windows box:
    .\ph.exe adapter -c adapter.toml
    ```
 
-4. `ph-cli.exe` (also elevated, same user) talks to it over a named pipe
-   (`\\.\pipe\zpr-control-<sid>`) instead of the unix socket; commands are
-   unchanged. A non-elevated `ph-cli` cannot reach an elevated `ph` in this
-   release.
+4. `ph-cli.exe` talks to it over a named pipe instead of the unix socket;
+   commands are unchanged. `ph-cli` tries `\\.\pipe\zpr-control-<sid>` (its
+   own user SID) first, then the shared `\\.\pipe\zpr-control`, which is
+   where `ph` binds unless `--control-path` says otherwise. Who may open the
+   pipe is the next subsection.
 
 Ctrl-C shuts down gracefully and deletes the Wintun adapter; a second Ctrl-C
 hard-exits. After a crash or hard kill, a stale adapter may remain, named
@@ -461,6 +479,61 @@ next `ph.exe` startup deletes it (`WinTun: Removed orphaned adapter "zpr 1"`).
 `ph.exe` does not need to be code-signed to run from an elevated console
 (`wintun.dll` is signed by WireGuard LLC); verified on Windows 11 with
 Defender SmartScreen at defaults.
+
+### Control pipe access and non-elevated `ph-cli`
+
+The control pipe's DACL is protected (nothing inherited) and grants full
+access to exactly: `BUILTIN\Administrators`, the user `ph` runs as, and —
+when configured — one local group:
+
+    D:P(A;;GA;;;BA)(A;;GA;;;<ph user SID>)[(A;;GA;;;<group SID>)]
+
+Administrators alone is not enough for everyday use: an administrator's
+non-elevated token carries `BUILTIN\Administrators` as deny-only, and a
+non-admin user has no matching ACE at all. The group is what lets the
+expected deployment — `ph` as a Windows service (LocalSystem, session 0),
+users running `ph-cli` as themselves, not elevated — work:
+
+```powershell
+# Service-run ph (the packager's service unit passes the name):
+ph.exe adapter -c C:\ProgramData\zipline\adapter.toml --control-group zipline
+```
+
+The setting is the same one the unix arm uses: `control_group` in
+`[global]`, or `--control-group` (the flag wins). At startup `ph` looks the
+name up on the local machine only — `<COMPUTERNAME>\<name>`, then
+`BUILTIN\<name>`, never an unqualified name, so a same-named domain group
+cannot stand in — and requires the result to be a group. The SID placed in
+the DACL is the one Windows returns for that lookup
+(`ConvertSidToStringSidW`), never text from the config. If the group is
+configured but missing, `ph` keeps the two-ACE DACL and logs one warning:
+
+    control group 'zipline' not found on this host; the control channel keeps its default access
+
+**Packager contract.** The packager owns the group's name and lifecycle on
+all three platforms: it creates the group at install, deletes it at
+uninstall, and passes the name to `ph` from its service unit
+(`zipline-svc` on Windows, `zipline.service` / the launchd plist on
+Linux/macOS) — [org-zpr/zipline#29](https://github.com/org-zpr/zipline/issues/29).
+An administrator then adds the users who may drive the adapter
+(`net localgroup zipline <user> /add`); that is the deliberate admission
+step, and nothing is opened up by default. Until a unit passes the name,
+the group exists but grants nothing.
+
+How each launch mode is covered:
+
+| How `ph` runs | Who reaches the pipe | How |
+|---|---|---|
+| Service (LocalSystem) — the expected common case | members of the configured group, not elevated | group ACE |
+| Elevated console, same user as `ph-cli` | that user, elevated or not (non-elevated: checked by the VM smoke) | user-SID ACE |
+| Elevated console via over-the-shoulder credentials (a different admin account) | members of the configured group | group ACE |
+
+**Re-logon caveat.** Group membership is read into a user's token at
+logon: a user just added to the group must log off and on again (or start
+a new logon session) before `ph-cli` can open the pipe.
+
+The security note above applies unchanged: membership in the control group
+is adapter control.
 
 For an end-to-end walkthrough against a Linux node and visa service, see
 [`integration-test/windows-adapter-test.md`](../integration-test/windows-adapter-test.md).
