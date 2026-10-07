@@ -63,6 +63,14 @@ pub struct CommonArgs {
     #[arg(long, value_name = "DOMAIN_SOCKET_PATH")]
     pub control_path: Option<String>,
 
+    /// Local group whose members may drive the control channel when ph
+    /// runs as a service (zipline#154). Windows: an extra ACE on the
+    /// control pipe. Linux/macOS: the socket's group when no invoking user
+    /// is resolved (systemd/launchd). No default; overrides `control_group`
+    /// in the config file's `[global]` section
+    #[arg(long, value_name = "GROUP")]
+    pub control_group: Option<String>,
+
     /// For a node this is listen substrate address for dock,
     /// for adapter it is best to leave this at its default setting (0.0.0.0:0)
     ///
