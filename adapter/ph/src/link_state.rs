@@ -7491,8 +7491,9 @@ mod tests {
     /// untouched"), and a refresh-grant id_token SHOULD NOT carry a nonce
     /// (OIDC Core §12.2) — so a cached or silently-refreshed token can
     /// never satisfy a new connect. Reusing a token across reconnects
-    /// therefore needs a protocol/VS design change, split out per the Q3
-    /// ruling; this test documents the current, intended behavior.
+    /// would need a protocol/VS design change, closed as wontfix in
+    /// zipline#166 (docs/OIDC.md, "Design decisions"); this test locks in
+    /// the intended behavior.
     #[tokio::test(start_paused = true)]
     async fn test_reconnect_within_token_lifetime_rerequests_interaction() {
         LocalSet::new()
