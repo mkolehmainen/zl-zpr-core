@@ -10,7 +10,8 @@ pub use data_home::get_data_home;
 #[cfg(unix)]
 pub use socket_owner::owner_socket_dir;
 pub use socket_owner::{
-    SocketOwner, choose_socket_path, control_socket_path, resolve_socket_owner, socket_is_live,
+    SocketOwner, choose_socket_path, control_socket_candidates, control_socket_path,
+    resolve_socket_owner, socket_is_live,
 };
 #[cfg(windows)]
 pub use user_id::local_group_sid;

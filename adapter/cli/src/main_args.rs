@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use admin_api::{choose_socket_path, control_socket_path};
+use admin_api::{choose_socket_path, control_socket_candidates};
 
 #[derive(Parser, Debug)]
 #[command(version = build_info::BUILD_VERSION, about = "This program controls the RPC calls to the ZPR Packet Handler\nRun without a command to enter CLI mode", long_about = None)]
@@ -40,8 +40,7 @@ where
 {
     choose_socket_path(
         explicit_control,
-        control_socket_path(Some(user_id)),
-        control_socket_path(None),
+        control_socket_candidates(user_id),
         &exists,
     )
 }
@@ -246,6 +245,7 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use admin_api::control_socket_path;
 
     /// `auth-agent <id> --no-browser` must parse, setting the flag
     /// (zipline#20).
@@ -313,20 +313,25 @@ mod tests {
         assert_eq!(control, shared);
     }
 
-    /// With no socket anywhere the error names both paths tried (zipline#39).
+    /// A systemd/launchd-started ph binds `/var/run/zpr/control.sock`; a
+    /// non-root user whose data home is `~/.local/share` must still find it
+    /// without `-p` (zipline#77).
+    #[cfg(unix)]
+    #[test]
+    fn fixed_shared_socket_fallback() {
+        let fixed = Path::new("/var/run/zpr/control.sock");
+        let control = resolve_sockets_with(None, "1000", |p: &Path| p == fixed).unwrap();
+        assert_eq!(control, fixed);
+    }
+
+    /// With no socket anywhere the error names every path tried (zipline#39).
     #[test]
     fn missing_sockets_error_names_paths() {
         let err = resolve_sockets_with(None, "1000", |_: &Path| false)
             .expect_err("no socket exists, resolution must fail");
-        let per_uid = control_socket_path(Some("1000"));
-        let shared = control_socket_path(None);
-        assert!(
-            err.contains(per_uid.to_str().unwrap()),
-            "error must name the per-uid path: {err}"
-        );
-        assert!(
-            err.contains(shared.to_str().unwrap()),
-            "error must name the shared path: {err}"
-        );
+        for path in control_socket_candidates("1000") {
+            let path = path.to_str().unwrap().to_string();
+            assert!(err.contains(&path), "error must name {path}: {err}");
+        }
     }
 }

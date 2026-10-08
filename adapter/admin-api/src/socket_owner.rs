@@ -144,19 +144,44 @@ pub fn socket_is_live(path: &std::path::Path) -> bool {
         .is_ok()
 }
 
+/// The control paths a client (`ph-cli`) running as `user_id` searches
+/// when no `-p` is given, in priority order (see [choose_socket_path]):
+///
+/// 1. the per-owner path for `user_id` (a `sudo`/`pkexec`-started `ph`);
+/// 2. the shared path, `control_socket_path(None)`;
+/// 3. unix only: the fixed shared path `/var/run/zpr/control.sock`, unless
+///    it is the same as 2 (zipline#77). A `ph` started by systemd or launchd
+///    has no `HOME`, so it binds under `/var/run/zpr`; a non-root `ph-cli`
+///    usually has `~/.local/share` or `XDG_DATA_HOME`, so its data home
+///    (and hence path 2) points elsewhere. This is the same environment
+///    mismatch [PER_UID_SOCKET_BASE] avoids for per-uid sockets.
+///
+/// Windows needs no third entry: pipe names do not depend on the environment.
+pub fn control_socket_candidates(user_id: &str) -> Vec<PathBuf> {
+    let per_owner = control_socket_path(Some(user_id));
+    let shared = control_socket_path(None);
+    #[cfg(unix)]
+    {
+        let fixed = PathBuf::from(PER_UID_SOCKET_BASE).join("control.sock");
+        if fixed != shared {
+            return vec![per_owner, shared, fixed];
+        }
+    }
+    vec![per_owner, shared]
+}
+
 /// Which socket path a client (`ph-cli`) should use, given an optional
-/// explicit path (`-p`) and an injected usability predicate
+/// explicit path (`-p`), the candidate paths to search in priority order
+/// (see [control_socket_candidates]) and an injected usability predicate
 /// (see [socket_is_live]).
 ///
-/// * An explicit path short-circuits everything — it is used whether or not
+/// * An explicit path short-circuits everything. It is used whether or not
 ///   it is usable, so error reporting stays at the connect site.
-/// * Otherwise the per-uid path for the caller's euid is preferred when it
-///   is usable, then the shared path when it is usable.
-/// * When neither is usable the result is an error naming both paths tried.
+/// * Otherwise the first usable candidate wins.
+/// * When none is usable the result is an error naming every path tried.
 pub fn choose_socket_path<F>(
     explicit: Option<PathBuf>,
-    per_uid: PathBuf,
-    shared: PathBuf,
+    candidates: Vec<PathBuf>,
     exists: F,
 ) -> Result<PathBuf, String>
 where
@@ -165,16 +190,13 @@ where
     if let Some(path) = explicit {
         return Ok(path);
     }
-    if exists(&per_uid) {
-        return Ok(per_uid);
+    if let Some(path) = candidates.iter().find(|p| exists(p)) {
+        return Ok(path.clone());
     }
-    if exists(&shared) {
-        return Ok(shared);
-    }
+    let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
     Err(format!(
-        "no live packet handler socket (tried {} and {}); is ph running? Use -p to point at an explicit socket path",
-        per_uid.display(),
-        shared.display()
+        "no live packet handler socket (tried {}); is ph running? Use -p to point at an explicit socket path",
+        tried.join(", ")
     ))
 }
 
@@ -348,14 +370,22 @@ mod test {
         assert_eq!(ph_side, cli_side);
     }
 
+    /// The three-candidate list the tests below search, in priority order.
+    fn candidates() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from("/per-uid/control.sock"),
+            PathBuf::from("/shared/control.sock"),
+            PathBuf::from("/fixed/control.sock"),
+        ]
+    }
+
     /// An explicit `-p` path short-circuits the search, even when it does
     /// not exist.
     #[test]
     fn explicit_path_short_circuits() {
         let chosen = choose_socket_path(
             Some(PathBuf::from("/explicit/control.sock")),
-            PathBuf::from("/per-uid/control.sock"),
-            PathBuf::from("/shared/control.sock"),
+            candidates(),
             |_: &Path| false,
         );
         assert_eq!(chosen, Ok(PathBuf::from("/explicit/control.sock")));
@@ -365,39 +395,39 @@ mod test {
     /// exists.
     #[test]
     fn per_uid_path_preferred_when_present() {
-        let chosen = choose_socket_path(
-            None,
-            PathBuf::from("/per-uid/control.sock"),
-            PathBuf::from("/shared/control.sock"),
-            |_: &Path| true,
-        );
+        let chosen = choose_socket_path(None, candidates(), |_: &Path| true);
         assert_eq!(chosen, Ok(PathBuf::from("/per-uid/control.sock")));
     }
 
     /// The shared path is the fallback when the per-uid path is absent.
     #[test]
     fn shared_path_used_when_per_uid_absent() {
-        let chosen = choose_socket_path(
-            None,
-            PathBuf::from("/per-uid/control.sock"),
-            PathBuf::from("/shared/control.sock"),
-            |p: &Path| p == Path::new("/shared/control.sock"),
-        );
+        let chosen = choose_socket_path(None, candidates(), |p: &Path| {
+            p == Path::new("/shared/control.sock")
+        });
         assert_eq!(chosen, Ok(PathBuf::from("/shared/control.sock")));
     }
 
-    /// When nothing exists the error names both paths tried.
+    /// The last candidate is still reached when every earlier one is
+    /// absent (zipline#77: the fixed shared path behind a data home that
+    /// `HOME`/`XDG_DATA_HOME` moved elsewhere).
     #[test]
-    fn error_names_both_paths_tried() {
-        let err = choose_socket_path(
-            None,
-            PathBuf::from("/per-uid/control.sock"),
-            PathBuf::from("/shared/control.sock"),
-            |_: &Path| false,
-        )
-        .expect_err("no socket exists, the search must fail");
-        assert!(err.contains("/per-uid/control.sock"), "err was: {err}");
-        assert!(err.contains("/shared/control.sock"), "err was: {err}");
+    fn last_candidate_used_when_earlier_absent() {
+        let chosen = choose_socket_path(None, candidates(), |p: &Path| {
+            p == Path::new("/fixed/control.sock")
+        });
+        assert_eq!(chosen, Ok(PathBuf::from("/fixed/control.sock")));
+    }
+
+    /// When nothing exists the error names every path tried.
+    #[test]
+    fn error_names_every_path_tried() {
+        let err = choose_socket_path(None, candidates(), |_: &Path| false)
+            .expect_err("no socket exists, the search must fail");
+        for path in candidates() {
+            let path = path.to_str().unwrap().to_string();
+            assert!(err.contains(&path), "err must name {path}: {err}");
+        }
     }
 
     /// The failure diagnostic points at `-p` and ONLY `-p`: `ph-cli`
@@ -408,17 +438,40 @@ mod test {
     /// calls [choose_socket_path].
     #[test]
     fn error_recommends_only_dash_p() {
-        let err = choose_socket_path(
-            None,
-            PathBuf::from("/per-uid/control.sock"),
-            PathBuf::from("/shared/control.sock"),
-            |_: &Path| false,
-        )
-        .expect_err("no socket exists, the search must fail");
+        let err = choose_socket_path(None, candidates(), |_: &Path| false)
+            .expect_err("no socket exists, the search must fail");
         assert!(err.contains("-p"), "err must recommend -p: {err}");
         assert!(
             !err.contains("-c"),
             "err must not mention the retired -c option: {err}"
+        );
+    }
+
+    /// zipline#77: a systemd/launchd-started `ph` has no `HOME`, so it binds
+    /// the shared socket under `/var/run/zpr`; a non-root `ph-cli` usually
+    /// has `~/.local/share`, so its data home differs. The candidates must
+    /// therefore end with the fixed `/var/run/zpr/control.sock`, after the
+    /// per-uid and data-home paths, and list it only once.
+    #[cfg(unix)]
+    #[test]
+    fn candidates_end_with_fixed_shared_path() {
+        let fixed = Path::new("/var/run/zpr/control.sock");
+        let list = control_socket_candidates("1000");
+        assert_eq!(list[0], control_socket_path(Some("1000")));
+        assert_eq!(list[1], control_socket_path(None));
+        assert_eq!(list.last().unwrap(), fixed);
+        assert_eq!(list.iter().filter(|p| *p == fixed).count(), 1);
+    }
+
+    /// Windows: the shared pipe name is not environment-derived, so the
+    /// search is just the per-SID pipe, then the shared pipe.
+    #[cfg(windows)]
+    #[test]
+    fn candidates_are_per_sid_then_shared() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        assert_eq!(
+            control_socket_candidates(sid),
+            vec![control_socket_path(Some(sid)), control_socket_path(None)]
         );
     }
 
