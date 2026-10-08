@@ -348,11 +348,18 @@ does: a host that relied on a `zpr` group must now say so explicitly, with
 socket stays root-only and `ph` logs the warning.
 
 `ph-cli`'s default search order is: the per-user socket for your uid, then
-the shared socket. A candidate is chosen by actually connecting to it, not
-by checking the pathname exists — a stale socket file left behind by a dead
-`ph` (nothing unlinks it on a crash) never shadows a live server at the
-other path. If neither answers, `ph-cli` fails with an error naming both
-paths tried. An explicit `-p` (control) always wins, on both `ph` and
+the shared socket under your data home, then the fixed shared socket
+`/var/run/zpr/control.sock`. The last entry is there because "the shared
+path" depends on the environment: it lives under `$XDG_DATA_HOME`, or
+`~/.local/share` if that exists, and only falls back to `/var/run`
+otherwise. A service-started `ph` has no `HOME` and so binds under
+`/var/run/zpr`, while a desktop user's `ph-cli` usually has
+`~/.local/share`. Without the fixed entry, a `control_group` member would
+need `-p` (zipline#77). A candidate is chosen by actually connecting to it,
+not by checking the pathname exists — a stale socket file left behind by a
+dead `ph` (nothing unlinks it on a crash) never shadows a live server at a
+later path. If none answers, `ph-cli` fails with an error naming every
+path tried. An explicit `-p` (control) always wins, on both `ph` and
 `ph-cli`, as does an explicit `control_path` in the config file — so
 multi-adapter and test setups keep full control.
 
