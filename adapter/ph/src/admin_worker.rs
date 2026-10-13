@@ -375,7 +375,7 @@ impl svc::Server for AdminServiceImpl {
         _: svc::PerfSampleParams,
         mut results: svc::PerfSampleResults,
     ) -> Result<(), capnp::Error> {
-        info!(target: RPC, "Perf sample procedure initiated");
+        debug!(target: RPC, "Perf sample procedure initiated");
         let mut results_builder = results.get();
         results_builder.set_result("Not currently supported");
         Ok(())
@@ -386,7 +386,7 @@ impl svc::Server for AdminServiceImpl {
         _: svc::ShowLinkSummaryParams,
         mut results: svc::ShowLinkSummaryResults,
     ) -> Result<(), capnp::Error> {
-        info!(target: RPC, "Show link summary procedure initiated");
+        debug!(target: RPC, "Show link summary procedure initiated");
         {
             let mut peer_ids = Vec::new();
             self.asm.peer_table.for_each(|(id, peer)| {
@@ -413,7 +413,7 @@ impl svc::Server for AdminServiceImpl {
         params: svc::ShowLinkParams,
         mut results: svc::ShowLinkResults,
     ) -> Result<(), capnp::Error> {
-        info!(target: RPC, "Show link procedure initiated");
+        debug!(target: RPC, "Show link procedure initiated");
         let id = params.get()?.get_id();
         debug!(target: RPC, "Show {} requested", self.asm.formatted_link_id(id));
 
@@ -577,7 +577,7 @@ impl svc::Server for AdminServiceImpl {
         _: svc::GetNodeInfoParams,
         mut results: svc::GetNodeInfoResults,
     ) -> Result<(), capnp::Error> {
-        info!(target: RPC, "Get node info from adapter");
+        debug!(target: RPC, "Get node info from adapter");
         let task_asm = self.asm.clone();
 
         let mut results_builder = results.get().init_result();
@@ -1798,5 +1798,109 @@ mod test {
                 );
             })
             .await
+    }
+
+    /// Read-only admin RPCs log at DEBUG, not INFO (zipline#188): a poller
+    /// such as `zipline log` must not fill the INFO log. State-changing
+    /// calls keep their INFO line — `resetCounters` is the positive control
+    /// that proves the capture works, so the negative assertion is not
+    /// vacuous.
+    #[tokio::test]
+    async fn test_read_only_rpcs_log_at_debug_state_changing_at_info() {
+        use std::sync::Mutex;
+        use tracing_subscriber::filter::targets::Targets;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .with_filter(Targets::new().with_target(RPC, Level::INFO)),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
+                    asm,
+                    agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    capture_supported: false,
+                });
+
+                service
+                    .show_link_summary_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("showLinkSummary must succeed");
+                let mut show_link = service.show_link_request();
+                show_link.get().set_id(1);
+                show_link
+                    .send()
+                    .promise
+                    .await
+                    .expect("showLink must succeed");
+                service
+                    .perf_sample_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("perfSample must succeed");
+                service
+                    .get_node_info_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("getNodeInfo must succeed");
+                service
+                    .reset_counters_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("resetCounters must succeed");
+            })
+            .await;
+
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        for read_only in [
+            "Show link summary procedure initiated",
+            "Show link procedure initiated",
+            "Perf sample procedure initiated",
+            "Get node info from adapter",
+        ] {
+            assert!(
+                !output.lines().any(|l| l.contains(read_only)),
+                "read-only RPC logged at INFO: {read_only:?}\ncaptured INFO output:\n{output}"
+            );
+        }
+        let control: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains("Reset counters procedure initiated"))
+            .collect();
+        assert_eq!(
+            control.len(),
+            1,
+            "state-changing resetCounters must log exactly one INFO line\ncaptured INFO output:\n{output}"
+        );
+        assert!(
+            control[0].contains(" INFO "),
+            "resetCounters line must be at INFO: {:?}",
+            control[0]
+        );
     }
 }
