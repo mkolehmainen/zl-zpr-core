@@ -1799,4 +1799,108 @@ mod test {
             })
             .await
     }
+
+    /// Read-only admin RPCs log at DEBUG, not INFO (zipline#188): a poller
+    /// such as `zipline log` must not fill the INFO log. State-changing
+    /// calls keep their INFO line — `resetCounters` is the positive control
+    /// that proves the capture works, so the negative assertion is not
+    /// vacuous.
+    #[tokio::test]
+    async fn test_read_only_rpcs_log_at_debug_state_changing_at_info() {
+        use std::sync::Mutex;
+        use tracing_subscriber::filter::targets::Targets;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .with_filter(Targets::new().with_target(RPC, Level::INFO)),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
+                    asm,
+                    agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    capture_supported: false,
+                });
+
+                service
+                    .show_link_summary_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("showLinkSummary must succeed");
+                let mut show_link = service.show_link_request();
+                show_link.get().set_id(1);
+                show_link
+                    .send()
+                    .promise
+                    .await
+                    .expect("showLink must succeed");
+                service
+                    .perf_sample_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("perfSample must succeed");
+                service
+                    .get_node_info_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("getNodeInfo must succeed");
+                service
+                    .reset_counters_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("resetCounters must succeed");
+            })
+            .await;
+
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        for read_only in [
+            "Show link summary procedure initiated",
+            "Show link procedure initiated",
+            "Perf sample procedure initiated",
+            "Get node info from adapter",
+        ] {
+            assert!(
+                !output.lines().any(|l| l.contains(read_only)),
+                "read-only RPC logged at INFO: {read_only:?}\ncaptured INFO output:\n{output}"
+            );
+        }
+        let control: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains("Reset counters procedure initiated"))
+            .collect();
+        assert_eq!(
+            control.len(),
+            1,
+            "state-changing resetCounters must log exactly one INFO line\ncaptured INFO output:\n{output}"
+        );
+        assert!(
+            control[0].contains(" INFO "),
+            "resetCounters line must be at INFO: {:?}",
+            control[0]
+        );
+    }
 }
