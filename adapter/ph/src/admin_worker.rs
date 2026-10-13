@@ -375,7 +375,7 @@ impl svc::Server for AdminServiceImpl {
         _: svc::PerfSampleParams,
         mut results: svc::PerfSampleResults,
     ) -> Result<(), capnp::Error> {
-        info!(target: RPC, "Perf sample procedure initiated");
+        debug!(target: RPC, "Perf sample procedure initiated");
         let mut results_builder = results.get();
         results_builder.set_result("Not currently supported");
         Ok(())
@@ -386,7 +386,7 @@ impl svc::Server for AdminServiceImpl {
         _: svc::ShowLinkSummaryParams,
         mut results: svc::ShowLinkSummaryResults,
     ) -> Result<(), capnp::Error> {
-        info!(target: RPC, "Show link summary procedure initiated");
+        debug!(target: RPC, "Show link summary procedure initiated");
         {
             let mut peer_ids = Vec::new();
             self.asm.peer_table.for_each(|(id, peer)| {
@@ -413,7 +413,7 @@ impl svc::Server for AdminServiceImpl {
         params: svc::ShowLinkParams,
         mut results: svc::ShowLinkResults,
     ) -> Result<(), capnp::Error> {
-        info!(target: RPC, "Show link procedure initiated");
+        debug!(target: RPC, "Show link procedure initiated");
         let id = params.get()?.get_id();
         debug!(target: RPC, "Show {} requested", self.asm.formatted_link_id(id));
 
@@ -577,7 +577,7 @@ impl svc::Server for AdminServiceImpl {
         _: svc::GetNodeInfoParams,
         mut results: svc::GetNodeInfoResults,
     ) -> Result<(), capnp::Error> {
-        info!(target: RPC, "Get node info from adapter");
+        debug!(target: RPC, "Get node info from adapter");
         let task_asm = self.asm.clone();
 
         let mut results_builder = results.get().init_result();
