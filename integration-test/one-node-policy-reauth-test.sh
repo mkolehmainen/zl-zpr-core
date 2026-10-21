@@ -70,7 +70,9 @@ NETEM_PARAMS=${NETEM_PARAMS:-}
 
 source "$(dirname $0)/lib/common_funcs.sh"
 
-ZPR_USER=$USER
+# Re-exec inside an unprivileged user+network namespace; everything below
+# runs there and needs no sudo.
+enter_test_namespace "$@"
 
 NODE_SUBSTRATE_ADDR_VS=10.0.0.1
 NODE_SUBSTRATE_ADDR_A=10.0.1.1
@@ -192,7 +194,7 @@ function counters() {
 function launch_fake_idp() {
   NETNS=$1
   SUB=$2
-  sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" python3 "$FAKE_IDP" \
+  in_ns "$NETNS" python3 "$FAKE_IDP" \
     --port "$IDP_PORT" \
     --state-dir idp-state \
     --tls-cert idp.crt --tls-key idp.key \
@@ -271,7 +273,7 @@ function assert_unreachable() {
   local NETNS=$1
   local ADDR=$2
   local OUT RC RECEIVED
-  OUT=$(sudo ip netns exec "$NETNS" ping -q -c 3 -w 5 "$ADDR" 2>&1) && RC=0 || RC=$?
+  OUT=$(in_ns "$NETNS" ping -q -c 3 -w 5 "$ADDR" 2>&1) && RC=0 || RC=$?
   if (( RC >= 2 )); then
     echo "ERROR: ping to $ADDR from $NETNS failed to execute (exit $RC):"
     echo "$OUT"
@@ -300,7 +302,7 @@ function revoke_budget() {
 
 # Run vs-admin against the admin API from inside the zpr-vs netns.
 function vs_admin() {
-  sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" \
+  in_ns zpr-vs \
     "$VS_ADMIN_BIN" --svc-url "$ADMIN_URL" --ca-cert ca.crt \
     --api-key-file vs-admin.key --format compact "$@"
 }
@@ -317,7 +319,7 @@ function install_policy() {
 # authentication path is the OIDC user blob supplied through the AuthAgent,
 # and its install-driven re-auth must be the silent refresh.
 function launch_adapter1() {
-  sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
+  in_ns zpr-a env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
     adapter \
     --logging "$DEBUG_TARGETS" \
     --control-path "$ADAPTER1_SOCK" \
@@ -348,7 +350,7 @@ function oidc_auth_agent() {
   LOGIN_LOG=$3
 
   rm -f "$LOGIN_LOG"
-  sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" \
+  in_ns "$NETNS" \
     env -u BROWSER SSL_CERT_FILE="$PWD/ca.crt" \
     "$PH_DEBUG_BIN" -p "$SOCK" auth-agent "$DOCK_LINK" --no-browser \
     > "$LOGIN_LOG" 2>&1 &
@@ -372,7 +374,7 @@ function oidc_auth_agent() {
 
   # Drive the browserless login: GET the authorization URL; the IdP 302s
   # to http://127.0.0.1:<port>/callback where ph-cli is listening.
-  sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" \
+  in_ns "$NETNS" \
     curl --silent --show-error --location --cacert ca.crt \
     --output /dev/null "$AUTH_URL" || true
 
@@ -481,7 +483,7 @@ launch_fake_idp zpr-a user-a
 
 # Each instance must answer discovery before anything dials it.
 function check_idp() {
-  sudo -E ip netns exec "$1" curl --silent --cacert ca.crt \
+  in_ns "$1" curl --silent --cacert ca.crt \
     --output /dev/null "$IDP_ISSUER/.well-known/openid-configuration"
 }
 wait_for 15 check_idp zpr-vs
@@ -493,7 +495,7 @@ wait_for 15 check_idp zpr-a
 
 echo "Launching ValKey"
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$VALKEY_SERVER_BIN" \
+in_ns zpr-vs "$VALKEY_SERVER_BIN" \
     --save "" \
     --appendonly no 2>&1 | tee valkey.log | prefix_log valkey &
 
@@ -507,7 +509,7 @@ echo "Launching Visa Service"
 # -v (debug): the `reauthorize` handler logs its arrival at debug level
 # (vs/src/vsapi_worker.rs) — useful in the failure diagnostics even though
 # the assertions key on info-level lines.
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" \
+in_ns zpr-vs \
     env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/ca.crt" "$VS_BIN" \
     -v \
     -c vs-config.toml \
@@ -522,7 +524,7 @@ sleep 2
 
 echo "Launching Node"
 
-sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-node "$PH_BIN" \
   node \
   --logging "$DEBUG_TARGETS vss_rpc=DEBUG" \
   --control-path "$NODE_SOCK" \
@@ -539,7 +541,7 @@ sleep 2
 
 echo "Launching Adapters"
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-vs "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$VS_SOCK" \
@@ -571,7 +573,7 @@ launch_adapter1
 # adapter2: DEVICE-ONLY — bootstrap key at launch, no user login ever. Its
 # dock link authenticates at startup and stays Active; the only credential
 # it can ever re-present is this RSA key.
-sudo -E ip netns exec zpr-b sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-b "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER2_SOCK" \
@@ -647,7 +649,7 @@ echo "LEG 1: RSA survival across three policy installs"
 # assertion is ZERO loss: the node's self re-auth is in-place (zipline#121)
 # and the adapters' renewals ride the existing links (zipline#122), so not
 # one packet may drop while three installs go by.
-sudo ip netns exec zpr-a ping -i 0.2 "$B_ZPR_ADDR" > "$CONT_PING_LOG" 2>&1 &
+in_ns zpr-a ping -i 0.2 "$B_ZPR_ADDR" > "$CONT_PING_LOG" 2>&1 &
 sleep 2
 
 for I in 1 2 3; do
@@ -682,7 +684,7 @@ fi
 
 # Stop the continuous ping (leg-1 scope) whether the leg passed or not, and
 # give ping a moment to flush its summary.
-sudo pkill -SIGINT -f "ping -i 0.2 $B_ZPR_ADDR" || true
+pkill_own -SIGINT -f "ping -i 0.2 $B_ZPR_ADDR" || true
 sleep 2
 
 if [[ "$PASS" == 0 ]] then
@@ -864,7 +866,7 @@ fi
 if [[ "$PASS" == 0 ]] then
 # adapter1 is unaffected: its user still reaches PingableVs across the
 # boundary — while adapter2, revoked and its visas dropped, is unreachable.
-if ! sudo ip netns exec zpr-a ping -q -c 5 -w 10 "$VS_ZPR_ADDR"; then
+if ! in_ns zpr-a ping -q -c 5 -w 10 "$VS_ZPR_ADDR"; then
   echo "ERROR: adapter1's traffic stopped when adapter2 was revoked"
   PASS=1
 fi
@@ -956,14 +958,14 @@ do
   kill -SIGINT "$AGENT_PID" 2> /dev/null || true
 done
 
-sudo pkill -SIGTERM -f "fake-idp.py --port" || true
+pkill_own -SIGTERM -f "fake-idp.py --port" || true
 
 for pid in $(get_descendants)
 do
   echo
   echo "Terminating $pid"
   sleep 1
-  sudo kill -SIGINT "$pid"
+  kill -SIGINT "$pid"
   sleep 1
 done
 

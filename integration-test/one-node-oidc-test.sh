@@ -51,7 +51,9 @@ NETEM_PARAMS=${NETEM_PARAMS:-}
 
 source "$(dirname $0)/lib/common_funcs.sh"
 
-ZPR_USER=$USER
+# Re-exec inside an unprivileged user+network namespace; everything below
+# runs there and needs no sudo.
+enter_test_namespace "$@"
 
 NODE_SUBSTRATE_ADDR_VS=10.0.0.1
 NODE_SUBSTRATE_ADDR_A=10.0.1.1
@@ -145,7 +147,7 @@ function counters() {
 function launch_fake_idp() {
   NETNS=$1
   SUB=$2
-  sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" python3 "$FAKE_IDP" \
+  in_ns "$NETNS" python3 "$FAKE_IDP" \
     --port "$IDP_PORT" \
     --state-dir idp-state \
     --tls-cert idp.crt --tls-key idp.key \
@@ -159,7 +161,7 @@ function launch_fake_idp() {
 # Launch adapter1 — user-only: deliberately NO --bootstrap-key, so the only
 # authentication path is the OIDC user blob supplied through the AuthAgent.
 function launch_adapter1() {
-  sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
+  in_ns zpr-a env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
     adapter \
     --logging "$DEBUG_TARGETS" \
     --control-path "$ADAPTER1_SOCK" \
@@ -186,7 +188,7 @@ function oidc_login() {
   LOGIN_LOG=$3
 
   rm -f "$LOGIN_LOG"
-  sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" \
+  in_ns "$NETNS" \
     env -u BROWSER SSL_CERT_FILE="$PWD/ca.crt" \
     "$PH_DEBUG_BIN" -p "$SOCK" connect "$DOCK_LINK" --no-browser \
     > "$LOGIN_LOG" 2>&1 &
@@ -204,7 +206,7 @@ function oidc_login() {
   if [ -n "$AUTH_URL" ]; then
     # Drive the browserless login: GET the authorization URL; the IdP 302s
     # to http://127.0.0.1:<port>/callback where ph-cli is listening.
-    sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" \
+    in_ns "$NETNS" \
       curl --silent --show-error --location --cacert ca.crt \
       --output /dev/null "$AUTH_URL" || true
   fi
@@ -289,7 +291,7 @@ launch_fake_idp zpr-b user-b
 
 # Each instance must answer discovery before anything dials it.
 function check_idp() {
-  sudo -E ip netns exec "$1" curl --silent --cacert ca.crt \
+  in_ns "$1" curl --silent --cacert ca.crt \
     --output /dev/null "$IDP_ISSUER/.well-known/openid-configuration"
 }
 wait_for 15 check_idp zpr-vs
@@ -302,7 +304,7 @@ wait_for 15 check_idp zpr-b
 
 echo "Launching ValKey"
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$VALKEY_SERVER_BIN" \
+in_ns zpr-vs "$VALKEY_SERVER_BIN" \
     --save "" \
     --appendonly no 2>&1 | tee valkey.log | prefix_log valkey &
 
@@ -312,7 +314,7 @@ echo "Launching Visa Service"
 
 # SSL_CERT_FILE: the visa service's JWKS refresh must trust the fake IdP's
 # test-CA TLS certificate.
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" \
+in_ns zpr-vs \
     env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/ca.crt" "$VS_BIN" \
     -c vs-config.toml \
     --clear-state \
@@ -326,7 +328,7 @@ sleep 2
 
 echo "Launching Node"
 
-sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-node "$PH_BIN" \
   node \
   --logging "$DEBUG_TARGETS vss_rpc=DEBUG" \
   --control-path "$NODE_SOCK" \
@@ -343,7 +345,7 @@ sleep 2
 
 echo "Launching Adapters"
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-vs "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$VS_SOCK" \
@@ -379,7 +381,7 @@ wait_for 30 check_node_has_auth_services || {
 launch_adapter1
 
 # adapter2: both blobs — bootstrap key here, user login below.
-sudo -E ip netns exec zpr-b sudo -E -u "$ZPR_USER" env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
+in_ns zpr-b env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER2_SOCK" \
@@ -478,7 +480,7 @@ if [ -z "$ADAPTER1_PID" ]; then
   echo "ERROR: cannot find adapter1 to restart"
   PASS=1
 else
-  sudo kill -SIGINT "$ADAPTER1_PID"
+  kill -SIGINT "$ADAPTER1_PID"
   # The old adapter must be gone before the new one docks: while its link
   # is up the visa service holds its granted address for a live actor and
   # rejects the new login with "already held by a live actor".
@@ -553,14 +555,14 @@ fi
 # Cleanup
 #
 
-sudo pkill -SIGTERM -f "fake-idp.py --port" || true
+pkill_own -SIGTERM -f "fake-idp.py --port" || true
 
 for pid in $(get_descendants)
 do
   echo
   echo "Terminating $pid"
   sleep 1
-  sudo kill -SIGINT "$pid"
+  kill -SIGINT "$pid"
   sleep 1
 done
 

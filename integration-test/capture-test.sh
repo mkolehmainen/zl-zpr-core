@@ -12,7 +12,9 @@ NODE_AUTH_PRIVATE_KEY="${NODE_AUTH_PRIVATE_KEY:-$PREGEN/node-rsa-key.pem}"
 
 source "$(dirname $0)/lib/common_funcs.sh"
 
-ZPR_USER=$USER
+# Re-exec inside an unprivileged user+network namespace; everything below
+# runs there and needs no sudo.
+enter_test_namespace "$@"
 
 NODE_SUBSTRATE_ADDR_VS=10.0.0.1
 NODE_SUBSTRATE_ADDR_A=10.0.1.1
@@ -137,13 +139,13 @@ copy_address_store
 # Launch ValKey + Visa Service
 #
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$VALKEY_SERVER_BIN" \
+in_ns zpr-vs "$VALKEY_SERVER_BIN" \
     --save "" \
     --appendonly no 2>&1 | tee valkey.log | prefix_log valkey &
 
 wait_for 15 check_vs_valkey_port
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" XDG_DATA_HOME=/tmp "$VS_BIN" \
+in_ns zpr-vs env XDG_DATA_HOME=/tmp "$VS_BIN" \
     -c vs-config.toml \
     --clear-state \
     "$PREGEN/$POLICY_BIN" 2>&1 | tee vs.log | prefix_log vs &
@@ -153,7 +155,7 @@ sleep 2
 #
 # Launch PHs
 #
-sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-node "$PH_BIN" \
   node \
   --logging "$DEBUG_TARGETS" \
   --control-path "$NODE_SOCK" \
@@ -168,7 +170,7 @@ sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
 
 sleep 2
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-vs "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$VS_SOCK" \
@@ -183,7 +185,7 @@ sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$PH_BIN" \
 
 sleep 5
 
-sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-a "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER1_SOCK" \
@@ -195,7 +197,7 @@ sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" "$PH_BIN" \
   --node-addr "$NODE_SUBSTRATE_ADDR_A":12345 \
   --zpr-addr "$A_ZPR_ADDR" 2>&1 | tee adapter1.log | prefix_log zpr-a &
 
-sudo -E ip netns exec zpr-b sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-b "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER2_SOCK" \
@@ -208,7 +210,7 @@ sudo -E ip netns exec zpr-b sudo -E -u "$ZPR_USER" "$PH_BIN" \
   --zpr-addr "$B_ZPR_ADDR" 2>&1 | tee adapter2.log | prefix_log zpr-b &
 
 if [[ "$NUM_ACTORS" -ge 3 ]]; then
-  sudo -E ip netns exec zpr-c sudo -E -u "$ZPR_USER" "$PH_BIN" \
+  in_ns zpr-c "$PH_BIN" \
     adapter \
     --logging "$DEBUG_TARGETS" \
     --control-path "$ADAPTER3_SOCK" \
@@ -267,7 +269,10 @@ close_program "$ADAPTER1_SOCK"
 close_program "$ADAPTER2_SOCK"
 
 # Make sure at least both actor and mgmt packets were captured.
-tcpdump -r "$TMPDIR/cap_test1.pcap" 'link[0] = 1 or link[0] == 0' >"$TMPDIR/checker.txt"
+# -Z root: tcpdump's default privilege drop to the `tcpdump` user cannot work
+# inside the user namespace (that uid is unmapped); as the namespace's mapped
+# root we keep our own (unprivileged-outside) identity instead.
+tcpdump -Z root -r "$TMPDIR/cap_test1.pcap" 'link[0] = 1 or link[0] == 0' >"$TMPDIR/checker.txt"
 
 # The node is configured in main.rs to expect ZPI 5 for management packets and 6 for transit
 # when getting messages from peer 1.
@@ -301,7 +306,7 @@ do
 	echo
 	echo "Terminating $pid"
 	sleep 1
-	sudo kill -SIGINT "$pid"
+	kill -SIGINT "$pid"
 	sleep 1
 done
 

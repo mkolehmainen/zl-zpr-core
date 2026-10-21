@@ -82,7 +82,9 @@ NETEM_PARAMS=${NETEM_PARAMS:-}
 
 source "$(dirname "$0")/lib/common_funcs.sh"
 
-ZPR_USER=$USER
+# Re-exec inside an unprivileged user+network namespace; everything below
+# runs there and needs no sudo.
+enter_test_namespace "$@"
 
 # The C actor is unused here (the fixture has two actors), but the shared
 # create_network() in lib/common_funcs.sh always sets up the zpr-c namespace
@@ -209,7 +211,7 @@ ADAPTER2_SOCK=adapter2.sock
 function launch_fake_idp() {
   NETNS=$1
   SUB=$2
-  sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" python3 "$FAKE_IDP" \
+  in_ns "$NETNS" python3 "$FAKE_IDP" \
     --port "$IDP_PORT" \
     --state-dir idp-state \
     --tls-cert idp.crt --tls-key idp.key \
@@ -227,7 +229,7 @@ function launch_fake_idp() {
 # $1 = data file
 function launch_attr_server() {
   DATA_FILE=$1
-  sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" \
+  in_ns zpr-vs \
     "$ZPR_ATTR_SERVER_BIN" \
     --listen "127.0.0.1:$ATTR_PORT" \
     --cert attr-server.crt --key attr-server.key \
@@ -238,7 +240,7 @@ function launch_attr_server() {
 
 # The server is up when /schema answers 200 to the bearer token.
 function check_attr_server() {
-  sudo -E ip netns exec zpr-vs curl --silent --fail \
+  in_ns zpr-vs curl --silent --fail \
     --cacert "$PREGEN/ca-cert.pem" \
     -H "Authorization: Bearer $(cat attr-server.token)" \
     --output /dev/null "https://127.0.0.1:$ATTR_PORT/schema"
@@ -252,7 +254,7 @@ function check_attr_server() {
 # keeps the port, and the data-v2 relaunch fails with "Address already in use".
 # Then wait for the listener to be gone rather than racing the relaunch.
 function stop_attr_server() {
-  sudo pkill -SIGTERM -f "zpr-attr-server --listen" || true
+  pkill_own -SIGTERM -f "zpr-attr-server --listen" || true
   wait_for 10 attr_server_down
 }
 
@@ -264,7 +266,7 @@ function attr_server_down() {
 # service-bound notify key (zipline#79). Extra args are the --notify
 # identity pairs; none means the untargeted `{}` body.
 function attr_notify() {
-  sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" \
+  in_ns zpr-vs \
     "$ZPR_ATTR_SERVER_BIN" \
     --notify "$@" \
     --vs-url "$ADMIN_URL" \
@@ -283,7 +285,7 @@ function oidc_login() {
   LOGIN_LOG=$3
 
   rm -f "$LOGIN_LOG"
-  sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" \
+  in_ns "$NETNS" \
     env -u BROWSER SSL_CERT_FILE="$PWD/ca.crt" \
     "$PH_DEBUG_BIN" -p "$SOCK" connect "$DOCK_LINK" --no-browser \
     > "$LOGIN_LOG" 2>&1 &
@@ -298,7 +300,7 @@ function oidc_login() {
   done
 
   if [ -n "$AUTH_URL" ]; then
-    sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" \
+    in_ns "$NETNS" \
       curl --silent --show-error --location --cacert ca.crt \
       --output /dev/null "$AUTH_URL" || true
   fi
@@ -314,7 +316,7 @@ function oidc_login() {
 
 # Run vs-admin against the admin API from inside the zpr-vs netns.
 function vs_admin() {
-  sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" \
+  in_ns zpr-vs \
     "$VS_ADMIN_BIN" --svc-url "$ADMIN_URL" --ca-cert ca.crt \
     --api-key-file vs-admin.key --format compact "$@"
 }
@@ -382,9 +384,9 @@ function contractor_tag_gone() {
 # to adapter1, so the b->a leg would fail by design.
 function connectivity_test() {
   RESULT=0
-  sudo ip netns exec zpr-node ping -q -c 5 -w 5 "$VS_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-  sudo ip netns exec zpr-vs ping -q -c 5 -w 5 "$NODE_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-  sudo ip netns exec zpr-a ping -q -c 5 -w 5 "$B_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
+  in_ns zpr-node ping -q -c 5 -w 5 "$VS_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
+  in_ns zpr-vs ping -q -c 5 -w 5 "$NODE_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
+  in_ns zpr-a ping -q -c 5 -w 5 "$B_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
   return "$RESULT"
 }
 
@@ -392,13 +394,13 @@ function connectivity_test() {
 # ping has to fail. The plumbing pings must still work — revoking the
 # contractor visa must not take the fabric down.
 function connectivity_denied_test() {
-  if sudo ip netns exec zpr-a ping -q -c 3 -w 5 "$B_ZPR_ADDR"; then
+  if in_ns zpr-a ping -q -c 3 -w 5 "$B_ZPR_ADDR"; then
     echo "ASSERTION FAILED (revocation): adapter1 still reaches Web"
     return 1
   fi
   RESULT=0
-  sudo ip netns exec zpr-node ping -q -c 3 -w 5 "$VS_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-  sudo ip netns exec zpr-vs ping -q -c 3 -w 5 "$NODE_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
+  in_ns zpr-node ping -q -c 3 -w 5 "$VS_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
+  in_ns zpr-vs ping -q -c 3 -w 5 "$NODE_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
   if [ "$RESULT" != 0 ]; then
     echo "ASSERTION FAILED (revocation): fabric plumbing went down with the visa"
     return 1
@@ -428,8 +430,8 @@ create_network
 # the fd5a:5052::/32 internal-net return route) on activation. Keep a bare
 # fd5a:5052::/32 route so adapter1's outbound traffic to the static actors
 # still enters the TUN (deleting the address removes its peer route too).
-sudo ip -n zpr-a addr del "$A_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
-sudo ip -n zpr-a -6 route add "$ZPR_SUBNET" dev tun0
+in_ns zpr-a ip addr del "$A_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
+in_ns zpr-a ip -6 route add "$ZPR_SUBNET" dev tun0
 
 if [ -n "$NETEM_PARAMS" ]
 then configure_netem $NETEM_PARAMS  # split on whitespace
@@ -552,7 +554,7 @@ launch_fake_idp zpr-vs user-vs-unused
 launch_fake_idp zpr-a user-a
 
 function check_idp() {
-  sudo -E ip netns exec "$1" curl --silent --cacert ca.crt \
+  in_ns "$1" curl --silent --cacert ca.crt \
     --output /dev/null "$IDP_ISSUER/.well-known/openid-configuration"
 }
 wait_for 15 check_idp zpr-vs
@@ -574,7 +576,7 @@ wait_for 15 check_attr_server
 
 echo "Launching ValKey"
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$VALKEY_SERVER_BIN" \
+in_ns zpr-vs "$VALKEY_SERVER_BIN" \
     --save "" \
     --appendonly no 2>&1 | tee valkey.log | prefix_log valkey &
 
@@ -582,7 +584,7 @@ wait_for 15 check_vs_valkey_port
 
 echo "Launching Visa Service"
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" \
+in_ns zpr-vs \
     env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/ca.crt" "$VS_BIN" \
     -c vs-config.toml \
     --clear-state \
@@ -596,7 +598,7 @@ sleep 2
 
 echo "Launching Node"
 
-sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-node "$PH_BIN" \
   node \
   --logging "$DEBUG_TARGETS vss_rpc=DEBUG" \
   --control-path "$NODE_SOCK" \
@@ -613,7 +615,7 @@ sleep 2
 
 echo "Launching Adapters"
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-vs "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$VS_SOCK" \
@@ -644,24 +646,12 @@ wait_for 30 check_node_has_auth_services || {
 # visa service (no join policy) and the adapter would exit on the
 # mismatch (zipline#83).
 #
-# Launched via setpriv with ambient CAP_NET_ADMIN (zipline#156): on the
-# dynamic grant the adapter must `ip addr add` the granted address onto
-# tun0 itself, which needs CAP_NET_ADMIN. `sudo -u "$ZPR_USER"` strips
-# it, so on the netns host route (ZPR_USER = the unprivileged operator)
-# activation failed with "RTNETLINK answers: Operation not permitted".
-# setpriv keeps the launch unprivileged but carries net_admin through —
-# matching a real deployment — and is a no-op privilege-wise in Docker,
-# where ZPR_USER=root. Unlike `sudo -u`, setpriv does not scrub the
-# environment, so the outer `sudo -E` env (ZPR_* overrides, HOME) still
-# reaches the binary; SSL_CERT_FILE is set explicitly as before.
-# --regid takes a gid or group name, not a username: derive the user's
-# primary GID so accounts whose primary group is shared (e.g.
-# `developers`) work; --init-groups restores the supplementary groups,
-# matching `sudo -u` semantics.
-ZPR_GID=$(id -g "$ZPR_USER")
-sudo -E ip netns exec zpr-a setpriv --reuid "$ZPR_USER" --regid "$ZPR_GID" --init-groups \
-  --inh-caps +net_admin --ambient-caps +net_admin -- \
-  env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
+# On the dynamic grant the adapter must `ip addr add` the granted address
+# onto tun0 itself, which needs CAP_NET_ADMIN (zipline#156). It runs as the
+# user namespace's mapped root, which holds that capability over its
+# namespaces, so no capability juggling is needed (zipline#191; before that
+# this launch went through setpriv to keep net_admin across `sudo -u`).
+in_ns zpr-a env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER1_SOCK" \
@@ -674,7 +664,7 @@ sudo -E ip netns exec zpr-a setpriv --reuid "$ZPR_USER" --regid "$ZPR_GID" --ini
   --node-addr "$NODE_SUBSTRATE_ADDR_A" 2>&1 | tee adapter1.log | prefix_log zpr-a &
 
 # adapter2: device-only (bootstrap key, no login) — it provides Web.
-sudo -E ip netns exec zpr-b sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-b "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER2_SOCK" \
@@ -825,15 +815,15 @@ fi
 
 # SIGTERM for the same reason as stop_attr_server (fake-idp is Python, which
 # also leaves an inherited SIGINT-ignore in place).
-sudo pkill -SIGTERM -f "fake-idp.py --port" || true
-sudo pkill -SIGTERM -f "zpr-attr-server --listen" || true
+pkill_own -SIGTERM -f "fake-idp.py --port" || true
+pkill_own -SIGTERM -f "zpr-attr-server --listen" || true
 
 for pid in $(get_descendants)
 do
   echo
   echo "Terminating $pid"
   sleep 1
-  sudo kill -SIGINT "$pid"
+  kill -SIGINT "$pid"
   sleep 1
 done
 

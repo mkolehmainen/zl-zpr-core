@@ -1,7 +1,10 @@
 # Run the integration tests inside a throwaway Docker container.
 #
-# The scripts need root for network namespaces and TUN devices.  Rather than
-# requiring passwordless sudo on the host, run them as root in a container:
+# The scripts run their network namespaces and TUN devices inside an
+# unprivileged user namespace (`unshare -nr`), so on a host that allows
+# unprivileged user namespaces they need no sudo and can be run directly.
+# Where that is blocked (and the sysctl cannot be changed), run them as
+# root in a container instead:
 #
 #   make docker-test                      # every *-test.sh (see TESTS), PASS/FAIL summary
 #   make docker-test TEST=one-node-test.sh

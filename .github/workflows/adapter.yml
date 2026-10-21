@@ -208,6 +208,11 @@ jobs:
         sudo systemctl stop valkey-server
         sudo systemctl disable valkey-server
 
+    - name: Allow unprivileged user namespaces
+      # The integration tests run inside `unshare -nr` instead of sudo;
+      # Ubuntu 24.04's AppArmor restriction would block that.
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
     - name: One Node v6 Test
       timeout-minutes: 10
       run: |
@@ -280,6 +285,11 @@ jobs:
         sudo systemctl stop valkey-server
         sudo systemctl disable valkey-server
 
+    - name: Allow unprivileged user namespaces
+      # The integration tests run inside `unshare -nr` instead of sudo;
+      # Ubuntu 24.04's AppArmor restriction would block that.
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
     - name: One Node OIDC Test
       timeout-minutes: 10
       run: |
@@ -351,6 +361,11 @@ jobs:
         sudo apt install -y valkey
         sudo systemctl stop valkey-server
         sudo systemctl disable valkey-server
+
+    - name: Allow unprivileged user namespaces
+      # The integration tests run inside `unshare -nr` instead of sudo;
+      # Ubuntu 24.04's AppArmor restriction would block that.
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
     - name: One Node OIDC Renewal Test
       timeout-minutes: 25
@@ -427,6 +442,11 @@ jobs:
         sudo systemctl stop valkey-server
         sudo systemctl disable valkey-server
 
+    - name: Allow unprivileged user namespaces
+      # The integration tests run inside `unshare -nr` instead of sudo;
+      # Ubuntu 24.04's AppArmor restriction would block that.
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
     - name: One Node Policy Reauth Test
       timeout-minutes: 25
       run: |
@@ -498,6 +518,11 @@ jobs:
     - name: Set env
       run: |
         echo "DEBUG_TARGETS=all=DEBUG" >> $GITHUB_ENV
+
+    - name: Allow unprivileged user namespaces
+      # The integration tests run inside `unshare -nr` instead of sudo;
+      # Ubuntu 24.04's AppArmor restriction would block that.
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
     - name: Capture Test
       timeout-minutes: 10

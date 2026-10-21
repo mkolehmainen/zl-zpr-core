@@ -28,14 +28,17 @@ function fail() {
 # Start a fake ph serving control socket $1 and set FAKE_PH_PID to its PID
 # and FAKE_WRAPPER_PID to the PID of the process wrapping it.
 #
-# The tests launch ph as
-#   sudo ... ip netns exec ... sudo ... env ... $PH_BIN adapter --control-path S
-# so every wrapper's command line also contains "--control-path S", and the
-# outermost wrapper has the lowest PID. Model that with a bash parent whose
-# command line contains the whole ph invocation, and a child whose command
-# line starts with $PH_BIN, the way ph's does once env has exec'd it.
+# The tests launch ph through wrappers (`nsenter ... env ... $PH_BIN adapter
+# --control-path S`) whose command lines may also contain "--control-path
+# S", and the outermost wrapper has the lowest PID. Model that with a bash
+# parent whose command line contains the whole ph invocation, and a child
+# whose command line starts with $PH_BIN, the way ph's does once nsenter or
+# env has exec'd it.
+#
+# An optional $2 prefixes the launch, e.g. `unshare -r` to start the fake
+# in a different user namespace, the way a concurrent test run's ph is.
 function start_fake_ph() {
-  bash -c "(exec -a '$PH_BIN adapter --control-path $1 --name adapter1' sleep 30); true" 2> /dev/null &
+  ${2:-} bash -c "(exec -a '$PH_BIN adapter --control-path $1 --name adapter1' sleep 30); true" 2> /dev/null &
   FAKE_WRAPPER_PID=$!
   WRAPPER_PIDS+=("$FAKE_WRAPPER_PID")
 
@@ -54,6 +57,11 @@ function start_fake_ph() {
 PH_BIN="$WORKDIR/build+asan/ph"
 SOCK="adapter1-$$.sock"
 
+# A concurrent run's ph: same binary, same (relative) socket name, but in
+# another user namespace. Started first so it has the lowest PID.
+start_fake_ph "$SOCK" "unshare -r"
+FOREIGN_PID=$FAKE_PH_PID
+
 # A decoy whose socket name matches "$SOCK" read as a regex ("." matching
 # "X"). Started first so it has the lower PID, which `head -n 1` would pick.
 start_fake_ph "adapter1-$$Xsock"
@@ -67,7 +75,16 @@ PH_WRAPPER_PID=$FAKE_WRAPPER_PID
 # (zipline#116), and not a process whose socket merely matches as a regex.
 FOUND=$(ph_pid_for_socket "$SOCK")
 [ "$FOUND" = "$PH_PID" ] \
-  || fail "ph_pid_for_socket returned '$FOUND', want ph at $PH_PID (wrapper $PH_WRAPPER_PID, decoy $DECOY_PID)"
+  || fail "ph_pid_for_socket returned '$FOUND', want ph at $PH_PID (wrapper $PH_WRAPPER_PID, decoy $DECOY_PID, other run $FOREIGN_PID)"
+
+# pkill_own must signal only this run's processes, never a concurrent run's
+# match in another user namespace.
+pkill_own -STOP -f "^$(ere_escape "$PH_BIN") .*--control-path $(ere_escape "$SOCK")( |\$)"
+[ "$(ps -o stat= -p "$FOREIGN_PID" | cut -c1)" != T ] \
+  || fail "pkill_own stopped PID $FOREIGN_PID in another user namespace"
+[ "$(ps -o stat= -p "$PH_PID" | cut -c1)" = T ] \
+  || fail "pkill_own did not stop this run's PID $PH_PID"
+kill -CONT "$PH_PID" "$FOREIGN_PID" 2> /dev/null || true
 
 FOUND=$(ph_pid_for_socket "other-$$.sock")
 [ -z "$FOUND" ] || fail "ph_pid_for_socket matched an unrelated socket: '$FOUND'"
