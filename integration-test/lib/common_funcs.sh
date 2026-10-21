@@ -34,6 +34,13 @@ function enter_test_namespace() {
     exit 1
   fi
 
+  # zipline divergence from main: ph reads SUDO_UID/SUDO_GID/PKEXEC_UID to
+  # decide who owns its control socket and chowns it to that user
+  # (admin-api socket_owner.rs, zipline#39).  Inside the user namespace that
+  # uid is unmapped, so the chown and the bind would fail.  Drop them so a
+  # script started via sudo behaves like one started directly (zipline#191).
+  unset SUDO_UID SUDO_GID SUDO_USER SUDO_COMMAND PKEXEC_UID
+
   export ZPR_TEST_IN_USERNS=1
   # Re-exec through $BASH with an absolute script path: a script started as
   # `bash script.sh` has a bare $0, which unshare would look up on PATH, and
