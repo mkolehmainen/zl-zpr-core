@@ -65,7 +65,9 @@ NETEM_PARAMS=${NETEM_PARAMS:-}
 
 source "$(dirname $0)/lib/common_funcs.sh"
 
-ZPR_USER=$USER
+# Re-exec inside an unprivileged user+network namespace; everything below
+# runs there and needs no sudo.
+enter_test_namespace "$@"
 
 NODE_SUBSTRATE_ADDR_VS=10.0.0.1
 NODE_SUBSTRATE_ADDR_A=10.0.1.1
@@ -176,7 +178,7 @@ ADAPTER2_SOCK=adapter2.sock
 function launch_fake_idp() {
   NETNS=$1
   SUB=$2
-  sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" python3 "$FAKE_IDP" \
+  in_ns "$NETNS" python3 "$FAKE_IDP" \
     --port "$IDP_PORT" \
     --state-dir idp-state \
     --tls-cert idp.crt --tls-key idp.key \
@@ -197,7 +199,7 @@ function oidc_login() {
   LOGIN_LOG=$3
 
   rm -f "$LOGIN_LOG"
-  sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" \
+  in_ns "$NETNS" \
     env -u BROWSER SSL_CERT_FILE="$PWD/ca.crt" \
     "$PH_DEBUG_BIN" -p "$SOCK" connect "$DOCK_LINK" --no-browser \
     > "$LOGIN_LOG" 2>&1 &
@@ -212,7 +214,7 @@ function oidc_login() {
   done
 
   if [ -n "$AUTH_URL" ]; then
-    sudo -E ip netns exec "$NETNS" sudo -E -u "$ZPR_USER" \
+    in_ns "$NETNS" \
       curl --silent --show-error --location --cacert ca.crt \
       --output /dev/null "$AUTH_URL" || true
   fi
@@ -228,7 +230,7 @@ function oidc_login() {
 
 # Run vs-admin against the admin API from inside the zpr-vs netns.
 function vs_admin() {
-  sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" \
+  in_ns zpr-vs \
     "$VS_ADMIN_BIN" --svc-url "$ADMIN_URL" --ca-cert ca.crt \
     --api-key-file vs-admin.key --format compact "$@"
 }
@@ -293,9 +295,9 @@ function refresh_cycle() {
 # so the b->a leg would fail by design.
 function connectivity_test() {
   RESULT=0
-  sudo ip netns exec zpr-node ping -q -c 5 -w 5 "$VS_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-  sudo ip netns exec zpr-vs ping -q -c 5 -w 5 "$NODE_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-  sudo ip netns exec zpr-a ping -q -c 5 -w 5 "$B_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
+  in_ns zpr-node ping -q -c 5 -w 5 "$VS_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
+  in_ns zpr-vs ping -q -c 5 -w 5 "$NODE_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
+  in_ns zpr-a ping -q -c 5 -w 5 "$B_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
   return "$RESULT"
 }
 
@@ -385,7 +387,7 @@ launch_fake_idp zpr-vs user-vs-unused
 launch_fake_idp zpr-a user-a
 
 function check_idp() {
-  sudo -E ip netns exec "$1" curl --silent --cacert ca.crt \
+  in_ns "$1" curl --silent --cacert ca.crt \
     --output /dev/null "$IDP_ISSUER/.well-known/openid-configuration"
 }
 wait_for 15 check_idp zpr-vs
@@ -397,7 +399,7 @@ wait_for 15 check_idp zpr-a
 
 echo "Launching ValKey"
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$VALKEY_SERVER_BIN" \
+in_ns zpr-vs "$VALKEY_SERVER_BIN" \
     --save "" \
     --appendonly no 2>&1 | tee valkey.log | prefix_log valkey &
 
@@ -405,7 +407,7 @@ wait_for 15 check_vs_valkey_port
 
 echo "Launching Visa Service"
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" \
+in_ns zpr-vs \
     env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/ca.crt" "$VS_BIN" \
     -c vs-config.toml \
     --clear-state \
@@ -419,7 +421,7 @@ sleep 2
 
 echo "Launching Node"
 
-sudo -E ip netns exec zpr-node sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-node "$PH_BIN" \
   node \
   --logging "$DEBUG_TARGETS vss_rpc=DEBUG" \
   --control-path "$NODE_SOCK" \
@@ -436,7 +438,7 @@ sleep 2
 
 echo "Launching Adapters"
 
-sudo -E ip netns exec zpr-vs sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-vs "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$VS_SOCK" \
@@ -462,7 +464,7 @@ wait_for 30 check_node_has_auth_services || {
 }
 
 # adapter1: user-only (no bootstrap key) — the interplay's subject.
-sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
+in_ns zpr-a env SSL_CERT_FILE="$PWD/ca.crt" "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER1_SOCK" \
@@ -476,7 +478,7 @@ sudo -E ip netns exec zpr-a sudo -E -u "$ZPR_USER" env SSL_CERT_FILE="$PWD/ca.cr
   --zpr-addr "$A_ZPR_ADDR" 2>&1 | tee adapter1.log | prefix_log zpr-a &
 
 # adapter2: device-only (bootstrap key, no login) — it provides Web.
-sudo -E ip netns exec zpr-b sudo -E -u "$ZPR_USER" "$PH_BIN" \
+in_ns zpr-b "$PH_BIN" \
   adapter \
   --logging "$DEBUG_TARGETS" \
   --control-path "$ADAPTER2_SOCK" \
@@ -586,14 +588,14 @@ fi
 # Cleanup
 #
 
-sudo pkill -SIGTERM -f "fake-idp.py --port" || true
+pkill_own -SIGTERM -f "fake-idp.py --port" || true
 
 for pid in $(get_descendants)
 do
   echo
   echo "Terminating $pid"
   sleep 1
-  sudo kill -SIGINT "$pid"
+  kill -SIGINT "$pid"
   sleep 1
 done
 

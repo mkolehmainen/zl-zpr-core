@@ -11,6 +11,15 @@
 # again (`down`). The documents are the authority on what this builds and
 # why; keep them in sync.
 #
+# Stays root-based (named `ip netns`, run as root in the container) rather
+# than moving to the unprivileged `unshare -nr` harness the *-test.sh
+# scripts use (zipline#191): its namespaces must be reachable from a real
+# remote machine, so their veths end in the HOST's network namespace (the
+# container runs with --network host) and the host NATs for them.  An
+# unprivileged user namespace has no CAP_NET_ADMIN over the host's network
+# namespace, so it cannot create those links.  Root here is the container's
+# (or `sudo` for nat-up/nat-down on the host), never the automated tier's.
+#
 # Deliberately NOT named *-test.sh: the Makefile's docker-test target sweeps
 # that glob, and this script needs a remote node on the network, which the
 # automated tier does not have.
