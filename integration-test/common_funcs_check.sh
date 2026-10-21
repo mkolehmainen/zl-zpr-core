@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Self-check for the process helpers in lib/common_funcs.sh. Needs no root,
-# network namespaces or built binaries, so it runs anywhere:
+# Self-check for the process and namespace helpers in lib/common_funcs.sh.
+# Needs no root or built binaries, only unprivileged user namespaces
+# (`unshare -r`, the same host prerequisite as the integration tests):
 #
 #   ./integration-test/common_funcs_check.sh
 #
@@ -76,6 +77,39 @@ process_exited "$PH_PID" && fail "process_exited says live PID $PH_PID has exite
 kill "$PH_PID"
 wait "$PH_WRAPPER_PID" 2> /dev/null || true
 process_exited "$PH_PID" || fail "process_exited says dead PID $PH_PID is still alive"
+
+# enter_test_namespace must re-exec the calling script however it was
+# started. `bash script.sh` from the script's own directory leaves $0 as a
+# bare file name, which unshare would look up on PATH (review of
+# zl-zpr-core#82).
+cat > "$WORKDIR/userns-probe.sh" <<EOF
+source "$(realpath "$(dirname "$0")")/lib/common_funcs.sh"
+enter_test_namespace "\$@"
+echo "in userns: \${ZPR_TEST_IN_USERNS:-no} args: \$*"
+EOF
+OUT=$(cd "$WORKDIR" && PATH=/usr/bin:/bin bash userns-probe.sh a "b c" 2> /dev/null) || true
+[ "$OUT" = "in userns: 1 args: a b c" ] \
+  || fail "enter_test_namespace did not re-exec 'bash userns-probe.sh': $OUT"
+
+# A namespace holder must not outlive its test shell. A SIGKILLed shell
+# runs no EXIT trap, so destroy_network never sees the holder (review of
+# zl-zpr-core#82). Model it: a shell creates a namespace, reports the
+# holder's PID, and is killed.
+cat > "$WORKDIR/holder-probe.sh" <<EOF
+source "$(realpath "$(dirname "$0")")/lib/common_funcs.sh"
+enter_test_namespace
+new_netns probe
+echo "\${NETNS_PID[probe]}" > "$WORKDIR/holder.pid"
+kill -KILL \$\$
+EOF
+bash "$WORKDIR/holder-probe.sh" 2> /dev/null || true
+HOLDER=$(cat "$WORKDIR/holder.pid" 2> /dev/null || true)
+if [ -z "$HOLDER" ]; then
+  fail "holder probe did not create a namespace"
+elif ! wait_for 3 process_exited "$HOLDER"; then
+  fail "namespace holder $HOLDER outlived its SIGKILLed test shell"
+  kill -KILL "$HOLDER" 2> /dev/null || true
+fi
 
 if [ "$FAILURES" -ne 0 ]; then
   echo "$FAILURES check(s) failed"

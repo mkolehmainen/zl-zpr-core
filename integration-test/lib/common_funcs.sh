@@ -35,7 +35,10 @@ function enter_test_namespace() {
   fi
 
   export ZPR_TEST_IN_USERNS=1
-  exec unshare -nr "$0" "$@"
+  # Re-exec through $BASH with an absolute script path: a script started as
+  # `bash script.sh` has a bare $0, which unshare would look up on PATH, and
+  # need not be executable (review of zl-zpr-core#82).
+  exec unshare -nr "$BASH" "$(realpath "$0")" "$@"
 }
 
 # TRANSITIONAL (zipline#190 -> zipline#191): succeed when the calling script
@@ -64,7 +67,12 @@ function new_netns() {
     return
   fi
 
-  unshare -n sleep infinity &
+  # --pdeathsig: the holder gets SIGKILL when this shell dies, however it
+  # dies.  A SIGKILLed test shell runs no EXIT trap, so destroy_network
+  # never sees the holder, and without this it would pin the namespace
+  # forever (review of zl-zpr-core#82).  setpriv and unshare both exec, so
+  # $! is the holder itself and the shell stays its parent.
+  setpriv --pdeathsig KILL unshare -n sleep infinity &
   local PID=$!
 
   # Wait until the holder has actually unshared its network namespace;
