@@ -37,13 +37,17 @@ impl From<Tun> for ZprTun {
 }
 
 /// Builder settings shared by every Linux TUN device ph opens: the
-/// interface name and the optional IPv4 address. The caller sets the queue
-/// count and builds.
+/// packet-information header, the interface name and the optional IPv4
+/// address. The caller sets the queue count and builds.
 fn tun_builder(
     ifname: Option<&str>,
     address: Option<IpAddr>,
 ) -> std::result::Result<TunBuilder, ZprTunError> {
-    let mut bldr = TunBuilder::new();
+    // ph's TUN framing reads and writes the 4-byte packet-information
+    // header on Linux (zprtun::TUN_HAS_PI / sys::TunPi). tokio-tun 0.15
+    // sets IFF_NO_PI unless asked (0.11 defaulted to packet info on), so
+    // request it explicitly. Without it packets are silently misframed.
+    let mut bldr = TunBuilder::new().packet_info();
     if let Some(ifname) = ifname {
         bldr = bldr.name(ifname);
     }
