@@ -196,6 +196,25 @@ function assert_actor_granted_addr() {
   echo "grant assertion OK: $CN joined at store-granted address $WANT"
 }
 
+# zipline#202: `ph-cli tun` must print the TUN interface ph opened on line 1
+# (the script's --tun-if) and the granted ZPR address on line 2, read back
+# over the admin RPC — the interface lookup macOS `zipline status` cannot do.
+#
+# $1 = label, $2 = control socket, $3 = expected interface, $4 = expected address
+function assert_ph_cli_tun() {
+  local LABEL=$1 SOCK=$2 WANT_IF=$3 WANT_ADDR=$4 OUT
+  OUT=$("$PH_DEBUG_BIN" -p "$SOCK" tun) || {
+    echo "PH-CLI TUN ASSERTION FAILED: $LABEL: ph-cli tun exited non-zero"
+    return 1
+  }
+  if [[ "$(sed -n 1p <<<"$OUT")" != "$WANT_IF" || "$(sed -n 2p <<<"$OUT")" != "$WANT_ADDR" ]]; then
+    echo "PH-CLI TUN ASSERTION FAILED: $LABEL: expected '$WANT_IF' then '$WANT_ADDR'; got:"
+    echo "$OUT"
+    return 1
+  fi
+  echo "ph-cli tun assertion OK: $LABEL reports $WANT_IF $WANT_ADDR"
+}
+
 #
 # Launch ValKey + Visa Service
 #
@@ -346,6 +365,11 @@ if [[ "$ACTOR_PROTOCOL" == "ipv6" ]]; then
   if [[ "$NUM_ACTORS" -ge 3 ]]; then
     assert_actor_granted_addr adapter3 "$C_ZPR_ADDR" || PASS=1
   fi
+  # zipline#202 (Q4): `ph-cli tun` on an adapter after its grant, and on
+  # the node (Q3: a node answers too). v6 only, like the grant assertion:
+  # zipline#201 reports `--actor_protocol ipv4` broken at tip.
+  assert_ph_cli_tun adapter1 "$ADAPTER1_SOCK" tun0 "$A_ZPR_ADDR" || PASS=1
+  assert_ph_cli_tun node "$NODE_SOCK" tun0 "$NODE_ZPR_ADDR" || PASS=1
 fi
 
 sleep 1
