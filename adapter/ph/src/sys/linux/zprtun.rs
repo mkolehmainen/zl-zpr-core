@@ -83,6 +83,12 @@ impl ZprTun {
         Ok(tok_tun_devs.into_iter().map(ZprTun::from).collect())
     }
 
+    /// The interface name of this TUN device, as the kernel reports it
+    /// (zipline#202).
+    pub fn name(&self) -> String {
+        self.ifname.clone()
+    }
+
     pub fn set_carrier(&self, carrier: bool) -> Result<()> {
         // SAFETY: the temporary pointer is valid for the lifetime of the ioctl, which is sufficient
         unsafe { tun_set_carrier(self.owned_fd.as_raw_fd(), &carrier.into()) }?;
@@ -421,6 +427,56 @@ mod tests {
         let module = module_path!();
         let module = module.split_once("::").map_or(module, |(_, rest)| rest);
         let name = format!("{module}::tun_builder_packet_info_matches_tun_has_pi");
+        let exe = std::env::current_exe().expect("current_exe");
+        let out = Command::new("unshare")
+            .args(["-Ur", "-n"])
+            .arg(exe)
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(IN_NETNS_ENV, "1")
+            .output()
+            .expect("run the test in unshare -Ur -n");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "namespaced child failed ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+            out.status
+        );
+    }
+
+    /// The interface name ph opened must be reported back unchanged, both by
+    /// `ZprTun::name` and through the `TunCtl` the admin RPC sees
+    /// (zipline#202: `ph-cli tun`). Creating a TUN needs a user+net
+    /// namespace, so the check runs in a child inside `unshare -Ur -n`.
+    #[tokio::test]
+    async fn configured_tun_name_round_trips() {
+        const IFNAME: &str = "zpr202test";
+        if std::env::var_os(IN_NETNS_ENV).is_some() {
+            let devs = ZprTun::new_mq(Some(IFNAME.to_string()), 1, None)
+                .expect("open a TUN device in the test namespace");
+            assert_eq!(devs.len(), 1);
+            assert_eq!(devs[0].name(), IFNAME);
+            let dev = devs.into_iter().next().unwrap();
+            let tun_ctl = crate::tun_ctl::TunCtlImpl::new(std::sync::Arc::new(dev));
+            assert_eq!(crate::tun_ctl::TunCtl::name(&tun_ctl), IFNAME);
+            return;
+        }
+
+        if !Path::new("/dev/net/tun").exists() {
+            eprintln!("SKIP: /dev/net/tun is not available");
+            return;
+        }
+        match Command::new("unshare").args(["-Ur", "-n", "true"]).status() {
+            Ok(status) if status.success() => {}
+            other => {
+                eprintln!("SKIP: unprivileged user+net namespaces are not available: {other:?}");
+                return;
+            }
+        }
+
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let name = format!("{module}::configured_tun_name_round_trips");
         let exe = std::env::current_exe().expect("current_exe");
         let out = Command::new("unshare")
             .args(["-Ur", "-n"])

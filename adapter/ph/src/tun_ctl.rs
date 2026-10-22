@@ -7,6 +7,12 @@ use std::sync::Arc;
 /// its state.  Its API is limited to restrict coupling of the full system
 /// with the TUN device.
 pub trait TunCtl: Sync {
+    /// The name of the TUN interface ph opened (e.g. `tun0`, or the
+    /// kernel-assigned `utun7` on macOS), as reported by `ph-cli tun`
+    /// (zipline#202). Deliberately no default: a platform without an
+    /// implementation fails to compile rather than report a placeholder.
+    fn name(&self) -> String;
+
     /// Inform the kernel's networking layer whether a carrier is present.
     /// (I.e. whether we are passing packets.)  This is reflected on the
     /// interface itself and is used by the kernel to make routing decisions.
@@ -77,6 +83,9 @@ impl TunCtlImpl {
 }
 
 impl TunCtl for TunCtlImpl {
+    fn name(&self) -> String {
+        self.tun.name()
+    }
     fn set_carrier(&self, carrier: bool) -> Result<()> {
         self.tun.set_carrier(carrier)
     }

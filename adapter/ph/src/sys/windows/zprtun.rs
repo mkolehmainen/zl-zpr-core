@@ -167,6 +167,12 @@ impl ZprTun {
         Ok(())
     }
 
+    /// The Wintun adapter name (config `tun_if` or [`DEFAULT_ADAPTER_NAME`])
+    /// (zipline#202).
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
     /// A NOP on Windows, as on macOS: Wintun has no carrier control; the
     /// adapter's media state is managed by the driver.
     pub fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
