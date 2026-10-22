@@ -281,6 +281,7 @@ async fn process_command(command: Commands, socket: &PathBuf) -> Result<bool, Cl
                 },
                 Commands::Logging { logs } => change_logging_task(service, logs).await?,
                 Commands::Addr => get_node_addr_task(service).await?,
+                Commands::Tun => get_tun_info_task(service).await?,
                 Commands::Connect { id, no_browser } => {
                     connect_task(service, id, no_browser).await?
                 }
@@ -838,6 +839,38 @@ async fn get_node_addr_task(service: svc::Client) -> Result<(), CliError> {
     }
 }
 
+/// `ph-cli tun` output (zipline#202): line 1 is the interface name, then
+/// one ZPR address per line. Pure, so the format is unit-tested.
+fn format_tun_info(if_name: &str, addrs: &[IpAddr]) -> String {
+    let mut out = String::new();
+    out.push_str(if_name);
+    out.push('\n');
+    for addr in addrs {
+        out.push_str(&addr.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+async fn get_tun_info_task(service: svc::Client) -> Result<(), CliError> {
+    let response = service.get_tun_info_request().send().promise.await?;
+    let results = response.get()?;
+    if let cli::success_or_error::Which::Error(e) = results.get_result()?.which()? {
+        return Err(CliError::RpcError(e?.get_txt()?.to_string()?));
+    }
+    let info = results.get_info()?;
+    let if_name = info.get_if_name()?.to_string()?;
+    let mut addrs = Vec::new();
+    for addr in info.get_zpr_addrs()?.iter() {
+        addrs.push(match addr.which()? {
+            cli::ip_addr::Which::V4(a) => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(a?)?)),
+            cli::ip_addr::Which::V6(a) => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(a?)?)),
+        });
+    }
+    print!("{}", format_tun_info(&if_name, &addrs));
+    Ok(())
+}
+
 // This struct implements the CaptureFile capability for the admin RPC: ph
 // calls back `get_fd` and the transport sends the descriptor as SCM_RIGHTS
 // ancillary data. Only used with the capnp-ancillary FD-passing transport
@@ -955,5 +988,21 @@ mod tests {
         let agent = interactive_auth_agent(false);
         assert!(agent.open_browser, "no_browser: false → open_browser: true");
         assert!(agent.progress.is_none());
+    }
+
+    /// `ph-cli tun` output (zipline#202, Q1): line 1 is the interface
+    /// name, then one ZPR address per line; no address lines before the
+    /// grant.
+    #[test]
+    fn format_tun_info_prints_name_then_one_address_per_line() {
+        let addrs: Vec<IpAddr> = vec![
+            "fd5a:5052::1234".parse().unwrap(),
+            "fd5a:5052::99".parse().unwrap(),
+        ];
+        assert_eq!(
+            format_tun_info("utun7", &addrs),
+            "utun7\nfd5a:5052::1234\nfd5a:5052::99\n"
+        );
+        assert_eq!(format_tun_info("tun0", &[]), "tun0\n");
     }
 }
