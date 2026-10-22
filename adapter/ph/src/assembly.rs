@@ -715,6 +715,9 @@ pub mod test {
     #[allow(dead_code)]
     struct DummyTunCtlImpl;
     impl TunCtl for DummyTunCtlImpl {
+        fn name(&self) -> String {
+            "tun-dummy".to_string()
+        }
         fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
             Ok(())
         }
@@ -748,6 +751,9 @@ pub mod test {
 
     #[cfg(test)]
     impl TunCtl for FakeTunCtl {
+        fn name(&self) -> String {
+            "tun-fake".to_string()
+        }
         fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
             Ok(())
         }
@@ -851,6 +857,9 @@ pub mod test {
 
     #[cfg(test)]
     impl TunCtl for RecordingTunCtl {
+        fn name(&self) -> String {
+            "tun-recording".to_string()
+        }
         fn set_carrier(&self, carrier: bool) -> std::io::Result<()> {
             self.carriers.lock().unwrap().push(carrier);
             Ok(())
@@ -1026,6 +1035,9 @@ pub mod test {
 
     #[cfg(test)]
     impl TunCtl for SelfAddressTunCtl {
+        fn name(&self) -> String {
+            "tun-self-address".to_string()
+        }
         fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
             Ok(())
         }

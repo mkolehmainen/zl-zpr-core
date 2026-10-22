@@ -18,6 +18,16 @@ interface CmdLineInter {
     resetLink            @14 (id: UInt32) -> ();
     changeLogging        @15 (logs: List(Log)) -> (result: LogsApplied);
     getNodeInfo          @16 () -> (result: SuccessOrError);
+    getTunInfo           @17 () -> (result: SuccessOrError, info: TunInfo); # zipline#202: `ph-cli tun`
+}
+
+# The TUN interface ph opened (zipline#202). `zprAddrs` lists only the
+# local ZPR addresses ph confirmed on that interface: empty on an adapter
+# before its address is granted, and an address the platform cannot
+# inspect is left out rather than guessed.
+struct TunInfo {
+    ifName   @0 :Text;
+    zprAddrs @1 :List(IpAddr);
 }
 
 interface CaptureFile {

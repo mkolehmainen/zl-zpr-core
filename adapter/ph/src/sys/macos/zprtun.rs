@@ -77,6 +77,12 @@ impl ZprTun {
         Ok(vec![ZprTun::new(dev)])
     }
 
+    /// The interface name of this utun, as the kernel assigned it — e.g.
+    /// `utun7`, which can differ on every start (zipline#202).
+    pub fn name(&self) -> String {
+        self.inner.get_name().to_string()
+    }
+
     /// A NOP on mac.
     pub fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
         Ok(())

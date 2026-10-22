@@ -100,6 +100,13 @@ pub enum Commands {
     Quit,
     /// Gets the address of an adapter's node
     Addr,
+    /// Print the TUN interface ph uses and its ZPR address(es).
+    ///
+    /// Line 1 is the interface name (e.g. `tun0`, or the kernel-assigned
+    /// `utun7` on macOS); each further line is one ZPR address confirmed on
+    /// that interface. An adapter prints no address line until its address
+    /// is granted. Works against a node as well as an adapter.
+    Tun,
     /// Connect (start) a link, authenticate interactively if the packet
     /// handler asks, then exit reporting the outcome.
     ///
@@ -279,6 +286,22 @@ mod tests {
             }
             other => panic!("auth-agent without --no-browser should parse: {other:?}"),
         }
+    }
+
+    /// `ph-cli tun` parses to `Commands::Tun` (zipline#202).
+    #[test]
+    fn tun_subcommand_parses() {
+        let parsed = CmdlineArgs::try_parse_from(["ph-cli", "tun"]);
+        assert!(
+            matches!(
+                parsed,
+                Ok(CmdlineArgs {
+                    command: Some(Commands::Tun),
+                    ..
+                })
+            ),
+            "`ph-cli tun` should parse to Commands::Tun: {parsed:?}"
+        );
     }
 
     /// An explicit `-p` short-circuits the socket search entirely, even

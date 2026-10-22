@@ -616,6 +616,51 @@ impl svc::Server for AdminServiceImpl {
 
         Ok(())
     }
+
+    /// `ph-cli tun` (zipline#202): the name of the TUN interface ph opened
+    /// and the local ZPR addresses confirmed on it. Answers on a node as
+    /// well as on an adapter. An address ph believes it owns is reported
+    /// only when `has_address` confirms it on the TUN, so a stale or
+    /// not-yet-applied address is never printed; one the platform cannot
+    /// inspect (`Unsupported`) is omitted and logged at debug.
+    async fn get_tun_info(
+        self: Rc<Self>,
+        _: svc::GetTunInfoParams,
+        mut results: svc::GetTunInfoResults,
+    ) -> Result<(), capnp::Error> {
+        debug!(target: RPC, "Get TUN info");
+        let asm = self.asm.clone();
+        let if_name = asm.tun_ctl.name();
+        let addrs: Vec<IpAddr> = asm
+            .get_local_zpr_addrs_std()
+            .into_iter()
+            .filter(|addr| match asm.tun_ctl.has_address(*addr) {
+                Ok(present) => present,
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                    debug!(target: RPC, "getTunInfo: omitting {addr}, which cannot be inspected on {if_name}: {e}");
+                    false
+                }
+                Err(e) => {
+                    debug!(target: RPC, "getTunInfo: omitting {addr}, cannot determine whether it is on {if_name}: {e}");
+                    false
+                }
+            })
+            .collect();
+
+        let mut rb = results.get();
+        let mut info = rb.reborrow().init_info();
+        info.set_if_name(&if_name[..]);
+        let mut list = info.init_zpr_addrs(addrs.len() as u32);
+        for (i, addr) in addrs.iter().enumerate() {
+            let mut entry = list.reborrow().get(i as u32);
+            match addr {
+                IpAddr::V4(a) => entry.set_v4(&a.octets()),
+                IpAddr::V6(a) => entry.set_v6(&a.octets()),
+            }
+        }
+        rb.init_result().init_success().set_none(());
+        Ok(())
+    }
 }
 
 // This code will eventually be removed and the logic moved into perf_sample above
@@ -1902,5 +1947,230 @@ mod test {
             "resetCounters line must be at INFO: {:?}",
             control[0]
         );
+    }
+
+    /// A `TunCtl` for the `getTunInfo` tests (zipline#202): a fixed
+    /// interface name, exactly the addresses it was given on the device,
+    /// and optionally an `Unsupported` answer to every `has_address`.
+    struct TunInfoTunCtl {
+        name: &'static str,
+        on_tun: Vec<IpAddr>,
+        inspect_unsupported: bool,
+    }
+
+    impl crate::tun_ctl::TunCtl for TunInfoTunCtl {
+        fn name(&self) -> String {
+            self.name.to_string()
+        }
+        fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn add_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn has_address(&self, addr: IpAddr) -> std::io::Result<bool> {
+            if self.inspect_unsupported {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "TunInfoTunCtl: has_address deliberately unsupported",
+                ));
+            }
+            Ok(self.on_tun.contains(&addr))
+        }
+        fn add_route(&self, _dest: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn route_owner_conflict(
+            &self,
+            _dest: IpAddr,
+            _prefix_len: u8,
+        ) -> std::io::Result<Option<String>> {
+            Ok(None)
+        }
+    }
+
+    /// Calls `getTunInfo` over an in-process RPC pair on an assembly in
+    /// `mode` whose local ZPR addresses are `zpr_addr` and whose TUN is
+    /// `tun_ctl`. Returns the interface name and the reported addresses, or
+    /// the error text when ph answered with an error.
+    async fn get_tun_info(
+        mode: PhMode,
+        zpr_addr: &[&str],
+        tun_ctl: TunInfoTunCtl,
+    ) -> Result<(String, Vec<IpAddr>), String> {
+        let mut builder = TestAssemblyBuilder::new();
+        builder.ph_mode = Some(mode);
+        let cfg = config::Config {
+            zpr_addr: zpr_addr.iter().map(|a| a.parse().unwrap()).collect(),
+            ..Default::default()
+        };
+        builder.config = Some(rcu::RcuBox::new(cfg));
+        builder.tun_ctl = Some(Box::new(tun_ctl));
+        let asm = Arc::new(create_assembly(builder));
+
+        LocalSet::new()
+            .run_until(async move {
+                let (client_end, server_end) = tokio::io::duplex(4096);
+                serve_connection(
+                    asm,
+                    byte_stream_network(server_end, capnp_rpc::rpc_twoparty_capnp::Side::Server),
+                    true,
+                );
+                let mut client_rpc = capnp_rpc::RpcSystem::new(
+                    byte_stream_network(client_end, capnp_rpc::rpc_twoparty_capnp::Side::Client),
+                    None,
+                );
+                let service: svc::Client =
+                    client_rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+                tokio::task::spawn_local(client_rpc);
+
+                let response = service
+                    .get_tun_info_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("getTunInfo must be answered");
+                let results = response.get().unwrap();
+                if let cli::success_or_error::Which::Error(e) =
+                    results.get_result().unwrap().which().unwrap()
+                {
+                    return Err(e.unwrap().get_txt().unwrap().to_string().unwrap());
+                }
+                let info = results.get_info().unwrap();
+                let name = info.get_if_name().unwrap().to_string().unwrap();
+                let addrs = info
+                    .get_zpr_addrs()
+                    .unwrap()
+                    .iter()
+                    .map(|a| match a.which().unwrap() {
+                        cli::ip_addr::Which::V4(b) => {
+                            IpAddr::from(<[u8; 4]>::try_from(b.unwrap()).unwrap())
+                        }
+                        cli::ip_addr::Which::V6(b) => {
+                            IpAddr::from(<[u8; 16]>::try_from(b.unwrap()).unwrap())
+                        }
+                    })
+                    .collect();
+                Ok((name, addrs))
+            })
+            .await
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// (a) zipline#202: `getTunInfo` reports the name of the TUN ph opened.
+    #[tokio::test]
+    async fn get_tun_info_reports_interface_name() {
+        let (name, _) = get_tun_info(
+            PhMode::Adapter,
+            &[],
+            TunInfoTunCtl {
+                name: "utun7",
+                on_tun: vec![],
+                inspect_unsupported: false,
+            },
+        )
+        .await
+        .expect("getTunInfo must succeed");
+        assert_eq!(name, "utun7");
+    }
+
+    /// (b) A granted address that is on the TUN is reported.
+    #[tokio::test]
+    async fn get_tun_info_reports_granted_address_on_tun() {
+        let (name, addrs) = get_tun_info(
+            PhMode::Adapter,
+            &["fd5a:5052::1234"],
+            TunInfoTunCtl {
+                name: "tun0",
+                on_tun: vec![ip("fd5a:5052::1234"), ip("fe80::1")],
+                inspect_unsupported: false,
+            },
+        )
+        .await
+        .expect("getTunInfo must succeed");
+        assert_eq!(name, "tun0");
+        assert_eq!(addrs, vec![ip("fd5a:5052::1234")]);
+    }
+
+    /// (c) An address ph believes it owns but which is not on the TUN (a
+    /// stale or not-yet-applied one) is not reported (plan Q2).
+    #[tokio::test]
+    async fn get_tun_info_omits_address_absent_from_tun() {
+        let (_, addrs) = get_tun_info(
+            PhMode::Adapter,
+            &["fd5a:5052::1234", "fd5a:5052::99"],
+            TunInfoTunCtl {
+                name: "tun0",
+                on_tun: vec![ip("fd5a:5052::99")],
+                inspect_unsupported: false,
+            },
+        )
+        .await
+        .expect("getTunInfo must succeed");
+        assert_eq!(addrs, vec![ip("fd5a:5052::99")]);
+    }
+
+    /// (d) Before the grant an adapter has no address: the name alone is
+    /// reported, with an empty address list.
+    #[tokio::test]
+    async fn get_tun_info_before_grant_has_no_addresses() {
+        let (name, addrs) = get_tun_info(
+            PhMode::Adapter,
+            &[],
+            TunInfoTunCtl {
+                name: "tun0",
+                on_tun: vec![ip("fd5a:5052::1234")],
+                inspect_unsupported: false,
+            },
+        )
+        .await
+        .expect("getTunInfo must succeed");
+        assert_eq!(name, "tun0");
+        assert!(addrs.is_empty(), "no address before the grant: {addrs:?}");
+    }
+
+    /// An address the platform cannot inspect (`Unsupported`) is omitted,
+    /// not guessed (plan Q2).
+    #[tokio::test]
+    async fn get_tun_info_omits_uninspectable_address() {
+        let (_, addrs) = get_tun_info(
+            PhMode::Adapter,
+            &["10.0.0.5"],
+            TunInfoTunCtl {
+                name: "tun0",
+                on_tun: vec![ip("10.0.0.5")],
+                inspect_unsupported: true,
+            },
+        )
+        .await
+        .expect("getTunInfo must succeed");
+        assert!(
+            addrs.is_empty(),
+            "uninspectable address reported: {addrs:?}"
+        );
+    }
+
+    /// A node answers too, not only an adapter (plan Q3).
+    #[tokio::test]
+    async fn get_tun_info_answers_in_node_mode() {
+        let (name, addrs) = get_tun_info(
+            PhMode::Node,
+            &["fd5a:5052:90de::1"],
+            TunInfoTunCtl {
+                name: "tun-node",
+                on_tun: vec![ip("fd5a:5052:90de::1")],
+                inspect_unsupported: false,
+            },
+        )
+        .await
+        .expect("getTunInfo must succeed on a node");
+        assert_eq!(name, "tun-node");
+        assert_eq!(addrs, vec![ip("fd5a:5052:90de::1")]);
     }
 }
